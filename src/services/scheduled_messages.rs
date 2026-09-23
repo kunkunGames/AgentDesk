@@ -67,7 +67,7 @@ pub async fn scheduled_message_loop(
         std::process::id(),
         uuid::Uuid::new_v4()
     );
-    tracing::info!("[smsg] scheduled message worker started (adaptive backoff 500ms-5s)");
+    tracing::info!("[smsg] scheduled message runner started (adaptive backoff 500ms-5s)");
 
     let mut poll_interval = Duration::from_millis(500);
     let max_interval = Duration::from_secs(5);
@@ -120,8 +120,8 @@ async fn tick_once(
         Err(error) => tracing::warn!("[smsg] due claim failed: {error}"),
     }
 
-    // A process without Discord runtime also has no message_outbox worker.
-    // Leave durable agent turns untouched for a runtime-capable leader to
+    // A process without Discord runtime also has no message_outbox runner.
+    // Leave durable agent turns untouched for a runtime-capable hub to
     // adopt; resolving NO_REPLY here could otherwise finalize a reservation
     // after enqueueing a push_raw fallback that nobody can deliver.
     if health_registry.is_some()
@@ -150,7 +150,7 @@ pub async fn fire_claimed(
 ) {
     let message = &fire.message;
 
-    // Compare against the claim time, not the fire slot: a worker that wakes
+    // Compare against the claim time, not the fire slot: a runner that wakes
     // up late must not deliver a message whose expiry has already passed. This
     // check intentionally precedes retry exhaustion: `push_raw` is still a
     // delivery and must never bypass the definition's expiry boundary.

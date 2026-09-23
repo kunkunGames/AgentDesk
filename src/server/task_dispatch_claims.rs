@@ -74,7 +74,7 @@ async fn claim_task_dispatches_with_cluster_config(
     let to_agent_id = clean_optional(request.to_agent_id.as_deref());
     let dispatch_type = clean_optional(request.dispatch_type.as_deref());
     let lease_ttl_secs = request.lease_ttl_secs.unwrap_or(60);
-    let worker_nodes = crate::server::cluster::list_worker_nodes(pool, lease_ttl_secs).await?;
+    let cluster_nodes = crate::server::cluster::list_cluster_nodes(pool, lease_ttl_secs).await?;
     let semaphore_configs = &cluster_config.semaphores;
 
     let mut tx = pool
@@ -133,7 +133,7 @@ async fn claim_task_dispatches_with_cluster_config(
             let required = required_capabilities.as_ref().expect("checked above");
             let candidates = semaphore_aware_route_candidates_on_pg_tx(
                 &mut tx,
-                &worker_nodes,
+                &cluster_nodes,
                 required,
                 semaphore_configs,
             )
@@ -143,7 +143,7 @@ async fn claim_task_dispatches_with_cluster_config(
                 .find(|candidate| candidate.decision.eligible);
             let selected =
                 selected_candidate.and_then(|candidate| candidate.decision.instance_id.as_deref());
-            let owner_node = worker_nodes.iter().find(|node| {
+            let owner_node = cluster_nodes.iter().find(|node| {
                 node.get("instance_id").and_then(|value| value.as_str())
                     == Some(claim_owner.as_str())
             });
@@ -161,7 +161,7 @@ async fn claim_task_dispatches_with_cluster_config(
                     eligible: false,
                     reasons: Vec::new(),
                 });
-            merge_worker_registry_reasons(&mut owner_decision, owner_node, lease_ttl_secs);
+            merge_runner_registry_reasons(&mut owner_decision, owner_node, lease_ttl_secs);
             if selected != Some(claim_owner.as_str()) {
                 merge_route_selection_reason(&mut owner_decision, selected);
                 let diagnostics = json!({
@@ -264,12 +264,12 @@ async fn claim_task_dispatches_with_cluster_config(
 
 async fn semaphore_aware_route_candidates_on_pg_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    worker_nodes: &[Value],
+    cluster_nodes: &[Value],
     required_capabilities: &Value,
     semaphore_configs: &BTreeMap<String, ClusterSemaphoreConfig>,
 ) -> Result<Vec<crate::server::cluster::CapabilityRouteCandidate>, String> {
     let mut candidates =
-        crate::server::cluster::select_capability_route(worker_nodes, required_capabilities);
+        crate::server::cluster::select_capability_route(cluster_nodes, required_capabilities);
     if crate::db::dispatch_semaphores::required_semaphore_names(Some(required_capabilities))
         .is_empty()
     {
@@ -302,7 +302,7 @@ async fn semaphore_aware_route_candidates_on_pg_tx(
     Ok(candidates)
 }
 
-/// Folds the worker-registry facts that capability matching cannot see into
+/// Folds the runner-registry facts that capability matching cannot see into
 /// the claim owner's skip reasons.
 ///
 /// `explain_capability_match` answers exactly one question — do this node's
@@ -318,7 +318,7 @@ async fn semaphore_aware_route_candidates_on_pg_tx(
 /// claim_owner`, and neither an offline nor an unregistered owner can ever be
 /// `selected`, because `select_capability_route` keeps `status = 'online'`
 /// nodes only — so nothing here can flip a claim into or out of existence.
-fn merge_worker_registry_reasons(
+fn merge_runner_registry_reasons(
     decision: &mut crate::server::cluster::CapabilityRouteDecision,
     owner_node: Option<&Value>,
     lease_ttl_secs: u64,
@@ -327,7 +327,7 @@ fn merge_worker_registry_reasons(
         decision.eligible = false;
         decision
             .reasons
-            .push("claim owner is not registered in worker_nodes".to_string());
+            .push("claim owner is not registered in cluster_nodes".to_string());
         return;
     };
     let status = node
@@ -339,7 +339,7 @@ fn merge_worker_registry_reasons(
     }
     decision.eligible = false;
     decision.reasons.push(format!(
-        "claim owner worker node is not online (status '{status}'; {lease_ttl_secs}s heartbeat lease)"
+        "claim owner runner node is not online (status '{status}'; {lease_ttl_secs}s heartbeat lease)"
     ));
 }
 
@@ -364,7 +364,7 @@ fn merge_route_selection_reason(
             }
         }
         None => decision.reasons.push(
-            "no online worker node satisfies required capabilities or semaphore constraints"
+            "no online runner node satisfies required capabilities or semaphore constraints"
                 .to_string(),
         ),
     }
@@ -480,12 +480,12 @@ mod task_dispatch_claims_pg_tests {
         let pool = pg_db.connect_and_migrate().await;
 
         sqlx::query(
-            "INSERT INTO worker_nodes (
+            "INSERT INTO cluster_nodes (
                 instance_id, hostname, role, effective_role, status, labels, capabilities,
                 last_heartbeat_at, started_at, updated_at
              )
              VALUES (
-                'mac-book-release', 'mac-book', 'worker', 'worker', 'online',
+                'mac-book-release', 'mac-book', 'runner', 'runner', 'online',
                 '[\"mac-book\"]'::jsonb,
                 '{\"providers\":[\"codex\"],\"mcp\":{\"filesystem\":{\"healthy\":true}}}'::jsonb,
                 NOW(), NOW(), NOW()
@@ -566,7 +566,7 @@ mod task_dispatch_claims_pg_tests {
             return;
         };
         let pool = pg_db.connect_and_migrate().await;
-        seed_two_worker_nodes(&pool).await;
+        seed_two_cluster_nodes(&pool).await;
         seed_agent_and_card(&pool).await;
         seed_dispatch_with_required_capabilities(
             &pool,
@@ -636,7 +636,7 @@ mod task_dispatch_claims_pg_tests {
             return;
         };
         let pool = pg_db.connect_and_migrate().await;
-        seed_two_worker_nodes(&pool).await;
+        seed_two_cluster_nodes(&pool).await;
         seed_agent_and_card(&pool).await;
         seed_dispatch_with_required_capabilities(
             &pool,
@@ -690,7 +690,7 @@ mod task_dispatch_claims_pg_tests {
             return;
         };
         let pool = pg_db.connect_and_migrate().await;
-        seed_two_worker_nodes(&pool).await;
+        seed_two_cluster_nodes(&pool).await;
         seed_agent_and_card(&pool).await;
         seed_dispatch_with_required_capabilities(
             &pool,
@@ -776,7 +776,7 @@ mod task_dispatch_claims_pg_tests {
             return;
         };
         let pool = pg_db.connect_and_migrate().await;
-        seed_two_worker_nodes(&pool).await;
+        seed_two_cluster_nodes(&pool).await;
         seed_agent_and_card(&pool).await;
         seed_dispatch_with_required_capabilities(
             &pool,
@@ -844,7 +844,7 @@ mod task_dispatch_claims_pg_tests {
             return;
         };
         let pool = pg_db.connect_and_migrate().await;
-        seed_two_worker_nodes(&pool).await;
+        seed_two_cluster_nodes(&pool).await;
         seed_agent_and_card(&pool).await;
         seed_dispatch_with_required_capabilities(
             &pool,
@@ -921,7 +921,7 @@ mod task_dispatch_claims_pg_tests {
             return;
         };
         let pool = pg_db.connect_and_migrate().await;
-        seed_two_worker_nodes(&pool).await;
+        seed_two_cluster_nodes(&pool).await;
         seed_agent_and_card(&pool).await;
         seed_dispatch_with_required_capabilities(
             &pool,
@@ -1003,7 +1003,7 @@ mod task_dispatch_claims_pg_tests {
         };
         let pool = pg_db.connect_and_migrate().await;
         seed_agent_and_card(&pool).await;
-        seed_worker_node(&pool, "mac-mini-release", "mac-mini", 600).await;
+        seed_runner_node(&pool, "mac-mini-release", "mac-mini", 600).await;
         seed_dispatch_with_required_capabilities(
             &pool,
             "disp-offline-owner",
@@ -1039,7 +1039,7 @@ mod task_dispatch_claims_pg_tests {
         assert!(
             reasons
                 .iter()
-                .any(|reason| reason.contains("no online worker node satisfies")),
+                .any(|reason| reason.contains("no online runner node satisfies")),
             "an all-offline cluster must reach the no-online-node reason; got {reasons:?}"
         );
         assert!(
@@ -1144,7 +1144,7 @@ mod task_dispatch_claims_pg_tests {
         assert_eq!(
             unregistered_owner,
             ScenarioVerdict::skipped(),
-            "owner missing from worker_nodes must still skip"
+            "owner missing from cluster_nodes must still skip"
         );
 
         let capability_mismatch = run_claim_scenario(
@@ -1207,12 +1207,12 @@ mod task_dispatch_claims_pg_tests {
             .execute(pool)
             .await
             .unwrap(); // agentdesk-audit: allow-unwrap — PG test fixture; a broken step must fail the test
-        sqlx::query("DELETE FROM worker_nodes")
+        sqlx::query("DELETE FROM cluster_nodes")
             .execute(pool)
             .await
             .unwrap(); // agentdesk-audit: allow-unwrap — PG test fixture; a broken step must fail the test
         for (instance_id, label, heartbeat_age_secs) in nodes {
-            seed_worker_node(pool, instance_id, label, *heartbeat_age_secs).await;
+            seed_runner_node(pool, instance_id, label, *heartbeat_age_secs).await;
         }
         seed_dispatch_with_required_capabilities(
             pool,
@@ -1269,19 +1269,19 @@ mod task_dispatch_claims_pg_tests {
         }
     }
 
-    async fn seed_worker_node(
+    async fn seed_runner_node(
         pool: &PgPool,
         instance_id: &str,
         label: &str,
         heartbeat_age_secs: i64,
     ) {
         sqlx::query(
-            "INSERT INTO worker_nodes (
+            "INSERT INTO cluster_nodes (
                 instance_id, hostname, role, effective_role, status, labels, capabilities,
                 last_heartbeat_at, started_at, updated_at
              )
              VALUES (
-                $1, $2, 'worker', 'worker', 'online',
+                $1, $2, 'runner', 'runner', 'online',
                 jsonb_build_array($3::TEXT), '{\"providers\":[\"codex\"]}'::jsonb,
                 NOW() - ($4::BIGINT * INTERVAL '1 second'), NOW(), NOW()
              )",
@@ -1295,20 +1295,20 @@ mod task_dispatch_claims_pg_tests {
         .unwrap(); // agentdesk-audit: allow-unwrap — PG test fixture; a broken step must fail the test
     }
 
-    async fn seed_two_worker_nodes(pool: &PgPool) {
+    async fn seed_two_cluster_nodes(pool: &PgPool) {
         sqlx::query(
-            "INSERT INTO worker_nodes (
+            "INSERT INTO cluster_nodes (
                 instance_id, hostname, role, effective_role, status, labels, capabilities,
                 last_heartbeat_at, started_at, updated_at
              )
              VALUES
                 (
-                    'mac-mini-release', 'mac-mini', 'worker', 'worker', 'online',
+                    'mac-mini-release', 'mac-mini', 'runner', 'runner', 'online',
                     '[\"mac-mini\"]'::jsonb, '{\"providers\":[\"codex\"]}'::jsonb,
                     NOW(), NOW(), NOW()
                 ),
                 (
-                    'mac-book-release', 'mac-book', 'worker', 'worker', 'online',
+                    'mac-book-release', 'mac-book', 'runner', 'runner', 'online',
                     '[\"mac-book\"]'::jsonb, '{\"providers\":[\"codex\"]}'::jsonb,
                     NOW() - INTERVAL '1 second', NOW(), NOW()
                 )",

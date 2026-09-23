@@ -2494,7 +2494,7 @@ mod watcher_jsonl_owner_tests {
     /// rotation opens it. A plain `O_RDONLY` open there waits for a writer that never
     /// comes, inside the `spawn_blocking` the watcher's poll loop awaits — so the
     /// assertion that matters is the one about *time*, and the call is driven from a
-    /// worker thread precisely so that a regression fails this test on the timeout
+    /// runner thread precisely so that a regression fails this test on the timeout
     /// instead of hanging the whole run at the open.
     ///
     /// Both halves of the fix are needed to pass: `O_NONBLOCK` for the open to return
@@ -3415,7 +3415,7 @@ Press any key to continue . . .
         // Assistant body text mentions "running" / "processing" / "thinking" but
         // there is NO `esc to interrupt` footer and NO spinner progress line.
         let capture = "\
-⏺ I checked the build: the test suite is running in CI and the worker is
+⏺ I checked the build: the test suite is running in CI and the runner is
   still processing the queue while thinking through the edge cases.
 some more scrolled-back assistant prose
 another line of prior output";

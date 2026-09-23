@@ -110,12 +110,12 @@ category_json="$(run_cli discord category-create --name "$CATEGORY_NAME" "${guil
 echo "$category_json"
 category_id="$(printf '%s' "$category_json" | extract_id)"
 
-# 2. Channels — 4 worker cells + 1 orchestrator
+# 2. Channels — 4 runner cells + 1 orchestrator
 channels=(
-  "adk-claude-pipe-e2e|Claude pipe runtime E2E worker"
-  "adk-claude-tui-e2e|Claude tui runtime E2E worker"
-  "adk-codex-pipe-e2e|Codex pipe runtime E2E worker"
-  "adk-codex-tui-e2e|Codex tui runtime E2E worker"
+  "adk-claude-pipe-e2e|Claude pipe runtime E2E runner"
+  "adk-claude-tui-e2e|Claude tui runtime E2E runner"
+  "adk-codex-pipe-e2e|Codex pipe runtime E2E runner"
+  "adk-codex-tui-e2e|Codex tui runtime E2E runner"
   "adk-e2e-orchestrator|Multi-provider E2E orchestrator (전체 e2e 시작 등)"
 )
 
@@ -140,7 +140,7 @@ Next steps:
   2. Under \`agents:\`, replace each \`PLACEHOLDER_ADK_*\` id with the matching
      channel id printed above. (See agentdesk.example.yaml for the entry
      shape.)
-  3. \`agentdesk restart-dcserver\` so the workers come online.
+  3. \`agentdesk restart-dcserver\` so the runners come online.
   4. Smoke a single cell:
        scripts/e2e/run_tui_relay.py --cell claude-pipe \\
          --channel-id <id of adk-claude-pipe-e2e>

@@ -1245,7 +1245,7 @@ async fn send_review_result_to_primary_with_context_and_transport<T: DispatchTra
         .and_then(|ctx| serde_json::from_str::<serde_json::Value>(ctx).ok());
 
     // For improve/rework/reject: create a review-decision dispatch via the
-    // authoritative path and let the outbox worker deliver the message.
+    // authoritative path and let the outbox runner deliver the message.
     if verdict != "pass" && verdict != "approved" && verdict != "unknown" {
         // #118/#420: If review automation already converged on a concrete
         // follow-up state, don't enqueue a generic review-decision dispatch on

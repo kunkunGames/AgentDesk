@@ -251,7 +251,7 @@ assert_class "r4 [1] narrowness: a bare 'bad request' elsewhere in the log does 
 # words on one line withholds the retry instead.
 LOOSE_PERMISSIONS_LOG="$(write_log outage-with-requesting-allowed-prose.log \
   'Failed to resolve action download info. Error: Service Unavailable' \
-  'DEBUG scheduler: worker is requesting a slot; queue growth is allowed')"
+  'DEBUG scheduler: runner is requesting a slot; queue growth is allowed')"
 assert_class "r4 [5] narrowness: unquoted 'requesting … allowed' prose does not withhold the retry" \
   "infra-unrelated" "$PG_JOB" "$LOOSE_PERMISSIONS_LOG" 1
 

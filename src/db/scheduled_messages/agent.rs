@@ -186,9 +186,9 @@ pub async fn mark_delivery_agent_turn_started_pg(
     Ok(recorded)
 }
 
-/// Hand a successfully started durable turn from the fire worker to the
+/// Hand a successfully started durable turn from the fire runner to the
 /// completion poller. The next poll adopts it with a fresh fencing token;
-/// failed starts keep their original token so the fire worker can rewind them.
+/// failed starts keep their original token so the fire runner can rewind them.
 pub async fn release_agent_delivery_to_poller_pg(
     pool: &PgPool,
     delivery_id: &str,

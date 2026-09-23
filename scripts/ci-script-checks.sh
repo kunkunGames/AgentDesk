@@ -557,7 +557,7 @@ banner "Generate env + CLI reference docs (README source-of-truth tables)"
 git diff --exit-code -- \
   ARCHITECTURE.md \
   docs/generated/route-inventory.md \
-  docs/generated/worker-inventory.md \
+  docs/generated/runner-inventory.md \
   docs/generated/env-reference.md \
   docs/generated/cli-reference.md
 

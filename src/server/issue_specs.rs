@@ -291,8 +291,8 @@ mod tests {
         let spec = parse_issue_spec_markdown(
             r#"
 ## Acceptance Criteria
-- Dispatch routes to a capable worker
-- [ ] Expired workers are rejected
+- Dispatch routes to a capable runner
+- [ ] Expired runners are rejected
 
 ## Test Plan
 - Run heartbeat expiry regression

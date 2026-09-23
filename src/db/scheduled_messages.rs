@@ -1,7 +1,7 @@
 //! Repository layer for the scheduled-message reservation pool.
 //!
 //! All raw SQL for `scheduled_messages` and `scheduled_message_deliveries`
-//! lives here. Route handlers and the scheduler worker delegate to these
+//! lives here. Route handlers and the scheduler runner delegate to these
 //! functions and never issue SQL directly.
 //!
 //! Design: docs/design/scheduled-messages.md — definition + delivery rows
@@ -431,7 +431,7 @@ pub async fn list_deliveries_pg(
     builder.build_query_as().fetch_all(pool).await
 }
 
-// ── Firing (worker) ─────────────────────────────────────────────────────────
+// ── Firing (runner) ─────────────────────────────────────────────────────────
 
 /// Claim up to `batch` due definitions for firing. For each claimed row a
 /// delivery slot row is created (or an interrupted one from a prior attempt is
@@ -642,7 +642,7 @@ pub async fn trigger_now_pg(
     Ok(claimed)
 }
 
-// ── Delivery + parent state transitions (worker) ────────────────────────────
+// ── Delivery + parent state transitions (runner) ────────────────────────────
 
 /// Terminal transition for a delivery row inside a caller-owned transaction.
 /// No-op when the row already left `running` (stale lease double-completion

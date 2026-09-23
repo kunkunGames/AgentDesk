@@ -65,7 +65,7 @@ invariant 위반은 별도의 hard gate다.
 
 - [Module inventory](generated/module-inventory.md)
 - [Route inventory](generated/route-inventory.md)
-- [Bootstrap worker inventory](generated/worker-inventory.md)
+- [Bootstrap runner inventory](generated/runner-inventory.md)
 
 ### 1. Discord Runtime (`src/services/discord/`)
 
@@ -118,7 +118,7 @@ Turn bridge decomposition anchors:
 
 ### 3. HTTP Server (`src/server/`)
 
-Axum router, WebSocket broadcast, auth middleware, REST API, bootstrap worker 시작점이 여기에 있다. 정확한 endpoint 목록은 generated route inventory를, `server::run`에서 시작되는 background task/thread 목록은 generated worker inventory를 참고한다.
+Axum router, WebSocket broadcast, auth middleware, REST API, bootstrap runner 시작점이 여기에 있다. 정확한 endpoint 목록은 generated route inventory를, `server::run`에서 시작되는 background task/thread 목록은 generated runner inventory를 참고한다.
 
 핵심 역할:
 - `/ws` WebSocket endpoint와 `/api/*` REST surface 제공

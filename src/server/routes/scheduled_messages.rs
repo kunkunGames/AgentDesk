@@ -903,7 +903,7 @@ pub async fn trigger_scheduled_message_now(
     {
         Ok(Some(claimed)) => claimed,
         Ok(None) => {
-            // Missing, terminal, firing, or claimed by a concurrent worker.
+            // Missing, terminal, firing, or claimed by a concurrent runner.
             return match db::get_scheduled_message_pg(pool, &id).await {
                 Ok(Some(row)) => Err(app_error(
                     StatusCode::CONFLICT,

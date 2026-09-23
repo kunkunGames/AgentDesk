@@ -1,5 +1,5 @@
 //! Scenario: a local-only `/model` observation must wake an idle durable queue
-//! through the production workers, without dispatching the queued turn twice.
+//! through the production runners, without dispatching the queued turn twice.
 //!
 //! The mock Discord transport, the `serenity::Context` over it and the
 //! production entry points live in [`super::relay_e2e`].
@@ -244,7 +244,7 @@ async fn completion_lifecycle_rejects_queue_eligible_before_mailbox_release() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn local_model_observation_wakes_idle_durable_queue_through_production_workers() {
+async fn local_model_observation_wakes_idle_durable_queue_through_production_runners() {
     let harness = RelayE2eHarness::start().await;
     let shared = harness.shared.clone();
     let channel_id = harness.channel_id;
@@ -309,7 +309,7 @@ async fn local_model_observation_wakes_idle_durable_queue_through_production_wor
             }
         })
         .await,
-        "production placeholder-failure recovery must leave idle durable B behind an armed normal worker"
+        "production placeholder-failure recovery must leave idle durable B behind an armed normal runner"
     );
 
     // Drain A's release event explicitly so the local-only assertion below observes only the
@@ -330,7 +330,7 @@ async fn local_model_observation_wakes_idle_durable_queue_through_production_wor
     harness.cache_relay_transport();
     let tmux = "AgentDesk-claude-4874-local-model-wake";
     harness.attach_tmux_watcher(tmux, "claude-queue-wake.jsonl");
-    harness.spawn_relay_worker();
+    harness.spawn_relay_runner();
 
     // Subscribe after draining A's release event so every edge after the local-only observations is
     // inspected, including promoted B's known two-phase completion lifecycle.
@@ -352,7 +352,7 @@ async fn local_model_observation_wakes_idle_durable_queue_through_production_wor
         harness
             .wait_for_placeholder_posts(2, Duration::from_millis(1500))
             .await,
-        "local /model must wake the occupied two-second deferred worker"
+        "local /model must wake the occupied two-second deferred runner"
     );
 
     let promoted_b = harness.mailbox().await;
@@ -367,7 +367,7 @@ async fn local_model_observation_wakes_idle_durable_queue_through_production_wor
     );
     assert_eq!(harness.placeholder_posts(), 2);
     // Deadline-bounded rather than a fixed sleep, same window: it covers a
-    // dispatch racing the wake, not the deferred worker's later kickoff.
+    // dispatch racing the wake, not the deferred runner's later kickoff.
     assert!(
         !harness
             .wait_for_placeholder_posts(3, Duration::from_millis(100))

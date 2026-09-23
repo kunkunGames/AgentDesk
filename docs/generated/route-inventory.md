@@ -334,4 +334,4 @@
 | `GET` | `/api/v1/tokens` | `tokens` | `src/server/routes/v1.rs:205` | `src/server/routes/v1.rs:122` |
 | `GET` | `/api/voice/config` | `voice_config::get_voice_config` | `src/server/routes/voice_config.rs:110` | `src/server/routes/domains/admin.rs:82` |
 | `PUT` | `/api/voice/config` | `voice_config::put_voice_config` | `src/server/routes/voice_config.rs:120` | `src/server/routes/domains/admin.rs:82` |
-| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:27` | `src/server/mod.rs:412` |
+| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:27` | `src/server/mod.rs:408` |

@@ -82,7 +82,7 @@ function categoryDetails(category) {
     return "API 마찰 모니터\nsrc/services/api_friction.rs";
   }
   if (category === "release-freshness") {
-    return "릴리스 신선도 모니터\ndocs/generated/worker-inventory.md";
+    return "릴리스 신선도 모니터\ndocs/generated/runner-inventory.md";
   }
   if (category === "outbox-delivery") {
     return "메시지 아웃박스 전달 모니터\nsrc/services/message_outbox.rs";

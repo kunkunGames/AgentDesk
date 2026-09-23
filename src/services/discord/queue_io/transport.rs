@@ -4,7 +4,7 @@ use super::*;
 mod tests;
 
 /// Owned HTTP handle plus borrowed runtime credentials. Gateway cache is an
-/// optional optimization; workers use the same intake and policy checks over REST.
+/// optional optimization; runners use the same intake and policy checks over REST.
 pub(super) struct QueueTransport<'a> {
     http: Arc<serenity::Http>,
     ctx: Option<&'a serenity::Context>,

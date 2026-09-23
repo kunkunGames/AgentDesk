@@ -902,7 +902,7 @@ impl RoutineAgentExecutor {
     }
 
     /// Boot-recovery reap (#3022): after a stale fresh run is marked
-    /// `interrupted` at worker startup, tear down the exact session it recorded
+    /// `interrupted` at runner startup, tear down the exact session it recorded
     /// as owned. Requires positive ownership proof (`owned_tmux_session` set on a
     /// `fresh` run); runs that own nothing are skipped, so an interrupted run can
     /// never reap a session it did not create. Idempotent — if the session is

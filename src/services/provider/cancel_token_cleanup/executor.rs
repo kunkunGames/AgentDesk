@@ -187,8 +187,8 @@ impl CancelToken {
             }
         }
         // The legacy timeout drain reads child_pid after this call to distinguish a
-        // killed worker from a naturally completed one. Leave the PID published until
-        // its worker clears it, after this chokepoint has delivered the signal.
+        // killed runner from a naturally completed one. Leave the PID published until
+        // its runner clears it, after this chokepoint has delivered the signal.
         if tmux_killed {
             self.clear_binding_if_matches(binding.as_ref());
         }

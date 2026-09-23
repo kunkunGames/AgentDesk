@@ -6,7 +6,7 @@ cells: [codex-pipe, codex-tui]
 isolation: required
 skip_reason: >
   Known gap for #3798: Codex relay cells currently provide live text and
-  lifecycle coverage, but their E2E worker role does not execute live shell or
+  lifecycle coverage, but their E2E runner role does not execute live shell or
   tool commands. Tool-command completeness therefore cannot be counted as a
   green live lane for codex-pipe or codex-tui.
 acceptance_criteria:

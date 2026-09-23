@@ -671,7 +671,7 @@ fn worktree_head_matches_commit(dir: &str, commit_sha: &str) -> bool {
 /// #2237 item 3: `git_tracked_change_paths*` shells out to `git status` and
 /// can block for a meaningful amount of time on a large monorepo worktree.
 /// Every async review-target resolver path that calls it must move the
-/// invocation onto a blocking thread so the tokio worker that drives every
+/// invocation onto a blocking thread so the tokio runner that drives every
 /// other dispatch task is not stalled.
 ///
 /// Returns an empty `Vec` both when the worktree is genuinely clean and
@@ -745,7 +745,7 @@ fn dirty_paths_sample(dirty_paths: &[String]) -> String {
 /// Blocking half of the review worktree probe.
 ///
 /// #2237 follow-up: async review-target resolution must not run git HEAD or
-/// status checks on the tokio worker. Keep the exact-HEAD validation and the
+/// status checks on the tokio runner. Keep the exact-HEAD validation and the
 /// strict tracked-status check in one `spawn_blocking` unit so callers never
 /// observe a clean status for a different HEAD than the reviewed commit.
 fn probe_clean_exact_review_worktree_blocking(path: String, commit: String) -> ReviewWorktreeProbe {

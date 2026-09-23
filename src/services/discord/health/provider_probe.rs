@@ -346,17 +346,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_profile_health_does_not_require_gateway_or_hide_recovery_failure() {
+    async fn runner_profile_health_does_not_require_gateway_or_hide_recovery_failure() {
         let registry = HealthRegistry::new();
         let shared = crate::services::discord::make_shared_data_for_tests();
         registry
-            .register_worker("codex".to_string(), shared.clone())
+            .register_runner("codex".to_string(), shared.clone())
             .await;
         assert!(!registry.all_providers_are_standby().await);
         let snapshot = build_health_snapshot(&registry).await;
         assert_eq!(snapshot.status(), HealthStatus::Healthy);
         let json = serde_json::to_value(snapshot).unwrap();
-        assert_eq!(json["providers"][0]["runtime_role"], "worker");
+        assert_eq!(json["providers"][0]["runtime_role"], "runner");
         assert_eq!(json["providers"][0]["connected"], false);
         shared
             .restart

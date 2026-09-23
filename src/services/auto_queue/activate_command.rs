@@ -78,7 +78,7 @@ pub(crate) async fn activate_with_deps_pg(
     // feature: rate-limit-aware-dispatch-gate.
     //
     // (1) P2 — populate the gate snapshots on EVERY serving node. `RateLimitSync`
-    // is leader-only, so on a follower the process-local pressure/agent maps are
+    // is hub-only, so on a follower the process-local pressure/agent maps are
     // never filled by the sync loop. Refresh them here (throttled to ~120s) from
     // the SHARED DB cache — read-only, no provider credentials — so the gate is
     // not silently a no-op on whichever node serves `dispatch-next`.

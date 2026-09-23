@@ -1,6 +1,6 @@
 use super::*;
 
-/// Restore inflight turns FIRST, then flush restart reports (leader-only).
+/// Restore inflight turns FIRST, then flush restart reports (hub-only).
 /// Recovery skips channels that have a pending restart report, so the report
 /// must still be on disk when recovery runs. After recovery completes, the
 /// flush loop starts and delivers/clears reports. Behavior-preserving

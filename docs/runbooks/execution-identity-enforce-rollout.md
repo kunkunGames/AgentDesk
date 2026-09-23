@@ -126,7 +126,7 @@ The `pinned.cancel.store(true, …)` in `submit_stale_foreign_inflight_cancel` s
 **after** that `is_none()` early return, so this path leaves the registration and
 the handle's `cancel` value as it found them.
 `demote_stale_foreign_inflight_if_current` then returns `false`, the caller's
-`reclaim_orphan_fn` reports `ReclaimStaleForeignOutcome::None`, and the worker
+`reclaim_orphan_fn` reports `ReclaimStaleForeignOutcome::None`, and the runner
 falls into bounded escalation instead of re-evaluating. After
 `PENDING_START_MAX_BACKSTOP_CYCLES` it takes the ABORT branch
 (`event = tui_direct_pending_start.backstop_abort_foreign_inflight_live`): the

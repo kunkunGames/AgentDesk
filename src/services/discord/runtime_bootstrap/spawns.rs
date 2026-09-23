@@ -46,7 +46,7 @@ fn capture_reachability_watcher_incarnation(
 ///
 /// This task owns no relay or recovery authority. File and ledger failures are
 /// reduced to observation state and logs, so they cannot stop either provider
-/// runtime or its intake worker.
+/// runtime or its intake runner.
 #[cfg(unix)]
 pub(super) fn run_bot_spawn_reachability_observation(
     shared_for_tmux: &Arc<SharedData>,

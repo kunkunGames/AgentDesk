@@ -87,7 +87,7 @@ class DiscordClient:
     timeout_s: float = 30.0
     # When set, prompts are sent via `agentdesk send-to-agent` instead of the
     # plain `POST /api/discord/send`. The direct headless turn API starts the
-    # worker even when the provider bot is not currently watching the channel.
+    # runner even when the provider bot is not currently watching the channel.
     handoff_to_agent: str | None = None
     handoff_from_agent: str | None = None
     captures: list[dict[str, Any]] | None = None
@@ -109,11 +109,11 @@ class DiscordClient:
         return json.loads(payload)
 
     def send_control(self, channel_id: int | str, content: str) -> dict[str, Any]:
-        """Send harness bookkeeping with notify-bot so workers do not wake.
+        """Send harness bookkeeping with notify-bot so runners do not wake.
 
         The E2E setup/teardown markers are for the operator-visible transcript
         and for assertion window boundaries. Sending them through the announce
-        bot can wake the worker agent and recursively start another E2E run.
+        bot can wake the runner agent and recursively start another E2E run.
         """
 
         body = json.dumps(
@@ -226,7 +226,7 @@ class DiscordClient:
         """Send a prompt that needs to land in the target agent's TUI.
 
         Routes through `agentdesk send-to-agent --no-prefix` when a handoff
-        identity is configured. Each E2E worker agent owns a single channel
+        identity is configured. Each E2E runner agent owns a single channel
         bound as `cc`, so `channel_kind` defaults to `cc`.
         """
 

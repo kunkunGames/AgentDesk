@@ -25,10 +25,10 @@ live-state pressure:
 - `working_sessions` — `sessions` rows in `working`.
 - `open_dispatch_outbox` — replayable `dispatch_outbox` rows that had not
   reached a terminal status. `done` and retry-exhausted `failed` rows are
-  terminal; the outbox worker only claimed `pending` rows.
+  terminal; the outbox runner only claimed `pending` rows.
 - `pending_message_outbox` — `message_outbox` rows still in `status = 'pending'`.
   These are Discord messages enqueued by the policy engine that the
-  message-outbox worker has not yet delivered.
+  message-outbox runner has not yet delivered.
 
 The PG-side counts used the same column names so the report could be compared
 before/after import.
@@ -46,21 +46,21 @@ before/after import.
    drained `pending`/`processing` rows first. Terminal `done` and `failed` rows
    were imported as history but did not block cutover.
 3. **Pending `message_outbox`.** With PG import enabled, leftover Discord
-   messages would never be delivered (the worker would switch to PG and forget
+   messages would never be delivered (the runner would switch to PG and forget
    the SQLite rows). The cutover refused unless the operator used
    `--allow-unsent-messages` to acknowledge the loss.
 
 ## Draining `message_outbox`
 
-Before cutover, normal operation depended on the message-outbox worker
+Before cutover, normal operation depended on the message-outbox runner
 (`src/server/background.rs` and
 `src/server/mod.rs`), which polled `status = 'pending'` rows every few seconds
 and flipped them to `sent` once the local `/api/discord/send` HTTP loop
 accepted them. The historical drain process was:
 
 - `dcserver` had to be running and the local HTTP server had to be reachable. A
-  stalled worker was the most common cause of accumulated pending rows.
-- If the worker was stuck, a `dcserver` restart let recovery pick the worker up
+  stalled runner was the most common cause of accumulated pending rows.
+- If the runner was stuck, a `dcserver` restart let recovery pick the runner up
   again and drain the queue.
 - Operators verified `sqlite.pending_message_outbox` was `0` before doing the
   real import.

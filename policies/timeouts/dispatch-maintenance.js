@@ -93,7 +93,7 @@ module.exports = function attachDispatchMaintenance(timeouts, helpers) {
       for (var un = 0; un < unnotifiedDispatches.length; un++) {
         var ud = unnotifiedDispatches[un];
 
-        // Re-enqueue into dispatch_outbox so the Rust outbox worker handles delivery
+        // Re-enqueue into dispatch_outbox so the Rust outbox runner handles delivery
         // with proper two-phase guard and retry/backoff (#209).
         // Do NOT send directly via message.queue — that bypasses the delivery guarantee.
         agentdesk.db.execute(
@@ -154,7 +154,7 @@ module.exports = function attachDispatchMaintenance(timeouts, helpers) {
 
           // Discord notification is handled by the dispatch outbox system (#209).
           // agentdesk.dispatch.create() enqueues an outbox entry via queue_dispatch_notify,
-          // and the outbox worker delivers with two-phase guard (no duplicate risk).
+          // and the outbox runner delivers with two-phase guard (no duplicate risk).
         } catch (e) {
           agentdesk.log.error("[retry] Failed to create retry dispatch for card " +
             fd.kanban_card_id + ": " + e);

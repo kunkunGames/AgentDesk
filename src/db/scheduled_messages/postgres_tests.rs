@@ -111,7 +111,7 @@ async fn postgres_external_handoff_scrubs_targets_and_terminal_payload() {
     )
     .await
     .expect("insert provider-targeted scheduled message");
-    let fire = claim_one(&pool, "external-handoff-worker", 60).await;
+    let fire = claim_one(&pool, "external-handoff-runner", 60).await;
     let outbox_id = Uuid::new_v4();
     let mut tx = pool.begin().await.expect("begin external handoff");
     assert!(
@@ -163,7 +163,7 @@ async fn postgres_external_handoff_scrubs_targets_and_terminal_payload() {
     assert!(terminal.provider_targets.is_none());
     assert!(terminal.provider_target_summary.is_some());
 
-    let claim = claim_external_deliveries_pg(&pool, "external-provider-worker", 10, 60, Utc::now())
+    let claim = claim_external_deliveries_pg(&pool, "external-provider-runner", 10, 60, Utc::now())
         .await
         .expect("claim external delivery")
         .pop()
@@ -280,7 +280,7 @@ async fn postgres_scheduled_message_rearm_rotates_token_and_clears_attempt_field
     )
     .await;
     let message = insert_due_message(&pool, KIND_PUSH).await;
-    let first = claim_one(&pool, "worker-a", 30).await;
+    let first = claim_one(&pool, "runner-a", 30).await;
 
     sqlx::query(
         "UPDATE scheduled_message_deliveries
@@ -313,7 +313,7 @@ async fn postgres_scheduled_message_rearm_rotates_token_and_clears_attempt_field
         "the current claim should rewind its parent"
     );
 
-    let second = claim_one(&pool, "worker-b", 45).await;
+    let second = claim_one(&pool, "runner-b", 45).await;
     assert_eq!(second.delivery_id, first.delivery_id, "slot row is reused");
     assert_ne!(
         second.claim_token, first.claim_token,
@@ -336,7 +336,7 @@ async fn postgres_scheduled_message_rearm_rotates_token_and_clears_attempt_field
     assert_eq!(row.try_get::<String, _>("status").unwrap(), "running");
     assert_eq!(
         row.try_get::<Option<String>, _>("claim_owner").unwrap(),
-        Some("worker-b".to_string())
+        Some("runner-b".to_string())
     );
     assert_eq!(
         row.try_get::<String, _>("claim_token").unwrap(),
@@ -394,7 +394,7 @@ async fn postgres_scheduled_message_retry_waits_until_next_attempt_at() {
     )
     .await;
     let message = insert_due_message(&pool, KIND_AGENT).await;
-    let first = claim_one(&pool, "retry-backoff-worker-a", 30).await;
+    let first = claim_one(&pool, "retry-backoff-runner-a", 30).await;
     let retry_at = Utc::now() + Duration::minutes(5);
     assert!(
         interrupt_delivery_and_rewind_pg(
@@ -412,7 +412,7 @@ async fn postgres_scheduled_message_retry_waits_until_next_attempt_at() {
 
     let blocked = claim_due_fires_pg(
         &pool,
-        "retry-backoff-worker-b",
+        "retry-backoff-runner-b",
         true,
         10,
         30,
@@ -424,7 +424,7 @@ async fn postgres_scheduled_message_retry_waits_until_next_attempt_at() {
 
     let mut ready = claim_due_fires_pg(
         &pool,
-        "retry-backoff-worker-c",
+        "retry-backoff-runner-c",
         true,
         10,
         30,
@@ -467,7 +467,7 @@ async fn postgres_scheduled_message_backoff_does_not_block_other_due_rows() {
     .expect("make delayed definition oldest");
     let ready_message = insert_due_message(&pool, KIND_PUSH).await;
     let mut first_claim =
-        claim_due_fires_pg(&pool, "retry-fairness-worker-a", true, 1, 30, Utc::now())
+        claim_due_fires_pg(&pool, "retry-fairness-runner-a", true, 1, 30, Utc::now())
             .await
             .expect("claim oldest due definition");
     let first = first_claim.pop().expect("oldest definition should claim");
@@ -486,7 +486,7 @@ async fn postgres_scheduled_message_backoff_does_not_block_other_due_rows() {
         .expect("back off oldest definition")
     );
 
-    let claims = claim_due_fires_pg(&pool, "retry-fairness-worker-b", true, 10, 30, Utc::now())
+    let claims = claim_due_fires_pg(&pool, "retry-fairness-runner-b", true, 10, 30, Utc::now())
         .await
         .expect("claim around backed-off definition");
     assert_eq!(claims.len(), 1);
@@ -504,7 +504,7 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
     )
     .await;
     let message = insert_due_message(&pool, KIND_AGENT).await;
-    let first = claim_one(&pool, "worker-a", 20).await;
+    let first = claim_one(&pool, "runner-a", 20).await;
     assert!(
         interrupt_delivery_and_rewind_pg(
             &pool,
@@ -513,12 +513,12 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
             &message.id,
             first.fire_scheduled_at,
             None,
-            "replace worker-a",
+            "replace runner-a",
         )
         .await
         .expect("interrupt first agent attempt")
     );
-    let second = claim_one(&pool, "worker-b", 20).await;
+    let second = claim_one(&pool, "runner-b", 20).await;
 
     assert!(
         !record_delivery_agent_turn_intent_pg(
@@ -621,7 +621,7 @@ async fn postgres_scheduled_message_stale_claim_is_fenced_and_current_claim_rene
     assert_eq!(turn_started_at, None);
     assert_eq!(lease_after_intent, Some(lease_before));
     assert!(
-        list_running_agent_deliveries_pg(&pool, "worker-b", 600, 10)
+        list_running_agent_deliveries_pg(&pool, "runner-b", 600, 10)
             .await
             .expect("poll before launch confirmation")
             .is_empty(),
@@ -768,7 +768,7 @@ async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
         .expect("insert scheduled-message poll definition");
     }
 
-    let claims = claim_due_fires_pg(&pool, "poll-worker", true, 10, 60, Utc::now())
+    let claims = claim_due_fires_pg(&pool, "poll-runner", true, 10, 60, Utc::now())
         .await
         .expect("claim scheduled-message poll definitions");
     assert_eq!(claims.len(), 2);
@@ -811,7 +811,7 @@ async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
         );
     }
 
-    let competing = list_running_agent_deliveries_pg(&pool, "competing-worker", 600, 10)
+    let competing = list_running_agent_deliveries_pg(&pool, "competing-runner", 600, 10)
         .await
         .expect("poll active deliveries from a competing owner");
     assert!(
@@ -834,10 +834,10 @@ async fn postgres_running_agent_poll_rotates_before_renewed_rows() {
     .await
     .expect("seed deterministic poll ordering");
 
-    let first = list_running_agent_deliveries_pg(&pool, "poll-worker", 600, 1)
+    let first = list_running_agent_deliveries_pg(&pool, "poll-runner", 600, 1)
         .await
         .expect("poll first running agent delivery");
-    let second = list_running_agent_deliveries_pg(&pool, "poll-worker", 600, 1)
+    let second = list_running_agent_deliveries_pg(&pool, "poll-runner", 600, 1)
         .await
         .expect("poll second running agent delivery");
     assert_eq!(first.len(), 1);
@@ -927,7 +927,7 @@ async fn postgres_expired_started_turn_is_adopted_instead_of_rearmed() {
         Some(fire.delivery_id.as_str())
     );
 
-    let adopted = list_running_agent_deliveries_pg(&pool, "adopting-worker", 600, 10)
+    let adopted = list_running_agent_deliveries_pg(&pool, "adopting-runner", 600, 10)
         .await
         .expect("adopt expired durable turn");
     assert_eq!(adopted.len(), 1);
@@ -995,7 +995,7 @@ async fn postgres_agent_launch_intent_crash_rearms_without_phantom_lease_renewal
     )
     .await;
     let message = insert_due_message(&pool, KIND_AGENT).await;
-    let first = claim_one(&pool, "pre-launch-worker", 30).await;
+    let first = claim_one(&pool, "pre-launch-runner", 30).await;
     assert!(
         record_delivery_agent_turn_intent_pg(
             &pool,
@@ -1031,7 +1031,7 @@ async fn postgres_agent_launch_intent_crash_rearms_without_phantom_lease_renewal
         1
     );
 
-    let retry = claim_one(&pool, "replacement-worker", 30).await;
+    let retry = claim_one(&pool, "replacement-runner", 30).await;
     assert_eq!(retry.delivery_id, first.delivery_id);
     assert_eq!(retry.retry_count, 1);
     let (turn_id, turn_intent_at, launch_committed_at, turn_started_at): (
@@ -1065,7 +1065,7 @@ async fn postgres_old_writer_rearm_after_new_intent_recovery_stays_ambiguous() {
     )
     .await;
     let message = insert_due_message(&pool, KIND_AGENT).await;
-    let first = claim_one(&pool, "new-pre-launch-worker", 30).await;
+    let first = claim_one(&pool, "new-pre-launch-runner", 30).await;
     assert!(
         record_delivery_agent_turn_intent_pg(
             &pool,
@@ -1178,7 +1178,7 @@ async fn postgres_launch_commit_without_runtime_ack_is_adopted_fail_closed() {
     )
     .await;
     let message = insert_due_message(&pool, KIND_AGENT).await;
-    let fire = claim_one(&pool, "launching-worker", 30).await;
+    let fire = claim_one(&pool, "launching-runner", 30).await;
     assert!(
         record_delivery_agent_turn_intent_pg(
             &pool,
@@ -1223,7 +1223,7 @@ async fn postgres_launch_commit_without_runtime_ack_is_adopted_fail_closed() {
     let launch_committed_at = launch_committed_at.expect("launch commit timestamp");
     assert_eq!(turn_started_at, None);
 
-    let adopted = list_running_agent_deliveries_pg(&pool, "adopting-worker", 600, 10)
+    let adopted = list_running_agent_deliveries_pg(&pool, "adopting-runner", 600, 10)
         .await
         .expect("adopt ambiguous launch");
     assert_eq!(adopted.len(), 1);
@@ -1339,7 +1339,7 @@ async fn postgres_runtime_deferred_backlog_does_not_starve_ready_rows_past_batch
     }
     let ready = insert_due_message(&pool, KIND_PUSH).await;
 
-    let claims = claim_due_fires_pg(&pool, "fair-runtime-worker", true, 1, 30, Utc::now())
+    let claims = claim_due_fires_pg(&pool, "fair-runtime-runner", true, 1, 30, Utc::now())
         .await
         .expect("claim through deferred backlog");
     assert_eq!(claims.len(), 1);
@@ -1399,7 +1399,7 @@ async fn postgres_cancel_reports_committed_agent_handoff_not_intent() {
     )
     .await;
     let message = insert_due_message(&pool, KIND_AGENT).await;
-    let fire = claim_one(&pool, "intent-worker", 30).await;
+    let fire = claim_one(&pool, "intent-runner", 30).await;
     assert!(
         record_delivery_agent_turn_intent_pg(
             &pool,
@@ -1461,7 +1461,7 @@ async fn postgres_cancel_reports_committed_agent_handoff_not_intent() {
     )
     .await
     .expect("insert launched agent message");
-    let launched = claim_one(&pool, "launched-worker", 30).await;
+    let launched = claim_one(&pool, "launched-runner", 30).await;
     assert!(
         record_delivery_agent_turn_intent_pg(
             &pool,
@@ -1568,7 +1568,7 @@ async fn postgres_agent_turn_start_waits_for_parent_lock_and_observes_cancel() {
     )
     .await;
     let message = insert_due_message(&pool, KIND_AGENT).await;
-    let fire = claim_one(&pool, "turn-start-lock-worker", 30).await;
+    let fire = claim_one(&pool, "turn-start-lock-runner", 30).await;
 
     let mut cancel_tx = pool.begin().await.expect("begin cancellation transaction");
     sqlx::query("SELECT id FROM scheduled_messages WHERE id = $1 FOR UPDATE")

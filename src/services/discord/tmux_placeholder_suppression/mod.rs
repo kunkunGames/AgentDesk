@@ -381,7 +381,7 @@ mod placeholder_suppression_tests {
     }
 
     fn completion_footer_block() -> String {
-        "📦 154.6k / 1.0M (15%) · auto-compact 60%\n\nSubagents\n└ bgworker Long background job ✓"
+        "📦 154.6k / 1.0M (15%) · auto-compact 60%\n\nSubagents\n└ bgrunner Long background job ✓"
             .to_string()
     }
 

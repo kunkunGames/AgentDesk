@@ -72,7 +72,7 @@ export function SettingsMachineCard({ node, localId, leaseTtlSeconds, stale, ses
       <Detail label={tr("등록된 API 주소", "Advertised API address")}>{origin || tr("등록 안 됨", "Not advertised")}</Detail>
       <Detail label={tr("프로세스 ID", "Process ID")}>{node.process_id ?? unknown}</Detail>
       <Detail label={tr("마지막 heartbeat", "Last heartbeat")}>{machineTimestamp(node.last_heartbeat_at, tr)}</Detail>
-      <Detail label={tr("시작 시각", "Started at")}>{machineTimestamp(node.started_at, tr)}</Detail>
+      <Detail label={tr("최초 등록 시각", "First registered")}>{machineTimestamp(node.started_at, tr)}</Detail>
       <Detail label={tr("실행 backend", "Execution backends")}>{probe?.backends.join(", ") || unknown}</Detail>
       <Detail label={tr("장치 라벨", "Device labels")}>{node.labels?.join(", ") || tr("없음", "None")}</Detail>
     </dl>

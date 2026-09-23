@@ -285,10 +285,10 @@ pub(super) async fn establish_tui_direct_synthetic_lifecycle_anchor(
 ///   0. refuses prompt classes that the shared injected-prompt decision says do
 ///      not start an external turn,
 ///   1. reads the prior-turn view (`synthetic_start_prior_turn_view`),
-///   2. either DEFERS the start to the detached per-channel worker when a prior
+///   2. either DEFERS the start to the detached per-channel runner when a prior
 ///      turn is still draining (`should_defer_synthetic_turn_start` /
 ///      `defer_synthetic_turn_start`) — the observer must then NOT spawn its own
-///      BridgeAdapter tail (the worker owns the relay-owner handoff), or
+///      BridgeAdapter tail (the runner owns the relay-owner handoff), or
 ///   3. INLINE-claims a passive synthetic inflight (`claim_tui_direct_synthetic_turn`)
 ///      and adopts the claim's resolved `relay_owner` back into the lease so the
 ///      post-block bridge-tail ownership guard sees the true single owner.
@@ -321,16 +321,16 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
         return false;
     }
     // #3154 P1-3: set when the synthetic turn-start is DEFERRED to the detached
-    // per-channel worker; the observer then must NOT spawn its own BridgeAdapter
+    // per-channel runner; the observer then must NOT spawn its own BridgeAdapter
     // tail below (a second observer tail would relay the SAME output twice — the
-    // original bug). The worker owns the relay-owner handoff.
+    // original bug). The runner owns the relay-owner handoff.
     let mut deferred_synthetic_start = false;
     if let Some(provider) = ProviderKind::from_str(provider_str) {
         // #3154 — TEMPORAL fix for turn-interleaving. An INLINE claim while the
         // PRIOR turn's tail still drains seeds `turn_start_offset` from the prior
         // cursor (duplicate relay), and an inline wait starves OTHER channels. So
         // an un-finalized prior turn persists a DURABLE pending-start and hands
-        // the claim to a DETACHED per-channel worker (fresh EOF offset); the
+        // the claim to a DETACHED per-channel runner (fresh EOF offset); the
         // common no-interleave case stays on the inline fast path.
         let prior = super::synthetic_start::synthetic_start_prior_turn_view(
             shared,
@@ -356,7 +356,7 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
                 channel_id = channel_id.get(),
                 tmux_session_name = %prompt.tmux_session_name,
                 anchor_message_id = anchor_message_id.get(),
-                "deferred TUI-direct synthetic turn-start off the observer loop; prior turn not yet finalized (durable record persisted, detached per-channel worker spawned)"
+                "deferred TUI-direct synthetic turn-start off the observer loop; prior turn not yet finalized (durable record persisted, detached per-channel runner spawned)"
             );
         } else {
             let lock = super::super::tui_direct_pending_start::channel_lock(
@@ -382,7 +382,7 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
                 && claim.relay_owner == ExternalInputRelayOwner::BridgeAdapter
             {
                 // The provider already accepted this input. Preserve the original
-                // bytes and anchor in the existing bounded claim/restart worker.
+                // bytes and anchor in the existing bounded claim/restart runner.
                 deferred_synthetic_start = true;
                 super::synthetic_start::defer_synthetic_turn_start(
                     shared,
@@ -416,7 +416,7 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
                 );
             }
             // #3350: the INLINE claim records the same #3303 DeferredClaim marker
-            // as the deferred worker (drain ✅ / sweep TTL ⚠). SC3/own-row/I5 gates
+            // as the deferred runner (drain ✅ / sweep TTL ⚠). SC3/own-row/I5 gates
             // live in the recorder; a pending_start test pins this wiring.
             super::super::tui_direct_pending_start::record_inline_claim_marker_if_claimed(
                 claim.claimed,

@@ -22,13 +22,13 @@ macOS/Linux/Windows에 공통 등록·배정 계약을 적용한다. 별도 실�
 
 | 범위 | 현재 구현/증거 | 완료 판정에 남은 검증 |
 | --- | --- | --- |
-| R1 공유 설정 소유권 | `src/db/postgres/shared_config.rs`로 동기화 책임 분리. worker/auto는 중앙 값 확인만 수행하며 초기화 전에는 오류 반환. audit/import도 동일 소유권 함수 사용. 실제 PG 보존·reset·선부팅·경쟁 등 관련 6개 테스트 통과 | 두 장비 배포·재시작 검증 |
+| R1 공유 설정 소유권 | `src/db/postgres/shared_config.rs`로 동기화 책임 분리. runner/auto는 중앙 값 확인만 수행하며 초기화 전에는 오류 반환. audit/import도 동일 소유권 함수 사용. 실제 PG 보존·reset·선부팅·경쟁 등 관련 6개 테스트 통과 | 두 장비 배포·재시작 검증 |
 | R4 공통 release | OS별 공통 패키징·manifest 검증·GitHub workflow 추가. 기존 `release-fast` 프로필 재사용. 패키징 테스트 7개와 GitHub run `35651612825`의 Windows/Linux/macOS arm64 native matrix 통과. Mac mini에서도 동일 계열 소스 native build 및 실행 확인 | 최종 구현 commit의 Release 게시, 노드 설치/갱신, LAN DB 연결과 노드별 pool 예산 적용 |
 | R2 원격 대시보드 | 공통 HTTP 인증 세대·cache 취소, truthful session probe, 15초 일회용 WS ticket, 로그인/logout UI 구현. 서버 인증 테스트 12개 및 전체 dashboard 단위 테스트 386개 통과. desktop/mobile browser fixture에서 로그인·재연결·교체·logout·refresh 검증 | 실제 LAN peer의 서버+브라우저 통합 검증 |
 | R3 readiness | CLI·인증 프로필 존재·로컬 repo·도구·backend·poller의 기한 있는 증거와 인증된 peer probe를 수집. 신규 remote admission에 연결. HTTP peer identity/auth 경계 및 TTL 테스트 통과 | 실제 LAN 노드에서 provider 인증·quota 확인 및 장애 주입 |
 | R5 필수 실행 조건 | OS/arch/node/tool/repo/backend 필수 조건과 선호 조건 분리. outbox와 재시도에 조건 snapshot 보존. 신규 PG 테스트 2개 통과. 관련 56개 중 55개 통과 후, 정책 조회 실패 시 fallback을 기대하던 기존 테스트를 fail-closed 계약으로 수정해 재실행 통과 | 최종 통합 검증 |
 | R7 중앙 관측·제어 | 노드 상태/readiness/owner와 process·tmux 출력 API를 Ops 화면에 연결. Windows native child 출력·종료 테스트 및 desktop/mobile 브라우저 fixture 2개 통과 | 실제 remote 작업의 출력·취소 검증 |
-| R8 실행 전용 기능 모드 | 공통 바이너리의 `runtime_profile: runner`에서 gateway/voice/dashboard/admin/leader services 초기화 제외. 실행·복구·poller·owner control 유지. profile·route·health·실행 노드 registry 테스트 통과 | 두 장비 배포 후 기능 범위·자원 측정 |
+| R8 실행 전용 기능 모드 | 공통 바이너리의 `runtime_profile: runner`에서 gateway/voice/dashboard/admin/hub services 초기화 제외. 실행·복구·poller·owner control 유지. profile·route·health·실행 노드 registry 테스트 통과 | 두 장비 배포 후 기능 범위·자원 측정 |
 | R6 첨부파일 | 기존 bundle validator, bounded PG 저장, typed queue 참조, 실행 guard의 임시 파일 복원·정리 연결 완료. 저장/재시도/만료/identity/hash/큐 복구/OS lock 관련 테스트 통과 | 실제 노드 간 첨부 E2E 및 Mac 파일 잠금 검증 |
 | R9 용량·분산 | 공통 provider 호출의 slot 제한, outbox 예약과 renewable lease 통합, 사용률·배정 시각 기반 선택, PG 원자적 상한 구현. 동시 12개/slot 2개, 여러 실행 노드 선택, 만료 취소·nonce fencing 테스트 통과 | 실제 여러 노드 부하·재시작 검증 |
 | 원격 접근 | Windows → Mac mini 공개키 SSH 및 원격 명령 실행 확인 | 배포·migration·허브/실행 노드 전환은 별도 검증 |
@@ -101,17 +101,17 @@ flowchart TB
     U["사용자 · 대시보드 · API 클라이언트"] --> H
 
     subgraph MINI["Mac mini"]
-        H["AgentDesk leader<br/>대표 API · 운영 정책 · 스케줄러"]
+        H["AgentDesk hub<br/>대표 API · 운영 정책 · 스케줄러"]
         G["선호 Discord gateway"]
         DB[("공유 PostgreSQL")]
         H <--> DB
         G --> H
     end
 
-    subgraph WORKERS["worker N개 · 각각 고유 instance_id"]
-        W["Mac Studio worker<br/>macOS 도구 · provider · 저장소"]
-        WIN["Windows worker<br/>Windows 도구 · provider · 저장소"]
-        LIN["Linux worker<br/>Linux 도구 · provider · 저장소"]
+    subgraph RUNNERS["runner N개 · 각각 고유 instance_id"]
+        W["Mac Studio runner<br/>macOS 도구 · provider · 저장소"]
+        WIN["Windows runner<br/>Windows 도구 · provider · 저장소"]
+        LIN["Linux runner<br/>Linux 도구 · provider · 저장소"]
     end
 
     H <-->|"지원하는 세션 제어"| W
@@ -130,7 +130,7 @@ flowchart TB
 
 ### 2.1 여러 실행 노드를 둘 수 있는가
 
-**등록·heartbeat·대상별 intake 소비는 N개 노드를 다루는 구조다.** [worker_nodes schema](../../migrations/postgres/0029_worker_nodes.sql#L1)는 instance_id를 기본키로 사용하고, [노드 조회](../../src/services/cluster/node_registry.rs#L730)는 전체 목록을 반환하며, [실행 노드 claim](../../src/services/cluster/intake_worker.rs#L258)은 target_instance_id/provider를 기준으로 동작한다. 이 경로에서 실행 노드 두 대 같은 고정 제한은 확인되지 않았다.
+**등록·heartbeat·대상별 intake 소비는 N개 노드를 다루는 구조다.** [cluster_nodes schema](../../migrations/postgres/0029_worker_nodes.sql#L1)는 instance_id를 기본키로 사용하고, [노드 조회](../../src/services/cluster/node_registry.rs#L730)는 전체 목록을 반환하며, [실행 노드 claim](../../src/services/cluster/intake_runner.rs#L258)은 target_instance_id/provider를 기준으로 동작한다. 이 경로에서 실행 노드 두 대 같은 고정 제한은 확인되지 않았다.
 
 다만 등록 가능 수, 공정한 배분, 실제 처리 용량은 구분해야 한다.
 
@@ -156,7 +156,7 @@ flowchart TB
 | 설치·서비스 운영 | 기존 macOS 설치·launchd 흐름 | native artifact/init + systemd 등 | native artifact/init + NSSM/sc.exe 등 |
 | 이번 조사에서 실기기 실행 노드 E2E | 미실행 | 미실행 | 미실행 |
 
-소스 근거는 [Claude의 non-Unix 분기](../../src/services/claude.rs#L855), [Codex의 ProcessBackend 분기](../../src/services/codex.rs#L1354), [Windows 프로세스 생성](../../src/services/session_backend.rs#L233), [Unix 전용 supervisor gate](../../src/server/worker_registry/registry.rs#L374), [tmux 세션 발견](../../src/services/cluster/session_discovery.rs#L1)이다.
+소스 근거는 [Claude의 non-Unix 분기](../../src/services/claude.rs#L855), [Codex의 ProcessBackend 분기](../../src/services/codex.rs#L1354), [Windows 프로세스 생성](../../src/services/session_backend.rs#L233), [Unix 전용 supervisor gate](../../src/server/runner_registry/registry.rs#L374), [tmux 세션 발견](../../src/services/cluster/session_discovery.rs#L1)이다.
 
 ProcessBackend는 실행 중 stdin·출력 파일·프로세스 레지스트리를 사용하는 구현이다. tmux가 없는 Mac/Linux에도 같은 재연결 한계가 적용된다. 재시작 후 다음 turn에서 새 process를 만들고 provider가 지원하는 native resume을 사용하는 것과, 기존 process에 다시 붙는 것은 구분한다.
 
@@ -176,11 +176,11 @@ ProcessBackend는 실행 중 stdin·출력 파일·프로세스 레지스트리�
 
 **역할별 별도 컴파일은 필요하지 않다. OS·CPU architecture·실행 환경별 artifact를 만들고 host와 실행 노드가 같은 artifact를 사용하면 된다.** 같은 플랫폼의 실행 노드가 여러 대여도 실행 노드 수만큼 다시 빌드하지 않는다.
 
-- [Cargo.toml](../../Cargo.toml#L8)은 공통 library와 단일 agentdesk binary를 정의한다. 검토한 manifest에 host/worker별 binary나 역할을 분리하는 Cargo feature는 없다.
+- [Cargo.toml](../../Cargo.toml#L8)은 공통 library와 단일 agentdesk binary를 정의한다. 검토한 manifest에 host/runner별 binary나 역할을 분리하는 Cargo feature는 없다.
 - [cluster.role](../../src/config.rs#L902)은 설정값이며, [bootstrap](../../src/services/cluster/node_registry.rs#L149)이 실행 시 허브/실행 노드 동작을 결정한다. 양쪽 모두 기존 `agentdesk dcserver`를 실행하고 역할·instance_id 등을 다르게 설정한다.
 - [build-release.sh](../../scripts/build-release.sh#L28)는 실행 환경의 OS/architecture를 판별하고 `agentdesk-{os}-{arch}` 이름으로 패키징한다. 내부 빌드는 [cargo build --release](../../scripts/build-release.sh#L116)이며 실행 노드 전용 compile 분기가 없다.
 
-| 배포 대상 예시 | 재사용할 artifact 예시 | host/worker 구분 |
+| 배포 대상 예시 | 재사용할 artifact 예시 | host/runner 구분 |
 | --- | --- | --- |
 | Apple Silicon Mac mini + Mac Studio | agentdesk-darwin-aarch64.tar.gz 한 개 | 각 장비의 cluster.role 설정 |
 | Intel Mac mini가 포함되는 경우 | Intel용 agentdesk-darwin-x86_64.tar.gz 추가 | CPU architecture 차이 때문에 추가 |
@@ -194,7 +194,7 @@ ProcessBackend는 실행 중 stdin·출력 파일·프로세스 레지스트리�
 1. 실제 운영에 필요한 OS/architecture만 matrix로 빌드한다. 처음 두 대가 모두 Apple Silicon이면 Mac용 artifact부터 완결하고 Windows/Linux 도입 시 해당 조합을 추가할 수 있다.
 2. 각 matrix job은 같은 commit/lockfile을 사용하고 해당 플랫폼의 호환 runner에서 native build한다. 현재 build-release.sh는 native 실행 환경을 판별하는 스크립트이며 범용 cross compiler가 아니다. Windows 경로는 MSYS/MinGW/Cygwin 계열 shell 판별을 사용하므로 필요한 shell·zip 등 준비도 포함한다.
 3. 플랫폼별 artifact·checksum을 별도 job 산출물로 올리고 publish 단계에서 모은다. 현재 스크립트는 각 실행에서 checksums.txt를 다시 쓰므로 여러 job의 파일을 같은 이름으로 덮어쓰지 않도록 합친다.
-4. artifact manifest에는 commit, target, 필요한 공통 자산 revision을 기록한다. 같은 플랫폼의 host/worker는 같은 artifact를 내려받고 노드별 설정·자격 증명을 유지한다. 장비마다 독립 소스 빌드를 반복할 필요는 없다.
+4. artifact manifest에는 commit, target, 필요한 공통 자산 revision을 기록한다. 같은 플랫폼의 host/runner는 같은 artifact를 내려받고 노드별 설정·자격 증명을 유지한다. 장비마다 독립 소스 빌드를 반복할 필요는 없다.
 5. 이미 배포된 전체 fleet의 schema/protocol 호환 범위를 확인하고 drain → 교체 → 서비스 기동 → health/readiness 확인을 한다. DB migration은 기존 직렬화·checksum 계약을 재사용한다.
 
 현재 checkout의 .github/workflows에는 CI·nightly·문서 관련 workflow가 있고, build-release.sh를 호출해 OS별 release를 모두 만들고 GitHub Releases에 게시하는 workflow는 확인되지 않았다. 릴리스 패키징 스크립트와 배포 스크립트가 존재하는 것, GitHub가 모든 플랫폼의 release asset을 자동으로 발행하는 것은 별개의 상태다. 외부 release 자동화나 현재 게시된 asset 목록은 조사하지 않았다.
@@ -212,7 +212,7 @@ ProcessBackend는 실행 중 stdin·출력 파일·프로세스 레지스트리�
 | 현재 공통 바이너리와 기존 role 설정 | 배포 artifact 재사용, 버전 정합성 관리 용이 | 현재 role만으로 gateway·voice 초기화·관리 API가 모두 제한되지는 않음 | 기존 기능을 활용하는 두 Mac pilot |
 | 공통 바이너리 + 명시적 모듈 시작/종료·API 범위 | 실행 노드에서 필요한 기능만 실행, 공통 provider·claim 코드 유지 | 실행 파일 자체의 크기는 크게 줄지 않을 수 있음 | **일부 기능만 쓰는 실행 노드 요구에 우선 적용** |
 | 공통 바이너리 + 역할별 자산 패키지 | 대시보드 등 선택 자산의 전송/설치 용량 절감 | 누락 자산의 자동 복원·route·health 가정도 함께 정리해야 함 | 측정된 배포 용량·시간 문제가 있을 때 |
-| 공통 core를 공유하는 host/worker 별도 바이너리 | 실행 노드에서 불필요한 의존성까지 compile에서 제외 가능 | build feature·artifact·설치·호환성 조합 증가, 실제 제거 가능 범위 조사 필요 | 런타임 분리 후에도 용량·의존성·운영 경계가 제약일 때 |
+| 공통 core를 공유하는 host/runner 별도 바이너리 | 실행 노드에서 불필요한 의존성까지 compile에서 제외 가능 | build feature·artifact·설치·호환성 조합 증가, 실제 제거 가능 범위 조사 필요 | 런타임 분리 후에도 용량·의존성·운영 경계가 제약일 때 |
 
 **용량 최적화의 현재 상태**
 
@@ -221,7 +221,7 @@ ProcessBackend는 실행 중 stdin·출력 파일·프로세스 레지스트리�
 - release의 symbol 보존은 hang 진단을 위해 의도된 설정이다. [Mac 배포의 dSYM 복사](../../scripts/deploy-release.sh#L2927)도 실행 파일과 별도의 비용이다. 이를 최적화한다면 바이너리와 UUID가 맞는 symbol을 보존·복원하고 필요한 진단 도구에서 사용할 수 있는 경로를 먼저 보장한다. 현재 소스 주석의 과거 용량 수치를 이번 실측값으로 사용하지 않는다.
 - 로컬에 완료된 release 실행 파일과 dist 패키지가 없어 이번 조사에서는 용량·RSS·빌드 시간의 전후 비교를 수행하지 않았다. 별도 실행 노드로 분리하면 몇 MB 또는 몇 %가 줄어든다는 수치는 제시하지 않는다.
 
-**모듈 분리는 지금 요구를 완결하는 설계로 구현한다.** 기존 [WorkerExecutionScope](../../src/server/worker_registry.rs#L162)와 실행 노드 registry를 확장 지점으로 사용하고, cluster/core·provider 실행·gateway/voice·관리 API/dashboard의 시작 조건과 의존 관계를 한 곳에서 계산한다. 여러 파일에 임의의 role 조건을 흩뿌리거나 기능 flag의 모든 조합을 지원하는 구조로 늘리지 않는다. 허브 선출 역할과 사용할 기능 범위는 의미를 구분한다.
+**모듈 분리는 지금 요구를 완결하는 설계로 구현한다.** 기존 [RunnerExecutionScope](../../src/server/runner_registry.rs#L162)와 실행 노드 registry를 확장 지점으로 사용하고, cluster/core·provider 실행·gateway/voice·관리 API/dashboard의 시작 조건과 의존 관계를 한 곳에서 계산한다. 여러 파일에 임의의 role 조건을 흩뿌리거나 기능 flag의 모든 조합을 지원하는 구조로 늘리지 않는다. 허브 선출 역할과 사용할 기능 범위는 의미를 구분한다.
 
 실행 노드에서 dashboard를 제외하려면 [dashboard provisioning](../../src/server/dashboard_provision.rs#L3)과 [서버 route 구성](../../src/server/mod.rs#L376)도 같은 실행 계획을 따라야 한다. 파일만 지운 뒤 부팅 때 다시 복사하거나, 제공하지 않는 UI를 필수 health 조건으로 검사하는 상태를 만들지 않는다. 필요한 provider 실행, heartbeat, claim, 세션 제어, restart/drain은 유지한다. 기능 축소만으로 DB·Discord credential 권한까지 제한됐다고 판단하지 않는다.
 
@@ -241,13 +241,13 @@ ProcessBackend는 실행 중 stdin·출력 파일·프로세스 레지스트리�
 | 기능 | 확인한 동작 | 소스 |
 | --- | --- | --- |
 | 허브/실행 노드/auto 역할 | 명시적 실행 노드는 중앙 허브 advisory lock 획득에 참여하지 않는다. | [node_registry.rs](../../src/services/cluster/node_registry.rs#L149) |
-| 중앙 작업 실행 범위 | 정책 tick, GitHub sync, 예약 메시지, routine, 카카오 캘린더 등은 LeaderOnly다. | [worker_registry.rs](../../src/server/worker_registry.rs#L194) |
-| 실행 노드 대화 실행 | 대상 instance/provider에 맞는 intake 행을 claim하고 실행 코어를 호출한다. | [intake_worker.rs](../../src/services/cluster/intake_worker.rs#L258), [worker_entry.rs](../../src/services/discord/router/message_handler/intake_turn/worker_entry.rs#L60) |
+| 중앙 작업 실행 범위 | 정책 tick, GitHub sync, 예약 메시지, routine, 카카오 캘린더 등은 HubOnly다. | [runner_registry.rs](../../src/server/runner_registry.rs#L194) |
+| 실행 노드 대화 실행 | 대상 instance/provider에 맞는 intake 행을 claim하고 실행 코어를 호출한다. | [intake_runner.rs](../../src/services/cluster/intake_runner.rs#L258), [runner_entry.rs](../../src/services/discord/router/message_handler/intake_turn/runner_entry.rs#L60) |
 | intake 라우팅 | disabled/observe/enforce, preferred labels, 명시적 /node 선택, 기존 세션 소유자 우선 처리. | [intake_routing_config.rs](../../src/services/cluster/intake_routing_config.rs), [intake_router_hook.rs](../../src/services/cluster/intake_router_hook.rs), [node.rs](../../src/services/discord/commands/node.rs) |
 | dispatch 선택·제한 | labels/provider/MCP capability 선택, 노드별 dispatch cap, blackout window. cap이 있으면 해당 constraint를 자동 추가한다. | [capability_routing.rs](../../src/services/cluster/capability_routing.rs), [routing_constraint.rs](../../src/services/dispatches/routing_constraint.rs#L393) |
 | 원격 세션 제어 | 출력·종료·재개·turn 취소 forwarding, 수신 측 소유자 확인. | [session_forwarding.rs](../../src/services/session_forwarding.rs#L296) |
 | forwarding 대상 제한 | 운영자가 지정한 origin과 광고 주소를 비교하고 DNS/IP/transport를 검증한다. | [trusted_target.rs](../../src/services/session_forwarding/trusted_target.rs#L188) |
-| 공유 agent 목록 보호 | worker/auto의 부팅 및 config audit에서 허브의 agent 목록을 덮어쓰지 않도록 제한한다. | [postgres.rs](../../src/db/postgres.rs#L561) |
+| 공유 agent 목록 보호 | runner/auto의 부팅 및 config audit에서 허브의 agent 목록을 덮어쓰지 않도록 제한한다. | [postgres.rs](../../src/db/postgres.rs#L561) |
 | 노드·세션 조회 | /api/cluster/nodes, /api/cluster/sessions, /api/cluster/routing-diagnostics가 있다. | [ops.rs](../../src/server/routes/domains/ops.rs#L61), [cluster.rs](../../src/server/routes/cluster.rs#L24) |
 | Mac 여러 노드 배포 | deploy-release.sh의 --all-nodes/--cluster/--peer, peer의 종료 표식·repo HEAD·health 판정이 있다. launchd 중심이며 Windows/Linux 범용 배포기로 간주하지 않는다. | [deploy-release.sh](../../scripts/deploy-release.sh#L1375) |
 | 기본 멀티노드 회귀 테스트 | 허브 lock 경합, dispatch claim/lease 회수, capability routing, resource lock을 검사한다. | [multinode_regression.rs](../../src/server/multinode_regression.rs), [ci-nightly.yml](../../.github/workflows/ci-nightly.yml#L253) |
@@ -308,9 +308,9 @@ pipeline sync는 기존 stage를 삭제하거나 덮어쓰는 구현은 아니�
 
 [intake_preflight.rs](../../src/services/cluster/intake_preflight.rs#L28)에 release SHA, provider 버전·인증·quota, workspace, 자원, relay 등을 검사하는 pure evaluator가 있다.
 
-그러나 현재 소스에서 evaluate_target_preflight 호출은 해당 모듈의 테스트에만 있다. 일반 intake 선택은 online 상태와 intake_worker provider/protocol capability를 검사하며, 이 evaluator를 호출하지 않는다. [라우팅 선택 경로](../../src/services/cluster/intake_router_hook.rs#L484)
+그러나 현재 소스에서 evaluate_target_preflight 호출은 해당 모듈의 테스트에만 있다. 일반 intake 선택은 online 상태와 intake_runner provider/protocol capability를 검사하며, 이 evaluator를 호출하지 않는다. [라우팅 선택 경로](../../src/services/cluster/intake_router_hook.rs#L484)
 
-또한 [runtime capability](../../src/services/cluster/intake_worker_capabilities.rs#L96)는 등록된 provider 집합 등을 광고한다. 이것만으로 poll loop가 현재 진행 중인지, CLI 인증이 유효한지, 해당 작업 디렉터리에 접근할 수 있는지 증명하지 못한다.
+또한 [runtime capability](../../src/services/cluster/intake_runner_capabilities.rs#L96)는 등록된 provider 집합 등을 광고한다. 이것만으로 poll loop가 현재 진행 중인지, CLI 인증이 유효한지, 해당 작업 디렉터리에 접근할 수 있는지 증명하지 못한다.
 
 기존 evaluator는 **planned handoff** 계약이며 일반 신규 작업 admission에 그대로 적용하면 안 된다. 예를 들어 source와 target의 workspace branch/HEAD 일치 조건은 의도적으로 다른 worktree에서 시작하는 신규 작업에는 적합하지 않을 수 있다. [기존 설계의 preflight 범위](intake-node-routing.md#planned-handoff-target-preflight-4779)
 
@@ -319,7 +319,7 @@ pipeline sync는 기존 stage를 삭제하거나 덮어쓰는 구현은 아니�
 [attachment_transfer.rs](../../src/services/cluster/attachment_transfer.rs#L1)는 bundle 자료형과 pure validator만 제공하며 production caller가 없다고 명시한다. 실제 router는 nonportable upload가 있는 원격 배정을 차단한다. 실행 노드 실행 진입점 역시 첨부 인자로 빈 목록을 전달한다.
 
 - [원격 첨부 차단](../../src/services/cluster/intake_router_hook.rs#L533)
-- [실행 노드 실행 진입점](../../src/services/discord/router/message_handler/intake_turn/worker_entry.rs#L60)
+- [실행 노드 실행 진입점](../../src/services/discord/router/message_handler/intake_turn/runner_entry.rs#L60)
 
 따라서 텍스트 전용 pilot은 기존 기능으로 가능하지만, 이미지·파일이 포함된 일반 대화를 스튜디오로 보내려면 추가 구현이 필요하다. 첨부를 버리고 텍스트만 실행하는 처리는 허용하지 않는다.
 
@@ -389,7 +389,7 @@ intake의 현재 후보 검사는 online·provider·일부 protocol feature 중�
 
 1. schema migration/검증, 공유 설정 초기화, node-local 초기화를 분리한다.
 2. 이 토폴로지에서는 기존 agent_roster_sync_enabled와 일관되게 single-node 또는 명시적 허브만 공유 설정을 seed하게 한다. 부팅 시 허브 election 이전이라는 호출 순서를 고려한다.
-3. worker/auto는 공유 설정을 읽고, 없으면 준비되지 않은 이유를 반환한다. 자신의 기본값으로 중앙 설정을 조용히 생성하지 않는다.
+3. runner/auto는 공유 설정을 읽고, 없으면 준비되지 않은 이유를 반환한다. 자신의 기본값으로 중앙 설정을 조용히 생성하지 않는다.
 4. server_port처럼 노드마다 다른 값은 기존 소비자를 조사한 뒤 중앙 값과 node metadata를 구분한다. key 의미를 변경하면서 기존 reader를 방치하지 않는다.
 5. migration lock과 migration checksum 검증은 유지한다. 실행 노드 seed를 막는다는 이유로 schema 검증까지 건너뛰지 않는다.
 6. 실행 노드 API를 통한 명시적 설정 변경은 부팅 seed와 별도의 계약이다. API 권한 제한은 R8이며 R1이 해결했다고 주장하지 않는다.
@@ -507,7 +507,7 @@ Windows 필수 작업이 Windows 실행 노드 offline 시 미니/Linux에서 �
 
 우선 /api/cluster/nodes 및 세션 owner 정보로 다음을 보여주는 UI를 추가한다.
 
-- 설정된 역할과 실제 leader/standby 상태.
+- 설정된 역할과 실제 hub/standby 상태.
 - heartbeat와 readiness의 관측 시각.
 - 세션의 실제 소유 노드와 제어 가능 여부/불가 사유.
 - 할당 작업 수와 dispatch cap. 이 cap을 모든 intake/provider 실행의 전역 제한이라고 표현하지 않는다.
@@ -539,7 +539,7 @@ Windows process의 중앙 출력 조회가 요구되면 tmux capture endpoint만
 **완료 기준**
 
 - 실행 노드의 활성 모듈·route·background task 목록이 선택한 역할의 계약과 일치한다. 사용하지 않는 gateway/voice/dashboard는 해당 모드를 선택했을 때 초기화·시작되지 않는다.
-- 필요한 provider wrapper, intake claim, heartbeat, 세션 제어와 restart/drain이 그대로 동작한다. 기존 leader/auto 동작과 선택하지 않은 기능의 기본 호환성도 검증한다.
+- 필요한 provider wrapper, intake claim, heartbeat, 세션 제어와 restart/drain이 그대로 동작한다. 기존 hub/auto 동작과 선택하지 않은 기능의 기본 호환성도 검증한다.
 - 실행 노드 전용 패키지를 채택한 경우 dashboard 자산이 없는 상태에서도 자동 복사·필수 UI health 검사 없이 정상 기동하고, 제공하지 않는 route의 동작이 명확하다.
 - RSS·idle CPU·DB 연결 수·시작 시간·artifact 크기를 분리 측정한다. 런타임 작업을 줄인 효과와 compile-time 의존성을 제거한 효과를 섞어 보고하지 않는다.
 - 별도 credential 또는 DB 비접속 모드를 채택한 경우에만 그 권한·protocol 격리까지 완료했다고 판정한다.
@@ -572,7 +572,7 @@ Windows process의 중앙 출력 조회가 요구되면 tmux capture endpoint만
 | 항목 | Mac mini | Mac Studio |
 | --- | --- | --- |
 | cluster.enabled | true | true |
-| cluster.instance_id | mac-mini-host | mac-studio-worker |
+| cluster.instance_id | mac-mini-host | mac-studio-runner |
 | cluster.role | 허브 | 실행 노드 |
 | database | 공유 운영 DB, 미니에 있으면 로컬 접속 | 같은 DB에 사설망 접속 |
 | database.pool_max / foreground_reserve | 전체 fleet 연결 예산에 맞게 검증 | 중앙과 합산하고 startup warmup도 계산 |
@@ -596,7 +596,7 @@ Windows process의 중앙 출력 조회가 요구되면 tmux capture endpoint만
 - observe는 실행 위치를 바꾸지 않는다. disabled로 시작해 consumer가 없는 상태에서 enforce만 바꾸는 배포를 피하고, 재시작/적용 뒤 실제 consumer 광고와 유효 mode를 확인한다.
 - /api/health/detail 같은 원격 제어·진단 경로에는 일반 API 외의 추가 제한이 있다. 무토큰 nonloopback opt-in이 모든 경로를 열어 주는 것은 아니다.
 - 기존 agent·channel·프롬프트 정본은 운영자 파일이다. 이 문서를 새 설정 정본으로 사용하지 않는다.
-- 실행 노드 추가 예시는 win-build-01, linux-worker-01처럼 안정적인 ID와 각각의 origin·labels·repo_dirs를 설정하는 것이다. 하나의 스튜디오 ID/주소를 여러 기기에 복제하지 않는다.
+- 실행 노드 추가 예시는 win-build-01, linux-runner-01처럼 안정적인 ID와 각각의 origin·labels·repo_dirs를 설정하는 것이다. 하나의 스튜디오 ID/주소를 여러 기기에 복제하지 않는다.
 - 공통 정책을 유지하더라도 node-local 절대 경로·CLI 인증·SDK 설치는 별도다. PG의 agent 목록 공유만으로 모든 실행 입력이 자동 배포되는 것은 아니다.
 
 기존 [두 노드 smoke 문서](../agent-maintenance/multinode-two-node-smoke.md)는 참고하되 갱신이 필요하다. 문서의 AGENTDESK_CLUSTER_ENABLED/ROLE/INSTANCE_ID는 검토한 src·scripts에서 값을 읽는 경로를 찾지 못했다. 실제 구현이 읽는 YAML cluster 필드를 기준으로 절차를 작성한다. 포트도 과거 예시의 8787을 고정하지 않고 실제 설정값을 사용한다. AGENTDESK_CLUSTER_API_BASE_URL은 별도의 실제 지원 경로이므로 모든 cluster 환경변수가 미지원이라고 일반화하지 않는다.
@@ -635,7 +635,7 @@ Windows process의 중앙 출력 조회가 요구되면 tmux capture endpoint만
 | OS 필수 작업의 적합 실행 노드 전부 offline | 부적합 OS로 fallback하지 않음 | R5 통합 |
 | 동일 조건 실행 노드 여러 개 + 동시 신규 요청 | R9 구현 후 적합 노드 간 분산·예약 상한 보장, 기존 owner 유지 | R9 PG 경쟁 테스트 |
 | N개 노드 동시 또는 순차 배포 | 실제 DB 연결 예산 안에서 기동, foreground starvation·pool timeout 측정 | R4 부하/배포 |
-| 같은 플랫폼 artifact를 host/worker에 배포 | 동일 commit의 같은 binary가 설정에 따라 역할 수행, 노드 로컬 설정 보존 | R4 빌드/배포 |
+| 같은 플랫폼 artifact를 host/runner에 배포 | 동일 commit의 같은 binary가 설정에 따라 역할 수행, 노드 로컬 설정 보존 | R4 빌드/배포 |
 | 플랫폼별 release matrix | artifact와 실제 binary target 일치, checksum 병합 시 누락/덮어쓰기 없음 | R4 CI/패키징 |
 | 같은 binary의 기능 제한 실행 노드 모드 | 비활성 모듈/route 미시작, provider self-exec·claim·세션 제어 유지 | R8 런타임 통합 |
 | dashboard 제외 패키지, 채택한 경우 | 자동 재복사 없이 정상 기동, UI 없는 health 계약 적용 | R4/R8 배포 |

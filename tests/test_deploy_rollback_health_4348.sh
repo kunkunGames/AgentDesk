@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unit test for #4348 — deploy/rollback brick fixes in scripts/_defaults.sh.
 #
-# Defect 1 (deploy readiness): a serving leader-only / no-agent-session node is
+# Defect 1 (deploy readiness): a serving hub-only / no-agent-session node is
 # structurally `status=unhealthy` forever (no_provider_runtimes_registered) but
 # must be treated as DEPLOY-READY, and ONLY for that exact cause.
 # Defect 2 (rollback safety): the migration-advance comparison used to refuse a
@@ -43,7 +43,7 @@ assert_eq() {
 . "$DEFAULTS_SH"
 
 # ── Fixtures — modelled on the real PUBLIC /api/health body shape ────────────
-# Serving leader-only node: unhealthy SOLELY due to no provider runtimes.
+# Serving hub-only node: unhealthy SOLELY due to no provider runtimes.
 NO_PROVIDER_BODY='{"ok":false,"status":"unhealthy","version":"x","db":true,"dashboard":true,"server_up":true,"fully_recovered":false,"cluster_standby":false,"degraded":true,"startup_status":"doctor_skipped","startup_degraded":false,"startup_degraded_reasons":[],"latest_startup_doctor":{"available":true,"doctor_status":"skipped","skipped":true,"skipped_reason":"no_provider_runtimes_registered"}}'
 # DB down: server_up=false — must NEVER be rescued.
 DB_DOWN_BODY='{"ok":false,"status":"unhealthy","version":"x","db":true,"dashboard":true,"server_up":false,"fully_recovered":false,"cluster_standby":false,"degraded":true,"startup_status":"doctor_skipped","latest_startup_doctor":{"skipped_reason":"no_provider_runtimes_registered"}}'

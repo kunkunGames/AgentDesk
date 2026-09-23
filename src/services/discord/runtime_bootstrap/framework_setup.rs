@@ -65,8 +65,8 @@ pub(super) async fn run_bot_framework_setup(
     let shared_for_tmux = shared_for_migrate.clone();
 
     // (Phase 5.1 of intake-node-routing — issue #2007: `run_bot()` starts the
-    // intake worker only after the lease result authorizes a registered gateway
-    // or standby runtime. No worker bootstrap belongs here.)
+    // intake runner only after the lease result authorizes a registered gateway
+    // or standby runtime. No runner bootstrap belongs here.)
 
     // Background: hot-reload skills on file changes (30s polling)
     // Scans home-level AND all active project-level skill directories.

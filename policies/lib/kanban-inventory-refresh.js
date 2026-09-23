@@ -19,7 +19,7 @@ var notifyCardOwner = _notifications.notifyCardOwner;
 
 var INVENTORY_DOC_PATHS = [
   "docs/generated/route-inventory.md",
-  "docs/generated/worker-inventory.md"
+  "docs/generated/runner-inventory.md"
 ];
 
 function _extractRepoFromUrl(url) {

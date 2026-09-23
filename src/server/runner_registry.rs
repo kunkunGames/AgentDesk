@@ -11,7 +11,7 @@ use crate::services::routines::validate_routine_runtime_config;
 use sqlx::PgPool;
 
 use super::cluster::ClusterRuntime;
-use super::worker_recovery::WorkerLocalTerminalReason;
+use super::runner_recovery::RunnerLocalTerminalReason;
 use super::ws::{BatchBuffer, BroadcastTx};
 
 mod registry;
@@ -19,14 +19,13 @@ mod status;
 
 #[cfg(test)]
 use self::status::{
-    LEADER_ONLY_WORKER_ACTIVE_COUNT, LEADER_ONLY_WORKER_LAST_SPAWN_UNIX_MS,
-    LEADER_ONLY_WORKERS_STARTED,
+    HUB_ONLY_RUNNER_ACTIVE_COUNT, HUB_ONLY_RUNNER_LAST_SPAWN_UNIX_MS, HUB_ONLY_RUNNERS_STARTED,
 };
 use self::status::{
-    LeaderOnlyWorkerEpoch, record_worker_local_terminal_signal, wait_until_leader_or_shutdown,
+    HubOnlyRunnerEpoch, record_runner_local_terminal_signal, wait_until_hub_or_shutdown,
     wait_until_shutdown,
 };
-pub(crate) use self::status::{leader_only_worker_status_json, rate_limit_sync_active};
+pub(crate) use self::status::{hub_only_runner_status_json, rate_limit_sync_active};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootStepId {
@@ -46,7 +45,7 @@ const BOOT_ONLY_STEPS: [BootStepSpec; 2] = [
     BootStepSpec {
         id: BootStepId::RefreshMemoryHealth,
         name: "refresh_memory_health_for_startup",
-        responsibility: "Prime runtime memory backend health before long-lived workers start",
+        responsibility: "Prime runtime memory backend health before long-lived runners start",
         order: 10,
     },
     BootStepSpec {
@@ -58,7 +57,7 @@ const BOOT_ONLY_STEPS: [BootStepSpec; 2] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServerWorkerId {
+enum ServerRunnerId {
     GithubSync,
     PolicyTick,
     RateLimitSync,
@@ -75,13 +74,13 @@ enum ServerWorkerId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkerKind {
+pub(crate) enum RunnerKind {
     TokioTask,
     DedicatedThread,
     SpawnHelper,
 }
 
-impl WorkerKind {
+impl RunnerKind {
     pub(crate) const fn as_doc_str(self) -> &'static str {
         match self {
             Self::TokioTask => "tokio::spawn",
@@ -92,12 +91,12 @@ impl WorkerKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkerStartStage {
+pub(crate) enum RunnerStartStage {
     AfterBootReconcile,
     AfterWebsocketBroadcast,
 }
 
-impl WorkerStartStage {
+impl RunnerStartStage {
     pub(crate) const fn as_doc_str(self) -> &'static str {
         match self {
             Self::AfterBootReconcile => "after_boot_reconcile",
@@ -107,14 +106,14 @@ impl WorkerStartStage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WorkerRestartBudget {
+pub(crate) struct RunnerRestartBudget {
     pub(crate) max_restarts: u32,
     pub(crate) window: Duration,
     pub(crate) initial_backoff: Duration,
     pub(crate) max_backoff: Duration,
 }
 
-pub(crate) const DEFAULT_WORKER_LOCAL_RESTART_BUDGET: WorkerRestartBudget = WorkerRestartBudget {
+pub(crate) const DEFAULT_RUNNER_LOCAL_RESTART_BUDGET: RunnerRestartBudget = RunnerRestartBudget {
     max_restarts: 5,
     window: Duration::from_secs(600),
     initial_backoff: Duration::from_secs(1),
@@ -122,18 +121,18 @@ pub(crate) const DEFAULT_WORKER_LOCAL_RESTART_BUDGET: WorkerRestartBudget = Work
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkerRestartPolicy {
+pub(crate) enum RunnerRestartPolicy {
     SkipWhenDisabled,
-    /// The worker future owns its retry/backoff loop and should only end during
-    /// runtime shutdown. Leader-only Tokio workers re-enter on future exit after
-    /// the next leader epoch; worker-local Tokio workers record a terminal
+    /// The runner future owns its retry/backoff loop and should only end during
+    /// runtime shutdown. Hub-only Tokio runners re-enter on future exit after
+    /// the next hub epoch; runner-local Tokio runners record a terminal
     /// supervision signal and do not auto-restart.
     LoopOwned,
-    RestartableWithBudget(WorkerRestartBudget),
+    RestartableWithBudget(RunnerRestartBudget),
     ManualProcessRestart,
 }
 
-impl WorkerRestartPolicy {
+impl RunnerRestartPolicy {
     pub(crate) const fn as_doc_str(self) -> &'static str {
         match self {
             Self::SkipWhenDisabled => "skip_when_disabled",
@@ -145,12 +144,12 @@ impl WorkerRestartPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkerShutdownPolicy {
+pub(crate) enum RunnerShutdownPolicy {
     RuntimeShutdown,
     ProcessExit,
 }
 
-impl WorkerShutdownPolicy {
+impl RunnerShutdownPolicy {
     pub(crate) const fn as_doc_str(self) -> &'static str {
         match self {
             Self::RuntimeShutdown => "runtime_shutdown",
@@ -160,258 +159,258 @@ impl WorkerShutdownPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WorkerExecutionScope {
-    LeaderOnly,
-    WorkerLocal,
+pub(crate) enum RunnerExecutionScope {
+    HubOnly,
+    RunnerLocal,
 }
 
-impl WorkerExecutionScope {
+impl RunnerExecutionScope {
     pub(crate) const fn as_doc_str(self) -> &'static str {
         match self {
-            Self::LeaderOnly => "leader_only",
-            Self::WorkerLocal => "worker_local",
+            Self::HubOnly => "hub_only",
+            Self::RunnerLocal => "runner_local",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WorkerSpec {
-    id: ServerWorkerId,
+pub(crate) struct RunnerSpec {
+    id: ServerRunnerId,
     pub(crate) name: &'static str,
-    pub(crate) kind: WorkerKind,
+    pub(crate) kind: RunnerKind,
     pub(crate) target: &'static str,
     pub(crate) responsibility: &'static str,
     pub(crate) owner: &'static str,
-    pub(crate) start_stage: WorkerStartStage,
+    pub(crate) start_stage: RunnerStartStage,
     pub(crate) start_order: u8,
-    pub(crate) restart_policy: WorkerRestartPolicy,
-    pub(crate) shutdown_policy: WorkerShutdownPolicy,
-    pub(crate) execution_scope: WorkerExecutionScope,
+    pub(crate) restart_policy: RunnerRestartPolicy,
+    pub(crate) shutdown_policy: RunnerShutdownPolicy,
+    pub(crate) execution_scope: RunnerExecutionScope,
     pub(crate) health_owner: &'static str,
     pub(crate) notes: &'static str,
 }
 
-pub(crate) const WORKER_SPECS: [WorkerSpec; 13] = [
-    WorkerSpec {
-        id: ServerWorkerId::GithubSync,
+pub(crate) const RUNNER_SPECS: [RunnerSpec; 13] = [
+    RunnerSpec {
+        id: ServerRunnerId::GithubSync,
         name: "github_sync_loop",
-        kind: WorkerKind::TokioTask,
+        kind: RunnerKind::TokioTask,
         target: "github_sync_loop",
         responsibility: "Periodically sync enabled GitHub repos into the local tracker",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 10,
-        restart_policy: WorkerRestartPolicy::SkipWhenDisabled,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::LeaderOnly,
+        restart_policy: RunnerRestartPolicy::SkipWhenDisabled,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::HubOnly,
         health_owner: "tracing logs and GitHub sync side effects",
         notes: "Skipped when github.sync_interval_minutes <= 0 or gh CLI is unavailable",
     },
-    WorkerSpec {
-        id: ServerWorkerId::PolicyTick,
+    RunnerSpec {
+        id: ServerRunnerId::PolicyTick,
         name: "policy-tick",
-        kind: WorkerKind::DedicatedThread,
+        kind: RunnerKind::DedicatedThread,
         target: "policy_tick_loop",
         responsibility: "Fire tiered policy hooks on a dedicated OS thread",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 20,
-        restart_policy: WorkerRestartPolicy::ManualProcessRestart,
-        shutdown_policy: WorkerShutdownPolicy::ProcessExit,
-        execution_scope: WorkerExecutionScope::LeaderOnly,
+        restart_policy: RunnerRestartPolicy::ManualProcessRestart,
+        shutdown_policy: RunnerShutdownPolicy::ProcessExit,
+        execution_scope: RunnerExecutionScope::HubOnly,
         health_owner: "kv_meta last_tick_* keys and memory health refresh",
         notes: "Uses a dedicated current-thread Tokio runtime to avoid engine lock deadlocks",
     },
-    WorkerSpec {
-        id: ServerWorkerId::RateLimitSync,
+    RunnerSpec {
+        id: ServerRunnerId::RateLimitSync,
         name: "rate_limit_sync_loop",
-        kind: WorkerKind::TokioTask,
+        kind: RunnerKind::TokioTask,
         target: "rate_limit_sync_loop",
         responsibility: "Refresh cached provider rate-limit data for dashboard APIs",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 30,
-        restart_policy: WorkerRestartPolicy::LoopOwned,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::LeaderOnly,
+        restart_policy: RunnerRestartPolicy::LoopOwned,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::HubOnly,
         health_owner: "rate_limit_cache freshness and tracing logs",
         notes: "Runs immediately on startup and then every 120 seconds",
     },
-    WorkerSpec {
-        id: ServerWorkerId::MaintenanceScheduler,
+    RunnerSpec {
+        id: ServerRunnerId::MaintenanceScheduler,
         name: "maintenance_scheduler_loop",
-        kind: WorkerKind::TokioTask,
+        kind: RunnerKind::TokioTask,
         target: "maintenance::scheduler_loop",
         responsibility: "Run registered maintenance jobs on interval schedules",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 35,
-        restart_policy: WorkerRestartPolicy::LoopOwned,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::LeaderOnly,
+        restart_policy: RunnerRestartPolicy::LoopOwned,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::HubOnly,
         health_owner: "kv_meta maintenance_job:* keys and tracing logs",
         notes: "Static registry seeded with a noop heartbeat; first runs are staggered after startup",
     },
-    WorkerSpec {
-        id: ServerWorkerId::MessageOutbox,
+    RunnerSpec {
+        id: ServerRunnerId::MessageOutbox,
         name: "message_outbox_loop",
-        kind: WorkerKind::TokioTask,
+        kind: RunnerKind::TokioTask,
         target: "message_outbox_loop",
         responsibility: "Drain queued message_outbox rows through the in-process Discord delivery path",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 40,
-        restart_policy: WorkerRestartPolicy::LoopOwned,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::LeaderOnly,
+        restart_policy: RunnerRestartPolicy::LoopOwned,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::HubOnly,
         health_owner: "message_outbox row state and delivery tracing",
         notes: "Waits three seconds for Discord runtime readiness before polling with adaptive backoff",
     },
-    WorkerSpec {
-        id: ServerWorkerId::ScheduledMessages,
+    RunnerSpec {
+        id: ServerRunnerId::ScheduledMessages,
         name: "scheduled_message_loop",
-        kind: WorkerKind::TokioTask,
+        kind: RunnerKind::TokioTask,
         target: "services::scheduled_messages::scheduled_message_loop",
         responsibility: "Fire due scheduled-message reservations: hand push fires to message_outbox and drive agent fires through headless turns",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 45,
-        restart_policy: WorkerRestartPolicy::LoopOwned,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::LeaderOnly,
+        restart_policy: RunnerRestartPolicy::LoopOwned,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::HubOnly,
         health_owner: "scheduled_messages/scheduled_message_deliveries row state and tracing logs",
         notes: "Waits three seconds for Discord runtime readiness before polling with adaptive backoff; lease-based delivery claims keep firing at-most-once per slot",
     },
-    WorkerSpec {
-        id: ServerWorkerId::KakaoCalendar,
+    RunnerSpec {
+        id: ServerRunnerId::KakaoCalendar,
         name: "kakao_calendar_loop",
-        kind: WorkerKind::TokioTask,
+        kind: RunnerKind::TokioTask,
         target: "services::calendar_sync::calendar_loop",
         responsibility: "Apply managed calendar intent to independently consenting Kakao accounts",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 46,
-        restart_policy: WorkerRestartPolicy::LoopOwned,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::LeaderOnly,
+        restart_policy: RunnerRestartPolicy::LoopOwned,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::HubOnly,
         health_owner: "kakao_calendar_operations status, revision and redacted error codes",
         notes: "Opt-in single-node credential owner; interrupted dispatch requires reconciliation",
     },
-    WorkerSpec {
-        id: ServerWorkerId::DispatchOutbox,
+    RunnerSpec {
+        id: ServerRunnerId::DispatchOutbox,
         name: "dispatch_outbox_loop",
-        kind: WorkerKind::TokioTask,
+        kind: RunnerKind::TokioTask,
         target: "routes::dispatches::dispatch_outbox_loop",
         responsibility: "Deliver dispatch follow-ups and centralize Discord side effects",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 50,
-        restart_policy: WorkerRestartPolicy::RestartableWithBudget(
-            DEFAULT_WORKER_LOCAL_RESTART_BUDGET,
+        restart_policy: RunnerRestartPolicy::RestartableWithBudget(
+            DEFAULT_RUNNER_LOCAL_RESTART_BUDGET,
         ),
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::WorkerLocal,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::RunnerLocal,
         health_owner: "dispatch outbox tables and delivery tracing",
         notes: "Runs on each cluster node; PostgreSQL row claims and capability filters select \
-                the worker. Unexpected return/panic is restarted with a bounded local budget \
+                the runner. Unexpected return/panic is restarted with a bounded local budget \
                 and capped exponential backoff.",
     },
-    WorkerSpec {
-        id: ServerWorkerId::RoutineRuntime,
+    RunnerSpec {
+        id: ServerRunnerId::RoutineRuntime,
         name: "routine-runtime",
-        kind: WorkerKind::TokioTask,
+        kind: RunnerKind::TokioTask,
         target: "routine_runtime_loop",
         responsibility: "Run scheduled JS routines independent of the policy-tick engine",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 55,
-        restart_policy: WorkerRestartPolicy::SkipWhenDisabled,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::LeaderOnly,
+        restart_policy: RunnerRestartPolicy::SkipWhenDisabled,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::HubOnly,
         health_owner: "routine_runs row state and tracing logs",
         notes: "Skipped when routines.enabled=false or postgres pool unavailable; \
                 performs boot recovery of stale running runs before the tick loop starts",
     },
-    WorkerSpec {
-        id: ServerWorkerId::DmReplyRetry,
+    RunnerSpec {
+        id: ServerRunnerId::DmReplyRetry,
         name: "dm_reply_retry_loop",
-        kind: WorkerKind::TokioTask,
+        kind: RunnerKind::TokioTask,
         target: "dm_reply_retry_loop",
         responsibility: "Retry failed Discord DM notifications on a five-minute cadence",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 60,
-        restart_policy: WorkerRestartPolicy::LoopOwned,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::LeaderOnly,
+        restart_policy: RunnerRestartPolicy::LoopOwned,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::HubOnly,
         health_owner: "failed DM notification rows and retry tracing",
         notes: "Skips the immediate tick and only starts retries after the first interval",
     },
-    WorkerSpec {
-        id: ServerWorkerId::SessionDiscovery,
+    RunnerSpec {
+        id: ServerRunnerId::SessionDiscovery,
         name: "session_discovery_loop",
-        kind: WorkerKind::TokioTask,
+        kind: RunnerKind::TokioTask,
         target: "services::cluster::session_discovery::run_discovery_loop",
         responsibility: "Enumerate tmux sessions, match to channel bindings, maintain SessionRegistry",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 65,
-        restart_policy: WorkerRestartPolicy::RestartableWithBudget(
-            DEFAULT_WORKER_LOCAL_RESTART_BUDGET,
+        restart_policy: RunnerRestartPolicy::RestartableWithBudget(
+            DEFAULT_RUNNER_LOCAL_RESTART_BUDGET,
         ),
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::WorkerLocal,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::RunnerLocal,
         health_owner: "SessionRegistry contents and /api/cluster/sessions diagnostic",
-        notes: "Worker-local because tmux is host-scoped — every node must enumerate its own \
+        notes: "Runner-local because tmux is host-scoped — every node must enumerate its own \
                 sessions for the cluster registry. Reconcile is instance_id-scoped so peers \
                 cannot stomp each other's entries. Boot reconcile runs immediately; subsequent \
                 polls every 10s. External request_discovery_tick() nudges fire an immediate tick \
                 for E3 event hooks. Unexpected return/panic is restarted with a bounded local \
                 budget and capped exponential backoff.",
     },
-    WorkerSpec {
-        id: ServerWorkerId::WatcherSupervisor,
+    RunnerSpec {
+        id: ServerRunnerId::WatcherSupervisor,
         name: "watcher_supervisor_loop",
-        kind: WorkerKind::TokioTask,
+        kind: RunnerKind::TokioTask,
         target: "services::discord::run_session_bound_discord_relay_supervisor",
         responsibility: "Spawn/teardown session-bound StreamRelay tasks in response to SessionRegistry events",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterBootReconcile,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterBootReconcile,
         start_order: 67,
-        restart_policy: WorkerRestartPolicy::LoopOwned,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::WorkerLocal,
+        restart_policy: RunnerRestartPolicy::LoopOwned,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::RunnerLocal,
         health_owner: "watcher-supervisor tracing + per-relay metrics",
         notes: "Epic #2285 / E3 (#2345), wired through E4 (#2411) and E5 (#2412). Gated by \
                 cluster.session_bound_relay_enabled (default true since E5); flipping the flag \
                 off restores the legacy watcher as the sole terminal delivery path. \
-                Worker-local because tmux is host-scoped — relays live next to the sessions \
+                Runner-local because tmux is host-scoped — relays live next to the sessions \
                 they observe. Production wires a Discord RelaySink that parses provider JSONL \
                 frames and owns Discord terminal delivery for eligible session-bound inflight \
                 shapes (rebind-origin/adopted sessions and watcher-owned relays). The legacy \
                 watcher remains a fallback for bridge-owned/no-inflight envelopes and for \
                 runtimes without a HealthRegistry. LoopOwned terminal semantics: unexpected \
-                return/panic is recorded as a worker-local terminal supervision signal; registry \
+                return/panic is recorded as a runner-local terminal supervision signal; registry \
                 does not auto-restart.",
     },
-    WorkerSpec {
-        id: ServerWorkerId::WsBatchFlusher,
+    RunnerSpec {
+        id: ServerRunnerId::WsBatchFlusher,
         name: "spawn_batch_flusher",
-        kind: WorkerKind::SpawnHelper,
+        kind: RunnerKind::SpawnHelper,
         target: "ws::spawn_batch_flusher",
         responsibility: "Flush deduplicated websocket events into the shared broadcast channel",
-        owner: "server::worker_registry",
-        start_stage: WorkerStartStage::AfterWebsocketBroadcast,
+        owner: "server::runner_registry",
+        start_stage: RunnerStartStage::AfterWebsocketBroadcast,
         start_order: 70,
-        restart_policy: WorkerRestartPolicy::LoopOwned,
-        shutdown_policy: WorkerShutdownPolicy::RuntimeShutdown,
-        execution_scope: WorkerExecutionScope::WorkerLocal,
+        restart_policy: RunnerRestartPolicy::LoopOwned,
+        shutdown_policy: RunnerShutdownPolicy::RuntimeShutdown,
+        execution_scope: RunnerExecutionScope::RunnerLocal,
         health_owner: "websocket broadcast throughput and tracing logs",
         notes: "Starts after the broadcast sender exists because it owns the shared batch buffer",
     },
 ];
 
-enum WorkerHandle {
+enum RunnerHandle {
     Tokio {
         _handle: tokio::task::JoinHandle<()>,
     },
@@ -471,37 +470,37 @@ fn policy_tick_captured_registry() -> Option<Option<usize>> {
         .unwrap_or_else(|poison| poison.into_inner())
 }
 
-struct RunningWorker {
-    spec: WorkerSpec,
-    _handle: WorkerHandle,
+struct RunningRunner {
+    spec: RunnerSpec,
+    _handle: RunnerHandle,
 }
 
-pub(crate) struct SupervisedWorkerRegistry {
+pub(crate) struct SupervisedRunnerRegistry {
     config: Config,
     engine: PolicyEngine,
     health_registry: Option<Arc<HealthRegistry>>,
     pg_pool: Option<Arc<PgPool>>,
     cluster_runtime: ClusterRuntime,
     shutdown: Arc<AtomicBool>,
-    running: Vec<RunningWorker>,
+    running: Vec<RunningRunner>,
 }
 
-impl Drop for SupervisedWorkerRegistry {
+impl Drop for SupervisedRunnerRegistry {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
     }
 }
 
-// #2202 regression guard. Verifies that `supervise_leader_tokio_worker` re-spawns
-// the underlying worker future after a lease takeover (leader=true → false → true),
-// which is the contract the PR #2115 fix introduced. Without it, leader-only
-// workers like `routine-runtime` go dormant on the new leader until dcserver
+// #2202 regression guard. Verifies that `supervise_hub_tokio_runner` re-spawns
+// the underlying runner future after a lease takeover (hub=true → false → true),
+// which is the contract the PR #2115 fix introduced. Without it, hub-only
+// runners like `routine-runtime` go dormant on the new hub until dcserver
 // restart.
 #[cfg(test)]
-mod leader_takeover_tests {
+mod hub_takeover_tests {
     use super::{
-        LEADER_ONLY_WORKER_ACTIVE_COUNT, LEADER_ONLY_WORKER_LAST_SPAWN_UNIX_MS,
-        LEADER_ONLY_WORKERS_STARTED, SupervisedWorkerRegistry, WORKER_SPECS, WorkerExecutionScope,
+        HUB_ONLY_RUNNER_ACTIVE_COUNT, HUB_ONLY_RUNNER_LAST_SPAWN_UNIX_MS, HUB_ONLY_RUNNERS_STARTED,
+        RUNNER_SPECS, RunnerExecutionScope, SupervisedRunnerRegistry,
     };
     use crate::server::cluster::ClusterRuntime;
     use std::sync::Arc;
@@ -509,7 +508,7 @@ mod leader_takeover_tests {
     use std::time::Duration;
 
     #[tokio::test]
-    async fn worker_profile_starts_local_workers_without_spawning_leader_waiters() {
+    async fn runner_profile_starts_local_runners_without_spawning_hub_waiters() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
         config.cluster.runtime_profile = crate::config::RuntimeProfile::Runner;
@@ -519,30 +518,30 @@ mod leader_takeover_tests {
         std::fs::create_dir_all(&config.policies.dir).unwrap();
         let engine = crate::engine::PolicyEngine::new_with_pg(&config, None).unwrap();
         let pool = sqlx::PgPool::connect_lazy("postgres://fixture@127.0.0.1:1/unused").unwrap();
-        let mut registry = SupervisedWorkerRegistry::new(
+        let mut registry = SupervisedRunnerRegistry::new(
             config,
             engine,
             None,
             Some(Arc::new(pool)),
-            ClusterRuntime::for_test_with_leader(Arc::new(AtomicBool::new(true))),
+            ClusterRuntime::for_test_with_hub(Arc::new(AtomicBool::new(true))),
         );
-        for spec in WORKER_SPECS
+        for spec in RUNNER_SPECS
             .into_iter()
-            .filter(|s| s.execution_scope == WorkerExecutionScope::LeaderOnly)
+            .filter(|s| s.execution_scope == RunnerExecutionScope::HubOnly)
         {
-            assert!(registry.start_worker(spec, None).unwrap().is_none());
+            assert!(registry.start_runner(spec, None).unwrap().is_none());
         }
         assert!(
             registry.running.is_empty(),
-            "no leader tasks or threads, even if leadership flips"
+            "no hub tasks or threads, even if hub ownership flips"
         );
-        let spec = WORKER_SPECS
+        let spec = RUNNER_SPECS
             .into_iter()
-            .find(|s| s.id == super::ServerWorkerId::WsBatchFlusher)
+            .find(|s| s.id == super::ServerRunnerId::WsBatchFlusher)
             .unwrap();
         assert!(
             registry
-                .start_worker(spec, Some(crate::eventbus::new_broadcast()))
+                .start_runner(spec, Some(crate::eventbus::new_broadcast()))
                 .unwrap()
                 .is_some()
         );
@@ -564,15 +563,15 @@ mod leader_takeover_tests {
     /// spawned thread captured `None` (mutation S2). A guard that a neighbouring
     /// line disarms is worse than no guard, because it reads as coverage.
     ///
-    /// This runs `start_worker` for real and compares the pointer identity of
+    /// This runs `start_runner` for real and compares the pointer identity of
     /// what the thread closed over against the registry the process was built
     /// with. The tick never reaches its loop body: `shutdown` is already set, so
-    /// `wait_until_leader_or_shutdown` returns immediately and the thread exits
+    /// `wait_until_hub_or_shutdown` returns immediately and the thread exits
     /// without a PostgreSQL round trip or a `PolicyEngine::new_for_tick`.
     ///
     /// What it still does not prove: that `policy_tick_loop` is handed this same
-    /// binding once leadership is granted. That line sits inside the leader-only
-    /// body, which needs a live pool and a leadership grant;
+    /// binding once hub ownership is granted. That line sits inside the hub-only
+    /// body, which needs a live pool and a hub ownership grant;
     /// `drain_with_health_registry_tears_down_provider_runtime_pg` is what proves
     /// the registry does something once it arrives.
     /// `#[tokio::test]` only because `PgPool::connect_lazy` installs a pool
@@ -600,7 +599,7 @@ mod leader_takeover_tests {
         );
     }
 
-    /// Start the real `policy-tick` worker with `health_registry` and return what
+    /// Start the real `policy-tick` runner with `health_registry` and return what
     /// `policy_tick_captured_registry` saw the spawned thread capture.
     fn spawn_policy_tick_and_capture(
         health_registry: Option<Arc<crate::services::discord::health::HealthRegistry>>,
@@ -610,29 +609,28 @@ mod leader_takeover_tests {
         let mut config = crate::config::Config::default();
         config.policies.hot_reload = false;
         let engine = crate::engine::PolicyEngine::new(&config).expect("build a policy engine");
-        // `start_worker` only requires the pool to exist. Nothing here issues a
+        // `start_runner` only requires the pool to exist. Nothing here issues a
         // query, and the address is deliberately unroutable so a regression that
         // did issue one could never reach a real PostgreSQL server.
         let pg_pool = sqlx::Pool::<sqlx::Postgres>::connect_lazy(
             "postgres://agentdesk-test@127.0.0.1:1/agentdesk-policy-tick-probe",
         )
         .expect("build a lazy pool");
-        let cluster_runtime =
-            ClusterRuntime::for_test_with_leader(Arc::new(AtomicBool::new(false)));
+        let cluster_runtime = ClusterRuntime::for_test_with_hub(Arc::new(AtomicBool::new(false)));
 
-        let mut worker_registry = SupervisedWorkerRegistry::new(
+        let mut runner_registry = SupervisedRunnerRegistry::new(
             config,
             engine,
             health_registry,
             Some(Arc::new(pg_pool)),
             cluster_runtime,
         );
-        // Stop the thread at its first leader check, after it has recorded what
+        // Stop the thread at its first hub check, after it has recorded what
         // it captured but before it touches the pool.
-        worker_registry.shutdown.store(true, Ordering::Release);
-        worker_registry
-            .start_worker(policy_tick_spec(), None)
-            .expect("start the policy-tick worker");
+        runner_registry.shutdown.store(true, Ordering::Release);
+        runner_registry
+            .start_runner(policy_tick_spec(), None)
+            .expect("start the policy-tick runner");
 
         for _ in 0..200 {
             if let Some(captured) = super::policy_tick_captured_registry() {
@@ -643,38 +641,38 @@ mod leader_takeover_tests {
         None
     }
 
-    fn policy_tick_spec() -> super::WorkerSpec {
-        WORKER_SPECS
+    fn policy_tick_spec() -> super::RunnerSpec {
+        RUNNER_SPECS
             .iter()
             .copied()
             .find(|spec| spec.name == "policy-tick")
-            .expect("the policy-tick worker spec is registered")
+            .expect("the policy-tick runner spec is registered")
     }
 
-    fn leader_only_spec_for_test() -> super::WorkerSpec {
-        WORKER_SPECS
+    fn hub_only_spec_for_test() -> super::RunnerSpec {
+        RUNNER_SPECS
             .iter()
             .copied()
-            .find(|spec| spec.execution_scope == WorkerExecutionScope::LeaderOnly)
-            .expect("at least one leader-only worker spec is registered")
+            .find(|spec| spec.execution_scope == RunnerExecutionScope::HubOnly)
+            .expect("at least one hub-only runner spec is registered")
     }
 
     #[tokio::test(start_paused = true)]
-    async fn supervisor_respawns_worker_after_lease_takeover() {
+    async fn supervisor_respawns_runner_after_lease_takeover() {
         // Reset the globals the supervisor mutates so this test stays
         // deterministic regardless of other tests in the binary.
-        LEADER_ONLY_WORKERS_STARTED.store(false, Ordering::Release);
-        LEADER_ONLY_WORKER_ACTIVE_COUNT.store(0, Ordering::Release);
-        LEADER_ONLY_WORKER_LAST_SPAWN_UNIX_MS.store(0, Ordering::Release);
+        HUB_ONLY_RUNNERS_STARTED.store(false, Ordering::Release);
+        HUB_ONLY_RUNNER_ACTIVE_COUNT.store(0, Ordering::Release);
+        HUB_ONLY_RUNNER_LAST_SPAWN_UNIX_MS.store(0, Ordering::Release);
 
-        let leader_active = Arc::new(AtomicBool::new(false));
+        let hub_active = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let runtime = ClusterRuntime::for_test_with_leader(leader_active.clone());
+        let runtime = ClusterRuntime::for_test_with_hub(hub_active.clone());
         let spawn_count = Arc::new(AtomicUsize::new(0));
-        let spec = leader_only_spec_for_test();
+        let spec = hub_only_spec_for_test();
 
         let supervisor_count = spawn_count.clone();
-        let supervisor = tokio::spawn(SupervisedWorkerRegistry::supervise_leader_tokio_worker(
+        let supervisor = tokio::spawn(SupervisedRunnerRegistry::supervise_hub_tokio_runner(
             spec,
             runtime,
             shutdown.clone(),
@@ -682,48 +680,48 @@ mod leader_takeover_tests {
                 let counter = supervisor_count.clone();
                 async move {
                     counter.fetch_add(1, Ordering::Release);
-                    // Park so the supervisor only re-spawns on a leader flip,
-                    // not because the worker future returned on its own.
+                    // Park so the supervisor only re-spawns on a hub flip,
+                    // not because the runner future returned on its own.
                     std::future::pending::<()>().await;
                 }
             },
         ));
 
-        // Not leader yet → supervisor blocks in wait_until_leader.
+        // Not hub yet → supervisor blocks in wait_until_hub.
         tokio::time::advance(Duration::from_secs(3)).await;
         tokio::task::yield_now().await;
         assert_eq!(spawn_count.load(Ordering::Acquire), 0);
 
-        // Acquire leadership → supervisor must spawn the worker.
-        leader_active.store(true, Ordering::Release);
+        // Acquire hub ownership → supervisor must spawn the runner.
+        hub_active.store(true, Ordering::Release);
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
         assert_eq!(
             spawn_count.load(Ordering::Acquire),
             1,
-            "worker future should run as soon as leadership is acquired"
+            "runner future should run as soon as hub ownership is acquired"
         );
-        assert!(LEADER_ONLY_WORKERS_STARTED.load(Ordering::Acquire));
-        assert_eq!(LEADER_ONLY_WORKER_ACTIVE_COUNT.load(Ordering::Acquire), 1);
+        assert!(HUB_ONLY_RUNNERS_STARTED.load(Ordering::Acquire));
+        assert_eq!(HUB_ONLY_RUNNER_ACTIVE_COUNT.load(Ordering::Acquire), 1);
 
-        // Lose leadership → supervisor self-fences the worker.
-        leader_active.store(false, Ordering::Release);
+        // Lose hub ownership → supervisor self-fences the runner.
+        hub_active.store(false, Ordering::Release);
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
-        assert_eq!(LEADER_ONLY_WORKER_ACTIVE_COUNT.load(Ordering::Acquire), 0);
+        assert_eq!(HUB_ONLY_RUNNER_ACTIVE_COUNT.load(Ordering::Acquire), 0);
 
-        // Lease takeover: regain leadership while supervisor is in the
+        // Lease takeover: regain hub ownership while supervisor is in the
         // post-loss 5s cooldown. The supervisor must re-enter the spawn loop.
-        leader_active.store(true, Ordering::Release);
+        hub_active.store(true, Ordering::Release);
         // 5s cooldown + 1s poll interval + jitter buffer.
         tokio::time::advance(Duration::from_secs(8)).await;
         tokio::task::yield_now().await;
         assert_eq!(
             spawn_count.load(Ordering::Acquire),
             2,
-            "worker must re-spawn after lease takeover (regression guard for #2202)"
+            "runner must re-spawn after lease takeover (regression guard for #2202)"
         );
-        assert_eq!(LEADER_ONLY_WORKER_ACTIVE_COUNT.load(Ordering::Acquire), 1);
+        assert_eq!(HUB_ONLY_RUNNER_ACTIVE_COUNT.load(Ordering::Acquire), 1);
 
         shutdown.store(true, Ordering::Release);
         // Let the supervisor observe shutdown on its next poll tick and exit.

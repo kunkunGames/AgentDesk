@@ -3,7 +3,7 @@
 # git-merge-regen-inventory.sh — custom git merge driver for generated inventory
 # docs (#4724 slice B).
 #
-# Problem it solves: the tracked route and worker inventory docs are generated
+# Problem it solves: the tracked route and runner inventory docs are generated
 # files. When two branches both change the SAME summary row, a plain 3-way merge
 # can leave conflict markers — and with the inventories
 # regenerated on every prod-line change, concurrent PRs collide constantly →

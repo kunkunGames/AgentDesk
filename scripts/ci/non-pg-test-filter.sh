@@ -22,6 +22,7 @@ NON_PG_SKIP_ARGS=(
   --skip db::auto_queue::tests::dispatch_terminal_sync_pg_tests
   --skip db::auto_queue::tests::grouped_card_count_pg_tests
   --skip db::automation_candidates::verdict_tests
+  --skip db::calendar_sync::postgres_tests
   --skip db::campaigns::tests
   --skip db::dispatched_session_canonical_identity::pg_tests
   --skip db::dispatched_session_rebind_override::tests
@@ -35,6 +36,7 @@ NON_PG_SKIP_ARGS=(
   --skip db::intake_outbox_delivery_proof::tests
   --skip db::intake_outbox_dispatch_stamp::tests
   --skip db::intake_outbox_dispatched_audit::postgres_tests
+  --skip db::postgres::hub_runner_names_tests
   --skip db::postgres::tests
   --skip db::prompt_manifests::tests
   --skip db::relay_dead_letter::tests
@@ -83,10 +85,17 @@ NON_PG_SKIP_ARGS=(
   --skip services::auto_queue::runtime::clear_slot_sessions_pg_tests::tests
   --skip services::auto_queue::tests
   --skip services::automation_candidate_materializer::iteration_result_tests
+  --skip services::cluster::attachment_transfer::storage_tests
+  --skip services::cluster::execution_capacity::tests
   --skip services::cluster::intake_preflight::tests
+  --skip services::cluster::intake_router_hook::agent_execution_node_tests
+  --skip services::cluster::intake_router_hook::attachment_tests
+  --skip services::cluster::intake_router_hook::capacity_tests
+  --skip services::cluster::intake_router_hook::edge_case_tests
+  --skip services::cluster::intake_router_hook::execution_requirement_tests
   --skip services::cluster::intake_router_hook::owner_record::tests
   --skip services::cluster::intake_router_hook::pg_tests
-  --skip services::cluster::intake_worker::dispatch_stamp_tests
+  --skip services::cluster::intake_runner::dispatch_stamp_tests
   --skip services::discord::catch_up::too_old_notice::tests
   --skip services::discord::health::recovery::stall_alert::tests
   --skip services::discord::health::recovery::stall_watchdog_auto_heal_tests
@@ -190,7 +199,7 @@ NON_PG_FILTER_REPLAY=(
   db::dispatches::metadata::tests::parse_pg_dispatch_context_rejects_malformed_json
   db::dispatches::metadata::tests::parse_pg_dispatch_context_rejects_non_object_context
   db::intake_outbox_delivery_proof::tests::stale_reader_projects_exactly_id
-  db::postgres::tests::agent_roster_sync_gated_to_leader_or_single_node
+  db::postgres::tests::agent_roster_sync_gated_to_hub_or_single_node
   db::postgres::tests::background_backpressure_disabled_when_reserve_zero
   db::postgres::tests::background_backpressure_saturating_boundaries
   db::postgres::tests::background_backpressure_yields_only_at_or_past_budget
@@ -198,6 +207,9 @@ NON_PG_FILTER_REPLAY=(
   db::postgres::tests::checksum_hex_formats_lowercase_byte_pairs
   db::postgres::tests::checksum_resolution_filters_down_migrations_to_avoid_false_positive
   db::postgres::tests::clamp_foreground_reserve_always_leaves_a_background_slot
+  db::postgres::tests::migration_compat_tests::postgres_migration_relocation_cancellation_does_not_leak_lock
+  db::postgres::tests::migration_compat_tests::postgres_migration_relocation_preserves_data_and_serializes_upgrade
+  db::postgres::tests::migration_compat_tests::postgres_migration_relocation_rejects_drift_without_partial_repair
   db::postgres::tests::ownership_registry_key_matches_between_admin_url_and_config_options
   db::postgres::tests::postgres_config_is_disabled_by_default
   db::postgres::tests::postgres_summary_uses_config_fields_when_enabled
@@ -281,6 +293,8 @@ NON_PG_FILTER_REPLAY=(
   services::auto_queue::tests::auto_queue_status_reports_delivery_split_brain_and_timeout
   services::auto_queue::tests::auto_queue_status_surfaces_review_cycle_clock
   services::auto_queue::tests::thread_link_view_only_builds_url_for_discord_snowflakes
+  services::cluster::attachment_transfer::storage_tests::attachment_upload_reference_preserves_legacy_json_and_enforces_size_limits
+  services::cluster::execution_capacity::tests::execution_capacity_ranking_uses_ratio_fairness_and_preserves_legacy_selector
   services::cluster::intake_preflight::tests::claude_and_codex_emit_structured_pass_and_fail_evidence
   services::cluster::intake_preflight::tests::each_required_failure_is_independently_fail_closed
   services::cluster::intake_preflight::tests::missing_or_malformed_snapshot_fails_closed
@@ -350,7 +364,7 @@ NON_PG_FILTER_REPLAY=(
   services::discord::router::intake_dispatch::tests::intake_dispatch_invariant_direct_execution_body_has_no_external_producer_callsites
   services::discord::router::intake_dispatch::tests::intake_dispatch_invariant_enforce_without_postgres_blocks_owner_unknown
   services::discord::router::intake_dispatch::tests::intake_dispatch_invariant_queued_entrypoints_promote_markers_after_admission_before_finish
-  services::discord::router::intake_dispatch::tests::intake_dispatch_invariant_worker_post_claim_is_the_only_router_bypass
+  services::discord::router::intake_dispatch::tests::intake_dispatch_invariant_runner_post_claim_is_the_only_router_bypass
   services::discord::router::intake_dispatch::tests::telemetry_only_unopted_live_foreign_owner_stays_fenced_5040
   services::discord::router::intake_dispatch::tests::telemetry_only_unopted_live_local_fresh_pending_route_stays_fenced_5040
   services::discord::router::intake_dispatch::tests::telemetry_only_unopted_live_local_pending_open_route_runs_locally_5040
@@ -367,7 +381,7 @@ NON_PG_FILTER_REPLAY=(
   services::discord::runtime_bootstrap::gateway_lease_recovery_tests::nonce_free_existing_marker_fails_closed_instead_of_claiming_promotion
   services::discord::runtime_bootstrap::gateway_lease_recovery_tests::nonce_free_supersession_folds_to_cancelled_despite_fresh_terminal_artifact
   services::discord::runtime_bootstrap::gateway_lease_recovery_tests::nonce_reuse_is_refused_without_publishing_an_index_only_marker
-  services::discord::runtime_bootstrap::gateway_lease_recovery_tests::orphan_reap_requires_named_stale_matching_worker
+  services::discord::runtime_bootstrap::gateway_lease_recovery_tests::orphan_reap_requires_named_stale_matching_runner
   services::discord::runtime_bootstrap::gateway_lease_recovery_tests::promotion_owner_recovers_all_runtimes_when_cancel_precedes_first_poll_tick
   services::discord::runtime_bootstrap::gateway_lease_recovery_tests::retired_mtime_lifetime_gate_has_no_remaining_source_references
   services::discord::runtime_bootstrap::gateway_lease_recovery_tests::sequential_requests_keep_independent_identities
@@ -465,7 +479,7 @@ NON_PG_FILTER_REPLAY=(
   services::session_forwarding::tests::encode_path_segment_escapes_session_key_separators
   services::session_forwarding::tests::every_session_forwarder_uses_the_shared_trusted_request_builder
   services::session_forwarding::tests::forward_cancel_sends_auth_and_owner_headers
-  services::session_forwarding::tests::forward_json_response_preserves_worker_auth_failure_status
+  services::session_forwarding::tests::forward_json_response_preserves_runner_auth_failure_status
   services::session_forwarding::tests::forwarded_header_is_detected_and_receiver_fence_is_exact
   services::session_forwarding::tests::invalid_forwarding_headers_send_no_authenticated_request
   services::session_forwarding::tests::legacy_session_key_match_is_numeric_delimiter_aware

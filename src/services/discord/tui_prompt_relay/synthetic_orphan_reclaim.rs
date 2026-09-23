@@ -11,7 +11,7 @@
 //!
 //! This module provides the injected
 //! [`ReclaimOrphanFn`](super::super::tui_direct_pending_start::ReclaimOrphanFn)
-//! the backstop worker consults before its terminal abort: it downgrades an
+//! the backstop runner consults before its terminal abort: it downgrades an
 //! orphan-shaped foreign inflight's relay owner to `None` via the existing
 //! identity-guarded [`downgrade_orphaned_session_bound_relay_owner_locked`], so
 //! the next view's ownerless-stale filter drops the row and the deferred claim
@@ -58,7 +58,7 @@ fn orphan_row_is_reclaimable(state: &InflightTurnState, require_tmux_session: &s
 /// * It NEVER consults the proven-stale `get_producer` oracle — the in-lock
 ///   orphan-shape re-check IS the liveness authority (a live turn cannot satisfy
 ///   300s-quiescence + zero-progress + never-delivered + `!session_bound_delivered`).
-/// * Only an orphan on THIS worker's own tmux session (the caller session) is
+/// * Only an orphan on THIS runner's own tmux session (the caller session) is
 ///   reclaimable, so a stray cross-session row is never touched.
 fn reclaim_orphan_inflight_owner(
     provider: &ProviderKind,
@@ -83,10 +83,10 @@ fn reclaim_orphan_inflight_owner(
     )
 }
 
-/// #3982: the worker's per-escalation-cycle orphan-reclaim action (the injected
+/// #3982: the runner's per-escalation-cycle orphan-reclaim action (the injected
 /// [`ReclaimOrphanFn`]). Delegates to the pure [`reclaim_orphan_inflight_owner`];
 /// returns `true` iff a producer-dead `SessionBoundRelay` orphan blocking this
-/// synthetic start was downgraded to ownerless. On `true` the worker re-evaluates
+/// synthetic start was downgraded to ownerless. On `true` the runner re-evaluates
 /// immediately so the deferred claim proceeds instead of aborting; on `false` it
 /// keeps the existing bounded escalation/abort.
 pub(super) fn pending_start_reclaim_orphan_fn() -> ReclaimOrphanFn {
@@ -223,7 +223,7 @@ mod tests {
     /// producer-dead `SessionBoundRelay` orphan on the caller session. This tests
     /// the trigger's DECISION with no I/O; the identity-guarded flock RMW it gates
     /// (`downgrade_orphaned_session_bound_relay_owner_locked`) is proven in
-    /// `inflight::orphan_relay_reclaim::tests`, and the worker wiring in
+    /// `inflight::orphan_relay_reclaim::tests`, and the runner wiring in
     /// `tui_direct_pending_start::tests::backstop_orphan_reclaim_*`.
     #[test]
     fn orphan_row_is_reclaimable_matches_stale_session_bound_orphan_on_caller_session() {
@@ -259,7 +259,7 @@ mod tests {
         );
     }
 
-    /// #3982: an orphan on a DIFFERENT tmux session than the worker's own (caller)
+    /// #3982: an orphan on a DIFFERENT tmux session than the runner's own (caller)
     /// session is never reclaimable — the trigger only downgrades an orphan
     /// belonging to the session it is deferring for, even though the row is
     /// otherwise orphan-shaped.
@@ -273,7 +273,7 @@ mod tests {
         );
         assert!(
             !orphan_row_is_reclaimable(&orphan, "AgentDesk-claude-OTHER"),
-            "an orphan on a foreign session must not be reclaimed by this worker (#3982)"
+            "an orphan on a foreign session must not be reclaimed by this runner (#3982)"
         );
     }
 

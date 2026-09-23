@@ -230,7 +230,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--channel-id",
         required=True,
-        help="Discord channel id bound to the cell's worker agent.",
+        help="Discord channel id bound to the cell's runner agent.",
     )
     parser.add_argument(
         "--thread-channel-id",
@@ -280,7 +280,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--handoff-to-agent",
         default=None,
-        help="Worker agent id whose channel binding receives send-to-agent prompts. "
+        help="Runner agent id whose channel binding receives send-to-agent prompts. "
         "Defaults to adk-<cell>-e2e.",
     )
     parser.add_argument(
@@ -407,7 +407,7 @@ def cell_runtime(cell: str) -> str:
 
 
 def cell_session_name(cell: str, *, thread_channel_id: str | None = None) -> str:
-    """tmux session name owned by the cell's worker agent."""
+    """tmux session name owned by the cell's runner agent."""
     suffix = f"-t{thread_channel_id}" if thread_channel_id else ""
     return f"AgentDesk-{cell_provider(cell)}-adk-{cell}-e2e{suffix}"
 
@@ -480,7 +480,7 @@ def provider_identity(cell: str, channel_id: str | None = None) -> dict[str, Any
         "cell": cell,
         "provider": cell_provider(cell),
         "runtime": cell_runtime(cell),
-        "worker_agent": cell_default_agent(cell),
+        "runner_agent": cell_default_agent(cell),
     }
     if channel_id is not None:
         identity["channel_id"] = str(channel_id)

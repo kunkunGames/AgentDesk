@@ -122,7 +122,7 @@ pub(crate) async fn mark_dispatch_dispatched_pg(
 }
 
 /// Mark an outbox row as `done` and clear claim state. Used both by the
-/// notify-suppressed early-exit and by the success branch of the worker.
+/// notify-suppressed early-exit and by the success branch of the runner.
 pub(crate) async fn mark_outbox_done_pg(
     pool: &PgPool,
     outbox_id: i64,

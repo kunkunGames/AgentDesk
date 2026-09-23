@@ -82,8 +82,8 @@ mod postgres_tests {
                 user_msg_id, request_owner_id, user_text, turn_kind, agent_id,
                 provider, status, claim_owner, dispatched_at
              ) VALUES (
-                'worker', 'leader', $1, $1, 'user', 'hello', 'standard', 'agent',
-                $2, $3, 'dispatch-worker', $4
+                'runner', 'hub', $1, $1, 'user', 'hello', 'standard', 'agent',
+                $2, $3, 'dispatch-runner', $4
              ) RETURNING id",
         )
         .bind(key)

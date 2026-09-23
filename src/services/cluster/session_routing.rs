@@ -12,7 +12,7 @@ fn normalize_api_base_url(raw: &str) -> Option<String> {
     }
 }
 
-fn resolve_worker_api_base_url(config: &ClusterConfig) -> Option<String> {
+fn resolve_runner_api_base_url(config: &ClusterConfig) -> Option<String> {
     if let Some(raw) = config.api_base_url.as_deref() {
         return normalize_api_base_url(raw);
     }
@@ -22,9 +22,9 @@ fn resolve_worker_api_base_url(config: &ClusterConfig) -> Option<String> {
         .and_then(normalize_api_base_url)
 }
 
-pub(crate) fn cluster_capabilities_with_worker_api(config: &ClusterConfig) -> Value {
+pub(crate) fn cluster_capabilities_with_runner_api(config: &ClusterConfig) -> Value {
     let mut capabilities = config.capabilities.clone();
-    if let Some(api_base_url) = resolve_worker_api_base_url(config) {
+    if let Some(api_base_url) = resolve_runner_api_base_url(config) {
         let mut metadata = capabilities
             .remove("agentdesk_api")
             .and_then(|value| value.as_object().cloned())
@@ -39,7 +39,7 @@ pub(crate) fn cluster_capabilities_with_worker_api(config: &ClusterConfig) -> Va
     Value::Object(capabilities)
 }
 
-pub(crate) fn worker_api_base_url_from_capabilities(capabilities: &Value) -> Option<String> {
+pub(crate) fn runner_api_base_url_from_capabilities(capabilities: &Value) -> Option<String> {
     capabilities
         .get("agentdesk_api")
         .and_then(|metadata| {
@@ -54,7 +54,7 @@ pub(crate) fn worker_api_base_url_from_capabilities(capabilities: &Value) -> Opt
 pub(crate) fn session_owner_routing_status(
     owner_instance_id: Option<&str>,
     local_instance_id: Option<&str>,
-    worker_nodes: &[Value],
+    cluster_nodes: &[Value],
 ) -> Value {
     let owner_instance_id = owner_instance_id
         .map(str::trim)
@@ -76,7 +76,7 @@ pub(crate) fn session_owner_routing_status(
     };
 
     let node = owner_instance_id.and_then(|owner| {
-        worker_nodes
+        cluster_nodes
             .iter()
             .find(|node| node.get("instance_id").and_then(|value| value.as_str()) == Some(owner))
     });
@@ -88,7 +88,7 @@ pub(crate) fn session_owner_routing_status(
         .map(str::to_string)
         .or_else(|| {
             node.and_then(|node| node.get("capabilities"))
-                .and_then(worker_api_base_url_from_capabilities)
+                .and_then(runner_api_base_url_from_capabilities)
         });
 
     let routable = !is_local && node_status == Some("online") && api_base_url.is_some();
@@ -97,11 +97,11 @@ pub(crate) fn session_owner_routing_status(
     } else if is_local {
         None
     } else if node.is_none() {
-        Some("worker_node_missing")
+        Some("runner_node_missing")
     } else if node_status != Some("online") {
-        Some("worker_node_stale")
+        Some("runner_node_stale")
     } else if api_base_url.is_none() {
-        Some("worker_api_base_url_missing")
+        Some("runner_api_base_url_missing")
     } else {
         None
     };
@@ -120,7 +120,7 @@ pub(crate) fn session_owner_routing_status(
 pub(crate) fn enrich_session_owner_routing(
     sessions: &mut [Value],
     local_instance_id: Option<&str>,
-    worker_nodes: &[Value],
+    cluster_nodes: &[Value],
 ) {
     for session in sessions {
         let owner_instance_id = session
@@ -130,7 +130,7 @@ pub(crate) fn enrich_session_owner_routing(
         let owner = session_owner_routing_status(
             owner_instance_id.as_deref(),
             local_instance_id,
-            worker_nodes,
+            cluster_nodes,
         );
         if let Some(obj) = session.as_object_mut() {
             obj.insert("owner".to_string(), owner);
@@ -138,8 +138,8 @@ pub(crate) fn enrich_session_owner_routing(
     }
 }
 
-pub(crate) fn attach_active_session_counts_to_worker_nodes(
-    worker_nodes: &mut [Value],
+pub(crate) fn attach_active_session_counts_to_cluster_nodes(
+    cluster_nodes: &mut [Value],
     sessions: &[Value],
 ) {
     let mut counts = std::collections::BTreeMap::<String, i64>::new();
@@ -154,7 +154,7 @@ pub(crate) fn attach_active_session_counts_to_worker_nodes(
         }
     }
 
-    for node in worker_nodes {
+    for node in cluster_nodes {
         let instance_id = node
             .get("instance_id")
             .and_then(|value| value.as_str())
@@ -202,7 +202,7 @@ pub(crate) fn summarize_session_owner_routing(sessions: &[Value]) -> Value {
             .and_then(|value| value.as_str())
             .filter(|value| !value.is_empty())
         {
-            if matches!(reason, "session_owner_missing" | "worker_node_missing") {
+            if matches!(reason, "session_owner_missing" | "runner_node_missing") {
                 orphaned += 1;
             }
             *reasons.entry(reason.to_string()).or_default() += 1;
@@ -226,9 +226,9 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{
-        attach_active_session_counts_to_worker_nodes, cluster_capabilities_with_worker_api,
-        session_owner_routing_status, summarize_session_owner_routing,
-        worker_api_base_url_from_capabilities,
+        attach_active_session_counts_to_cluster_nodes, cluster_capabilities_with_runner_api,
+        runner_api_base_url_from_capabilities, session_owner_routing_status,
+        summarize_session_owner_routing,
     };
     use crate::config::ClusterConfig;
     use serde_json::json;
@@ -259,15 +259,15 @@ mod tests {
     }
 
     #[test]
-    fn configured_api_base_url_is_published_as_worker_metadata_and_validates_scheme() {
+    fn configured_api_base_url_is_published_as_runner_metadata_and_validates_scheme() {
         let config = ClusterConfig {
             api_base_url: Some(" http://mac-book.local:8791/ ".to_string()),
             ..ClusterConfig::default()
         };
-        let capabilities = cluster_capabilities_with_worker_api(&config);
+        let capabilities = cluster_capabilities_with_runner_api(&config);
 
         assert_eq!(
-            worker_api_base_url_from_capabilities(&capabilities).as_deref(),
+            runner_api_base_url_from_capabilities(&capabilities).as_deref(),
             Some("http://mac-book.local:8791")
         );
         assert_eq!(
@@ -283,8 +283,8 @@ mod tests {
             api_base_url: Some(" file:///tmp/agentdesk.sock ".to_string()),
             ..ClusterConfig::default()
         };
-        let capabilities = cluster_capabilities_with_worker_api(&invalid);
-        assert!(worker_api_base_url_from_capabilities(&capabilities).is_none());
+        let capabilities = cluster_capabilities_with_runner_api(&invalid);
+        assert!(runner_api_base_url_from_capabilities(&capabilities).is_none());
     }
 
     #[test]
@@ -294,14 +294,14 @@ mod tests {
         unsafe {
             std::env::set_var(
                 "AGENTDESK_CLUSTER_API_BASE_URL",
-                " https://worker.example.test:8791/ ",
+                " https://runner.example.test:8791/ ",
             )
         };
 
-        let capabilities = cluster_capabilities_with_worker_api(&ClusterConfig::default());
+        let capabilities = cluster_capabilities_with_runner_api(&ClusterConfig::default());
         assert_eq!(
-            worker_api_base_url_from_capabilities(&capabilities).as_deref(),
-            Some("https://worker.example.test:8791")
+            runner_api_base_url_from_capabilities(&capabilities).as_deref(),
+            Some("https://runner.example.test:8791")
         );
     }
 
@@ -323,7 +323,7 @@ mod tests {
         );
         assert_eq!(
             sessions[2]["owner"]["reason"].as_str(),
-            Some("worker_node_missing")
+            Some("runner_node_missing")
         );
     }
 
@@ -336,20 +336,20 @@ mod tests {
                 "api_base_url": "http://mac-mini.local:8791"
             }),
             json!({
-                "instance_id": "old-worker",
+                "instance_id": "old-runner",
                 "status": "offline",
-                "api_base_url": "http://old-worker.local:8791"
+                "api_base_url": "http://old-runner.local:8791"
             }),
         ];
         let mut sessions = vec![
             json!({"id": 1, "instance_id": "mac-mini-release"}),
-            json!({"id": 2, "instance_id": "old-worker"}),
-            json!({"id": 3, "instance_id": "missing-worker"}),
+            json!({"id": 2, "instance_id": "old-runner"}),
+            json!({"id": 3, "instance_id": "missing-runner"}),
             json!({"id": 4, "instance_id": null}),
         ];
 
         super::enrich_session_owner_routing(&mut sessions, Some("mac-mini-release"), &nodes);
-        attach_active_session_counts_to_worker_nodes(&mut nodes, &sessions);
+        attach_active_session_counts_to_cluster_nodes(&mut nodes, &sessions);
         let summary = summarize_session_owner_routing(&sessions);
 
         assert_eq!(nodes[0]["active_session_count"].as_i64(), Some(1));
@@ -360,8 +360,8 @@ mod tests {
         assert_eq!(summary["unknown_owner"].as_i64(), Some(1));
         assert_eq!(summary["orphaned"].as_i64(), Some(2));
         assert_eq!(summary["unroutable"].as_i64(), Some(3));
-        assert_eq!(summary["reasons"]["worker_node_stale"].as_i64(), Some(1));
-        assert_eq!(summary["reasons"]["worker_node_missing"].as_i64(), Some(1));
+        assert_eq!(summary["reasons"]["runner_node_stale"].as_i64(), Some(1));
+        assert_eq!(summary["reasons"]["runner_node_missing"].as_i64(), Some(1));
         assert_eq!(
             summary["reasons"]["session_owner_missing"].as_i64(),
             Some(1)
@@ -377,12 +377,12 @@ mod tests {
                 "api_base_url": "http://mac-book.local:8791"
             }),
             json!({
-                "instance_id": "old-worker",
+                "instance_id": "old-runner",
                 "status": "offline",
-                "api_base_url": "http://old-worker.local:8791"
+                "api_base_url": "http://old-runner.local:8791"
             }),
             json!({
-                "instance_id": "no-url-worker",
+                "instance_id": "no-url-runner",
                 "status": "online"
             }),
         ];
@@ -408,16 +408,16 @@ mod tests {
         );
 
         let stale =
-            session_owner_routing_status(Some("old-worker"), Some("mac-mini-release"), &nodes);
+            session_owner_routing_status(Some("old-runner"), Some("mac-mini-release"), &nodes);
         assert_eq!(stale["routable"].as_bool(), Some(false));
-        assert_eq!(stale["reason"].as_str(), Some("worker_node_stale"));
+        assert_eq!(stale["reason"].as_str(), Some("runner_node_stale"));
 
         let missing_url =
-            session_owner_routing_status(Some("no-url-worker"), Some("mac-mini-release"), &nodes);
+            session_owner_routing_status(Some("no-url-runner"), Some("mac-mini-release"), &nodes);
         assert_eq!(missing_url["routable"].as_bool(), Some(false));
         assert_eq!(
             missing_url["reason"].as_str(),
-            Some("worker_api_base_url_missing")
+            Some("runner_api_base_url_missing")
         );
     }
 }

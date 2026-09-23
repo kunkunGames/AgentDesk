@@ -9,7 +9,7 @@ slot 수와 자동 배정 여부를 설정한다. 별도 scheduler 서비스나 
 ```yaml
 cluster:
   enabled: true
-  instance_id: windows-worker-1
+  instance_id: windows-runner-1
   role: runner
   runtime_profile: runner
   execution_slots: 2

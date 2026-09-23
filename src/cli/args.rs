@@ -535,7 +535,7 @@ pub(crate) enum Commands {
     /// Show consolidated health snapshot of the current node (server status,
     /// dcserver pid, last deploy time, queue lag, Discord/disk/outbox).
     Health,
-    /// Compare release/main/dev state across every registered worker node
+    /// Compare release/main/dev state across every registered runner node
     /// (`mac-mini`, `mac-book`, …). Renders a side-by-side table with
     /// dcserver pid, last deploy, queue lag, and a `diff` column.
     MachineCompare,

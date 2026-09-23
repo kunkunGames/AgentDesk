@@ -198,7 +198,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/claude-accounts/switch",
             "claude-accounts",
-            "Switch the machine-global Claude auth via cswap --switch-to (single-flight, 20s timeout). Schedules a best-effort leader rate-limit refresh; the switch applies on the receiving node only.",
+            "Switch the machine-global Claude auth via cswap --switch-to (single-flight, 20s timeout). Schedules a best-effort hub rate-limit refresh; the switch applies on the receiving node only.",
         )
         .with_params([
             ("account", body_param("string", true, "Account number or email as shown by the list endpoint")),

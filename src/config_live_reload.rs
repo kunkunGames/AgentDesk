@@ -342,7 +342,7 @@ pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str>
     if agent_launch_fingerprint(old) != agent_launch_fingerprint(new) {
         changed.push("agents");
     }
-    // Discord voice receive/STT/TTS workers are constructed during gateway setup.
+    // Discord voice receive/STT/TTS runners are constructed during gateway setup.
     if old.voice != new.voice {
         changed.push("voice");
     }
@@ -364,7 +364,7 @@ pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str>
     if section_changed(&old.memory, &new.memory) {
         changed.push("memory");
     }
-    // GitHub sync worker cadence is captured when the worker starts.
+    // GitHub sync runner cadence is captured when the runner starts.
     if old.github.sync_interval_minutes != new.github.sync_interval_minutes {
         changed.push("github");
     }
@@ -372,7 +372,7 @@ pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str>
     if old.placeholder != new.placeholder {
         changed.push("placeholder");
     }
-    // Routine worker startup, script dirs, tick cadence, store limits/timezone, and
+    // Routine runner startup, script dirs, tick cadence, store limits/timezone, and
     // agent timeout are boot-bound. Per-tick caps and alert knobs are live-read.
     if routines_restart_fingerprint(&old.routines) != routines_restart_fingerprint(&new.routines) {
         changed.push("routines");
@@ -418,8 +418,8 @@ pub fn reload_from_path(path: &Path) -> ReloadOutcome {
     }
 }
 
-/// Guard returned by [`start`]; keeps the watcher and worker thread alive and
-/// joins the worker on drop. Mirrors `engine::loader::HotReloadGuard`.
+/// Guard returned by [`start`]; keeps the watcher and runner thread alive and
+/// joins the runner on drop. Mirrors `engine::loader::HotReloadGuard`.
 pub struct ConfigHotReloadGuard {
     _watcher: Option<RecommendedWatcher>,
     join: Option<std::thread::JoinHandle<()>>,
@@ -485,7 +485,7 @@ pub fn start(path: PathBuf, enabled: bool) -> Option<ConfigHotReloadGuard> {
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_worker = stop.clone();
+    let stop_runner = stop.clone();
     let target_name = path.file_name().map(std::ffi::OsString::from);
     let path_display = path.display().to_string();
     let join = std::thread::Builder::new()
@@ -493,12 +493,12 @@ pub fn start(path: PathBuf, enabled: bool) -> Option<ConfigHotReloadGuard> {
         .spawn(move || {
             let mut last_reload = Instant::now() - DEBOUNCE;
             loop {
-                if stop_worker.load(Ordering::Acquire) {
+                if stop_runner.load(Ordering::Acquire) {
                     break;
                 }
                 match rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(event) => {
-                        if stop_worker.load(Ordering::Acquire) {
+                        if stop_runner.load(Ordering::Acquire) {
                             break;
                         }
                         // Ignore events for sibling files in the directory.
@@ -549,7 +549,7 @@ pub fn start(path: PathBuf, enabled: bool) -> Option<ConfigHotReloadGuard> {
         .ok();
 
     if join.is_none() {
-        tracing::warn!("config hot-reload: failed to spawn worker thread; disabled");
+        tracing::warn!("config hot-reload: failed to spawn runner thread; disabled");
         return None;
     }
 

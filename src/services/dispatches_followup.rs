@@ -7,7 +7,7 @@
 //!
 //! The helpers themselves are pure DB writes (insert into `dispatch_outbox`)
 //! with no HTTP/Axum surface, so their correct home is in the service layer.
-//! The outbox worker loop still lives under `server::routes::dispatches::outbox`
+//! The outbox runner loop still lives under `server::routes::dispatches::outbox`
 //! because it owns the Discord side-effect transport — but the *enqueue* side
 //! that callers need is now here.
 //!

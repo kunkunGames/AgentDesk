@@ -101,5 +101,5 @@ Active reservations and pending outbox rows retain the validated UUIDs under
 the same PostgreSQL access boundary; terminal transitions scrub those payloads.
 
 The delivery history exposes independent `friends` and `self` status entries.
-If a worker disappears after the provider-dispatch fence, the result becomes
+If a runner disappears after the provider-dispatch fence, the result becomes
 `unknown` and is not replayed automatically, preventing duplicate messages.

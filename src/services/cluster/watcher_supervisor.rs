@@ -24,19 +24,19 @@
 //! reconcile via [`SessionRegistry::list_matched`] so no session is silently
 //! orphaned — the same idempotent path handles boot and lag recovery.
 //!
-//! ## Worker-local
+//! ## Runner-local
 //!
-//! Placed under `WorkerLocal` in `worker_registry` — tmux is host-scoped and
+//! Placed under `RunnerLocal` in `runner_registry` — tmux is host-scoped and
 //! every node runs its own discovery, so every node owns relays for its own
 //! sessions. Cross-host relay placement is out of scope here.
 //!
 //! ## Flag gate
 //!
 //! `cluster.session_bound_relay_enabled` (default `true` since E5 / #2412).
-//! When `false`, the supervisor is not started by the worker registry and
+//! When `false`, the supervisor is not started by the runner registry and
 //! the legacy turn-bound relay path remains the only delivery channel —
 //! that escape hatch lets operators disable the new path if a regression
-//! surfaces. Under the default-on configuration the production worker wires a
+//! surfaces. Under the default-on configuration the production runner wires a
 //! Discord sink and the production tmux frame producer
 //! (`services::discord::tmux_watcher`) pushes frames into the supervisor-owned
 //! relay via [`super::relay_producer_registry::RelayProducerRegistry`]. The

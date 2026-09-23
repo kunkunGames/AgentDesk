@@ -273,9 +273,9 @@ Agent turn lifecycle is managed by a dedicated orchestration layer (`src/service
 - **Inflight tracking** — Per-provider inflight files for concurrent session management
 
 ### Multinode Runtime
-AgentDesk can run multiple release instances against one PostgreSQL control plane. Each node advertises identity, labels, provider capabilities, and node-local MCP health through `worker_nodes`, while PostgreSQL leases prevent duplicate cluster-wide side effects.
+AgentDesk can run multiple release instances against one PostgreSQL control plane. Each node advertises identity, labels, provider capabilities, and node-local MCP health through `cluster_nodes`, while PostgreSQL leases prevent duplicate cluster-wide side effects.
 
-- **Hub and runners** — The hub coordinates shared work and can also execute agents. Runners execute assigned work. Each device keeps a stable `cluster.instance_id`, and `/api/cluster/nodes` reports its current role. The dashboard displays **Hub / Runner** for `hub / runner` and the separate feature modes **Full features / Execution only** for `full / runner`. See the [terminology and configuration guide](docs/operations/node-terminology.md).
+- **Hub and runners** — The hub coordinates shared work and can also execute agents. Runners execute assigned work. Each device keeps a stable `cluster.instance_id`, and `/api/cluster/nodes` reports its current role. The dashboard displays **Hub / Runner** for `hub / runner` and the separate feature modes **Full features / Execution only** for `full / runner`. See the [terminology and configuration guide](docs/operations/node-terminology.md) and [multiple runners, device preferences, and hub migration](docs/operations/hub-runner-topology-and-migration.md).
 - **Agent roster ownership** — In cluster mode, exactly one node should be configured as `cluster.role: hub`; that configured hub owns the destructive config-to-DB agent roster sync. All-`auto` clusters can elect a runtime hub, but startup roster sync is intentionally disabled on `auto` nodes so agent edits can appear frozen.
 - **Preferred execution device** — Select a device for an agent's new Discord sessions, or use the default policy. Existing sessions keep their owner. A single installation with clustering disabled is displayed as **This computer · Standalone**.
 - **Capability-aware routing** — Dispatch claims compare required labels/providers/MCP health against registered runner capabilities and record routing diagnostics when a node is ineligible.
@@ -370,8 +370,8 @@ database:
 # dispatch claims, and resource locks.
 cluster:
   enabled: true
-  instance_id: example-main-node   # use a unique value per host, e.g. example-worker-node
-  role: hub                     # Hub; auto | hub | runner; legacy leader/worker values also load
+  instance_id: example-main-node   # use a unique value per host, e.g. example-runner-node
+  role: hub                     # Hub; auto | hub | runner
   runtime_profile: full            # Full features; runner selects Execution only
   heartbeat_interval_secs: 10
   lease_ttl_secs: 30
@@ -384,7 +384,7 @@ cluster:
       unreal_editor:
         healthy: false
   dispatch_routing:
-    default_preferred_labels: [example-worker]
+    default_preferred_labels: [example-runner]
     opt_out_dispatch_types: ["create-pr", "github-sync"]
     constraints: [noop]
   # Operator-owned trust roots for authenticated cross-node session forwarding.
@@ -394,8 +394,8 @@ cluster:
   nodes:
     example-main-node:
       trusted_forward_origin: "https://main.example.net:8791"
-    example-worker-node:
-      trusted_forward_origin: "https://worker.tailnet.example:8791"
+    example-runner-node:
+      trusted_forward_origin: "https://runner.tailnet.example:8791"
       # Required only when DNS resolves to RFC1918, IPv6 ULA, or Tailscale CGNAT.
       # Deprecated IPv6 site-local fec0::/10 remains blocked on every transport,
       # even with this opt-in.
@@ -700,7 +700,7 @@ Full API documentation is available at `/api/docs` when the server is running, w
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └───┬────┘  │
 │       │              │             │             │       │
 │  ┌────┴──────────────┴─────────────┴─────────────┴────┐  │
-│  │           Supervised Worker Registry                 │  │
+│  │           Supervised Runner Registry                 │  │
 │  └────┬──────────────┬─────────────┬─────────────┬────┘  │
 │       │              │             │             │       │
 │  ┌────┴─────┐  ┌─────┴────┐  ┌────┴─────┐  ┌───┴────┐  │
@@ -724,7 +724,7 @@ Full API documentation is available at `/api/docs` when the server is running, w
 ### Design Principles
 1. **Single Binary** — One Rust binary; PostgreSQL is the only required external runtime dependency
 2. **Single Process Per Node** — Each node is one `agentdesk dcserver` process; multinode coordination is persisted in PostgreSQL rather than a sidecar coordinator
-3. **Single Database Control Plane** — PostgreSQL holds all live state (agents, cards, dispatches, sessions, kv_meta, worker nodes, resource locks, phase evidence). The old SQLite-only test feature was retired after the #868 / #1239 / #3035 cutovers; SQLite compatibility files are migration inputs, not a live runtime backend.
+3. **Single Database Control Plane** — PostgreSQL holds all live state (agents, cards, dispatches, sessions, kv_meta, runner nodes, resource locks, phase evidence). The old SQLite-only test feature was retired after the #868 / #1239 / #3035 cutovers; SQLite compatibility files are migration inputs, not a live runtime backend.
 4. **Hot-Reloadable Policies** — Business logic in JS, editable without rebuild
 5. **Self-Contained** — No Node.js, Python, or other runtimes needed at deploy time
 6. **Pipeline-Driven** — State machines defined in YAML, not hardcoded in Rust or JS

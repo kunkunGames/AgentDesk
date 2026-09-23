@@ -447,28 +447,28 @@ fn configure_execute_command_simple(command: &mut Command, args: &[String]) {
 
 // #3034: retained for the #2387 timeout-drain regression test below.
 #[allow(dead_code)]
-fn execute_command_simple_with_timeout_worker<F>(
+fn execute_command_simple_with_timeout_runner<F>(
     timeout: std::time::Duration,
     label: &str,
     provider_name: &'static str,
-    run_worker: F,
+    run_runner: F,
 ) -> Result<String, String>
 where
     F: FnOnce(std::sync::Arc<CancelToken>) -> Result<String, String> + Send + 'static,
 {
     let label_owned = label.to_string();
     let cancel_token = std::sync::Arc::new(CancelToken::new());
-    let cancel_for_worker = std::sync::Arc::clone(&cancel_token);
+    let cancel_for_runner = std::sync::Arc::clone(&cancel_token);
     let (tx, rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let result = run_worker(std::sync::Arc::clone(&cancel_for_worker));
-        cancel_for_worker.clear_child_pid();
+    let runner = std::thread::spawn(move || {
+        let result = run_runner(std::sync::Arc::clone(&cancel_for_runner));
+        cancel_for_runner.clear_child_pid();
         let _ = tx.send(result);
     });
 
     match rx.recv_timeout(timeout) {
         Ok(result) => {
-            let _ = worker.join();
+            let _ = runner.join();
             result
         }
         Err(_) => {
@@ -478,7 +478,7 @@ where
                     stage = %label_owned,
                     "execute_command_simple_with_timeout completed in race with timeout; skipping kill"
                 );
-                let _ = worker.join();
+                let _ = runner.join();
                 return result;
             }
 
@@ -490,7 +490,7 @@ where
             );
             cancel_token.cancel_with_tmux_cleanup();
             // request_cleanup owns signal delivery and deliberately leaves the PID
-            // published until the worker clears it, preserving the drain distinction.
+            // published until the runner clears it, preserving the drain distinction.
             let child_pid = cancel_token.child_pid_value();
             let child_pid_was_none = child_pid.is_none();
             if let Some(pid) = child_pid {
@@ -509,7 +509,7 @@ where
             }
 
             if let Ok(result) = rx.recv_timeout(std::time::Duration::from_secs(3)) {
-                let _ = worker.join();
+                let _ = runner.join();
                 if child_pid_was_none {
                     tracing::debug!(
                         provider = provider_name,
@@ -522,7 +522,7 @@ where
                 tracing::warn!(
                     provider = provider_name,
                     stage = %label_owned,
-                    "execute_command_simple_with_timeout worker did not drain within 3s; abandoning join"
+                    "execute_command_simple_with_timeout runner did not drain within 3s; abandoning join"
                 );
             }
 
@@ -536,12 +536,12 @@ where
 
 #[cfg(test)]
 mod simple_timeout_2387_tests {
-    use super::execute_command_simple_with_timeout_worker;
+    use super::execute_command_simple_with_timeout_runner;
     use std::time::Duration;
 
     #[test]
     fn timeout_drain_prefers_late_result_when_child_pid_snapshot_is_none() {
-        let result = execute_command_simple_with_timeout_worker(
+        let result = execute_command_simple_with_timeout_runner(
             Duration::from_millis(10),
             "claude 2387 regression",
             "claude",

@@ -763,7 +763,7 @@ pub fn cmd_status(json: bool) -> Result<(), String> {
 //   1. git log         — commits landed on the local default branch
 //   2. gh issue list   — issues closed inside the window
 //   3. gh pr list      — PRs merged inside the window
-//   4. AgentDesk API   — deploys (worker_node started_at) + recent incidents
+//   4. AgentDesk API   — deploys (runner_node started_at) + recent incidents
 //                        (high_risk_recovery / manual_intervention events)
 //
 // Sources 1–3 are always available; source 4 is best-effort and silently
@@ -1026,7 +1026,7 @@ fn collect_agentdesk_events(
     until: chrono::DateTime<chrono::Utc>,
 ) -> Vec<ActivityEntry> {
     let mut out = Vec::new();
-    // Deploys: worker_node started_at falling inside the window is, in the
+    // Deploys: runner_node started_at falling inside the window is, in the
     // current ops model, the closest stable signal of "node was redeployed".
     // The cluster endpoint may be missing (PG offline / cluster disabled),
     // in which case we silently skip the section rather than crashing the
@@ -1371,11 +1371,11 @@ mod activity_tests {
 // These commands replace the recurring "ssh + mtime + 자연어 보고" loop that
 // every deploy / outage triggers. They are intentionally read-only and run
 // against the local API only — cross-machine state is obtained through the
-// existing `worker_nodes` cluster heartbeat table (no SSH, no shell-out).
+// existing `cluster_nodes` cluster heartbeat table (no SSH, no shell-out).
 // ---------------------------------------------------------------------------
 
 /// Resolve a `cluster.lease_ttl_secs`-shaped staleness budget for treating a
-/// worker_node row as offline. Falls back to the `/api/cluster/nodes`
+/// runner_node row as offline. Falls back to the `/api/cluster/nodes`
 /// response, then to a conservative 60 s default.
 fn cluster_lease_ttl_secs(cluster_meta: Option<&Value>) -> u64 {
     cluster_meta
@@ -1585,13 +1585,13 @@ pub fn cmd_health(json_output: bool) -> Result<(), String> {
     );
     if local.is_null() {
         println!(
-            "  Note        : local worker_node row not found — cluster heartbeat may be disabled."
+            "  Note        : local runner_node row not found — cluster heartbeat may be disabled."
         );
     }
     Ok(())
 }
 
-/// Display canonical roles while accepting both registry generations.
+/// Display the effective role from the current node registry.
 fn node_role_name(node: &Value) -> &str {
     let raw = node
         .get("effective_role")
@@ -1891,7 +1891,7 @@ fn render_machine_compare_table(rows: &[MachineRow]) -> String {
 
 /// `agentdesk machine-compare [--json]`
 ///
-/// Side-by-side health/state table for every registered worker node. Built
+/// Side-by-side health/state table for every registered runner node. Built
 /// from `/api/cluster/nodes` — no SSH, no shell-out, no `ssh user@host mtime`.
 pub fn cmd_machine_compare(json_output: bool) -> Result<(), String> {
     let cluster = get_json("/api/cluster/nodes")?;
@@ -1933,7 +1933,7 @@ pub fn cmd_machine_compare(json_output: bool) -> Result<(), String> {
     }
 
     if rows.is_empty() {
-        println!("No worker_node rows registered.");
+        println!("No runner_node rows registered.");
         println!("(cluster.enabled may be false, or Postgres is unavailable.)");
         return Ok(());
     }
@@ -2686,28 +2686,22 @@ mod health_compare_tests {
 
     #[test]
     fn classify_machine_label_falls_back_to_instance_id_for_unknown_hosts() {
-        let node = json!({"instance_id": "worker-x", "hostname": "linux-build-01"});
+        let node = json!({"instance_id": "runner-x", "hostname": "linux-build-01"});
         // hostname doesn't match either alias, but isn't empty — we expose
         // it so operators can still see the row.
         assert_eq!(classify_machine_label(&node), "linux-build-01");
-        let node = json!({"instance_id": "worker-x"});
-        assert_eq!(classify_machine_label(&node), "worker-x");
+        let node = json!({"instance_id": "runner-x"});
+        assert_eq!(classify_machine_label(&node), "runner-x");
     }
 
     #[test]
-    fn machine_role_display_uses_effective_role_and_accepts_legacy_names() {
-        for (raw, expected) in [
-            ("leader", "hub"),
-            ("hub", "hub"),
-            ("worker", "runner"),
-            ("runner", "runner"),
-            ("standby", "standby"),
-        ] {
+    fn machine_role_display_uses_effective_role_and_canonical_names() {
+        for (raw, expected) in [("hub", "hub"), ("runner", "runner"), ("standby", "standby")] {
             let node = serde_json::json!({"role":"hub", "effective_role":raw});
             assert_eq!(node_role_name(&node), expected);
         }
         assert_eq!(
-            node_role_name(&serde_json::json!({"role":"worker"})),
+            node_role_name(&serde_json::json!({"role":"runner"})),
             "runner"
         );
         assert_eq!(node_role_name(&serde_json::json!({})), "-");
@@ -2721,7 +2715,7 @@ mod health_compare_tests {
             label: "mac-mini".to_string(),
             hostname: "mac-mini.local".to_string(),
             instance_id: "mac-mini-rel-1".to_string(),
-            role: "leader".to_string(),
+            role: "hub".to_string(),
             status: "online".to_string(),
             pid: "1234".to_string(),
             version: "0.1.2".to_string(),
@@ -2734,7 +2728,7 @@ mod health_compare_tests {
         assert!(table.contains("mac-book"));
         assert!(table.contains("(no heartbeat)"));
         // The single-side row must still surface its pid so operators can
-        // distinguish leader-only deployments from full clusters.
+        // distinguish hub-only deployments from full clusters.
         assert!(table.contains("1234"));
     }
 

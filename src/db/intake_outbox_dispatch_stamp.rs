@@ -5,7 +5,7 @@ use sqlx::PgPool;
 
 /// Transitions `spawned -> dispatched` immediately before bridge handoff.
 ///
-/// The bridge site does not own the worker's claim token, so the monotonic
+/// The bridge site does not own the runner's claim token, so the monotonic
 /// status CAS is the authority boundary. Dispatch audit fields are retained.
 pub(crate) async fn mark_dispatched(pool: &PgPool, outbox_id: i64) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(

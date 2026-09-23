@@ -1867,7 +1867,7 @@ mod tests {
     #[test]
     fn completion_footer_strip_supports_suppression_exposure_test() {
         let completion =
-            "📦 154.6k / 1.0M (15%) · auto-compact 60%\n\nSubagents\n└ bgworker Long job ✓";
+            "📦 154.6k / 1.0M (15%) · auto-compact 60%\n\nSubagents\n└ bgrunner Long job ✓";
 
         assert_eq!(
             super::strip_streaming_footer(completion, &ProviderKind::Claude),
@@ -1898,7 +1898,7 @@ mod tests {
 
     #[test]
     fn completion_footer_strip_still_removes_real_slot_section() {
-        let body = "visible assistant body\n\nSubagents\n└ bgworker Long job ✓";
+        let body = "visible assistant body\n\nSubagents\n└ bgrunner Long job ✓";
 
         assert_eq!(
             super::strip_streaming_footer(body, &ProviderKind::Claude),
@@ -1909,7 +1909,7 @@ mod tests {
     #[test]
     fn completion_footer_strip_removes_frozen_supersede_shape() {
         let completion =
-            "📦 154.6k / 1.0M (15%) · auto-compact 60%\n\nSubagents\n└ bgworker Long job …";
+            "📦 154.6k / 1.0M (15%) · auto-compact 60%\n\nSubagents\n└ bgrunner Long job …";
 
         assert_eq!(
             super::strip_streaming_footer(
@@ -2001,7 +2001,7 @@ mod tests {
         shared.ui.placeholder_live_events.push_status_event(
             channel_id,
             StatusEvent::SubagentStart {
-                subagent_type: Some("bgworker".to_string()),
+                subagent_type: Some("bgrunner".to_string()),
                 desc: Some("Carried agent".to_string()),
                 agent_id: None,
                 tool_use_id: Some("toolu_latest_agent".to_string()),

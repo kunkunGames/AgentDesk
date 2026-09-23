@@ -27,13 +27,13 @@ pub(super) enum SessionOwnerResolution {
 ///
 /// Session heartbeats are deliberately not used as a lease: an idle tmux may
 /// be healthy without emitting output. Foreign-owner liveness comes from the
-/// existing worker-node heartbeat and provider-specific intake capability.
+/// existing runner-node heartbeat and provider-specific intake capability.
 pub(super) async fn resolve_session_owner(
     pool: &PgPool,
     provider: &str,
     channel_id: &str,
     local_instance_id: &str,
-    worker_lease_ttl_secs: u64,
+    runner_lease_ttl_secs: u64,
     preserve_on_cancel: bool,
 ) -> Result<SessionOwnerResolution, String> {
     let mut instance_ids: Vec<String> = sqlx::query_scalar(
@@ -61,10 +61,10 @@ pub(super) async fn resolve_session_owner(
     let has_foreign_candidate = instance_ids
         .iter()
         .any(|instance_id| instance_id != local_instance_id);
-    let worker_nodes = if has_foreign_candidate {
-        crate::services::cluster::node_registry::list_worker_nodes(pool, worker_lease_ttl_secs)
+    let cluster_nodes = if has_foreign_candidate {
+        crate::services::cluster::node_registry::list_cluster_nodes(pool, runner_lease_ttl_secs)
             .await
-            .map_err(|error| format!("classify session owner worker: {error}"))?
+            .map_err(|error| format!("classify session owner runner: {error}"))?
     } else {
         Vec::new()
     };
@@ -75,7 +75,7 @@ pub(super) async fn resolve_session_owner(
     for instance_id in &instance_ids {
         let matching_node = (instance_id != local_instance_id)
             .then(|| {
-                worker_nodes.iter().find(|node| {
+                cluster_nodes.iter().find(|node| {
                     node.get("instance_id").and_then(serde_json::Value::as_str)
                         == Some(instance_id.as_str())
                         && node

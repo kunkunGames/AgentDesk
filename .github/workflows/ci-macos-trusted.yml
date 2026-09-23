@@ -218,7 +218,7 @@ jobs:
     timeout-minutes: 45
     # CPU headroom for the co-located operational Postgres (see #3658). This
     # self-hosted runner shares the Mac mini (M4 Pro, 12-14 cores) with the
-    # production Postgres + a dcserver worker node, so an unbounded parallel
+    # production Postgres + a dcserver runner node, so an unbounded parallel
     # cargo build saturated every core and starved Postgres → cluster-wide pool
     # acquire timeouts. Cap cargo's parallel build units at 8 to leave >=4 cores
     # for Postgres + the control plane. This only bounds peak CPU; it cannot

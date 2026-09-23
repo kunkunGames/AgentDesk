@@ -476,7 +476,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/generate_inventory_docs.py
-          if git diff --quiet -- ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/worker-inventory.md; then
+          if git diff --quiet -- ARCHITECTURE.md docs/generated/route-inventory.md docs/generated/runner-inventory.md; then
             echo "Tracked generated docs are up to date."
           else
             echo "::warning::Tracked generated docs drift detected. The weekly Regen inventory docs workflow opens a maintenance PR; this check is intentionally warning-only."

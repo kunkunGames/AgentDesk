@@ -12,7 +12,7 @@
 /// Postgres server that the lane did not hand them.
 mod multinode_regression_pg_tests {
     use crate::db::postgres::AdvisoryLockLease;
-    use crate::server::cluster::CLUSTER_LEADER_ADVISORY_LOCK_ID;
+    use crate::server::cluster::CLUSTER_HUB_ADVISORY_LOCK_ID;
     use crate::server::resource_locks::{
         ResourceLockRequest, acquire_resource_lock, release_resource_lock, unreal_project_lock_key,
     };
@@ -85,39 +85,38 @@ mod multinode_regression_pg_tests {
     }
 
     #[tokio::test]
-    async fn multinode_single_leader_lock_allows_one_holder() {
+    async fn multinode_single_hub_lock_allows_one_holder() {
         let Some(pg_db) = TestPostgresDb::create().await else {
             return;
         };
-        let leader_pool = pg_db.connect_and_migrate().await;
-        let worker_pool = pg_db.connect_pool().await;
+        let hub_pool = pg_db.connect_and_migrate().await;
+        let runner_pool = pg_db.connect_pool().await;
 
-        let leader =
-            AdvisoryLockLease::try_acquire(&leader_pool, CLUSTER_LEADER_ADVISORY_LOCK_ID, "leader")
-                .await
-                .unwrap()
-                .expect("first node must acquire leader lease");
+        let hub = AdvisoryLockLease::try_acquire(&hub_pool, CLUSTER_HUB_ADVISORY_LOCK_ID, "hub")
+            .await
+            .unwrap()
+            .expect("first node must acquire hub lease");
         let denied =
-            AdvisoryLockLease::try_acquire(&worker_pool, CLUSTER_LEADER_ADVISORY_LOCK_ID, "worker")
+            AdvisoryLockLease::try_acquire(&runner_pool, CLUSTER_HUB_ADVISORY_LOCK_ID, "runner")
                 .await
                 .unwrap();
         assert!(
             denied.is_none(),
-            "second node must not acquire leader lease while first holder is alive"
+            "second node must not acquire hub lease while first holder is alive"
         );
 
-        leader.unlock().await.unwrap();
+        hub.unlock().await.unwrap();
         let replacement =
-            AdvisoryLockLease::try_acquire(&worker_pool, CLUSTER_LEADER_ADVISORY_LOCK_ID, "worker")
+            AdvisoryLockLease::try_acquire(&runner_pool, CLUSTER_HUB_ADVISORY_LOCK_ID, "runner")
                 .await
                 .unwrap();
         assert!(
             replacement.is_some(),
-            "standby node must acquire leader lease after release"
+            "standby node must acquire hub lease after release"
         );
 
-        leader_pool.close().await;
-        worker_pool.close().await;
+        hub_pool.close().await;
+        runner_pool.close().await;
         pg_db.drop().await;
     }
 
@@ -160,11 +159,11 @@ mod multinode_regression_pg_tests {
         ];
 
         // Safety half of exactly-once: under real contention the same dispatch
-        // must never be handed to both workers. Unconditional — no interleaving
+        // must never be handed to both runners. Unconditional — no interleaving
         // may relax it.
         assert!(
             contended_claims <= 1,
-            "two workers sharing PG must never claim one dispatch twice; {}",
+            "two runners sharing PG must never claim one dispatch twice; {}",
             trace.join(" | ")
         );
 
@@ -172,10 +171,10 @@ mod multinode_regression_pg_tests {
         // capabilities, so `select_capability_route` elects a single route owner
         // (mac-book-release — it is inserted second, so it carries the later
         // heartbeat, and the instance_id tie-break favours it as well) and the
-        // other worker skips as "not preferred route owner". A contended round
-        // therefore claims nothing whenever the *non-elected* worker wins the
+        // other runner skips as "not preferred route owner". A contended round
+        // therefore claims nothing whenever the *non-elected* runner wins the
         // `FOR UPDATE SKIP LOCKED` race in `claim_task_dispatches`: it holds the
-        // row for the length of its transaction while the elected worker's
+        // row for the length of its transaction while the elected runner's
         // select comes back empty. That is a lock-race artifact, not a claim
         // leak — the dispatch stays pending and the next poll takes it.
         //
@@ -195,7 +194,7 @@ mod multinode_regression_pg_tests {
         assert_eq!(
             contended_claims + settled_claims,
             1,
-            "two workers sharing PG must claim one dispatch exactly once; {}",
+            "two runners sharing PG must claim one dispatch exactly once; {}",
             trace.join(" | ")
         );
 
@@ -226,7 +225,7 @@ mod multinode_regression_pg_tests {
         assert_eq!(
             reclaimed.claimed.len(),
             1,
-            "expired dispatch lease must be reclaimable by a different worker; {}",
+            "expired dispatch lease must be reclaimable by a different runner; {}",
             describe_claim_outcome("reclaim mac-book-release", &reclaimed)
         );
         assert_eq!(reclaimed.claimed[0].id, "dispatch-multinode-1");
@@ -252,15 +251,15 @@ mod multinode_regression_pg_tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO worker_nodes (
+            "INSERT INTO cluster_nodes (
                 instance_id, hostname, role, effective_role, status, labels, capabilities,
                 last_heartbeat_at, started_at, updated_at
              )
              VALUES
-                ('mac-book-release', 'mac-book', 'worker', 'worker', 'online',
+                ('mac-book-release', 'mac-book', 'runner', 'runner', 'online',
                  '[\"mac-book\"]'::jsonb, '{\"providers\":[\"codex\"]}'::jsonb,
                  NOW() - INTERVAL '2 minutes', NOW(), NOW()),
-                ('mac-mini-release', 'mac-mini', 'worker', 'worker', 'online',
+                ('mac-mini-release', 'mac-mini', 'runner', 'runner', 'online',
                  '[\"mac-mini\"]'::jsonb, '{\"providers\":[\"codex\"]}'::jsonb,
                  NOW(), NOW(), NOW())",
         )
@@ -319,15 +318,15 @@ mod multinode_regression_pg_tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO worker_nodes (
+            "INSERT INTO cluster_nodes (
                 instance_id, hostname, role, effective_role, status, labels, capabilities,
                 last_heartbeat_at, started_at, updated_at
              )
              VALUES
-                ('mac-mini-release', 'mac-mini', 'worker', 'worker', 'online',
+                ('mac-mini-release', 'mac-mini', 'runner', 'runner', 'online',
                  '[\"mac-mini\"]'::jsonb, '{\"providers\":[\"codex\"]}'::jsonb,
                  NOW(), NOW(), NOW()),
-                ('mac-book-release', 'mac-book', 'worker', 'worker', 'online',
+                ('mac-book-release', 'mac-book', 'runner', 'runner', 'online',
                  '[\"mac-book\"]'::jsonb, '{\"providers\":[\"codex\"]}'::jsonb,
                  NOW() - INTERVAL '1 second', NOW(), NOW())",
         )
@@ -428,7 +427,7 @@ mod multinode_regression_pg_tests {
         .unwrap();
         assert!(
             !second.acquired,
-            "same Unreal project lock must not be held by two workers"
+            "same Unreal project lock must not be held by two runners"
         );
 
         assert!(
@@ -442,11 +441,11 @@ mod multinode_regression_pg_tests {
     }
 
     /// Renders a claim outcome for assert messages. The skip reasons are the
-    /// part that matters: they say *why* a worker claimed nothing, which is what
+    /// part that matters: they say *why* a runner claimed nothing, which is what
     /// #5387 could not tell from `claims=0` alone. The reasons discriminate the
     /// candidates — "not preferred route owner; selected <instance>" means
     /// another node was elected (and an empty `skipped` alongside it means this
-    /// worker's `FOR UPDATE SKIP LOCKED` select found the row already locked),
+    /// runner's `FOR UPDATE SKIP LOCKED` select found the row already locked),
     /// "selected unknown" means no node was eligible at all (offline heartbeat
     /// or capability mismatch), and semaphore text points at cluster config.
     fn describe_claim_outcome(
@@ -479,11 +478,11 @@ mod multinode_regression_pg_tests {
             .unwrap();
         for instance_id in ["mac-mini-release", "mac-book-release"] {
             sqlx::query(
-                "INSERT INTO worker_nodes (
+                "INSERT INTO cluster_nodes (
                     instance_id, hostname, role, effective_role, status, labels, capabilities,
                     last_heartbeat_at, started_at, updated_at
                  )
-                 VALUES ($1, $1, 'worker', 'worker', 'online',
+                 VALUES ($1, $1, 'runner', 'runner', 'online',
                          '[\"mac\"]'::jsonb, '{\"providers\":[\"codex\"]}'::jsonb,
                          NOW(), NOW(), NOW())",
             )

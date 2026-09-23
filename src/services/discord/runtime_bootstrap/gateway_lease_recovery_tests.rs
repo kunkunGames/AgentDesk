@@ -122,7 +122,7 @@ impl PromotionFixture {
             assert!(
                 runtime
                     .restart
-                    .intake_worker_lifecycle
+                    .intake_runner_lifecycle
                     .admission_is_fenced(),
                 "committed promotion keeps every runtime admission fence closed"
             );
@@ -141,7 +141,7 @@ impl PromotionFixture {
             assert!(
                 !runtime
                     .restart
-                    .intake_worker_lifecycle
+                    .intake_runner_lifecycle
                     .admission_is_fenced(),
                 "cancelled promotion reopens every runtime admission fence"
             );
@@ -345,7 +345,7 @@ async fn promotion_owner_recovers_all_runtimes_when_cancel_precedes_first_poll_t
     let runtime_b = crate::services::discord::make_shared_data_for_tests();
     let runtimes = vec![runtime_a.clone(), runtime_b.clone()];
     for runtime in &runtimes {
-        runtime.restart.intake_worker_lifecycle.fence_admission();
+        runtime.restart.intake_runner_lifecycle.fence_admission();
         runtime
             .restart
             .restart_pending
@@ -378,7 +378,7 @@ async fn promotion_owner_recovers_all_runtimes_when_cancel_precedes_first_poll_t
         assert!(
             !runtime
                 .restart
-                .intake_worker_lifecycle
+                .intake_runner_lifecycle
                 .admission_is_fenced()
         );
         assert!(
@@ -399,7 +399,7 @@ async fn superseded_promotion_preserves_new_owner_fence_and_flags() {
     let runtime_b = crate::services::discord::make_shared_data_for_tests();
     let runtimes = vec![runtime_a.clone(), runtime_b.clone()];
     for runtime in &runtimes {
-        runtime.restart.intake_worker_lifecycle.fence_admission();
+        runtime.restart.intake_runner_lifecycle.fence_admission();
         runtime
             .restart
             .restart_pending
@@ -422,7 +422,7 @@ async fn superseded_promotion_preserves_new_owner_fence_and_flags() {
         assert!(
             runtime
                 .restart
-                .intake_worker_lifecycle
+                .intake_runner_lifecycle
                 .admission_is_fenced()
         );
         assert!(
@@ -443,7 +443,7 @@ async fn supersession_chain_keeps_owner_until_final_cancel_and_recovers_all_runt
     let runtime_b = crate::services::discord::make_shared_data_for_tests();
     let runtimes = vec![runtime_a.clone(), runtime_b.clone()];
     for runtime in &runtimes {
-        runtime.restart.intake_worker_lifecycle.fence_admission();
+        runtime.restart.intake_runner_lifecycle.fence_admission();
         runtime
             .restart
             .restart_pending
@@ -476,7 +476,7 @@ async fn supersession_chain_keeps_owner_until_final_cancel_and_recovers_all_runt
         assert!(
             !runtime
                 .restart
-                .intake_worker_lifecycle
+                .intake_runner_lifecycle
                 .admission_is_fenced()
         );
         assert!(
@@ -497,7 +497,7 @@ async fn existing_marker_cancel_restores_promotion_fence_for_retry() {
     let runtime_b = crate::services::discord::make_shared_data_for_tests();
     let runtimes = vec![runtime_a.clone(), runtime_b.clone()];
     for runtime in &runtimes {
-        runtime.restart.intake_worker_lifecycle.fence_admission();
+        runtime.restart.intake_runner_lifecycle.fence_admission();
         runtime
             .restart
             .restart_pending
@@ -534,7 +534,7 @@ async fn existing_marker_cancel_restores_promotion_fence_for_retry() {
         assert!(
             !runtime
                 .restart
-                .intake_worker_lifecycle
+                .intake_runner_lifecycle
                 .admission_is_fenced()
         );
         assert!(
@@ -891,7 +891,7 @@ fn retired_mtime_lifetime_gate_has_no_remaining_source_references() {
 }
 
 #[test]
-fn orphan_reap_requires_named_stale_matching_worker() {
+fn orphan_reap_requires_named_stale_matching_runner() {
     let safe = GatewayLeaseHolder {
         pid: 42,
         application_name: gateway_lease_application_name_for("node:a", 42, "claude"),
@@ -962,15 +962,15 @@ async fn gateway_orphan_reap_uses_production_query_and_right_parses_instance_id_
     let instance_id = &format!("node:east:{}", "x".repeat(120));
     let dcserver_pid = std::process::id() as i32;
     sqlx::query(
-        "INSERT INTO worker_nodes (
+        "INSERT INTO cluster_nodes (
              instance_id, process_id, role, effective_role, status, last_heartbeat_at
-         ) VALUES ($1, $2, 'auto', 'worker', 'offline', NOW() - INTERVAL '1 minute')",
+         ) VALUES ($1, $2, 'auto', 'runner', 'offline', NOW() - INTERVAL '1 minute')",
     )
     .bind(instance_id)
     .bind(dcserver_pid)
     .execute(&pool)
     .await
-    .expect("seed stale worker node");
+    .expect("seed stale runner node");
 
     let holder_name =
         gateway_lease_application_name_for(instance_id, dcserver_pid as u32, "claude");

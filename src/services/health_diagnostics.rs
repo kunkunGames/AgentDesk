@@ -25,7 +25,7 @@
 //! | `load_config_audit_report_pg`           | 1        | always                                          |
 //! | `load_pipeline_override_report_pg`      | 1        | always                                          |
 //! | `load_dispatch_gate_runtime_overrides`  | 1        | a `health_registry` is attached                 |
-//! | `is_recent_cluster_worker`              | 1        | …and the node is a cluster standby with none    |
+//! | `is_recent_cluster_runner`              | 1        | …and the node is a cluster standby with none    |
 //!
 //! That is **9 unconditional sequential acquires**, a 10th whenever the handler
 //! has a `health_registry` (`server::routes::health_api`'s `if let Some(ref
@@ -312,7 +312,7 @@ pub async fn load_dispatch_gate_runtime_overrides(
     (enabled, danger)
 }
 
-pub async fn is_recent_cluster_worker(
+pub async fn is_recent_cluster_runner(
     pg_pool: Option<&PgPool>,
     instance_id: &str,
     lease_ttl_secs: u64,
@@ -334,7 +334,7 @@ pub async fn is_recent_cluster_worker(
                 sqlx::query_scalar::<_, String>(
                     r#"
         SELECT effective_role
-          FROM worker_nodes
+          FROM cluster_nodes
          WHERE instance_id = $1
            AND last_heartbeat_at >= NOW() - ($2::double precision * INTERVAL '1 second')
         "#,
@@ -349,7 +349,7 @@ pub async fn is_recent_cluster_worker(
         .ok()
         .flatten()
         .as_deref()
-        == Some("worker")
+        == Some("runner")
 }
 
 pub async fn load_channel_session_state(
@@ -828,9 +828,9 @@ mod tests {
             super::load_dispatch_gate_runtime_overrides(Some(&pool))
         );
         assert_bracketed!(
-            "is_recent_cluster_worker",
+            "is_recent_cluster_runner",
             1,
-            super::is_recent_cluster_worker(Some(&pool), "node-1", 30)
+            super::is_recent_cluster_runner(Some(&pool), "node-1", 30)
         );
         // Detail-only, bracketed because it is health-exclusive.
         assert_bracketed!(
@@ -957,7 +957,7 @@ mod tests {
     async fn diagnostics_without_pg_pool_stay_safe() {
         assert!(super::load_dispatch_outbox_stats(None).await.is_none());
         assert!(!super::probe_server_up(None).await);
-        assert!(!super::is_recent_cluster_worker(None, "node-1", 30).await);
+        assert!(!super::is_recent_cluster_runner(None, "node-1", 30).await);
 
         let audit = super::build_active_session_audit(None, Some("node-1")).await;
         assert!(!audit.enabled);

@@ -841,7 +841,7 @@ where
         }) {
         Ok(handle) => handle.join().unwrap_or_else(|panic| {
             tracing::warn!(
-                "codex prompt readiness fast-path worker panicked: {:?}; falling back to polling",
+                "codex prompt readiness fast-path runner panicked: {:?}; falling back to polling",
                 panic
             );
             T::fallback()
@@ -849,7 +849,7 @@ where
         Err(error) => {
             tracing::warn!(
                 error = %error,
-                "failed to spawn codex prompt readiness fast-path worker; falling back to polling"
+                "failed to spawn codex prompt readiness fast-path runner; falling back to polling"
             );
             T::fallback()
         }

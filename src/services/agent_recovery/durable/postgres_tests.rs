@@ -214,10 +214,10 @@ async fn postgres_takeover_is_invisible_until_commit() {
     .fetch_one(&mut *blocker)
     .await
     .unwrap();
-    let worker = Arc::clone(&coordinator);
+    let runner = Arc::clone(&coordinator);
     let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
     let transition = tokio::spawn(async move {
-        worker
+        runner
             .transition(CHANNEL, |runtime| {
                 let outcome = takeover(runtime, "turn-1");
                 staged_tx.send(()).unwrap();
@@ -425,7 +425,7 @@ async fn postgres_mailbox_admission_serializes_takeover_before_a_state_row_exist
         .unwrap();
     let second = runtime(&pool);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let worker = tokio::spawn(async move {
+    let runner = tokio::spawn(async move {
         second
             .transition(CHANNEL, |runtime| {
                 ready_tx.send(()).unwrap();
@@ -435,9 +435,9 @@ async fn postgres_mailbox_admission_serializes_takeover_before_a_state_row_exist
     });
     ready_rx.await.unwrap();
     assert!(load_channel_state(&pool, CHANNEL).await.unwrap().is_none());
-    assert!(!worker.is_finished());
+    assert!(!runner.is_finished());
     drop(guard);
-    tokio::time::timeout(Duration::from_secs(10), worker)
+    tokio::time::timeout(Duration::from_secs(10), runner)
         .await
         .unwrap()
         .unwrap()

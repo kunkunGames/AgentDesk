@@ -88,7 +88,7 @@ fn watcher_handle(tmux_session_name: &str, output_path: &std::path::Path) -> Tmu
 /// `serenity::Context` over it, and a channel already bound to a session.
 ///
 /// Field order is drop order and is load-bearing: the mock server and the
-/// workers holding `shared` must stop before the guards unset
+/// runners holding `shared` must stop before the guards unset
 /// `AGENTDESK_ROOT_DIR` and before `root` deletes the tree they write into.
 pub(super) struct RelayE2eHarness {
     pub(super) data: Data,
@@ -297,7 +297,7 @@ impl RelayE2eHarness {
     }
 
     /// Publishes this fixture's context and token on the shared HTTP cache, which
-    /// is how relay workers reach Discord without a live gateway.
+    /// is how relay runners reach Discord without a live gateway.
     pub(super) fn cache_relay_transport(&self) {
         self.shared
             .http
@@ -322,7 +322,7 @@ impl RelayE2eHarness {
         transcript_path
     }
 
-    pub(super) fn spawn_relay_worker(&self) {
+    pub(super) fn spawn_relay_runner(&self) {
         super::spawn_tui_prompt_relay(self.shared.clone(), self.data.provider.clone());
     }
 

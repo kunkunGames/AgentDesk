@@ -19,7 +19,7 @@ pub(crate) use ordered_queue::OrderedHookRelayRecoveryOwner;
 use ordered_queue::relay_queue_dir;
 use ordered_queue::{
     handoff_non_wait_hook_event, handoff_ordered_hook_event_response_with_timeout,
-    run_ordered_hook_relay_worker_from_env, start_ordered_hook_relay_recovery_owner,
+    run_ordered_hook_relay_runner_from_env, start_ordered_hook_relay_recovery_owner,
 };
 
 pub(crate) fn start_relay_recovery_owner() -> Option<OrderedHookRelayRecoveryOwner> {
@@ -29,8 +29,8 @@ pub(crate) fn start_relay_recovery_owner() -> Option<OrderedHookRelayRecoveryOwn
 const RELAY_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_RELAY_TIMEOUT: Duration = Duration::from_millis(750);
 const FAILURE_MARKER_TTL_SECS: i64 = 24 * 60 * 60;
-const FAILURE_MARKER_WORKER_ENV: &str = "AGENTDESK_HOOK_RELAY_FAILURE_MARKER_WORKER";
-const NON_WAIT_RELAY_WORKER_ENV: &str = "AGENTDESK_HOOK_RELAY_NON_WAIT_WORKER";
+const FAILURE_MARKER_RUNNER_ENV: &str = "AGENTDESK_HOOK_RELAY_FAILURE_MARKER_RUNNER";
+const NON_WAIT_RELAY_RUNNER_ENV: &str = "AGENTDESK_HOOK_RELAY_NON_WAIT_RUNNER";
 
 #[cfg(test)]
 const FAILURE_MARKER_PARENT_TEST_ENV: &str = "AGENTDESK_HOOK_RELAY_FAILURE_MARKER_PARENT_TEST";
@@ -200,7 +200,9 @@ where
 
     // The narrow Memento remember gate runs locally before publishing stdout;
     // relay availability cannot bypass its durable duplicate-write receipts.
-    // All other hooks retain their observational fail-open behavior.
+    // All other hooks retain their observational fail-open behavior:
+    // publish and flush the model-visible stdout before even handing
+    // the observational event to its surviving runner.
     let rendered_stdout =
         super::memento_writer_hook::observe(provider, event, &effective_session_id, &payload)
             .unwrap_or_else(|| hook_stdout(provider, event, &payload));
@@ -662,18 +664,18 @@ fn handoff_hook_relay_failure(
     let encoded = serde_json::to_string(&request)
         .map_err(|err| format!("serialize hook relay failure marker handoff: {err}"))?;
     let executable = std::env::current_exe()
-        .map_err(|err| format!("resolve hook relay failure marker worker: {err}"))?;
+        .map_err(|err| format!("resolve hook relay failure marker runner: {err}"))?;
     let mut command = Command::new(executable);
     #[cfg(test)]
     command.args([
         "--ignored",
         "--exact",
-        "services::claude_tui::hook_relay::tests::failure_marker_worker_subprocess_entry",
+        "services::claude_tui::hook_relay::tests::failure_marker_runner_subprocess_entry",
     ]);
     let child = command
-        .env(FAILURE_MARKER_WORKER_ENV, encoded)
-        .env_remove(NON_WAIT_RELAY_WORKER_ENV)
-        // The request owns the resolved marker directory. Keeping the worker
+        .env(FAILURE_MARKER_RUNNER_ENV, encoded)
+        .env_remove(NON_WAIT_RELAY_RUNNER_ENV)
+        // The request owns the resolved marker directory. Keeping the runner
         // independent of later process-global env changes prevents test/runtime
         // root drift after the handoff has succeeded.
         .env_remove("AGENTDESK_ROOT_DIR")
@@ -681,15 +683,15 @@ fn handoff_hook_relay_failure(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|err| format!("start hook relay failure marker worker: {err}"))?;
+        .map_err(|err| format!("start hook relay failure marker runner: {err}"))?;
     // Dropping a process handle does not terminate the child. Unlike a detached
-    // in-process thread, this worker survives the one-shot hook CLI's exit.
+    // in-process thread, this runner survives the one-shot hook CLI's exit.
     drop(child);
     Ok(())
 }
 
-pub(crate) fn run_failure_marker_worker_from_env() -> Option<Result<(), String>> {
-    if let Some(encoded) = std::env::var_os(FAILURE_MARKER_WORKER_ENV) {
+pub(crate) fn run_failure_marker_runner_from_env() -> Option<Result<(), String>> {
+    if let Some(encoded) = std::env::var_os(FAILURE_MARKER_RUNNER_ENV) {
         return Some(
             encoded
                 .into_string()
@@ -701,8 +703,8 @@ pub(crate) fn run_failure_marker_worker_from_env() -> Option<Result<(), String>>
                 .and_then(write_hook_relay_failure_marker),
         );
     }
-    let encoded = std::env::var_os(NON_WAIT_RELAY_WORKER_ENV)?;
-    Some(run_ordered_hook_relay_worker_from_env(encoded))
+    let encoded = std::env::var_os(NON_WAIT_RELAY_RUNNER_ENV)?;
+    Some(run_ordered_hook_relay_runner_from_env(encoded))
 }
 
 fn write_hook_relay_failure_marker(
@@ -941,7 +943,7 @@ mod tests {
             request_tx.send(request).expect("publish non-wait request");
             let hanging_since = Instant::now();
             std::thread::sleep(RELAY_TIMEOUT + Duration::from_millis(250));
-            // Close without a response so the surviving worker records the
+            // Close without a response so the surviving runner records the
             // transport failure marker after the hook command has returned.
             hanging_since.elapsed()
         });
@@ -1076,7 +1078,7 @@ mod tests {
         while !path.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(path.exists(), "timed out waiting to release marker worker");
+        assert!(path.exists(), "timed out waiting to release marker runner");
     }
 
     #[test]
@@ -1551,7 +1553,7 @@ mod tests {
     // 순서 보장 hook relay 는 flock 기반이고 tmux 호스팅 TUI(Unix 전용) 런치만 설치하므로 Windows 에는 실행 경로가 없다.
     #[cfg(unix)]
     #[test]
-    fn ordered_worker_preserves_search_feedback_stop_session_start_producer_sequence() {
+    fn ordered_runner_preserves_search_feedback_stop_session_start_producer_sequence() {
         let temp_dir = tempfile::tempdir().unwrap();
         let _env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp_dir.path());
         let (endpoint, request_rx, release_tx, receiver) = spawn_ordered_hook_receiver(4);
@@ -1690,8 +1692,8 @@ mod tests {
             .env(NON_WAIT_RELAY_TEST_ELAPSED_PATH_ENV, &elapsed_path)
             .env(NON_WAIT_RELAY_TEST_STDOUT_PATH_ENV, &stdout_path)
             .env("AGENTDESK_ROOT_DIR", temp_dir.path())
-            .env_remove(NON_WAIT_RELAY_WORKER_ENV)
-            .env_remove(FAILURE_MARKER_WORKER_ENV)
+            .env_remove(NON_WAIT_RELAY_RUNNER_ENV)
+            .env_remove(FAILURE_MARKER_RUNNER_ENV)
             .status()
             .expect("run non-wait relay parent subprocess");
         assert!(status.success(), "non-wait relay parent failed: {status}");
@@ -1701,7 +1703,7 @@ mod tests {
             .unwrap();
         assert!(
             Duration::from_nanos(elapsed_nanos.try_into().unwrap()) < STOP_RELAY_TIMEOUT,
-            "non-wait hook command blocked on its surviving transport worker"
+            "non-wait hook command blocked on its surviving transport runner"
         );
         let output: Value = serde_json::from_slice(&std::fs::read(&stdout_path).unwrap()).unwrap();
         assert_eq!(output["suppressOutput"], true);
@@ -1709,7 +1711,7 @@ mod tests {
 
         let request = request_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("surviving worker delivers non-wait event");
+            .expect("surviving runner delivers non-wait event");
         assert!(
             std::str::from_utf8(&request)
                 .unwrap()
@@ -1724,30 +1726,30 @@ mod tests {
         let marker_dir = marker_dir_under_root(temp_dir.path(), "claude");
         wait_for_published_markers(&marker_dir, 1);
         let markers = drain_hook_relay_failure_markers("claude", "hanging-non-wait-session");
-        assert_eq!(markers.len(), 1, "worker failure must remain durable");
+        assert_eq!(markers.len(), 1, "runner failure must remain durable");
         assert_eq!(markers[0].event, "PostToolUse");
         assert!(markers[0].error.contains("timed out"));
     }
 
     #[test]
     #[ignore = "helper subprocess for durable hook relay marker writes"]
-    fn failure_marker_worker_subprocess_entry() {
-        if std::env::var_os(FAILURE_MARKER_WORKER_ENV).is_none() {
+    fn failure_marker_runner_subprocess_entry() {
+        if std::env::var_os(FAILURE_MARKER_RUNNER_ENV).is_none() {
             return;
         }
         if let Some(release_path) = std::env::var_os(FAILURE_MARKER_TEST_RELEASE_PATH_ENV) {
             wait_for_test_release(Path::new(&release_path));
         }
-        crate::run_from_args().expect("marker worker entrypoint writes durable marker");
+        crate::run_from_args().expect("marker runner entrypoint writes durable marker");
     }
 
     #[test]
     #[ignore = "helper subprocess for surviving non-wait hook relays"]
-    fn non_wait_relay_worker_subprocess_entry() {
-        if std::env::var_os(NON_WAIT_RELAY_WORKER_ENV).is_none() {
+    fn non_wait_relay_runner_subprocess_entry() {
+        if std::env::var_os(NON_WAIT_RELAY_RUNNER_ENV).is_none() {
             return;
         }
-        crate::run_from_args().expect("non-wait relay worker delivers event or durable marker");
+        crate::run_from_args().expect("non-wait relay runner delivers event or durable marker");
     }
 
     #[cfg(unix)]
@@ -1786,7 +1788,7 @@ mod tests {
             handoff_non_wait_hook_event,
             |_, _, _, _, _, _| panic!("PostToolUse must not use the wait transport"),
         )
-        .expect("parent hands request to ordered relay worker");
+        .expect("parent hands request to ordered relay runner");
         assert!(stderr.is_empty());
         std::fs::write(elapsed_path, started.elapsed().as_nanos().to_string()).unwrap();
         std::fs::write(stdout_path, stdout).unwrap();
@@ -1806,7 +1808,7 @@ mod tests {
             "process-exit-session",
             "post hook event: timed out",
         )
-        .expect("parent hands marker to surviving worker");
+        .expect("parent hands marker to surviving runner");
         std::fs::write(
             std::env::var_os(FAILURE_MARKER_TEST_ELAPSED_PATH_ENV)
                 .expect("handoff elapsed output path"),
@@ -1817,10 +1819,10 @@ mod tests {
     }
 
     #[test]
-    fn failure_marker_worker_survives_parent_process_exit() {
+    fn failure_marker_runner_survives_parent_process_exit() {
         let temp_dir = tempfile::tempdir().unwrap();
         let elapsed_path = temp_dir.path().join("handoff-elapsed-ms");
-        let release_path = temp_dir.path().join("release-marker-worker");
+        let release_path = temp_dir.path().join("release-marker-runner");
         let marker_dir = marker_dir_under_root(temp_dir.path(), "claude");
         let executable = std::env::current_exe().unwrap();
         let status = Command::new(executable)
@@ -1850,7 +1852,7 @@ mod tests {
         assert_eq!(
             published_marker_count(&marker_dir),
             0,
-            "marker worker must still be waiting after its parent exited"
+            "marker runner must still be waiting after its parent exited"
         );
 
         std::fs::write(&release_path, b"release").unwrap();

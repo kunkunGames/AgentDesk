@@ -32,7 +32,7 @@ impl StreamChild {
         Self {
             pid,
             #[cfg(unix)]
-            // The unreaped group leader reserves this PID until cleanup completes.
+            // The unreaped group hub reserves this PID until cleanup completes.
             owned_group: pid > 1 && unsafe { libc::getpgid(pid as i32) == pid as i32 && libc::getpgrp() != pid as i32 },
             status: None,
             exited_at: None,
@@ -55,7 +55,7 @@ impl StreamChild {
         #[cfg(unix)]
         {
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-            // WNOWAIT keeps the dead leader's identity reserved while its group is cleaned.
+            // WNOWAIT keeps the dead hub's identity reserved while its group is cleaned.
             let rc = unsafe {
                 libc::waitid(
                     libc::P_PID,

@@ -3095,7 +3095,7 @@ mod tests {
                 automation_recommender_context(
                     None,
                     vec![categorized_observation(
-                        "release-freshness:worker-inventory",
+                        "release-freshness:runner-inventory",
                         "release-freshness",
                         "precomputed_digest",
                         5,
@@ -3110,7 +3110,7 @@ mod tests {
             crate::services::routines::RoutineAction::Agent { prompt, .. } => {
                 assert!(prompt.contains("카테고리: release-freshness"));
                 assert!(prompt.contains("릴리스 신선도 모니터"));
-                let inventory_path = ["docs", "generated", "worker-inventory.md"].join("/");
+                let inventory_path = ["docs", "generated", "runner-inventory.md"].join("/");
                 assert!(prompt.contains(&inventory_path));
             }
             other => panic!("unexpected action: {other:?}"),

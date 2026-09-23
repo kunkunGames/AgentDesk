@@ -17,11 +17,11 @@
 //! 1. Persist a durable [`TuiDirectPendingStart`] under a new runtime_store
 //!    root the instant the anchor/lease are created (BEFORE any wait).
 //! 2. [`relay_observed_prompt`] returns to the observer loop immediately and a
-//!    DETACHED per-`(provider, channel_id)` worker performs the claim — so a
+//!    DETACHED per-`(provider, channel_id)` runner performs the claim — so a
 //!    long wait on channel A never starves channel B.
-//! 3. The worker serializes per channel ([`channel_lock`]); multiple pending
+//! 3. The runner serializes per channel ([`channel_lock`]); multiple pending
 //!    prompts on the same channel drain FIFO.
-//! 4. The worker polls [`prior_turn_finalized`] (~100ms) bounded by an 8s
+//! 4. The runner polls [`prior_turn_finalized`] (~100ms) bounded by an 8s
 //!    backstop, then claims with a FRESH `turn_start_offset = relay_last_offset()`
 //!    (post-drain == EOF) and `response_sent_offset = 0`.
 //! 5. While a pending start exists for a channel, the watcher no-inflight
@@ -62,11 +62,11 @@ pub(super) use state::{pending_synthetic_start_abandoned, reset_present_for_test
 
 #[cfg(test)]
 use state::{
-    ActiveWorkerGuard, claude_tui_output_path_missing, inflight_generation_precedes_current,
+    ActiveRunnerGuard, claude_tui_output_path_missing, inflight_generation_precedes_current,
     mark_absent, mark_present, records_for_channel, restart_orphan_independent_pane_ready, root,
 };
 use state::{
-    active_worker_guard_for_spawn, committed_foreign_complete_finalize_context,
+    active_runner_guard_for_spawn, committed_foreign_complete_finalize_context,
     committed_foreign_inflight_is_finalize_clearable, output_capture_offset,
     restart_orphan_evidence_at, restart_orphan_pane_ready_for_input,
     stale_foreign_cancel_finalize_context, stale_foreign_inflight_is_reclaimable_at,
@@ -132,7 +132,7 @@ fn set_destructive_cancel_post_gate_hook_for_tests(
 // ---------------------------------------------------------------------------
 
 /// Module-static lock table (smaller surface than threading a field through
-/// `SharedData`). One `tokio::Mutex` per `(provider, channel_id)`; the worker
+/// `SharedData`). One `tokio::Mutex` per `(provider, channel_id)`; the runner
 /// holds it for the whole wait+claim so same-channel pending prompts serialize
 /// FIFO while different channels run fully in parallel.
 #[allow(clippy::type_complexity)]
@@ -552,7 +552,7 @@ pub(in crate::services::discord) async fn demote_stale_foreign_inflight_if_curre
 }
 
 /// #3296 codex r3: choose the foreign identity an aborted-anchor marker pins.
-/// The worker's LAST-VIEW identity is PRIMARY — that row was observed LIVE
+/// The runner's LAST-VIEW identity is PRIMARY — that row was observed LIVE
 /// during the backstop window, so it is definitionally the turn the ABORT
 /// deferred on. The cleanup-instant inflight row is read (lazily) ONLY when
 /// no poll ever captured an identity: between the final backstop view and the
@@ -573,13 +573,13 @@ pub(super) fn pin_abort_foreign_identity(
     last_view_foreign.or_else(read_cleanup_instant_row)
 }
 
-/// Spawn the DETACHED per-channel worker. Acquires the channel lock (FIFO
+/// Spawn the DETACHED per-channel runner. Acquires the channel lock (FIFO
 /// serialization), polls the wait predicate until the prior turn finalizes (or
 /// the 8s backstop fires), runs the claim, and deletes the record. On the
 /// terminal backstop ABORT it runs `abort_cleanup_fn` (the aborted-anchor
 /// marker record — #3282/#3296) before dropping the record. Returns immediately
 /// so the observer loop is never blocked.
-pub(super) fn spawn_worker(
+pub(super) fn spawn_runner(
     shared: Arc<SharedData>,
     record: TuiDirectPendingStart,
     view_fn: ViewFn,
@@ -587,10 +587,10 @@ pub(super) fn spawn_worker(
     abort_cleanup_fn: AbortCleanupFn,
     reclaim_orphan_fn: ReclaimOrphanFn,
 ) {
-    let active_guard = active_worker_guard_for_spawn(&record.provider, record.channel_id);
-    super::task_supervisor::spawn_observed("tui_direct_pending_start_worker", async move {
+    let active_guard = active_runner_guard_for_spawn(&record.provider, record.channel_id);
+    super::task_supervisor::spawn_observed("tui_direct_pending_start_runner", async move {
         let _active_guard = active_guard;
-        run_worker_inner(
+        run_runner_inner(
             shared,
             record,
             view_fn,
@@ -602,7 +602,7 @@ pub(super) fn spawn_worker(
     });
 }
 
-/// Why the worker's wait loop ended this cycle.
+/// Why the runner's wait loop ended this cycle.
 enum WaitOutcome {
     /// The prior turn genuinely finalized — claiming is safe.
     Finalized,
@@ -616,7 +616,7 @@ enum WaitOutcome {
 }
 
 #[cfg(test)]
-async fn run_worker(
+async fn run_runner(
     shared: Arc<SharedData>,
     record: TuiDirectPendingStart,
     view_fn: ViewFn,
@@ -624,8 +624,8 @@ async fn run_worker(
     abort_cleanup_fn: AbortCleanupFn,
     reclaim_orphan_fn: ReclaimOrphanFn,
 ) {
-    let _active_guard = ActiveWorkerGuard::new(&record.provider, record.channel_id);
-    run_worker_inner(
+    let _active_guard = ActiveRunnerGuard::new(&record.provider, record.channel_id);
+    run_runner_inner(
         shared,
         record,
         view_fn,
@@ -636,7 +636,7 @@ async fn run_worker(
     .await;
 }
 
-async fn run_worker_inner(
+async fn run_runner_inner(
     shared: Arc<SharedData>,
     mut record: TuiDirectPendingStart,
     view_fn: ViewFn,
@@ -649,7 +649,7 @@ async fn run_worker_inner(
 
     let mut backstop_cycles: u32 = 0;
     let mut claim_attempts: u32 = 0;
-    let worker_start = tokio::time::Instant::now();
+    let runner_start = tokio::time::Instant::now();
     // codex r2: the most recent poll's live FOREIGN inflight identity. Handed
     // to the ABORT cleanup so the aborted-anchor marker pins WHICH turn it was
     // deferring on even when that row vanishes before the cleanup's own read.
@@ -705,7 +705,7 @@ async fn run_worker_inner(
                 // whose relay frontier never advanced despite captured output;
                 // then it falls back to the #3982 producer-dead SessionBoundRelay
                 // orphan downgrade. Either success only causes an immediate
-                // re-evaluation; the worker never claims on this stale view.
+                // re-evaluation; the runner never claims on this stale view.
                 let reclaim_outcome = reclaim_orphan_fn(&shared, &record).await;
                 if reclaim_outcome.is_reclaimed() {
                     tracing::warn!(
@@ -759,7 +759,7 @@ async fn run_worker_inner(
                         anchor_message_id = record.anchor_message_id,
                         backstop_cycles,
                         anchor_slot_released,
-                        waited_ms = worker_start.elapsed().as_millis(),
+                        waited_ms = runner_start.elapsed().as_millis(),
                         event = "tui_direct_pending_start.backstop_abort_foreign_inflight_live",
                         "tui_direct_pending_start: prior inflight stayed LIVE across the backstop escalation budget; ABORTING the synthetic turn-start claim without overwriting the live prior turn — input already submitted; abort marker recorded, reconcile lands ✅ via prior-owner completion or ⚠ via TTL fallback (#3296)"
                     );
@@ -810,7 +810,7 @@ async fn run_worker_inner(
                 channel_id = record.channel_id,
                 tmux_session_name = %record.tmux_session_name,
                 anchor_message_id = record.anchor_message_id,
-                waited_ms = worker_start.elapsed().as_millis(),
+                waited_ms = runner_start.elapsed().as_millis(),
                 backstop_cycles,
                 claim_attempts,
                 "tui_direct_pending_start: deferred synthetic turn-start claimed after prior turn finalized"
@@ -821,7 +821,7 @@ async fn run_worker_inner(
             // overwrites). Fail-open: nothing in there can fail the claim.
             record_deferred_claim_marker_if_watcher_owned(&record);
             // Delete only AFTER a successful claim (P1-2). A crash between the
-            // inflight save and this delete is healed on restart: the worker
+            // inflight save and this delete is healed on restart: the runner
             // re-runs and the claim adopts the matching anchor's existing
             // inflight idempotently, then deletes.
             delete(&record);
@@ -843,7 +843,7 @@ async fn run_worker_inner(
                 anchor_message_id = record.anchor_message_id,
                 claim_attempts,
                 anchor_slot_released,
-                waited_ms = worker_start.elapsed().as_millis(),
+                waited_ms = runner_start.elapsed().as_millis(),
                 event = "tui_direct_pending_start.claim_retry_exhausted",
                 "tui_direct_pending_start: claim returned false across the retry budget (another turn owns the mailbox or saves keep failing); abandoning the synthetic ownership claim to avoid an unbounded spin (record retained for restart re-attempt)"
             );
@@ -910,7 +910,7 @@ fn record_deferred_claim_marker_if_watcher_owned(record: &TuiDirectPendingStart)
 /// fresh turn (slot genuinely free) or MERGES the follow-up into a still-live
 /// prior turn — so even if the deferred-on row is in fact a live turn, the worst
 /// case is a normal merge with ZERO live-turn loss. The serialization is the
-/// channel lock the worker already holds (this runs before its `return`, under
+/// channel lock the runner already holds (this runs before its `return`, under
 /// `_guard`); the kickoff's own work is detached, so no new lock-order risk.
 /// Fail-soft: an unparseable provider only warns — the ABORT path is otherwise
 /// unchanged (pre-#3540 behavior: the follow-up waits for the sweep).

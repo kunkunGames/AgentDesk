@@ -102,7 +102,7 @@ pub(crate) async fn bind_pending_voice_announcement_by_key_durable(
     value.map(decode_voice_announcement_value).transpose()
 }
 
-/// Atomic consume variant for workers that receive a forwarded readable
+/// Atomic consume variant for runners that receive a forwarded readable
 /// announcement before the posting process successfully binds `message_id`.
 #[allow(dead_code)] // voice runtime wired only when voice config enabled; no target exercises it. See #3034
 pub(crate) async fn take_pending_voice_announcement_by_key_durable(
@@ -425,7 +425,7 @@ pub(crate) async fn take_handoff_reservation_durable(
 /// receive `Ok(None)` and MUST abort routing.
 ///
 /// Crash semantics mirror the announce path: the row is marked consumed,
-/// not deleted; the GC sweep removes the row after TTL. If a worker
+/// not deleted; the GC sweep removes the row after TTL. If a runner
 /// crashes after `take_handoff_durable` but before routing, the spoken
 /// summary is dropped — that is the conservative choice, matching the
 /// fail-safe-drop posture #2236 established.
@@ -554,7 +554,7 @@ pub(crate) async fn rehydrate_handoffs_from_pg(pool: &PgPool) -> Result<u64, sql
 /// Delete durable rows whose effective TTL has elapsed. The live deadline is
 /// stored in `expires_at` (migration 0064), which is refreshed by
 /// `refresh_handoff_ttl_durable` when the watchdog deadline is extended.
-/// Wired into the leader-only maintenance scheduler.
+/// Wired into the hub-only maintenance scheduler.
 pub(crate) async fn gc_expired_voice_background_handoff_meta_pg(
     pool: &PgPool,
     _ttl: Duration,

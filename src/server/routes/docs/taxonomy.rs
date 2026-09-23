@@ -183,7 +183,7 @@ pub(super) fn category_description(category: &str) -> &'static str {
             "Loop-enabled automation candidate cards, iteration results, worktrees, and final gates."
         }
         "cron" => "Registered cron jobs per agent.",
-        "cluster" => "Multinode worker-node registry, heartbeat, and role diagnostics.",
+        "cluster" => "Multinode runner-node registry, heartbeat, and role diagnostics.",
         "departments" => "Department CRUD and ordering.",
         "discord" => "Discord delivery helpers, bindings, message reads, and DM reply hooks.",
         "dispatched-sessions" => "Persisted dispatched-session lifecycle and cleanup helpers.",

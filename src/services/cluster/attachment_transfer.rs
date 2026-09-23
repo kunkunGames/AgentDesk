@@ -10,12 +10,12 @@ pub(crate) mod uploads;
 pub(crate) const CAPABILITY: &str = "attachment_bundle_v1";
 
 pub(crate) fn supports(node: &serde_json::Value) -> bool {
-    node.pointer("/capabilities/intake_worker/features")
+    node.pointer("/capabilities/intake_runner/features")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|features| features.iter().any(|feature| feature == CAPABILITY))
 }
 
-pub(crate) async fn worker_uploads(
+pub(crate) async fn runner_uploads(
     pool: &sqlx::PgPool,
     row: &crate::db::intake_outbox::IntakeOutboxRow,
 ) -> Result<uploads::PendingUploads, String> {

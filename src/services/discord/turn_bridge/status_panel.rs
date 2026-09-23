@@ -443,7 +443,7 @@ pub(super) fn status_panel_message_id_for_turn(
 ///
 /// Returns `true` when an old separate panel existed and was reconciled
 /// (regardless of edit success), `false` when there was nothing to migrate.
-/// This is worker-local: it operates only on the resuming turn's own handle.
+/// This is runner-local: it operates only on the resuming turn's own handle.
 pub(super) async fn migrate_separate_status_panel_to_footer<G: TurnGateway + ?Sized>(
     gateway: &G,
     channel_id: ChannelId,

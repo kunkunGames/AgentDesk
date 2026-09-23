@@ -91,7 +91,7 @@ pub const TERMINAL_OUTCOME_RING_CAPACITY: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamFrame {
     /// The tmux session name this frame originated from. Used by sinks that
-    /// multiplex frames from many sessions onto a single delivery worker.
+    /// multiplex frames from many sessions onto a single delivery runner.
     pub session_name: String,
     /// Routing snapshot captured when the frame was enqueued. Sinks must not
     /// re-parse `session_name` or consult mutable registry state to route

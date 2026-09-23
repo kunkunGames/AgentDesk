@@ -8,7 +8,6 @@ use super::{ClusterConfig, ClusterIntakeRoutingMode, ClusterRole};
 pub enum RuntimeProfile {
     #[default]
     Full,
-    #[serde(alias = "worker")]
     Runner,
 }
 
@@ -18,7 +17,6 @@ pub struct RuntimeModulePlan {
     pub voice: bool,
     pub dashboard: bool,
     pub admin_api: bool,
-    #[serde(rename = "leader_services")]
     pub hub_services: bool,
 }
 
@@ -52,17 +50,6 @@ impl RuntimeProfile {
         }
         Ok(())
     }
-
-    /// Schema-1 probes are also consumed by nodes that have not upgraded yet.
-    pub(crate) fn serialize_registry<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(match self {
-            Self::Full => "full",
-            Self::Runner => "worker",
-        })
-    }
 }
 
 #[cfg(test)]
@@ -83,14 +70,15 @@ mod tests {
     }
 
     #[test]
-    fn runner_profile_is_explicit_validated_and_does_not_change_legacy_roles() {
-        for role in ["hub", "runner", "leader", "auto", "worker"] {
-            let legacy: ClusterConfig = serde_yaml::from_str(&format!("role: {role}")).unwrap();
-            assert_eq!(legacy.runtime_profile, RuntimeProfile::Full);
-            assert!(legacy.runtime_profile.modules().gateway);
-            assert!(legacy.runtime_profile.validate(&legacy).is_ok());
+    fn runner_profile_is_explicit_validated_and_keeps_full_default() {
+        for role in ["hub", "runner", "auto"] {
+            let config: ClusterConfig = serde_yaml::from_str(&format!("role: {role}")).unwrap();
+            assert_eq!(config.runtime_profile, RuntimeProfile::Full);
+            assert!(config.runtime_profile.modules().gateway);
+            assert!(config.runtime_profile.validate(&config).is_ok());
         }
         assert!(serde_yaml::from_str::<ClusterConfig>("runtime_profile: typo").is_err());
+        assert!(serde_yaml::from_str::<ClusterConfig>("runtime_profile: worker").is_err());
         let mut cluster = ClusterConfig {
             runtime_profile: RuntimeProfile::Runner,
             enabled: true,
@@ -102,7 +90,7 @@ mod tests {
         assert!(cluster.runtime_profile.validate(&cluster).is_ok());
         assert_eq!(
             serde_json::to_value(cluster.runtime_profile.modules()).unwrap(),
-            serde_json::json!({"gateway":false,"voice":false,"dashboard":false,"admin_api":false,"leader_services":false})
+            serde_json::json!({"gateway":false,"voice":false,"dashboard":false,"admin_api":false,"hub_services":false})
         );
         cluster.role = ClusterRole::Auto;
         assert!(cluster.runtime_profile.validate(&cluster).is_err());
@@ -112,24 +100,18 @@ mod tests {
     }
 
     #[test]
-    fn runner_and_legacy_profiles_have_identical_modules_and_canonical_output() {
-        for role in ["runner", "worker"] {
-            for profile in ["runner", "worker"] {
-                let yaml = format!(
-                    "enabled: true\nrole: {role}\nruntime_profile: {profile}\nintake_routing:\n  enabled: true\n  mode: enforce\n"
-                );
-                let cluster: ClusterConfig = serde_yaml::from_str(&yaml).unwrap();
-                assert!(cluster.runtime_profile.validate(&cluster).is_ok());
-                assert_eq!(cluster.runtime_profile, RuntimeProfile::Runner);
-                assert!(!cluster.runtime_profile.modules().gateway);
-                assert!(!cluster.runtime_profile.modules().hub_services);
-                let value = serde_json::to_value(&cluster).unwrap();
-                assert_eq!(value["role"], "runner");
-                assert_eq!(value["runtime_profile"], "runner");
-                let reloaded: ClusterConfig = serde_json::from_value(value).unwrap();
-                assert_eq!(reloaded, cluster);
-            }
-        }
+    fn runner_profile_round_trip_preserves_module_plan() {
+        let yaml = "enabled: true\nrole: runner\nruntime_profile: runner\nintake_routing:\n  enabled: true\n  mode: enforce\n";
+        let cluster: ClusterConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(cluster.runtime_profile.validate(&cluster).is_ok());
+        assert_eq!(cluster.runtime_profile, RuntimeProfile::Runner);
+        assert!(!cluster.runtime_profile.modules().gateway);
+        assert!(!cluster.runtime_profile.modules().hub_services);
+        let value = serde_json::to_value(&cluster).unwrap();
+        assert_eq!(value["role"], "runner");
+        assert_eq!(value["runtime_profile"], "runner");
+        let reloaded: ClusterConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(reloaded, cluster);
         for role in [ClusterRole::Hub, ClusterRole::Auto] {
             let mut cluster = ClusterConfig {
                 enabled: true,

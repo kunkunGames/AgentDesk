@@ -572,7 +572,7 @@ async fn fail_runtime_dispatch_with_pool(
         );
     }
     // AlreadyTerminal can be a replay after the original terminal transition
-    // missed its immediate wake. The periodic leader sweep is the correctness
+    // missed its immediate wake. The periodic hub sweep is the correctness
     // backstop, but replaying the wake here preserves the canonical writer's
     // low-latency contract instead of accepting up to the default 30s delay.
     Ok((outcome, post_commit))
@@ -984,7 +984,7 @@ mod dispatch_failure_pg_tests {
             "INSERT INTO dispatch_semaphore_holdings (
                  semaphore_name, scope, scope_key, slot_index,
                  holder_instance_id, dispatch_id, expires_at
-             ) VALUES ('gpu', 'per-cluster', 'global', 0, 'worker-1', $1, NOW() + INTERVAL '1 hour')",
+             ) VALUES ('gpu', 'per-cluster', 'global', 0, 'runner-1', $1, NOW() + INTERVAL '1 hour')",
         )
         .bind(&dispatch_id)
         .execute(&pool)
@@ -1040,22 +1040,22 @@ mod dispatch_failure_pg_tests {
         let (_run_id, _entry_id, dispatch_id) =
             seed_failure_fixture(&pool, "wait-wake", "dispatched", 1).await;
         sqlx::query(
-            "INSERT INTO worker_nodes (
+            "INSERT INTO cluster_nodes (
                  instance_id, hostname, process_id, role, effective_role, status,
                  labels, capabilities, last_heartbeat_at, started_at, updated_at
              ) VALUES (
-                 'worker-wake', 'worker', 100, 'auto', 'leader', 'online',
+                 'runner-wake', 'runner', 100, 'auto', 'hub', 'online',
                  '[]'::jsonb, '{}'::jsonb, NOW(), NOW(), NOW()
              )",
         )
         .execute(&pool)
         .await
-        .expect("seed wake worker");
+        .expect("seed wake runner");
         sqlx::query(
             "INSERT INTO dispatch_outbox (
                  dispatch_id, action, status, wait_reason, wait_started_at, created_at
              ) VALUES (
-                 'waiting-dispatch', 'notify', 'pending', 'no worker before release', NOW(), NOW()
+                 'waiting-dispatch', 'notify', 'pending', 'no runner before release', NOW(), NOW()
              )",
         )
         .execute(&pool)
@@ -1081,7 +1081,7 @@ mod dispatch_failure_pg_tests {
         .fetch_one(&pool)
         .await
         .expect("load woken wait row");
-        assert_eq!(wait_state.0.as_deref(), Some("worker-wake"));
+        assert_eq!(wait_state.0.as_deref(), Some("runner-wake"));
         assert!(wait_state.1.is_none());
 
         pool.close().await;

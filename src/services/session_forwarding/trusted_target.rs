@@ -31,7 +31,7 @@ impl TrustedTargetError {
         match self {
             Self::MissingConfig => "trusted_forward_origin_missing",
             Self::InvalidConfiguredOrigin => "trusted_forward_origin_invalid",
-            Self::InvalidAdvertisedOrigin => "worker_api_base_url_invalid",
+            Self::InvalidAdvertisedOrigin => "runner_api_base_url_invalid",
             Self::OriginMismatch => "trusted_forward_origin_mismatch",
             Self::MissingCapability => "session_forwarding_capability_missing",
             Self::DnsResolutionFailed => "trusted_forward_dns_failed",
@@ -453,7 +453,7 @@ mod tests {
     ) -> ClusterConfig {
         let mut nodes = BTreeMap::new();
         nodes.insert(
-            "worker-a".to_string(),
+            "runner-a".to_string(),
             ClusterNodeConfig {
                 max_concurrent_dispatches: None,
                 trusted_forward_origin: origin.map(str::to_string),
@@ -482,7 +482,7 @@ mod tests {
         };
         build_trusted_target_with_resolver(
             cluster,
-            "worker-a",
+            "runner-a",
             advertised,
             "session_forwarding",
             &capabilities(),
@@ -496,7 +496,7 @@ mod tests {
         assert_eq!(
             resolve(
                 &ClusterConfig::default(),
-                "https://worker.example:8791",
+                "https://runner.example:8791",
                 vec!["203.0.113.10:8791".parse().unwrap()],
             )
             .await
@@ -519,10 +519,10 @@ mod tests {
     async fn origin_parser_rejects_ambiguous_components() {
         for origin in [
             "file:///tmp/api",
-            "https://user@worker.example:8791/",
-            "https://worker.example:8791/?x=1",
-            "https://worker.example:8791/#fragment",
-            "https://worker.example:8791/api",
+            "https://user@runner.example:8791/",
+            "https://runner.example:8791/?x=1",
+            "https://runner.example:8791/#fragment",
+            "https://runner.example:8791/api",
         ] {
             assert_eq!(
                 resolve(
@@ -616,8 +616,8 @@ mod tests {
         let public = vec!["203.0.113.10:8791".parse().unwrap()];
         assert_eq!(
             resolve(
-                &cluster_with_transport(Some("http://worker.example:8791"), true, true),
-                "http://worker.example:8791",
+                &cluster_with_transport(Some("http://runner.example:8791"), true, true),
+                "http://runner.example:8791",
                 public,
             )
             .await
@@ -631,8 +631,8 @@ mod tests {
         ];
         assert_eq!(
             resolve(
-                &cluster_with_transport(Some("http://worker.example:8791"), true, true),
-                "http://worker.example:8791",
+                &cluster_with_transport(Some("http://runner.example:8791"), true, true),
+                "http://runner.example:8791",
                 mixed,
             )
             .await
@@ -642,15 +642,15 @@ mod tests {
 
         let private = vec!["10.0.0.2:8791".parse().unwrap()];
         for config in [
-            cluster_with_transport(Some("http://worker.example:8791"), false, false),
-            cluster_with_transport(Some("http://worker.example:8791"), true, false),
-            cluster_with_transport(Some("http://worker.example:8791"), false, true),
+            cluster_with_transport(Some("http://runner.example:8791"), false, false),
+            cluster_with_transport(Some("http://runner.example:8791"), true, false),
+            cluster_with_transport(Some("http://runner.example:8791"), false, true),
         ] {
             assert_eq!(
-                resolve(&config, "http://worker.example:8791", private.clone())
+                resolve(&config, "http://runner.example:8791", private.clone())
                     .await
                     .unwrap_err(),
-                if config.nodes["worker-a"].allow_private_forwarding {
+                if config.nodes["runner-a"].allow_private_forwarding {
                     TrustedTargetError::InsecureTransport
                 } else {
                     TrustedTargetError::UnsafeAddress
@@ -659,8 +659,8 @@ mod tests {
         }
         assert!(
             resolve(
-                &cluster_with_transport(Some("http://worker.example:8791"), true, true),
-                "http://worker.example:8791",
+                &cluster_with_transport(Some("http://runner.example:8791"), true, true),
+                "http://runner.example:8791",
                 private,
             )
             .await
@@ -672,8 +672,8 @@ mod tests {
     async fn https_transport_keeps_public_and_private_address_semantics() {
         assert!(
             resolve(
-                &cluster(Some("https://worker.example:8791"), false),
-                "https://worker.example:8791",
+                &cluster(Some("https://runner.example:8791"), false),
+                "https://runner.example:8791",
                 vec!["203.0.113.10:8791".parse().unwrap()],
             )
             .await
@@ -681,8 +681,8 @@ mod tests {
         );
         assert!(
             resolve(
-                &cluster(Some("https://worker.example:8791"), true),
-                "https://worker.example:8791",
+                &cluster(Some("https://runner.example:8791"), true),
+                "https://runner.example:8791",
                 vec!["10.0.0.2:8791".parse().unwrap()],
             )
             .await
@@ -693,8 +693,8 @@ mod tests {
     #[tokio::test]
     async fn canonical_origin_and_endpoint_preserve_authority() {
         let target = resolve(
-            &cluster(Some("https://Worker.Example:443/"), false),
-            "https://worker.example/",
+            &cluster(Some("https://Runner.Example:443/"), false),
+            "https://runner.example/",
             vec!["203.0.113.10:443".parse().unwrap()],
         )
         .await
@@ -704,7 +704,7 @@ mod tests {
                 .endpoint_for_test("/api/sessions/42/tmux-output")
                 .unwrap()
                 .as_str(),
-            "https://worker.example/api/sessions/42/tmux-output"
+            "https://runner.example/api/sessions/42/tmux-output"
         );
         assert_eq!(
             target
@@ -722,9 +722,9 @@ mod tests {
             lookups: lookups.clone(),
         };
         let target = build_trusted_target_with_resolver(
-            &cluster(Some("https://worker.example:8791"), false),
-            "worker-a",
-            "https://worker.example:8791/",
+            &cluster(Some("https://runner.example:8791"), false),
+            "runner-a",
+            "https://runner.example:8791/",
             "session_forwarding",
             &capabilities(),
             &resolver,
@@ -733,14 +733,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             lookups.lock().unwrap().as_slice(),
-            &[("worker.example".to_string(), 8791)]
+            &[("runner.example".to_string(), 8791)]
         );
         let request = target
             .request(Method::GET, "/api/sessions/42/tmux-output")
             .unwrap()
             .build()
             .unwrap();
-        assert_eq!(request.url().host_str(), Some("worker.example"));
+        assert_eq!(request.url().host_str(), Some("runner.example"));
         assert_eq!(lookups.lock().unwrap().len(), 1);
     }
 
@@ -788,9 +788,9 @@ mod tests {
         };
         assert_eq!(
             build_trusted_target_with_resolver(
-                &cluster(Some("https://worker.example:8791"), false),
-                "worker-a",
-                "https://worker.example:8791/",
+                &cluster(Some("https://runner.example:8791"), false),
+                "runner-a",
+                "https://runner.example:8791/",
                 "cancel_forwarding_v1",
                 &json!({"agentdesk_api": {"session_forwarding": true}}),
                 &resolver,

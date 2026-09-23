@@ -19,8 +19,8 @@ async fn seed(
             user_msg_id, request_owner_id, user_text, turn_kind, agent_id,
             status, claim_owner, spawned_at, dispatched_at
          ) VALUES (
-            'worker', 'leader', $1, $1, 'user', 'hello', 'standard', 'agent',
-            $2, 'dispatch-worker', NOW(), $3
+            'runner', 'hub', $1, $1, 'user', 'hello', 'standard', 'agent',
+            $2, 'dispatch-runner', NOW(), $3
          ) RETURNING id",
     )
     .bind(key)
@@ -120,7 +120,7 @@ async fn dispatched_row_blocks_new_open_route_for_the_channel_pg() {
             target_instance_id, forwarded_by_instance_id, channel_id,
             user_msg_id, request_owner_id, user_text, turn_kind, agent_id, status
          ) VALUES (
-            'worker', 'leader', 'blocked-channel', 'next-message', 'user',
+            'runner', 'hub', 'blocked-channel', 'next-message', 'user',
             'next', 'standard', 'agent', 'pending'
          )",
     )
@@ -179,7 +179,7 @@ async fn dispatched_row_is_reclaimed_by_sweep_pg() {
             target_instance_id, forwarded_by_instance_id, channel_id,
             user_msg_id, request_owner_id, user_text, turn_kind, agent_id, status
          ) VALUES (
-            'worker', 'leader', 'sweep-channel', 'next-message', 'user',
+            'runner', 'hub', 'sweep-channel', 'next-message', 'user',
             'next', 'standard', 'agent', 'pending'
          )",
     )

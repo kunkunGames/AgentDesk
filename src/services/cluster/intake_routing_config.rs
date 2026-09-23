@@ -1,14 +1,14 @@
 use crate::config::{ClusterIntakeRoutingConfig, ClusterIntakeRoutingMode};
 
 /// How aggressively to apply the Phase-2 routing decision in front of
-/// the existing leader intake path.
+/// the existing hub intake path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IntakeRoutingMode {
-    /// Hook is a no-op; the leader runs every intake locally as today.
+    /// Hook is a no-op; the hub runs every intake locally as today.
     /// Default until Phase 5 flips the global flag — keeps prod
     /// behaviour byte-identical while phases 1-4 land.
     Disabled,
-    /// The hook does the full decision (label match, worker eligibility,
+    /// The hook does the full decision (label match, runner eligibility,
     /// 23505 classification) but never INSERTs. Logs the decision so
     /// operators can verify routing behaviour against real traffic
     /// before promoting to `Enforce`.
@@ -116,7 +116,7 @@ impl EffectiveIntakeRoutingConfig {
         matches!(self.mode, IntakeRoutingMode::Enforce)
     }
 
-    pub(crate) fn worker_consumer_should_spawn(&self) -> bool {
+    pub(crate) fn runner_consumer_should_spawn(&self) -> bool {
         !matches!(self.mode, IntakeRoutingMode::Disabled)
     }
 

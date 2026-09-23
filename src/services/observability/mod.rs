@@ -21,7 +21,7 @@ pub mod turn_lifecycle;
 pub mod watcher_latency;
 
 // #2049: mod.rs was a 3,946-line monolith. Splitting along responsibility
-// boundaries (helpers / emit / worker / retention / pg I/O / queries) without
+// boundaries (helpers / emit / runner / retention / pg I/O / queries) without
 // changing the public API. Regression alerting is intentionally owned only by
 // `services::agent_quality::regression_alerts`. Global state (`OnceLock`
 // runtime) stays in this module to avoid relocating the singleton.
@@ -31,7 +31,7 @@ mod pg_io;
 mod queries;
 mod relay_signal_alert;
 mod retention;
-mod worker;
+mod runner;
 
 // Public surface re-exports — keep `crate::services::observability::*`
 // import paths working unchanged. `#[allow(unused_imports)]` because some
@@ -234,7 +234,7 @@ pub(crate) fn live_analytics_counter_values(
     counter_limit: usize,
 ) -> Vec<Value> {
     let limit = helpers::normalized_counter_limit(counter_limit);
-    worker::snapshot_rows(&runtime(), Some(filters))
+    runner::snapshot_rows(&runtime(), Some(filters))
         .into_iter()
         .take(limit)
         .filter_map(|row| {
@@ -353,7 +353,7 @@ pub(super) struct QueuedQualityEvent {
 }
 
 #[derive(Debug)]
-pub(super) enum WorkerMessage {
+pub(super) enum RunnerMessage {
     Event(QueuedEvent),
     QualityEvent(QueuedQualityEvent),
 }
@@ -367,7 +367,7 @@ pub(super) struct StorageHandles {
 pub(super) struct ObservabilityRuntime {
     pub(super) counters: DashMap<CounterKey, Arc<CounterBucket>>,
     pub(super) storage: Mutex<StorageHandles>,
-    pub(super) sender: Mutex<Option<mpsc::UnboundedSender<WorkerMessage>>>,
+    pub(super) sender: Mutex<Option<mpsc::UnboundedSender<RunnerMessage>>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -603,7 +603,7 @@ pub fn init_observability(pg_pool: Option<PgPool>) {
     if let Ok(mut storage) = runtime.storage.lock() {
         storage.pg_pool = pg_pool;
     }
-    worker::ensure_worker(&runtime);
+    runner::ensure_runner(&runtime);
     // #1070: start the periodic JSONL flush task for the in-memory event log.
     events::ensure_flusher();
 }

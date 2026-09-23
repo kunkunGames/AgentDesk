@@ -401,7 +401,7 @@ pub(super) async fn handle_no_result_exits(
                     // #3016 S3 (Concern 2 — residual TOCTOU): the destructive
                     // on-disk clear must not wipe a FOLLOW-UP turn's inflight.
                     // The earlier read→check→unconditional-clear spanned TWO
-                    // locks, so a follow-up saved on another worker thread in
+                    // locks, so a follow-up saved on another runner thread in
                     // the gap was wiped. The nonce-aware guarded clear closes
                     // the window atomically: read + validate + unlink under ONE
                     // sidecar lock, deleting only while the on-disk FULL

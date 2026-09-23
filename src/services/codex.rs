@@ -879,52 +879,52 @@ pub fn execute_command_simple_cancellable_with_model(
 /// caller has moved on (issue #2249).
 ///
 /// PID-reuse safety: before signalling we re-check the channel for a
-/// late natural completion (worker finished after `recv_timeout` returned
+/// late natural completion (runner finished after `recv_timeout` returned
 /// but before we got here). On a hit we skip the kill entirely so we
 /// never SIGKILL a numeric PID that may already have been reaped and
 /// reused by the OS. We also clear `child_pid` from the CancelToken when
-/// the worker completes naturally, so any later cancel cannot fire a
-/// stale PID. Thread cleanup is bounded: we only `join()` the worker
+/// the runner completes naturally, so any later cancel cannot fire a
+/// stale PID. Thread cleanup is bounded: we only `join()` the runner
 /// after observing it sent its result (or after the kill drained it),
 /// never on an indefinitely blocked thread.
 // #3034: retained for the #2387 timeout-drain regression test below.
 #[allow(dead_code)]
-fn execute_command_simple_with_timeout_worker<F>(
+fn execute_command_simple_with_timeout_runner<F>(
     timeout: Duration,
     label: &str,
     provider_name: &'static str,
-    run_worker: F,
+    run_runner: F,
 ) -> Result<String, String>
 where
     F: FnOnce(std::sync::Arc<CancelToken>) -> Result<String, String> + Send + 'static,
 {
     let label_owned = label.to_string();
     let cancel_token = std::sync::Arc::new(CancelToken::new());
-    let cancel_for_worker = std::sync::Arc::clone(&cancel_token);
+    let cancel_for_runner = std::sync::Arc::clone(&cancel_token);
     let (tx, rx) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
-        let result = run_worker(std::sync::Arc::clone(&cancel_for_worker));
+    let runner = std::thread::spawn(move || {
+        let result = run_runner(std::sync::Arc::clone(&cancel_for_runner));
         // Clear the registered child PID *before* sending the result.
         // The Child has already been reaped by wait_with_output() inside
         // execute_command_simple_cancellable, so the kernel may recycle
         // this PID at any moment. Clearing here prevents a late timeout
         // path (timer raced ahead of recv on a different timeline) from
         // signalling a reused, unrelated PID.
-        cancel_for_worker.clear_child_pid();
+        cancel_for_runner.clear_child_pid();
         let _ = tx.send(result);
     });
 
     match rx.recv_timeout(timeout) {
         Ok(result) => {
-            // Worker already finished and cleared child_pid; safe to join.
-            let _ = worker.join();
+            // Runner already finished and cleared child_pid; safe to join.
+            let _ = runner.join();
             result
         }
         Err(_) => {
-            // Re-check the channel: the worker may have sent its result in
+            // Re-check the channel: the runner may have sent its result in
             // the tiny window between recv_timeout returning Err and us
             // getting here. If so, take the natural completion and skip
-            // the kill — child_pid was cleared by the worker, but the OS
+            // the kill — child_pid was cleared by the runner, but the OS
             // could already have reused the numeric PID, so signalling it
             // would be a stray SIGKILL to an unrelated process.
             if let Ok(result) = rx.try_recv() {
@@ -933,7 +933,7 @@ where
                     stage = %label_owned,
                     "execute_command_simple_with_timeout completed in race with timeout; skipping kill"
                 );
-                let _ = worker.join();
+                let _ = runner.join();
                 return result;
             }
 
@@ -945,7 +945,7 @@ where
             );
             cancel_token.cancel_with_tmux_cleanup();
             // request_cleanup owns signal delivery and leaves the PID visible
-            // until the worker clears it, preserving the timeout drain meaning.
+            // until the runner clears it, preserving the timeout drain meaning.
             let child_pid = cancel_token.child_pid_value();
             let child_pid_was_none = child_pid.is_none();
             if let Some(pid) = child_pid {
@@ -962,14 +962,14 @@ where
                     "execute_command_simple_with_timeout had no registered child PID at cancel time"
                 );
             }
-            // Bounded drain: wait up to 3s for the worker to observe the
+            // Bounded drain: wait up to 3s for the runner to observe the
             // kill, drop its sender, and let the channel close. Only
-            // join() if we actually saw the worker hand back a result;
+            // join() if we actually saw the runner hand back a result;
             // otherwise drop the JoinHandle and let the OS reap the
             // thread when this process exits, rather than blocking the
             // caller forever on a stuck wait_with_output.
             if let Ok(result) = rx.recv_timeout(Duration::from_secs(3)) {
-                let _ = worker.join();
+                let _ = runner.join();
                 if child_pid_was_none {
                     tracing::debug!(
                         provider = provider_name,
@@ -982,7 +982,7 @@ where
                 tracing::warn!(
                     provider = provider_name,
                     stage = %label_owned,
-                    "execute_command_simple_with_timeout worker did not drain within 3s; abandoning join"
+                    "execute_command_simple_with_timeout runner did not drain within 3s; abandoning join"
                 );
             }
             Err(format!(
@@ -995,12 +995,12 @@ where
 
 #[cfg(test)]
 mod simple_timeout_2387_tests {
-    use super::execute_command_simple_with_timeout_worker;
+    use super::execute_command_simple_with_timeout_runner;
     use std::time::Duration;
 
     #[test]
     fn timeout_drain_prefers_late_result_when_child_pid_snapshot_is_none() {
-        let result = execute_command_simple_with_timeout_worker(
+        let result = execute_command_simple_with_timeout_runner(
             Duration::from_millis(10),
             "codex 2387 regression",
             "codex",

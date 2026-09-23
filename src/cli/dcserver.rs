@@ -1154,7 +1154,7 @@ pub fn handle_dcserver(token: Option<String>) {
             launch_configs.len()
         };
         if !ad_config.cluster.runtime_profile.is_full() && startup_provider_count == 0 {
-            eprintln!("  ✖ Worker profile requires a configured provider bot for intake execution");
+            eprintln!("  ✖ Runner profile requires a configured provider bot for intake execution");
             std::process::exit(1);
         }
         let startup_reconcile_remaining =
@@ -1361,7 +1361,7 @@ pub fn handle_dcserver(token: Option<String>) {
                 .await;
                 if ad_config.cluster.enabled {
                     eprintln!(
-                        "  ▸ Cluster runtime {:?}: keeping HTTP and worker heartbeat online",
+                        "  ▸ Cluster runtime {:?}: keeping HTTP and runner heartbeat online",
                         ad_config.cluster.runtime_profile
                     );
                     loop {
@@ -1467,7 +1467,7 @@ pub fn handle_dcserver(token: Option<String>) {
                 }
                 if ad_config.cluster.enabled {
                     eprintln!(
-                        "  ▸ Cluster runtime {:?}: keeping HTTP and worker heartbeat online",
+                        "  ▸ Cluster runtime {:?}: keeping HTTP and runner heartbeat online",
                         ad_config.cluster.runtime_profile
                     );
                     loop {

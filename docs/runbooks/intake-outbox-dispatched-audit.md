@@ -51,7 +51,7 @@ risk remains.
 
 `provider_nonempty` means exactly that `provider.trim()` is non-empty, matching
 the provider guard used by the operator force-fail implementation. It does not
-establish worker availability, capability, feature support, labels, placement
+establish runner availability, capability, feature support, labels, placement
 ownership, generation, or freedom from route and attempt conflicts. A
 dispatched row is still refused by that force-fail command.
 
@@ -85,4 +85,4 @@ The command does not determine whether Discord delivery occurred, repair a
 NULL clock, resolve an open route, or authorize a retry. Correlate the printed
 row identity with the incident's independently collected delivery and receipt
 evidence before choosing any later response. Run this audit on demand; this
-procedure does not define a schedule or batch worker.
+procedure does not define a schedule or batch runner.

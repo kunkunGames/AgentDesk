@@ -1,6 +1,6 @@
 //! Dispatch outbox queue + state-transition service (#1694).
 //!
-//! Owns the worker that drains `dispatch_outbox` rows, calls the configured
+//! Owns the runner that drains `dispatch_outbox` rows, calls the configured
 //! notifier (real Discord transport in production, mock in tests), and
 //! transitions row state (`pending` → `processing` → `done`/`failed`/retry)
 //! plus the `task_dispatches.status = 'dispatched'` flip on first successful
@@ -21,7 +21,7 @@ use crate::services::dispatches::outbox_claiming::claim_pending_dispatch_outbox_
 use sqlx::PgPool;
 use std::sync::Arc;
 
-// ── Outbox worker trait ───────────────────────────────────────
+// ── Outbox runner trait ───────────────────────────────────────
 
 /// Trait for outbox side-effects (Discord notifications, followups).
 /// Extracted from `dispatch_outbox_loop` to allow mock injection in tests.
@@ -375,7 +375,7 @@ pub(crate) async fn process_outbox_batch_with_pg<N: OutboxNotifier>(
     count
 }
 
-/// Worker loop that drains dispatch_outbox and executes Discord side-effects.
+/// Runner loop that drains dispatch_outbox and executes Discord side-effects.
 ///
 /// This is the SINGLE place where dispatch-related Discord HTTP calls originate.
 /// All other code paths insert into the outbox table and return immediately.
@@ -391,7 +391,7 @@ pub(crate) async fn dispatch_outbox_loop(
     tokio::time::sleep(Duration::from_secs(3)).await;
     tracing::info!(
         claim_owner,
-        "[dispatch-outbox] Worker started (adaptive backoff 500ms-5s)"
+        "[dispatch-outbox] Runner started (adaptive backoff 500ms-5s)"
     );
 
     let notifier = RealOutboxNotifier::new(pg_pool);
@@ -424,7 +424,7 @@ pub(crate) async fn dispatch_outbox_loop(
             continue;
         }
 
-        if cluster_runtime.is_leader() && last_wake.elapsed() >= wake_interval {
+        if cluster_runtime.is_hub() && last_wake.elapsed() >= wake_interval {
             match crate::services::dispatches::wait_queue::wake_waiting_dispatch_outbox_pg(
                 notifier.pg_pool.as_ref(),
                 &cluster_config,

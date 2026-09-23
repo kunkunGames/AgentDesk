@@ -11,19 +11,19 @@ pub(crate) mod maintenance;
 pub(crate) mod multinode_regression;
 mod outbox_actionable_delivery;
 mod outbox_delivery_alert;
-mod outbox_worker;
-use outbox_worker::message_outbox_loop;
+mod outbox_runner;
+use outbox_runner::message_outbox_loop;
 mod rate_limit_profiles;
 mod rate_limit_sync;
 use rate_limit_profiles::{sync_named_profile_rate_limits, upsert_rate_limit_cache_entry};
 pub(crate) mod resource_locks;
 pub mod routes;
 mod routine_script_audit;
+mod runner_recovery;
+mod runner_registry;
 mod startup_preflight;
 pub(crate) mod task_dispatch_claims;
 pub(crate) mod test_phase_runs;
-mod worker_recovery;
-mod worker_registry;
 pub mod ws;
 
 use std::sync::{Arc, OnceLock};
@@ -193,8 +193,8 @@ fn is_five_min_policy_tick(count: u64) -> bool {
     count != 0 && count % FIVE_MIN_POLICY_TICK_INTERVAL == 0
 }
 
-fn should_run_slo_api_friction_aggregation(count: u64, leader_epoch_pending: bool) -> bool {
-    leader_epoch_pending || is_five_min_policy_tick(count)
+fn should_run_slo_api_friction_aggregation(count: u64, hub_epoch_pending: bool) -> bool {
+    hub_epoch_pending || is_five_min_policy_tick(count)
 }
 
 async fn run_slo_api_friction_aggregation_tick(
@@ -225,7 +225,7 @@ async fn run_slo_api_friction_aggregation_tick(
     );
 }
 
-async fn run_leader_epoch_slo_api_friction_kickstart(
+async fn run_hub_epoch_slo_api_friction_kickstart(
     engine: &PolicyEngine,
     pg_pool: Option<&PgPool>,
 ) -> bool {
@@ -234,19 +234,19 @@ async fn run_leader_epoch_slo_api_friction_kickstart(
         match try_acquire_pg_singleton_lock(
             pool,
             POLICY_TICK_ADVISORY_LOCK_ID,
-            "policy-tick-leader-epoch",
+            "policy-tick-hub-epoch",
         )
         .await
         {
             Ok(Some(conn)) => Some(conn),
             Ok(None) => {
                 tracing::debug!(
-                    "[policy-tick] leader-epoch SLO/API-friction kickstart skipped: advisory lock held elsewhere"
+                    "[policy-tick] hub-epoch SLO/API-friction kickstart skipped: advisory lock held elsewhere"
                 );
                 return false;
             }
             Err(error) => {
-                tracing::warn!("[policy-tick] leader-epoch advisory lock failed: {error}");
+                tracing::warn!("[policy-tick] hub-epoch advisory lock failed: {error}");
                 return false;
             }
         }
@@ -254,15 +254,11 @@ async fn run_leader_epoch_slo_api_friction_kickstart(
         None
     };
 
-    run_slo_api_friction_aggregation_tick(engine, pool, "leader_epoch").await;
+    run_slo_api_friction_aggregation_tick(engine, pool, "hub_epoch").await;
 
     if let Some(conn) = advisory_lock {
-        release_pg_singleton_lock(
-            conn,
-            POLICY_TICK_ADVISORY_LOCK_ID,
-            "policy-tick-leader-epoch",
-        )
-        .await;
+        release_pg_singleton_lock(conn, POLICY_TICK_ADVISORY_LOCK_ID, "policy-tick-hub-epoch")
+            .await;
     }
 
     true
@@ -368,15 +364,15 @@ pub(crate) async fn run(
     drop(boot_reconcile_engine);
     drop(startup_pg_pool);
 
-    let mut worker_registry = worker_registry::SupervisedWorkerRegistry::new(
+    let mut runner_registry = runner_registry::SupervisedRunnerRegistry::new(
         config.clone(),
         engine.clone(),
         health_registry.clone(),
         pg_pool.clone().map(Arc::new),
         cluster_runtime,
     );
-    worker_registry.run_boot_only_steps().await?;
-    worker_registry.start_after_boot_reconcile()?;
+    runner_registry.run_boot_only_steps().await?;
+    runner_registry.start_after_boot_reconcile()?;
     if modules.dashboard {
         routes::receipt::spawn_token_analytics_cache_prewarm();
     }
@@ -392,7 +388,7 @@ pub(crate) async fn run(
     }
 
     let broadcast_tx = ws::new_broadcast();
-    let batch_buffer = worker_registry.start_after_websocket_broadcast(broadcast_tx.clone())?;
+    let batch_buffer = runner_registry.start_after_websocket_broadcast(broadcast_tx.clone())?;
     let dashboard_service = ServeDir::new(&dashboard_dir)
         .append_index_html_on_directories(true)
         .fallback(ServeFile::new(dashboard_dir.join("index.html")));
@@ -501,7 +497,7 @@ async fn policy_tick_loop(
     // started without Discord providers has no registry to hand over
     // (`launch.rs` calls `server::run(.., None, ..)`). What changed is only that
     // the tick now receives whatever the process actually has instead of
-    // discarding it — see `worker_registry::policy_tick_health_registry`. On a
+    // discarding it — see `runner_registry::policy_tick_health_registry`. On a
     // registry-less node the replay converges every PostgreSQL-visible part of
     // the cleanup and skips only the in-memory teardown, which is correct there
     // because there is no provider runtime to tear down.
@@ -510,30 +506,30 @@ async fn policy_tick_loop(
     tracing::info!("[policy-tick] 3-tier tick started: 30s / 1min / 5min");
 
     let mut count = 0u64;
-    let mut leader_epoch_slo_api_friction_pending = true;
+    let mut hub_epoch_slo_api_friction_pending = true;
 
     if shutdown
         .as_ref()
         .is_some_and(|flag| flag.load(Ordering::Acquire))
     {
-        tracing::info!("[policy-tick] shutdown requested before leader-epoch kickstart");
+        tracing::info!("[policy-tick] shutdown requested before hub-epoch kickstart");
         return;
     }
 
     if let Some(runtime) = cluster_runtime.as_ref()
-        && !runtime.is_leader()
+        && !runtime.is_hub()
     {
         tracing::warn!(
             instance_id = runtime.instance_id(),
-            "[policy-tick] self-fenced before leader-epoch kickstart after cluster leadership was lost"
+            "[policy-tick] self-fenced before hub-epoch kickstart after cluster hub ownership was lost"
         );
         return;
     }
 
-    if should_run_slo_api_friction_aggregation(count, leader_epoch_slo_api_friction_pending)
-        && run_leader_epoch_slo_api_friction_kickstart(&engine, pg_pool.as_deref()).await
+    if should_run_slo_api_friction_aggregation(count, hub_epoch_slo_api_friction_pending)
+        && run_hub_epoch_slo_api_friction_kickstart(&engine, pg_pool.as_deref()).await
     {
-        leader_epoch_slo_api_friction_pending = false;
+        hub_epoch_slo_api_friction_pending = false;
     }
 
     let mut interval_30s = tokio::time::interval(Duration::from_secs(30));
@@ -554,11 +550,11 @@ async fn policy_tick_loop(
         }
 
         if let Some(runtime) = cluster_runtime.as_ref()
-            && !runtime.is_leader()
+            && !runtime.is_hub()
         {
             tracing::warn!(
                 instance_id = runtime.instance_id(),
-                "[policy-tick] self-fenced after cluster leadership was lost"
+                "[policy-tick] self-fenced after cluster hub ownership was lost"
             );
             break;
         }
@@ -581,21 +577,19 @@ async fn policy_tick_loop(
             None
         };
 
-        let ran_slo_api_friction_this_tick = if should_run_slo_api_friction_aggregation(
-            count,
-            leader_epoch_slo_api_friction_pending,
-        ) {
-            let reason = if leader_epoch_slo_api_friction_pending {
-                "leader_epoch_retry"
+        let ran_slo_api_friction_this_tick =
+            if should_run_slo_api_friction_aggregation(count, hub_epoch_slo_api_friction_pending) {
+                let reason = if hub_epoch_slo_api_friction_pending {
+                    "hub_epoch_retry"
+                } else {
+                    "five_min_tick"
+                };
+                run_slo_api_friction_aggregation_tick(&engine, pg_pool.as_deref(), reason).await;
+                hub_epoch_slo_api_friction_pending = false;
+                true
             } else {
-                "five_min_tick"
+                false
             };
-            run_slo_api_friction_aggregation_tick(&engine, pg_pool.as_deref(), reason).await;
-            leader_epoch_slo_api_friction_pending = false;
-            true
-        } else {
-            false
-        };
 
         // ── 30s tier: every tick ── (#134: fire by name for dynamic hook binding)
         fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick30s", "30s").await;
@@ -1021,17 +1015,17 @@ impl ClaudeRateLimitRefreshOutcome {
     }
 }
 
-pub(crate) fn spawn_claude_rate_limit_refresh_if_leader(
+pub(crate) fn spawn_claude_rate_limit_refresh_if_hub(
     pg_pool: PgPool,
 ) -> ClaudeRateLimitRefreshOutcome {
-    if !worker_registry::rate_limit_sync_active() {
+    if !runner_registry::rate_limit_sync_active() {
         return ClaudeRateLimitRefreshOutcome::skipped("rate_limit_sync_not_active_on_this_node");
     }
 
     tokio::spawn(async move {
         match tokio::time::timeout(
             CLAUDE_RATE_LIMIT_FORCED_REFRESH_TIMEOUT,
-            trigger_claude_rate_limit_refresh_if_leader(&pg_pool),
+            trigger_claude_rate_limit_refresh_if_hub(&pg_pool),
         )
         .await
         {
@@ -1063,10 +1057,10 @@ pub(crate) fn spawn_claude_rate_limit_refresh_if_leader(
     ClaudeRateLimitRefreshOutcome::scheduled()
 }
 
-pub(crate) async fn trigger_claude_rate_limit_refresh_if_leader(
+pub(crate) async fn trigger_claude_rate_limit_refresh_if_hub(
     pg_pool: &PgPool,
 ) -> ClaudeRateLimitRefreshOutcome {
-    if !worker_registry::rate_limit_sync_active() {
+    if !runner_registry::rate_limit_sync_active() {
         return ClaudeRateLimitRefreshOutcome::skipped("rate_limit_sync_not_active_on_this_node");
     }
 
@@ -1091,15 +1085,15 @@ pub(crate) async fn trigger_claude_rate_limit_refresh_if_leader(
 /// and the current agent/channel bindings. Runs off the hot dispatch path (once
 /// per ~120s rate-limit tick), so any DB cost here never touches activation.
 ///
-/// Note: `RateLimitSync` is leader-only, so this leader-side refresh only keeps
-/// the leader's snapshots warm. Non-leader serving nodes refresh their own
+/// Note: `RateLimitSync` is hub-only, so this hub-side refresh only keeps
+/// the hub's snapshots warm. Non-hub serving nodes refresh their own
 /// process-local snapshots lazily from the shared DB cache on the activation
 /// path (`dispatch_gate::refresh_snapshots_if_stale`), so the gate is populated
 /// on every node — not silently a no-op on followers.
 async fn refresh_dispatch_gate_snapshots(pg_pool: &PgPool) {
     let now = chrono::Utc::now().timestamp();
     crate::services::dispatch_gate::refresh_snapshots_from_db(pg_pool, now).await;
-    // Record the refresh so the activation-path throttle treats the leader's
+    // Record the refresh so the activation-path throttle treats the hub's
     // snapshots as fresh and does not redundantly re-read the cache here.
     crate::services::dispatch_gate::mark_snapshots_refreshed(now);
 }
@@ -1109,7 +1103,7 @@ mod policy_tick_schedule_tests {
     use super::{is_five_min_policy_tick, should_run_slo_api_friction_aggregation};
 
     #[test]
-    fn slo_api_friction_aggregation_runs_while_leader_epoch_is_pending() {
+    fn slo_api_friction_aggregation_runs_while_hub_epoch_is_pending() {
         assert!(should_run_slo_api_friction_aggregation(0, true));
         assert!(should_run_slo_api_friction_aggregation(1, true));
         assert!(should_run_slo_api_friction_aggregation(9, true));
@@ -1896,7 +1890,7 @@ async fn github_sync_loop(pg_pool: Arc<PgPool>, interval_minutes: u64) {
     }
 }
 
-/// Async worker that drains the message_outbox table via the in-process Discord delivery path (#120).
+/// Async runner that drains the message_outbox table via the in-process Discord delivery path (#120).
 /// Runs every 2 seconds, processes up to 10 messages per tick.
 #[derive(Clone, Debug)]
 struct PendingMessageOutboxRow {
@@ -2381,7 +2375,7 @@ mod message_outbox_retry_tests {
     async fn drain_fences_superseded_circuit_row_before_delivery_pg() {
         let Some(pg_db) = crate::dispatch::test_support::DispatchPostgresTestDb::try_create(
             "agentdesk_drain_delivery_fence",
-            "worker delivery fence drain integration",
+            "runner delivery fence drain integration",
         )
         .await
         else {

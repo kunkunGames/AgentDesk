@@ -526,11 +526,11 @@ async fn restart_recovery_does_not_repost_prior_typed_dispatch_delivery_pg() {
 
     seed_agent_pg(&pool).await;
     sqlx::query(
-        "INSERT INTO worker_nodes (
+        "INSERT INTO cluster_nodes (
             instance_id, hostname, process_id, role, effective_role, status,
             labels, capabilities, last_heartbeat_at, started_at, updated_at
          ) VALUES (
-            'restart-test', 'restart-host', 100, 'worker', 'worker', 'online',
+            'restart-test', 'restart-host', 100, 'runner', 'runner', 'online',
             $1, $2, NOW(), NOW(), NOW()
          )",
     )
@@ -538,7 +538,7 @@ async fn restart_recovery_does_not_repost_prior_typed_dispatch_delivery_pg() {
     .bind(serde_json::json!({"providers": ["codex", "claude"]}))
     .execute(&pool)
     .await
-    .expect("seed restart worker node");
+    .expect("seed restart runner node");
     seed_card_pg(&pool, "card-pg-restart-delivery", "in_progress").await;
     sqlx::query(
         "INSERT INTO task_dispatches (
@@ -622,7 +622,7 @@ async fn restart_recovery_does_not_repost_prior_typed_dispatch_delivery_pg() {
     assert_eq!(recovered_status, "pending");
     assert!(
         recovered_claim_owner.is_none(),
-        "boot recovery must clear stale claim_owner so the restarted worker can claim"
+        "boot recovery must clear stale claim_owner so the restarted runner can claim"
     );
 
     let transport = RestartGuardTransport::default();
@@ -819,7 +819,7 @@ async fn runtime_reconcile_auto_queue_pending_delivery_orphans_requeues_notify_o
             'failed',
             $1::jsonb,
             NOW() - INTERVAL '9 minutes',
-            'old-worker',
+            'old-runner',
             $2::jsonb
          ),
          (
@@ -836,7 +836,7 @@ async fn runtime_reconcile_auto_queue_pending_delivery_orphans_requeues_notify_o
             'failed',
             $1::jsonb,
             NOW() - INTERVAL '9 minutes',
-            'old-worker',
+            'old-runner',
             $2::jsonb
          )",
     )
@@ -935,7 +935,7 @@ async fn runtime_reconcile_auto_queue_pending_delivery_orphans_requeues_notify_o
     .expect("load live notify row");
     assert_eq!(
         untouched_live,
-        ("failed".to_string(), 7, Some("old-worker".to_string()))
+        ("failed".to_string(), 7, Some("old-runner".to_string()))
     );
 
     let runtime_states: Vec<(String, String, String)> = sqlx::query_as(

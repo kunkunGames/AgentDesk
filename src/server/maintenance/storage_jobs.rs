@@ -32,7 +32,7 @@ const STORAGE_DB_RETENTION_STARTUP_STAGGER: Duration = Duration::from_secs(90);
 /// weekly memento consolidation trails every other job at startup.
 const MEMORY_MEMENTO_CONSOLIDATION_STARTUP_STAGGER: Duration = Duration::from_secs(110);
 
-/// #3909 — leader-only voice TTS cache/temp sweep (pool-less thin wrapper; the
+/// #3909 — hub-only voice TTS cache/temp sweep (pool-less thin wrapper; the
 /// sweep logic + full rationale live in
 /// `services::maintenance::jobs::voice_cache_sweep`). The `config` is resolved
 /// from the loaded runtime `VoiceConfig` (same dirs the TTS write path uses, so
@@ -188,8 +188,8 @@ impl MaintenanceJob for StorageHangDumpCleanupJob {
 /// #1093 / #3231 — weekly postgres retention sweep. Reuses
 /// `services::maintenance::jobs::db_retention::db_retention_job` verbatim.
 /// PG-only; the live scheduler always has a pool — the
-/// `ServerWorkerId::MaintenanceScheduler` arm in `worker_registry.rs` skips the
-/// whole worker when none is available — so no skip branch is needed here.
+/// `ServerRunnerId::MaintenanceScheduler` arm in `runner_registry.rs` skips the
+/// whole runner when none is available — so no skip branch is needed here.
 pub(super) struct StorageDbRetentionJob;
 
 impl MaintenanceJob for StorageDbRetentionJob {

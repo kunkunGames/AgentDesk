@@ -62,8 +62,8 @@ async fn postgres_migration_relocation_preserves_data_and_serializes_upgrade() {
     drop(conn);
     let before = history(&pool).await;
     let (a, b) = tokio::join!(migrate(&pool), migrate(&pool));
-    a.expect("leader upgrade");
-    b.expect("concurrent worker upgrade");
+    a.expect("hub upgrade");
+    b.expect("concurrent runner upgrade");
     let after = history(&pool).await;
     for mut original in before.as_array().unwrap().clone() {
         let old_version = original["version"].as_i64().unwrap();

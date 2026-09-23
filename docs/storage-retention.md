@@ -14,7 +14,7 @@ Prerequisite context:
   `spawn_maintenance_scheduler`) — **dead as of #5463**: it has zero registered
   jobs and zero callers, so the dynamic slice of `/api/cron-jobs`
   (`services::maintenance::list_maintenance_jobs`) is permanently empty. Every
-  job below actually runs on the leader-only `src/server/maintenance` registry.
+  job below actually runs on the hub-only `src/server/maintenance` registry.
 - [#1092 / 909-3] Storage maintenance jobs wired: `target_sweep`,
   `worktree_orphan_sweep`, `hang_dump_cleanup`.
 - [#1093 / 909-4] DB retention job wired: `db_retention`.
@@ -69,7 +69,7 @@ Each row is a (vector × action × job) tuple. If a vector is not in this table,
 | `dcserver.stdout.log`                         | 100 MB × 10 files by default            | Internal dcserver tracing writer rotates before append; launchd stdout/stderr are bootstrap-only | Built into `logging.rs` startup    | Continuous |
 
 Job implementations live under `src/services/maintenance/jobs/`; the production
-leader-only wrappers are registered by `src/server/maintenance`. Prompt-manifest
+hub-only wrappers are registered by `src/server/maintenance`. Prompt-manifest
 retention lives in `src/db/prompt_manifests/retention.rs` (status API in
 `src/server/routes/prompt_manifest_retention.rs`).
 
@@ -164,7 +164,7 @@ If post-rebuild size exceeds **30 GB**, something is wrong — see §6.
 
 ### 3.5 Enable automated maintenance
 
-The leader-only scheduler starts the jobs registered in
+The hub-only scheduler starts the jobs registered in
 `src/server/maintenance` on server boot. No operator action is required beyond
 restarting `dcserver` after the deploy. Verify:
 

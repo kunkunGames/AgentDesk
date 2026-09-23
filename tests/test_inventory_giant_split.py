@@ -139,6 +139,29 @@ class InventoryTrackingContractTest(unittest.TestCase):
 
 
 class ProdTestSplitTest(unittest.TestCase):
+    def test_file_module_declaration_counts_as_test_without_absorbing_production(self) -> None:
+        for predicate in ("test", 'all(test, feature = "integration")'):
+            with self.subTest(predicate=predicate):
+                text = (
+                    "pub fn before() {}\n"
+                    f"#[cfg({predicate})]\n"
+                    '#[path = "integration_tests.rs"]\n'
+                    "pub(crate) mod integration_tests;\n"
+                    "pub fn after() {}\n"
+                )
+                self.assertEqual(GEN.split_prod_test_lines(text), (2, 3))
+                self.assertEqual(GEN.test_line_numbers(text), {2, 3, 4})
+
+    def test_file_module_available_in_production_stays_production(self) -> None:
+        for predicate in ("not(test)", 'any(test, feature = "integration")'):
+            with self.subTest(predicate=predicate):
+                text = f"#[cfg({predicate})]\nmod integration;\n"
+                self.assertEqual(GEN.split_prod_test_lines(text), (2, 0))
+
+    def test_file_module_inside_inline_test_module_is_not_double_counted(self) -> None:
+        text = "#[cfg(test)]\nmod tests {\n#[cfg(test)]\nmod fixture;\n}\n"
+        self.assertEqual(GEN.split_prod_test_lines(text), (0, 5))
+
     def test_cfg_test_mod_block_counts_as_test(self) -> None:
         text = _src(
             """

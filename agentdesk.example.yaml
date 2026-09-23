@@ -5,7 +5,6 @@ server:
 cluster:
   # Roles: hub = Hub, runner = Runner, auto = Automatic.
   # Feature mode: runtime_profile full = Full features, runner = Execution only.
-  # Legacy role leader/worker and runtime_profile worker remain accepted aliases.
   # With clustering disabled, the dashboard shows This computer / Standalone.
   enabled: false
   role: auto
@@ -20,13 +19,13 @@ cluster:
     example-main-node:
       max_concurrent_dispatches: 4
       trusted_forward_origin: "https://main.example.net:8791"
-    example-worker-node:
+    example-runner-node:
       max_concurrent_dispatches: 4
       # Private RFC1918, IPv6 ULA, and Tailscale CGNAT addresses require this
       # node-specific opt-in. Loopback, link-local, metadata, unspecified,
       # multicast, and deprecated IPv6 site-local fec0::/10 targets remain
       # blocked on every transport even when the opt-in is true.
-      trusted_forward_origin: "https://worker.tailnet.example:8791"
+      trusted_forward_origin: "https://runner.tailnet.example:8791"
       allow_private_forwarding: true
       # Cleartext HTTP exposes the shared bearer to the private network. Use only
       # for an operator-controlled private/Tailscale development origin, and only
@@ -42,7 +41,7 @@ cluster:
     wait_timeout_secs: 600
     wake_interval_secs: 30
   # Intake routing is opt-in. Keep disabled until runners advertise
-  # intake_worker capability and the operator is ready to test observe/enforce.
+  # intake_runner capability and the operator is ready to test observe/enforce.
   intake_routing:
     enabled: false
     mode: "observe"
@@ -58,7 +57,7 @@ cluster:
   # ordering silently decides where sessions live. Set it to pin the gateway to
   # one instance: a non-preferred node yields the lease when this node is
   # online, and takes it when this node is offline (failover is unchanged).
-  # gateway_preferred_instance_id: "mac-book-release"
+  # gateway_preferred_instance_id: "example-main-node"
   # gateway_yield_grace_secs: 90
 
 discord:
@@ -246,11 +245,11 @@ agents:
     department: engineering
 
   # ─── Multi-provider Discord E2E cells ────────────────────────────────
-  # Each worker owns one (provider, runtime) cell and one channel under
+  # Each runner owns one (provider, runtime) cell and one channel under
   # the `ADK E2E` Discord category. Channel IDs below are placeholders —
   # `scripts/setup-multi-provider-e2e.sh` provisions the real category +
   # channels through the announce bot and emits the ids to paste in.
-  # The orchestrator drives fan-out by `send-to-agent` to each worker.
+  # The orchestrator drives fan-out by `send-to-agent` to each runner.
   - id: adk-claude-pipe-e2e
     name: "ADK Claude pipe E2E"
     name_ko: "ADK Claude pipe E2E"
@@ -318,7 +317,7 @@ agents:
         workspace: "~/.adk/release/workspaces/adk-e2e-orchestrator"
         prompt_file: "~/.adk/release/config/agents/adk-e2e-orchestrator.prompt.md"
         # Orchestrator itself does not exercise a provider runtime — it
-        # only dispatches to workers. Pick pipe so the channel stays light.
+        # only dispatches to runners. Pick pipe so the channel stays light.
         runtime: pipe
     keywords: ["e2e", "orchestrator", "전체"]
     department: devsecops
@@ -447,7 +446,7 @@ prompt_manifest_retention:
   per_layer_max_bytes_adk_provided: 65536
   per_layer_max_bytes_user_derived: 16384
 
-# JS routine worker 설정입니다. 기본값은 enabled=false, dir=./routines, tick=30초이며 PostgreSQL 없이는 실행되지 않습니다.
+# JS routine runner 설정입니다. 기본값은 enabled=false, dir=./routines, tick=30초이며 PostgreSQL 없이는 실행되지 않습니다.
 # 운영 자동화 루틴을 켤 때 enabled를 true로 바꾸고 additional_dirs로 operator script를 덧붙이세요.
 # routines:
 #   enabled: false

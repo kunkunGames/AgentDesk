@@ -331,7 +331,7 @@ pub(super) async fn handle_runtime_handoff_loop_message(
                         // (Phase 5.2) so the post lands on Discord
                         // even without the gateway runtime.
                         //
-                        // Leader path is unchanged: when
+                        // Hub path is unchanged: when
                         // `cached_serenity_ctx` is set, spawn the
                         // watcher as before so streaming partial
                         // output continues to work.
@@ -340,7 +340,7 @@ pub(super) async fn handle_runtime_handoff_loop_message(
                             // Phase 5.3 of intake-node-routing (issue #2011):
                             // skip the watcher entirely on standby and
                             // spawn the standalone JSONL → Discord relay
-                            // task instead. The watcher's leader-only
+                            // task instead. The watcher's hub-only
                             // state machine prevents its relay step from
                             // firing on standby nodes; bypassing it
                             // sidesteps an entire class of

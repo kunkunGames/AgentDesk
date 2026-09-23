@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run the AgentDesk Discord relay E2E matrix.
 
-This is the operator/orchestrator entry point. It drives worker channels from
-outside those workers, so a worker never runs a driver against its own mailbox.
+This is the operator/orchestrator entry point. It drives runner channels from
+outside those runners, so a runner never runs a driver against its own mailbox.
 """
 
 from __future__ import annotations
@@ -754,7 +754,7 @@ def run_cross_channel_scenario(
             "provider": participant["provider"],
             "runtime": participant["runtime"],
             "channel_id": participant["channel_id"],
-            "worker_agent": participant["handoff_to_agent"],
+            "runner_agent": participant["handoff_to_agent"],
             "provider_identity": participant["provider_identity"],
             "marker": participant["marker"],
         }

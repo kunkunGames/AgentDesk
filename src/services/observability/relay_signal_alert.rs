@@ -21,7 +21,7 @@
 //!     1-hour TTL so each signal alerts at most once per hour.
 //!   * Delivery reuses the existing `message_outbox` enqueue path with the
 //!     announce bot because a threshold breach is operator-actionable. The
-//!     shared #4449 worker policy falls back to notify only if announce delivery
+//!     shared #4449 runner policy falls back to notify only if announce delivery
 //!     fails; cooldown and target off-switches still bound turn creation.
 //!   * Double off-switch: the alert target (`kanban_human_alert_channel_id`)
 //!     being unset short-circuits to 0 alerts, so an unconfigured deploy is
@@ -177,7 +177,7 @@ async fn enqueue_relay_alert_pg(
     now_ms: i64,
 ) -> Result<bool> {
     // Claim the dedupe slot atomically *before* enqueueing so concurrent
-    // leaders cannot double-post the same signal in the same window.
+    // hubs cannot double-post the same signal in the same window.
     if !claim_relay_alert_slot_pg(pool, dedupe_key, now_ms).await? {
         return Ok(false);
     }

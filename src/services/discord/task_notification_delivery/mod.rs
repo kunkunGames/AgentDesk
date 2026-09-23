@@ -752,7 +752,7 @@ async fn ensure_card_with_metadata<T: TaskCardTransport>(
             }
             CardClaim::Busy { bot_key } => {
                 return Err(CardEnsureError::Busy(format!(
-                    "another worker owns the card lease (bot={bot_key})"
+                    "another runner owns the card lease (bot={bot_key})"
                 )));
             }
         }
@@ -762,7 +762,7 @@ async fn ensure_card_with_metadata<T: TaskCardTransport>(
 
 /// Replace a task card only after Discord authoritatively rejects it as a
 /// required response reference. The old message id is an exact CAS input: a
-/// concurrent worker that already installed a replacement returns that card
+/// concurrent runner that already installed a replacement returns that card
 /// instead of issuing another POST.
 pub(in crate::services::discord) async fn replace_confirmed_missing_card<T: TaskCardTransport>(
     pool: Option<&PgPool>,
@@ -792,7 +792,7 @@ pub(in crate::services::discord) async fn replace_confirmed_missing_card<T: Task
             }
             store::MissingCardReplacementClaim::Busy { bot_key } => {
                 return Err(CardEnsureError::Busy(format!(
-                    "another worker owns the missing-card replacement lease (bot={bot_key})"
+                    "another runner owns the missing-card replacement lease (bot={bot_key})"
                 )));
             }
             store::MissingCardReplacementClaim::Owned(claimed) => {

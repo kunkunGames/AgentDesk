@@ -105,7 +105,7 @@ pub(super) async fn ensure_rollout_ready(pool: &PgPool) -> Result<(), AppError> 
         Ok(true) => Ok(()),
         Ok(false) => Err(app_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "discordMentionUserIds requires every online worker to advertise discord_mention_consumer_v1",
+            "discordMentionUserIds requires every online runner to advertise discord_mention_consumer_v1",
         )),
         Err(error) => Err(app_error(
             StatusCode::INTERNAL_SERVER_ERROR,

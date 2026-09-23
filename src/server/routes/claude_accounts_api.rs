@@ -88,7 +88,7 @@ pub async fn switch_claude_account(
     );
 
     let rate_limit_refresh = if let Some(pg_pool) = state.pg_pool.clone() {
-        match serde_json::to_value(crate::server::spawn_claude_rate_limit_refresh_if_leader(
+        match serde_json::to_value(crate::server::spawn_claude_rate_limit_refresh_if_hub(
             pg_pool,
         )) {
             Ok(value) => value,

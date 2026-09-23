@@ -545,7 +545,7 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
     // (no self-deadlock) while still waiting on a genuinely distinct previous turn.
     let current_turn_anchor_id: Option<u64>;
     // #3154 P1-3: function-scope so the post-block bridge-tail guard reads it; set
-    // true when the synthetic turn-start is deferred to the detached worker, so the
+    // true when the synthetic turn-start is deferred to the detached runner, so the
     // observer skips its own BridgeAdapter tail (no duplicate relay).
     let deferred_synthetic_start: bool;
     if suppresses_user_turn_lifecycle {
@@ -669,10 +669,10 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             "passive system injections must not reach active-turn handling",
         );
         // #3154 P1-3 / #4002 / #4082: run the shared synthetic-start wiring. It reads the
-        // prior-turn view and either DEFERS to the detached per-channel worker when
+        // prior-turn view and either DEFERS to the detached per-channel runner when
         // a prior turn is still draining — the observer then must NOT spawn its own
         // BridgeAdapter tail below (a second observer tail would relay the SAME
-        // output twice — the original bug); the worker owns the relay-owner handoff
+        // output twice — the original bug); the runner owns the relay-owner handoff
         // — else INLINE-claims a passive synthetic inflight and adopts the resolved
         // relay_owner into `lease` for the post-block bridge-tail ownership guard.
         // The helper also carries the classifier-derived external-turn gate so a
@@ -713,7 +713,7 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
     #[cfg(unix)]
     {
         // #3154 P1-3: when the synthetic turn-start was deferred, the detached
-        // worker owns the relay-owner handoff (it claims after the prior turn
+        // runner owns the relay-owner handoff (it claims after the prior turn
         // drains and re-records the lease as the watcher owner). The observer
         // must NOT also spawn a BridgeAdapter tail here on the pre-claim lease,
         // or the SAME output relays twice once the watcher claims.

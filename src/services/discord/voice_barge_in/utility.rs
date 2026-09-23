@@ -69,7 +69,7 @@ pub(in crate::services::discord) const INTERNAL_VOICE_MESSAGE_ID_START: u64 =
 
 /// `true` iff `msg_id` is a synthetic voice-originated id (≥
 /// `INTERNAL_VOICE_MESSAGE_ID_START`). Real Discord snowflakes encode
-/// timestamps and worker/process/sequence fields and stay well below 2^63
+/// timestamps and runner/process/sequence fields and stay well below 2^63
 /// for the foreseeable future, so the 9e18 prefix is safely above them.
 /// Used by the message intake to skip ⏳/📬 reactions, placeholder POSTs,
 /// and `message_reference` lookups that would fail with "Unknown message"

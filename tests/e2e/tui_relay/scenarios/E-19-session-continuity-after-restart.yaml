@@ -7,7 +7,7 @@ isolation: required
 destructive: true
 acceptance_criteria:
   - Give the live TUI session a secret token before restart without relaying it.
-  - Capture the worker tmux session identity before restart.
+  - Capture the runner tmux session identity before restart.
   - Restart dcserver with the existing destructive guard.
   - Assert the tmux pane ids, pane pids, cwd, and session name are unchanged.
   - Verify a post-restart prompt recalls the secret token and health counters drain.

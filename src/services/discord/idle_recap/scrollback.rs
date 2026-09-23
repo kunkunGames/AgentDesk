@@ -75,7 +75,7 @@ pub(crate) async fn capture_transcript_scrollback(
         .flatten()
 }
 
-/// Synchronous worker for `capture_transcript_scrollback`. Splits out so
+/// Synchronous runner for `capture_transcript_scrollback`. Splits out so
 /// the parsing logic is unit-testable without an async runtime.
 pub(super) fn extract_transcript_tail_text(transcript_path: &std::path::Path) -> Option<String> {
     use std::collections::VecDeque;

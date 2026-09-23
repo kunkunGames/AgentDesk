@@ -67,10 +67,10 @@ pub(super) async fn run_bot_rehydrate_voice_handoffs(pg_pool: &Option<sqlx::PgPo
 
 /// Build the voice receive hook (when barge-in is enabled), construct the
 /// `VoiceReceiver`, and spawn the barge-in sensitivity-TTL-reset and progress
-/// workers. Returns the `VoiceReceiver` so run_bot can hand it to the poise
+/// runners. Returns the `VoiceReceiver` so run_bot can hand it to the poise
 /// framework setup. Runs after SharedData is built and before the intake
-/// worker spawn — order preserved.
-pub(super) fn run_bot_init_voice_workers(
+/// runner spawn — order preserved.
+pub(super) fn run_bot_init_voice_runners(
     voice_config: &crate::voice::VoiceConfig,
     voice_barge_in: &Arc<voice_barge_in::VoiceBargeInRuntime>,
     shared: &Arc<SharedData>,
@@ -87,7 +87,7 @@ pub(super) fn run_bot_init_voice_workers(
     let voice_receiver =
         crate::voice::VoiceReceiver::from_voice_config_with_hook(voice_config, voice_hook);
     voice_barge_in.spawn_sensitivity_ttl_reset(shared.restart.shutdown_reader());
-    voice_barge_in.spawn_progress_worker(shared.clone(), shared.restart.shutdown_reader());
+    voice_barge_in.spawn_progress_runner(shared.clone(), shared.restart.shutdown_reader());
     voice_receiver
 }
 
@@ -120,7 +120,7 @@ pub(super) fn voice_bootstrap_plan(
 }
 
 /// Start the rejoin supervisor (whenever voice is enabled) and auto-join
-/// configured voice channels (leader-only). The gating lives inside
+/// configured voice channels (hub-only). The gating lives inside
 /// (`voice_bootstrap_plan`) so the call site is unconditional. Async because it
 /// reads `shared_clone.settings` before spawning.
 pub(super) async fn run_bot_spawn_voice_auto_join(

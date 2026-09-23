@@ -99,7 +99,7 @@ pub(crate) fn discord_pending_queue_root() -> Option<PathBuf> {
 /// #3154: durable store for TUI-direct synthetic turn-starts that must be
 /// claimed only AFTER the prior turn on the same channel finalizes. A wakeup/
 /// loop turn writes one record here (before any wait); a detached per-channel
-/// worker claims it post-drain and deletes the record. Restored on startup so a
+/// runner claims it post-drain and deletes the record. Restored on startup so a
 /// dcserver restart mid-wait neither loses the turn nor resubmits the prompt.
 pub(crate) fn tui_direct_pending_start_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("discord_tui_direct_pending_start"))

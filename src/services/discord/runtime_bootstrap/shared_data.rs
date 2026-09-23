@@ -158,8 +158,8 @@ pub(super) fn run_bot_build_shared_data(
         restart: RestartLifecycle {
             recovering_channels: dashmap::DashMap::new(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            intake_worker_lifecycle:
-                crate::services::cluster::intake_worker::IntakeWorkerLifecycle::default(),
+            intake_runner_lifecycle:
+                crate::services::cluster::intake_runner::IntakeRunnerLifecycle::default(),
             finalizing_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             current_generation: process_generation,
             restart_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),

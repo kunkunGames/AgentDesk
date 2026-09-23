@@ -213,7 +213,7 @@ async fn handle_send(
     // P3 #4616: `handle_send_with_backend` acquires the per-pane composer mutation
     // lock (a `std::sync::Mutex`) and holds it across the blocking tmux paste +
     // Enter, which can wait several seconds behind a busy-pane auto `/compact`.
-    // Blocking a tokio worker thread on a std Mutex starves the async runtime, so
+    // Blocking a tokio runner thread on a std Mutex starves the async runtime, so
     // run the whole blocking section on a blocking thread — matching the other
     // composer holders, which already offload via `spawn_blocking`
     // (`claude_stop_delivery`, `claude_compact_trigger`).
@@ -224,7 +224,7 @@ async fn handle_send(
         Err(join_error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(error_json(&format!(
-                "tui send worker join error: {join_error}"
+                "tui send runner join error: {join_error}"
             ))),
         ),
     }
@@ -775,19 +775,19 @@ mod tests {
     /// P3 #4616 regression: the async `handle_send` must offload its blocking
     /// composer-lock wait (`handle_send_with_backend` holds a `std::sync::Mutex`
     /// across the tmux paste + Enter) onto a blocking thread via `spawn_blocking`,
-    /// so it never blocks a tokio runtime worker. On a current-thread runtime, a
+    /// so it never blocks a tokio runtime runner. On a current-thread runtime, a
     /// concurrently-spawned canary task must still make progress WHILE the handler
     /// is parked on a composer lock held elsewhere.
     ///
     /// Guard removal: reverting `handle_send` to call `handle_send_with_backend`
-    /// directly (no `spawn_blocking`) blocks the single runtime worker on the std
+    /// directly (no `spawn_blocking`) blocks the single runtime runner on the std
     /// Mutex for the whole composer hold, so the canary cannot be polled until the
     /// lock releases — the observer samples `false` and this test fails. The
     /// composer hold is time-bounded on an independent std thread, so the pre-fix
     /// behaviour fails cleanly rather than hanging.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn handle_send_offloads_blocking_composer_wait_off_the_runtime_worker() {
+    async fn handle_send_offloads_blocking_composer_wait_off_the_runtime_runner() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;
         use std::time::Duration;
@@ -815,7 +815,7 @@ mod tests {
             .recv_timeout(Duration::from_millis(500))
             .expect("compact must acquire the composer lock first");
 
-        // Canary task: flips the flag the moment the runtime worker polls it.
+        // Canary task: flips the flag the moment the runtime runner polls it.
         let canary = std::sync::Arc::new(AtomicBool::new(false));
         let canary_task = std::sync::Arc::clone(&canary);
         tokio::spawn(async move {
@@ -823,7 +823,7 @@ mod tests {
         });
 
         // Observer runs OFF the runtime: it samples the canary mid-hold-window, so
-        // it can witness worker starvation the starved runtime could not report.
+        // it can witness runner starvation the starved runtime could not report.
         let observer_canary = std::sync::Arc::clone(&canary);
         let (observed_tx, observed_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -833,8 +833,8 @@ mod tests {
                 .expect("report mid-window canary sample");
         });
 
-        // Drive the async handler; awaiting it must free the worker (fix) so the
-        // runtime can poll the canary while the blocking paste waits off-worker.
+        // Drive the async handler; awaiting it must free the runner (fix) so the
+        // runtime can poll the canary while the blocking paste waits off-runner.
         let backend: Arc<dyn SendBackend> = Arc::new(FakeSendBackend);
         let req = SendRequest {
             session_name: session.clone(),
@@ -848,7 +848,7 @@ mod tests {
             .expect("observer must report the mid-window canary sample");
         assert!(
             observed_mid_window,
-            "the current-thread runtime worker must stay free to poll other tasks while /tui/send is parked on the composer lock"
+            "the current-thread runtime runner must stay free to poll other tasks while /tui/send is parked on the composer lock"
         );
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body.0["ok"], true);

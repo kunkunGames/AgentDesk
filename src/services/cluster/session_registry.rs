@@ -9,7 +9,7 @@
 //!
 //! - **Single source of truth (per process)**: each dcserver process owns
 //!   exactly one registry, exposed via [`global_session_registry`]. Discovery
-//!   runs on every node (worker-local — tmux is host-scoped) and writes only
+//!   runs on every node (runner-local — tmux is host-scoped) and writes only
 //!   to its own `instance_id` slice via [`SessionRegistry::reconcile_for_node`].
 //!   Multiple readers (HTTP diagnostic endpoint, future supervisor) share the
 //!   same in-memory state.
@@ -46,8 +46,8 @@ const CHANGE_CHANNEL_CAPACITY: usize = 256;
 ///
 /// `instance_id` is the cluster instance whose dcserver process observed this
 /// session via its local `tmux list-sessions`. Discovery runs on every node
-/// (worker-local) so the supervisor can match watcher placement to host —
-/// tmux is host-scoped and a leader on machine A cannot drive a session on
+/// (runner-local) so the supervisor can match watcher placement to host —
+/// tmux is host-scoped and a hub on machine A cannot drive a session on
 /// machine B. The field is `Option<String>` only to keep legacy / test
 /// fixtures simple; production callers always set it.
 #[derive(Clone, Debug, PartialEq, Eq)]

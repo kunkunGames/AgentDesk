@@ -1,7 +1,7 @@
 //! Ownerless placement: per-agent primary, compatible fallback, and bounded capacity.
 use super::*;
 use crate::services::cluster::intake_routing::{
-    IntakeRouteTarget, LocalRouteReason, candidates_from_worker_nodes_json, pick_intake_target,
+    IntakeRouteTarget, LocalRouteReason, candidates_from_cluster_nodes_json, pick_intake_target,
 };
 use crate::services::cluster::{
     attachment_transfer, execution_capacity, intake_routing, readiness,
@@ -66,9 +66,9 @@ pub(super) async fn route_by_preference(
     }
 
     let auth_profile = readiness::expected_auth_profile(ctx.provider, ctx.channel_id, &agent_id);
-    let mut candidates = match crate::services::cluster::node_registry::list_worker_nodes(
+    let mut candidates = match crate::services::cluster::node_registry::list_cluster_nodes(
         pool,
-        worker_heartbeat_lease_secs(),
+        runner_heartbeat_lease_secs(),
     )
     .await
     {
@@ -96,7 +96,7 @@ pub(super) async fn route_by_preference(
             if capacity_aware {
                 execution_capacity::rank(&mut eligible_nodes);
             }
-            candidates_from_worker_nodes_json(&eligible_nodes)
+            candidates_from_cluster_nodes_json(&eligible_nodes)
         }
         Err(error) => {
             if !requirements.is_empty() || capacity_aware {
@@ -104,7 +104,7 @@ pub(super) async fn route_by_preference(
             }
             return apply_observe_mode(
                 ctx.mode,
-                preferred_label_dependency_fallback(format!("list worker_nodes: {error}")),
+                preferred_label_dependency_fallback(format!("list cluster_nodes: {error}")),
             );
         }
     };
@@ -115,35 +115,35 @@ pub(super) async fn route_by_preference(
                 &candidates,
                 primary,
                 &preferred_labels,
-                ctx.leader_instance_id,
+                ctx.hub_instance_id,
             )
         } else if requirements.is_empty() && !capacity_aware {
-            pick_intake_target(&candidates, &preferred_labels, ctx.leader_instance_id)
+            pick_intake_target(&candidates, &preferred_labels, ctx.hub_instance_id)
         } else {
             intake_routing::pick_required_intake_target(
                 &candidates,
                 &preferred_labels,
-                ctx.leader_instance_id,
+                ctx.hub_instance_id,
             )
         };
         let target = match selection {
-            IntakeRouteTarget::Worker { instance_id } => instance_id,
+            IntakeRouteTarget::Runner { instance_id } => instance_id,
             IntakeRouteTarget::Local { reason } => {
                 if (!requirements.is_empty() || capacity_aware)
-                    && reason == LocalRouteReason::NoEligibleWorker
+                    && reason == LocalRouteReason::NoEligibleRunner
                 {
-                    return required_block("no ready worker has capacity and satisfies the execution requirements; retry when capacity is available".into());
+                    return required_block("no ready runner has capacity and satisfies the execution requirements; retry when capacity is available".into());
                 }
                 return apply_observe_mode(
                     ctx.mode,
                     IntakeRouterDecision::RanLocal {
                         reason: match reason {
-                            LocalRouteReason::NoEligibleWorker => RanLocalReason::NoEligibleWorker,
-                            LocalRouteReason::LeaderIsOnlyEligible => {
-                                RanLocalReason::LeaderIsOnlyEligible
+                            LocalRouteReason::NoEligibleRunner => RanLocalReason::NoEligibleRunner,
+                            LocalRouteReason::HubIsOnlyEligible => {
+                                RanLocalReason::HubIsOnlyEligible
                             }
-                            LocalRouteReason::PreferredNodeIsLeader => {
-                                RanLocalReason::AgentDefaultIsLeader
+                            LocalRouteReason::PreferredNodeIsHub => {
+                                RanLocalReason::AgentDefaultIsHub
                             }
                             LocalRouteReason::NoPreference => unreachable!(
                                 "pick_intake_target cannot return no-preference after non-empty preference gate"

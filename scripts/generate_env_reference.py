@@ -144,7 +144,7 @@ def production_rust_files() -> list[Path]:
 
 
 def blank_test_modules(text: str) -> str:
-    """Replace ``#[cfg(test)] mod x { ... }`` bodies with newlines.
+    """Replace test-only module declarations and bodies with newlines.
 
     Line numbers of the surrounding code are preserved because every removed
     character that is not a newline is dropped while newlines are kept.
@@ -157,11 +157,13 @@ def blank_test_modules(text: str) -> str:
             continue
         if not cfg_requires_test(match.group("predicate")):
             continue
-        open_index = match.end() - 1
-        try:
-            _body, close_index = scan_balanced(text, open_index, "{", "}")
-        except Exception as error:  # pragma: no cover - defensive
-            raise ParseError(f"unbalanced test module at offset {open_index}: {error}") from error
+        close_index = match.end()
+        if match.group("delimiter") == "{":
+            open_index = match.end() - 1
+            try:
+                _body, close_index = scan_balanced(text, open_index, "{", "}")
+            except Exception as error:  # pragma: no cover - defensive
+                raise ParseError(f"unbalanced test module at offset {open_index}: {error}") from error
         result.append(text[cursor : match.start()])
         # ``scan_balanced`` returns the index just past the closing brace.
         removed = text[match.start() : close_index]

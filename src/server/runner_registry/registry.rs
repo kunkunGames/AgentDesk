@@ -1,8 +1,8 @@
-//! Worker construction, startup staging, and supervision loops.
+//! Runner construction, startup staging, and supervision loops.
 
 use super::*;
 
-impl SupervisedWorkerRegistry {
+impl SupervisedRunnerRegistry {
     pub(crate) fn new(
         config: Config,
         engine: PolicyEngine,
@@ -47,7 +47,7 @@ impl SupervisedWorkerRegistry {
     }
 
     pub(crate) fn start_after_boot_reconcile(&mut self) -> Result<()> {
-        self.start_stage(WorkerStartStage::AfterBootReconcile, None)
+        self.start_stage(RunnerStartStage::AfterBootReconcile, None)
             .map(|_| ())
     }
 
@@ -56,7 +56,7 @@ impl SupervisedWorkerRegistry {
         broadcast_tx: BroadcastTx,
     ) -> Result<BatchBuffer> {
         self.start_stage(
-            WorkerStartStage::AfterWebsocketBroadcast,
+            RunnerStartStage::AfterWebsocketBroadcast,
             Some(broadcast_tx),
         )?
         .ok_or_else(|| anyhow!("missing websocket batch flusher registration"))
@@ -64,17 +64,17 @@ impl SupervisedWorkerRegistry {
 
     pub(super) fn start_stage(
         &mut self,
-        stage: WorkerStartStage,
+        stage: RunnerStartStage,
         broadcast_tx: Option<BroadcastTx>,
     ) -> Result<Option<BatchBuffer>> {
         let mut batch_buffer = None;
-        for spec in WORKER_SPECS {
+        for spec in RUNNER_SPECS {
             if spec.start_stage != stage || self.is_started(spec.id) {
                 continue;
             }
             self.log_start(spec);
             batch_buffer = self
-                .start_worker(spec, broadcast_tx.clone())?
+                .start_runner(spec, broadcast_tx.clone())?
                 .or(batch_buffer);
         }
         tracing::info!(
@@ -82,26 +82,26 @@ impl SupervisedWorkerRegistry {
             started = self
                 .running
                 .iter()
-                .filter(|worker| worker.spec.start_stage == stage)
+                .filter(|runner| runner.spec.start_stage == stage)
                 .count(),
-            "supervised worker stage complete"
+            "supervised runner stage complete"
         );
         Ok(batch_buffer)
     }
 
-    pub(super) fn start_worker(
+    pub(super) fn start_runner(
         &mut self,
-        spec: WorkerSpec,
+        spec: RunnerSpec,
         broadcast_tx: Option<BroadcastTx>,
     ) -> Result<Option<BatchBuffer>> {
-        if spec.execution_scope == WorkerExecutionScope::LeaderOnly
+        if spec.execution_scope == RunnerExecutionScope::HubOnly
             && !self.config.cluster.runtime_profile.modules().hub_services
         {
-            self.log_skip(spec, "disabled by worker runtime profile");
+            self.log_skip(spec, "disabled by runner runtime profile");
             return Ok(None);
         }
         match spec.id {
-            ServerWorkerId::GithubSync => {
+            ServerRunnerId::GithubSync => {
                 let sync_interval = self.config.github.sync_interval_minutes;
                 if sync_interval <= 0 {
                     self.log_skip(spec, "github.sync_interval_minutes <= 0");
@@ -111,7 +111,7 @@ impl SupervisedWorkerRegistry {
                     self.log_skip(spec, "postgres pool unavailable");
                     return Ok(None);
                 };
-                self.register_leader_tokio(spec, move || {
+                self.register_hub_tokio(spec, move || {
                     let sync_pg_pool = sync_pg_pool.clone();
                     async move {
                         super::super::github_sync_loop(sync_pg_pool, sync_interval).await;
@@ -119,7 +119,7 @@ impl SupervisedWorkerRegistry {
                 });
                 Ok(None)
             }
-            ServerWorkerId::PolicyTick => {
+            ServerRunnerId::PolicyTick => {
                 let Some(tick_pg_pool) = self.pg_pool.clone() else {
                     self.log_skip(spec, "postgres pool unavailable");
                     return Ok(None);
@@ -151,7 +151,7 @@ impl SupervisedWorkerRegistry {
                             std::process::exit(1);
                         });
                     loop {
-                        if !rt.block_on(wait_until_leader_or_shutdown(
+                        if !rt.block_on(wait_until_hub_or_shutdown(
                             &tick_cluster_runtime,
                             shutdown.clone(),
                         )) {
@@ -159,9 +159,9 @@ impl SupervisedWorkerRegistry {
                         }
                         // #747: build a dedicated tick engine so a stuck tick hook
                         // cannot back up the main engine's actor queue and starve
-                        // HTTP/Discord hook paths. Recreate it per leader epoch
+                        // HTTP/Discord hook paths. Recreate it per hub epoch
                         // because `policy_tick_loop` owns and consumes the engine.
-                        let _epoch = LeaderOnlyWorkerEpoch::start(spec);
+                        let _epoch = HubOnlyRunnerEpoch::start(spec);
                         match PolicyEngine::new_for_tick(
                             &tick_config,
                             Some(tick_pg_pool.as_ref().clone()),
@@ -195,12 +195,12 @@ impl SupervisedWorkerRegistry {
                 })?;
                 Ok(None)
             }
-            ServerWorkerId::RateLimitSync => {
+            ServerRunnerId::RateLimitSync => {
                 let Some(rate_limit_pg_pool) = self.pg_pool.clone() else {
                     self.log_skip(spec, "postgres pool unavailable");
                     return Ok(None);
                 };
-                self.register_leader_tokio(spec, move || {
+                self.register_hub_tokio(spec, move || {
                     let rate_limit_pg_pool = rate_limit_pg_pool.clone();
                     async move {
                         super::super::rate_limit_sync::rate_limit_sync_loop(rate_limit_pg_pool)
@@ -209,7 +209,7 @@ impl SupervisedWorkerRegistry {
                 });
                 Ok(None)
             }
-            ServerWorkerId::MaintenanceScheduler => {
+            ServerRunnerId::MaintenanceScheduler => {
                 let Some(maintenance_pg_pool) = self.pg_pool.clone() else {
                     self.log_skip(spec, "postgres pool unavailable");
                     return Ok(None);
@@ -224,7 +224,7 @@ impl SupervisedWorkerRegistry {
                     crate::services::maintenance::jobs::voice_cache_sweep::Config::from_voice_config(
                         &self.config.voice,
                     );
-                self.register_leader_tokio(spec, move || {
+                self.register_hub_tokio(spec, move || {
                     let maintenance_pg_pool = maintenance_pg_pool.clone();
                     let prompt_manifest_retention = prompt_manifest_retention.clone();
                     let voice_cache_sweep = voice_cache_sweep.clone();
@@ -239,13 +239,13 @@ impl SupervisedWorkerRegistry {
                 });
                 Ok(None)
             }
-            ServerWorkerId::MessageOutbox => {
+            ServerRunnerId::MessageOutbox => {
                 let Some(outbox_pg_pool) = self.pg_pool.clone() else {
                     self.log_skip(spec, "postgres pool unavailable");
                     return Ok(None);
                 };
                 let outbox_health_registry = self.health_registry.clone();
-                self.register_leader_tokio(spec, move || {
+                self.register_hub_tokio(spec, move || {
                     let outbox_pg_pool = outbox_pg_pool.clone();
                     let outbox_health_registry = outbox_health_registry.clone();
                     async move {
@@ -255,13 +255,13 @@ impl SupervisedWorkerRegistry {
                 });
                 Ok(None)
             }
-            ServerWorkerId::ScheduledMessages => {
+            ServerRunnerId::ScheduledMessages => {
                 let Some(smsg_pg_pool) = self.pg_pool.clone() else {
                     self.log_skip(spec, "postgres pool unavailable");
                     return Ok(None);
                 };
                 let smsg_health_registry = self.health_registry.clone();
-                self.register_leader_tokio(spec, move || {
+                self.register_hub_tokio(spec, move || {
                     let smsg_pg_pool = smsg_pg_pool.clone();
                     let smsg_health_registry = smsg_health_registry.clone();
                     async move {
@@ -274,9 +274,9 @@ impl SupervisedWorkerRegistry {
                 });
                 Ok(None)
             }
-            ServerWorkerId::KakaoCalendar => {
+            ServerRunnerId::KakaoCalendar => {
                 // Parse errors still need lease recovery after a restart. The
-                // worker uses an empty claim allowlist when configuration is invalid.
+                // runner uses an empty claim allowlist when configuration is invalid.
                 if self.config.cluster.enabled
                     || matches!(
                         crate::services::kakao::account::calendar_enabled(),
@@ -293,7 +293,7 @@ impl SupervisedWorkerRegistry {
                     self.log_skip(spec, "postgres pool unavailable");
                     return Ok(None);
                 };
-                self.register_leader_tokio(spec, move || {
+                self.register_hub_tokio(spec, move || {
                     let pool = pool.clone();
                     async move {
                         crate::services::calendar_sync::calendar_loop(pool).await;
@@ -301,7 +301,7 @@ impl SupervisedWorkerRegistry {
                 });
                 Ok(None)
             }
-            ServerWorkerId::DispatchOutbox => {
+            ServerRunnerId::DispatchOutbox => {
                 let Some(dispatch_outbox_pg_pool) = self.pg_pool.clone() else {
                     self.log_skip(spec, "postgres pool unavailable");
                     return Ok(None);
@@ -326,12 +326,12 @@ impl SupervisedWorkerRegistry {
                 });
                 Ok(None)
             }
-            ServerWorkerId::DmReplyRetry => {
+            ServerRunnerId::DmReplyRetry => {
                 let Some(dm_retry_pg_pool) = self.pg_pool.clone() else {
                     self.log_skip(spec, "postgres pool unavailable");
                     return Ok(None);
                 };
-                self.register_leader_tokio(spec, move || {
+                self.register_hub_tokio(spec, move || {
                     let dm_retry_pg_pool = dm_retry_pg_pool.clone();
                     async move {
                         super::super::dm_reply_retry_loop(dm_retry_pg_pool).await;
@@ -339,21 +339,21 @@ impl SupervisedWorkerRegistry {
                 });
                 Ok(None)
             }
-            ServerWorkerId::WsBatchFlusher => {
+            ServerRunnerId::WsBatchFlusher => {
                 let tx = broadcast_tx.ok_or_else(|| {
                     anyhow!(
-                        "worker {} requires a websocket broadcast sender before startup",
+                        "runner {} requires a websocket broadcast sender before startup",
                         spec.name
                     )
                 })?;
                 let buffer = super::super::ws::spawn_batch_flusher(tx);
-                self.running.push(RunningWorker {
+                self.running.push(RunningRunner {
                     spec,
-                    _handle: WorkerHandle::SpawnHelper,
+                    _handle: RunnerHandle::SpawnHelper,
                 });
                 Ok(Some(buffer))
             }
-            ServerWorkerId::SessionDiscovery => {
+            ServerRunnerId::SessionDiscovery => {
                 if !cfg!(unix) {
                     self.log_skip(spec, "tmux session discovery requires Unix; native process sessions use their owned registry");
                     return Ok(None);
@@ -364,7 +364,7 @@ impl SupervisedWorkerRegistry {
                 };
                 let instance_id = Some(self.cluster_runtime.instance_id().to_string());
                 let shutdown = self.shutdown.clone();
-                // Worker-local (not register_leader_tokio): tmux is host-scoped,
+                // Runner-local (not register_hub_tokio): tmux is host-scoped,
                 // so every node must enumerate its own sessions. The registry's
                 // reconcile_for_node is instance_id-scoped to keep peers from
                 // stomping each other's entries.
@@ -384,7 +384,7 @@ impl SupervisedWorkerRegistry {
                 });
                 Ok(None)
             }
-            ServerWorkerId::WatcherSupervisor => {
+            ServerRunnerId::WatcherSupervisor => {
                 #[cfg(not(unix))]
                 {
                     self.log_skip(spec, "session-bound relay supervisor requires Unix tmux");
@@ -398,8 +398,8 @@ impl SupervisedWorkerRegistry {
                         return Ok(None);
                     }
                     let shutdown = self.shutdown.clone();
-                    // Worker-local: tmux is host-scoped, so every node supervises
-                    // its own relays. No leader gating — peer hosts can't observe
+                    // Runner-local: tmux is host-scoped, so every node supervises
+                    // its own relays. No hub gating — peer hosts can't observe
                     // each other's sessions anyway.
                     let health_registry = self.health_registry.clone();
                     self.register_tokio(spec, move || {
@@ -416,7 +416,7 @@ impl SupervisedWorkerRegistry {
                     Ok(None)
                 }
             }
-            ServerWorkerId::RoutineRuntime => {
+            ServerRunnerId::RoutineRuntime => {
                 if !self.config.routines.enabled {
                     self.log_skip(spec, "routines.enabled=false");
                     return Ok(None);
@@ -445,7 +445,7 @@ impl SupervisedWorkerRegistry {
                     .filter(|value| !value.is_empty())
                     .map(|value| format!("channel:{value}"));
                 let routine_health_registry = self.health_registry.clone();
-                self.register_leader_tokio(spec, move || {
+                self.register_hub_tokio(spec, move || {
                     let routine_pg_pool = routine_pg_pool.clone();
                     let routine_health_registry = routine_health_registry.clone();
                     let routines_config = routines_config.clone();
@@ -468,18 +468,18 @@ impl SupervisedWorkerRegistry {
 
     pub(super) fn register_tokio<MakeFuture, Fut>(
         &mut self,
-        spec: WorkerSpec,
+        spec: RunnerSpec,
         make_future: MakeFuture,
     ) where
         MakeFuture: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let future = super::super::worker_recovery::supervise_worker_local(
+        let future = super::super::runner_recovery::supervise_runner_local(
             spec,
             self.shutdown.clone(),
             make_future,
             move |reason, expected_shutdown, auto_restart, restart_attempt| {
-                record_worker_local_terminal_signal(
+                record_runner_local_terminal_signal(
                     spec,
                     reason,
                     expected_shutdown,
@@ -490,40 +490,40 @@ impl SupervisedWorkerRegistry {
             // #4515 PR3: restart-budget exhaustion completes the recovery circuit
             // — readiness down (via the Exhausted recovery state) plus process
             // exit so launchd KeepAlive restarts a clean process.
-            super::super::worker_recovery::production_fatal_hook(self.shutdown.clone()),
+            super::super::runner_recovery::production_fatal_hook(self.shutdown.clone()),
         );
-        self.running.push(RunningWorker {
+        self.running.push(RunningRunner {
             spec,
-            _handle: WorkerHandle::Tokio {
+            _handle: RunnerHandle::Tokio {
                 _handle: tokio::spawn(future),
             },
         });
     }
 
-    pub(super) fn register_leader_tokio<MakeFuture, Fut>(
+    pub(super) fn register_hub_tokio<MakeFuture, Fut>(
         &mut self,
-        spec: WorkerSpec,
+        spec: RunnerSpec,
         make_future: MakeFuture,
     ) where
         MakeFuture: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let future = Self::supervise_leader_tokio_worker(
+        let future = Self::supervise_hub_tokio_runner(
             spec,
             self.cluster_runtime.clone(),
             self.shutdown.clone(),
             make_future,
         );
-        self.running.push(RunningWorker {
+        self.running.push(RunningRunner {
             spec,
-            _handle: WorkerHandle::Tokio {
+            _handle: RunnerHandle::Tokio {
                 _handle: tokio::spawn(future),
             },
         });
     }
 
-    pub(super) async fn supervise_leader_tokio_worker<MakeFuture, Fut>(
-        spec: WorkerSpec,
+    pub(super) async fn supervise_hub_tokio_runner<MakeFuture, Fut>(
+        spec: RunnerSpec,
         cluster_runtime: ClusterRuntime,
         shutdown: Arc<AtomicBool>,
         make_future: MakeFuture,
@@ -532,16 +532,16 @@ impl SupervisedWorkerRegistry {
         Fut: Future<Output = ()> + Send + 'static,
     {
         loop {
-            if !wait_until_leader_or_shutdown(&cluster_runtime, shutdown.clone()).await {
+            if !wait_until_hub_or_shutdown(&cluster_runtime, shutdown.clone()).await {
                 break;
             }
-            let _epoch = LeaderOnlyWorkerEpoch::start(spec);
+            let _epoch = HubOnlyRunnerEpoch::start(spec);
             let future = make_future();
             tokio::pin!(future);
             tokio::select! {
                 _ = &mut future => {
                     tracing::warn!(
-                        worker = spec.name,
+                        runner = spec.name,
                         target = spec.target,
                         observability_target = spec.target,
                         kind = spec.kind.as_doc_str(),
@@ -554,12 +554,12 @@ impl SupervisedWorkerRegistry {
                         health = spec.health_owner,
                         responsibility = spec.responsibility,
                         notes = spec.notes,
-                        "leader-only worker future exited"
+                        "hub-only runner future exited"
                     );
                 }
-                _ = cluster_runtime.wait_until_not_leader() => {
+                _ = cluster_runtime.wait_until_not_hub() => {
                     tracing::warn!(
-                        worker = spec.name,
+                        runner = spec.name,
                         target = spec.target,
                         observability_target = spec.target,
                         kind = spec.kind.as_doc_str(),
@@ -573,12 +573,12 @@ impl SupervisedWorkerRegistry {
                         responsibility = spec.responsibility,
                         notes = spec.notes,
                         instance_id = cluster_runtime.instance_id(),
-                        "leader-only worker self-fenced after cluster leadership was lost"
+                        "hub-only runner self-fenced after cluster hub ownership was lost"
                     );
                 }
                 _ = wait_until_shutdown(shutdown.clone()) => {
                     tracing::info!(
-                        worker = spec.name,
+                        runner = spec.name,
                         target = spec.target,
                         observability_target = spec.target,
                         kind = spec.kind.as_doc_str(),
@@ -591,7 +591,7 @@ impl SupervisedWorkerRegistry {
                         health = spec.health_owner,
                         responsibility = spec.responsibility,
                         notes = spec.notes,
-                        "leader-only worker supervisor shutting down"
+                        "hub-only runner supervisor shutting down"
                     );
                     break;
                 }
@@ -604,7 +604,7 @@ impl SupervisedWorkerRegistry {
         }
     }
 
-    pub(super) fn register_thread<F>(&mut self, spec: WorkerSpec, name: &str, body: F) -> Result<()>
+    pub(super) fn register_thread<F>(&mut self, spec: RunnerSpec, name: &str, body: F) -> Result<()>
     where
         F: FnOnce() + Send + 'static,
     {
@@ -612,20 +612,20 @@ impl SupervisedWorkerRegistry {
             .name(name.to_string())
             .spawn(body)
             .map_err(|e| anyhow!("Failed to spawn {} thread: {e}", spec.name))?;
-        self.running.push(RunningWorker {
+        self.running.push(RunningRunner {
             spec,
-            _handle: WorkerHandle::Thread { _handle: handle },
+            _handle: RunnerHandle::Thread { _handle: handle },
         });
         Ok(())
     }
 
-    pub(super) fn is_started(&self, id: ServerWorkerId) -> bool {
-        self.running.iter().any(|worker| worker.spec.id == id)
+    pub(super) fn is_started(&self, id: ServerRunnerId) -> bool {
+        self.running.iter().any(|runner| runner.spec.id == id)
     }
 
-    pub(super) fn log_start(&self, spec: WorkerSpec) {
+    pub(super) fn log_start(&self, spec: RunnerSpec) {
         tracing::info!(
-            worker = spec.name,
+            runner = spec.name,
             target = spec.target,
             observability_target = spec.target,
             kind = spec.kind.as_doc_str(),
@@ -638,13 +638,13 @@ impl SupervisedWorkerRegistry {
             health = spec.health_owner,
             responsibility = spec.responsibility,
             notes = spec.notes,
-            "starting supervised worker"
+            "starting supervised runner"
         );
     }
 
-    pub(super) fn log_skip(&self, spec: WorkerSpec, reason: &str) {
+    pub(super) fn log_skip(&self, spec: RunnerSpec, reason: &str) {
         tracing::info!(
-            worker = spec.name,
+            runner = spec.name,
             target = spec.target,
             observability_target = spec.target,
             kind = spec.kind.as_doc_str(),
@@ -658,7 +658,7 @@ impl SupervisedWorkerRegistry {
             responsibility = spec.responsibility,
             notes = spec.notes,
             reason,
-            "skipping supervised worker"
+            "skipping supervised runner"
         );
     }
 }

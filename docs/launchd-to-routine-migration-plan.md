@@ -12,7 +12,7 @@ All routine scripts live under `routines/migrated-launchd/`. Each routine's
 agent to invoke the repo-deployed entrypoint under
 `${AGENTDESK_ROOT_DIR:-$HOME/.adk/release}/scripts/launchd-migrated/`. The entrypoints
 were copied from the original `~/.local/bin/*.sh` launchd targets and are
-deployed by `adk-release`, so leadership can move between eligible nodes
+deployed by `adk-release`, so hub ownership can move between eligible nodes
 without a manual script rsync.
 
 ## Migrated jobs
@@ -53,7 +53,7 @@ This section is for the legacy operator cutover from the original
 launchd routines unattached until each optional connector is configured
 and validated.
 
-Run on whichever node is the cluster leader. The workspace containing
+Run on whichever node is the cluster hub. The workspace containing
 `routines/migrated-launchd/` must be deployed before the script loader
 will see the new files, and `scripts/launchd-migrated/` must be deployed
 under `${AGENTDESK_ROOT_DIR:-$HOME/.adk/release}/scripts/launchd-migrated/`.
@@ -218,12 +218,12 @@ ID10=$(curl -sf "$API/api/routines" -X POST -H 'Content-Type: application/json' 
 curl -sf "$API/api/routines/$ID10/pause" -X POST
 ```
 
-## Cross-leader prerequisite — script availability
+## Cross-hub prerequisite — script availability
 
 Migrated shell jobs now invoke scripts staged by `adk-release` at
 `${AGENTDESK_ROOT_DIR:-$HOME/.adk/release}/scripts/launchd-migrated/*.sh`; the
 helper `run-claude-message-job.sh` is staged in the same directory and
-called via the script's own directory. Cross-leader failover therefore
+called via the script's own directory. Cross-hub failover therefore
 uses the release artifact instead of host-local `~/.local/bin` state.
 
 Before attaching any migrated job, deploy the release on every node
@@ -233,9 +233,9 @@ eligible to hold the `routine-runtime` lease and verify the directory:
 ls -l "${AGENTDESK_ROOT_DIR:-$HOME/.adk/release}/scripts/launchd-migrated/"*.sh | sort
 ```
 
-No supported `preferred-leader` / `execution_scope` knob currently exists
-to pin `routine-runtime` to mac-mini (`WORKER_SPECS` declares it
-hardcoded `LeaderOnly`; the only way to keep the lease on mac-mini is to
+No supported `preferred-hub` / `execution_scope` knob currently exists
+to pin `routine-runtime` to mac-mini (`RUNNER_SPECS` declares it
+hardcoded `HubOnly`; the only way to keep the lease on mac-mini is to
 keep mac-book down or out of the cluster). The release-deployed
 entrypoint directory is the supported source of truth for routine
 execution.
@@ -507,13 +507,13 @@ the end of the 24h window, move the plist to
 copy-back + bootstrap (Rollback B equivalent) rather than recreation
 from documentation.
 
-## Cross-leader correctness
+## Cross-hub correctness
 
-Routines run on whichever node holds the `routine-runtime` leader-only
-worker lease (see issue #2202 §1). After the §1 fix, lease succession
-re-spawns `routine-runtime` on the new leader, so the migrated jobs fire
-regardless of which physical node (mac-mini or mac-book) is leader at
+Routines run on whichever node holds the `routine-runtime` hub-only
+runner lease (see issue #2202 §1). After the §1 fix, lease succession
+re-spawns `routine-runtime` on the new hub, so the migrated jobs fire
+regardless of which physical node (mac-mini or mac-book) is hub at
 schedule time — unlike launchd, which only fires on the node where the
 plist is loaded (currently mac-mini). This is the principal reliability
 gain of the migration **once the release-deployed entrypoint directory
-exists on every eligible leader** (see Cross-leader prerequisite above).
+exists on every eligible hub** (see Cross-hub prerequisite above).

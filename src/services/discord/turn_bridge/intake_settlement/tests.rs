@@ -32,8 +32,8 @@ async fn seed(
             user_msg_id, request_owner_id, user_text, turn_kind, agent_id,
             status, claim_owner, spawned_at, dispatched_at
          ) VALUES (
-            'worker', 'leader', $1, $1, 'user', 'hello', 'standard', 'agent',
-            $2, 'dispatch-worker', $3, $4
+            'runner', 'hub', $1, $1, 'user', 'hello', 'standard', 'agent',
+            $2, 'dispatch-runner', $3, $4
          ) RETURNING id",
     )
     .bind(key)
@@ -211,7 +211,7 @@ async fn settle_is_idempotent_and_preserves_dispatch_audit_fields_pg() {
     assert!(!second_won, "the idempotent second CAS must be a no-op");
     assert_eq!(first.0, IntakeOutboxStatus::Done);
     assert_eq!(first.1, second.1, "completed_at must be preserved");
-    assert_eq!(first.2, Some("dispatch-worker".to_owned()));
+    assert_eq!(first.2, Some("dispatch-runner".to_owned()));
     assert_eq!(first.3, Some(spawned_at));
     assert_eq!(first.4, Some(dispatched_at));
     assert_eq!(
@@ -260,7 +260,7 @@ async fn settle_does_not_touch_terminal_or_pre_spawn_states_pg() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn worker_mark_done_and_settlement_converge_under_either_order_pg() {
+async fn runner_mark_done_and_settlement_converge_under_either_order_pg() {
     let database = TestPostgresDb::create().await;
     let pool = database.connect_and_migrate().await;
     let now = Utc::now();
@@ -276,27 +276,27 @@ async fn worker_mark_done_and_settlement_converge_under_either_order_pg() {
         settle_with_lock_timeout(&pool, settlement_first, IntakeSettlementSource::Committed)
             .await
             .expect("settlement-first CAS");
-    let worker_won = mark_done(&pool, settlement_first, "dispatch-worker")
+    let runner_won = mark_done(&pool, settlement_first, "dispatch-runner")
         .await
-        .expect("worker CAS after settlement commit");
-    assert_eq!((settlement_won, worker_won), (true, false));
+        .expect("runner CAS after settlement commit");
+    assert_eq!((settlement_won, runner_won), (true, false));
 
-    let worker_first = seed(
+    let runner_first = seed(
         &pool,
-        "settle-converge-worker-first",
+        "settle-converge-runner-first",
         IntakeOutboxStatus::Spawned,
         Some(now),
         None,
     )
     .await;
-    let worker_won = mark_done(&pool, worker_first, "dispatch-worker")
+    let runner_won = mark_done(&pool, runner_first, "dispatch-runner")
         .await
-        .expect("worker-first CAS");
+        .expect("runner-first CAS");
     let settlement_won =
-        settle_with_lock_timeout(&pool, worker_first, IntakeSettlementSource::Committed)
+        settle_with_lock_timeout(&pool, runner_first, IntakeSettlementSource::Committed)
             .await
-            .expect("settlement CAS after worker commit");
-    assert_eq!((worker_won, settlement_won), (true, false));
+            .expect("settlement CAS after runner commit");
+    assert_eq!((runner_won, settlement_won), (true, false));
 
     let concurrent = seed(
         &pool,
@@ -318,22 +318,22 @@ async fn worker_mark_done_and_settlement_converge_under_either_order_pg() {
         )
         .await
     };
-    let worker_barrier = Arc::clone(&barrier);
-    let worker_pool = pool.clone();
-    let worker = async move {
-        worker_barrier.wait().await;
-        mark_done(&worker_pool, concurrent, "dispatch-worker").await
+    let runner_barrier = Arc::clone(&barrier);
+    let runner_pool = pool.clone();
+    let runner = async move {
+        runner_barrier.wait().await;
+        mark_done(&runner_pool, concurrent, "dispatch-runner").await
     };
-    let (settlement_won, worker_won) = tokio::join!(settlement, worker);
+    let (settlement_won, runner_won) = tokio::join!(settlement, runner);
     let settlement_won = settlement_won.expect("concurrent settlement CAS");
-    let worker_won = worker_won.expect("concurrent worker CAS");
+    let runner_won = runner_won.expect("concurrent runner CAS");
     assert_eq!(
-        usize::from(settlement_won) + usize::from(worker_won),
+        usize::from(settlement_won) + usize::from(runner_won),
         1,
         "exactly one concurrent CAS must win"
     );
 
-    for id in [settlement_first, worker_first, concurrent] {
+    for id in [settlement_first, runner_first, concurrent] {
         assert_eq!(status(&pool, id).await, IntakeOutboxStatus::Done);
     }
     pool.close().await;
@@ -601,7 +601,7 @@ async fn settlement_row_lock_timeout_is_swallowed_and_counted_pg() {
 }
 
 #[tokio::test]
-async fn fresh_off_and_observe_leave_own_rows_for_worker_pg() {
+async fn fresh_off_and_observe_leave_own_rows_for_runner_pg() {
     let database = TestPostgresDb::create().await;
     let pool = database.connect_and_migrate().await;
     let now = Utc::now();
@@ -628,7 +628,7 @@ async fn fresh_off_and_observe_leave_own_rows_for_worker_pg() {
         )
         .await;
         assert_eq!(status(&pool, id).await, IntakeOutboxStatus::Spawned);
-        assert!(mark_done(&pool, id, "dispatch-worker").await.unwrap());
+        assert!(mark_done(&pool, id, "dispatch-runner").await.unwrap());
         assert_eq!(status(&pool, id).await, IntakeOutboxStatus::Done);
     }
     pool.close().await;

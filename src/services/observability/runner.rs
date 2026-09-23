@@ -1,4 +1,4 @@
-//! #2049: background worker loop + counter snapshot flush split out of
+//! #2049: background runner loop + counter snapshot flush split out of
 //! `mod.rs`. Owns batching, dead-letter JSONL fallback, and the snapshot
 //! collection path. The Postgres write primitives live in `pg_io`; the
 //! retention sweep lives in `retention`.
@@ -17,17 +17,17 @@ use super::pg_io::{
 use super::retention::run_retention_sweep;
 use super::{
     AnalyticsFilters, EVENT_BATCH_SIZE, EVENT_FLUSH_INTERVAL, ObservabilityRuntime, QueuedEvent,
-    QueuedQualityEvent, RETENTION_SWEEP_INTERVAL, SNAPSHOT_FLUSH_INTERVAL, SnapshotRow,
-    StorageHandles, WorkerMessage, runtime,
+    QueuedQualityEvent, RETENTION_SWEEP_INTERVAL, RunnerMessage, SNAPSHOT_FLUSH_INTERVAL,
+    SnapshotRow, StorageHandles, runtime,
 };
 
-pub(super) fn worker_sender() -> Option<mpsc::UnboundedSender<WorkerMessage>> {
+pub(super) fn runner_sender() -> Option<mpsc::UnboundedSender<RunnerMessage>> {
     let runtime = runtime();
-    ensure_worker(&runtime);
+    ensure_runner(&runtime);
     runtime.sender.lock().ok().and_then(|sender| sender.clone())
 }
 
-pub(super) fn ensure_worker(runtime: &Arc<ObservabilityRuntime>) {
+pub(super) fn ensure_runner(runtime: &Arc<ObservabilityRuntime>) {
     let mut sender_guard = match runtime.sender.lock() {
         Ok(guard) => guard,
         Err(_) => return,
@@ -41,12 +41,12 @@ pub(super) fn ensure_worker(runtime: &Arc<ObservabilityRuntime>) {
 
     let (tx, rx) = mpsc::unbounded_channel();
     *sender_guard = Some(tx);
-    spawn_worker(runtime.clone(), rx);
+    spawn_runner(runtime.clone(), rx);
 }
 
-fn spawn_worker(runtime: Arc<ObservabilityRuntime>, rx: mpsc::UnboundedReceiver<WorkerMessage>) {
+fn spawn_runner(runtime: Arc<ObservabilityRuntime>, rx: mpsc::UnboundedReceiver<RunnerMessage>) {
     let task = async move {
-        worker_loop(runtime, rx).await;
+        runner_loop(runtime, rx).await;
     };
 
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -61,15 +61,15 @@ fn spawn_worker(runtime: Arc<ObservabilityRuntime>, rx: mpsc::UnboundedReceiver<
         match runtime {
             Ok(runtime) => runtime.block_on(task),
             Err(error) => {
-                tracing::warn!("[observability] failed to bootstrap worker runtime: {error}");
+                tracing::warn!("[observability] failed to bootstrap runner runtime: {error}");
             }
         }
     });
 }
 
-async fn worker_loop(
+async fn runner_loop(
     runtime: Arc<ObservabilityRuntime>,
-    mut rx: mpsc::UnboundedReceiver<WorkerMessage>,
+    mut rx: mpsc::UnboundedReceiver<RunnerMessage>,
 ) {
     let mut batch = Vec::new();
     let mut quality_batch = Vec::new();
@@ -88,13 +88,13 @@ async fn worker_loop(
         tokio::select! {
             maybe_message = rx.recv() => {
                 match maybe_message {
-                    Some(WorkerMessage::Event(event)) => {
+                    Some(RunnerMessage::Event(event)) => {
                         batch.push(event);
                         if batch.len() >= EVENT_BATCH_SIZE {
                             flush_event_batch(&runtime, &mut batch).await;
                         }
                     }
-                    Some(WorkerMessage::QualityEvent(event)) => {
+                    Some(RunnerMessage::QualityEvent(event)) => {
                         quality_batch.push(event);
                         if quality_batch.len() >= EVENT_BATCH_SIZE {
                             flush_quality_event_batch(&runtime, &mut quality_batch).await;
@@ -160,7 +160,7 @@ fn deferrable_flush_should_yield(
 /// own tx so a single broken row does not lose its 63 healthy neighbors.
 /// (3) Rows that still fail are appended to a dead-letter JSONL on disk so
 /// the sample is recoverable. (4) If JSONL fallback also fails, push the
-/// events back to the front of the worker batch so the next tick retries.
+/// events back to the front of the runner batch so the next tick retries.
 async fn flush_event_batch(runtime: &Arc<ObservabilityRuntime>, batch: &mut Vec<QueuedEvent>) {
     if batch.is_empty() {
         return;
@@ -214,7 +214,7 @@ async fn flush_quality_event_batch(
 }
 
 /// #2049 Finding 1: Dump failed event rows to JSONL; if disk fallback fails,
-/// push them back to the front of `batch` so the next worker tick retries.
+/// push them back to the front of `batch` so the next runner tick retries.
 fn handle_event_flush_fallback(
     batch: &mut Vec<QueuedEvent>,
     failed: Vec<QueuedEvent>,
@@ -229,7 +229,7 @@ fn handle_event_flush_fallback(
         }
         Err(disk_error) => {
             tracing::error!(
-                "[observability] dead-letter JSONL also failed (suffix={suffix}, {count} events): {disk_error}; pushing back to worker batch"
+                "[observability] dead-letter JSONL also failed (suffix={suffix}, {count} events): {disk_error}; pushing back to runner batch"
             );
             let mut rescued = failed;
             rescued.extend(std::mem::take(batch));
@@ -251,7 +251,7 @@ fn handle_quality_event_flush_fallback(
         }
         Err(disk_error) => {
             tracing::error!(
-                "[quality] dead-letter JSONL also failed ({count} events): {disk_error}; pushing back to worker batch"
+                "[quality] dead-letter JSONL also failed ({count} events): {disk_error}; pushing back to runner batch"
             );
             let mut rescued = failed;
             rescued.extend(std::mem::take(batch));

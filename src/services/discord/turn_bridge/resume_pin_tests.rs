@@ -320,8 +320,8 @@ inflight_state: durable.clone(), };
             resume_tx.send(()).unwrap();
             tx.send(StreamMessage::Done { result: "NO_REPLY".into(), session_id: Some("routine-provider-session".into()) }).unwrap();
             drop(tx);
-            // Stand in for the delivery worker, not for bridge/postlude execution.
-            let worker = async {
+            // Stand in for the delivery runner, not for bridge/postlude execution.
+            let runner = async {
                 loop {
                     sqlx::query("UPDATE message_outbox SET status='sent', sent_at=NOW() WHERE status='pending'")
                         .execute(pool.as_ref().unwrap()).await.unwrap();
@@ -330,7 +330,7 @@ inflight_state: durable.clone(), };
             };
             tokio::select! {
                 result = tokio::time::timeout(std::time::Duration::from_secs(10), completed_rx) => { result.unwrap().unwrap(); },
-                _ = worker => unreachable!(),
+                _ = runner => unreachable!(),
             }
             let pairs = crate::db::session_transcripts::fetch_recent_channel_pairs(pool.as_ref().unwrap(), &channel, 10).await.unwrap();
             assert_eq!(pairs.len(), usize::from(case == "bridge_own"), "actual bridge case={case}");

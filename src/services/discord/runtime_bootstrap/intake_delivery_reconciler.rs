@@ -135,8 +135,8 @@ mod postgres_tests {
             "INSERT INTO public.intake_outbox(
                target_instance_id,forwarded_by_instance_id,channel_id,user_msg_id,
                request_owner_id,user_text,turn_kind,agent_id,status,claim_owner,dispatched_at)
-             VALUES('worker','leader',$1,$1,'user','hello','standard','agent',
-                    'dispatched','dispatch-worker',$2)
+             VALUES('runner','hub',$1,$1,'user','hello','standard','agent',
+                    'dispatched','dispatch-runner',$2)
              RETURNING id",
         )
         .bind(key)
@@ -312,7 +312,7 @@ mod postgres_tests {
             let row = audit(&pool, id).await;
             assert_eq!(
                 (row.0.as_str(), row.2.as_str(), row.3),
-                (status, "dispatch-worker", at)
+                (status, "dispatch-runner", at)
             );
             assert_eq!(row.1.is_some(), matches!(status, "done" | "unknown"));
         }
@@ -343,7 +343,7 @@ mod postgres_tests {
         .expect("remove rollback trigger");
         assert_eq!(
             audit(&pool, rollback).await,
-            ("dispatched".into(), None, "dispatch-worker".into(), old)
+            ("dispatched".into(), None, "dispatch-runner".into(), old)
         );
 
         let hostile = seed_outbox(&pool, "proof-hostile", old).await;
@@ -363,8 +363,8 @@ mod postgres_tests {
             "INSERT INTO {hostile_schema}.intake_outbox(
                id,target_instance_id,forwarded_by_instance_id,channel_id,user_msg_id,
                request_owner_id,user_text,turn_kind,agent_id,status,claim_owner,dispatched_at)
-             VALUES($1,'worker','leader','decoy','decoy','user','hello','standard','agent',
-                    'done','dispatch-worker',$2)"
+             VALUES($1,'runner','hub','decoy','decoy','user','hello','standard','agent',
+                    'done','dispatch-runner',$2)"
         ))
         .bind(hostile)
         .bind(old)

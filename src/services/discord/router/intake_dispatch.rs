@@ -223,7 +223,7 @@ pub(crate) async fn admit_text_intake(
     };
     let ctx = IntakeRouterContext {
         mode,
-        leader_instance_id: &self_instance_id,
+        hub_instance_id: &self_instance_id,
         provider: submission.provider.as_str(),
         channel_id: &channel_id,
         policy_channel_id: &policy_channel_id,
@@ -342,7 +342,7 @@ fn admission_for_decision(
             outbox_id,
         },
         IntakeRouterDecision::SkippedDuplicate { .. } => IntakeAdmission::SkippedDuplicate,
-        // A pending row has not crossed the worker claim boundary; claimed,
+        // A pending row has not crossed the runner claim boundary; claimed,
         // accepted, and spawned rows may already be executing and remain
         // fenced. Local recovery retires only a stale pending row before
         // execution begins. The retirement CAS relies on the pending status

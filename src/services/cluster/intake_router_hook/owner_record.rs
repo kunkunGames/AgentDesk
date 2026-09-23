@@ -164,7 +164,7 @@ pub(crate) enum AdoptOutcome {
 /// initial outbox status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AdmissionKind {
-    /// The leader is both owner and executor: claim/accept collapse into the
+    /// The hub is both owner and executor: claim/accept collapse into the
     /// initial `spawned` state.
     Local,
     /// A foreign owner will claim + execute: the row starts `pending`.
@@ -243,7 +243,7 @@ struct LatestOwnerAndCount {
 /// (§3.3.1). The caller MUST already hold `pg_advisory_xact_lock(id.advisory_key())`
 /// on `tx` so this runs serially against transfer/reclaim for the same channel.
 /// `is_instance_live` reports whether a foreign owner instance is still live
-/// (the leader's node-registry liveness in production; a fixture in tests). The
+/// (the hub's node-registry liveness in production; a fixture in tests). The
 /// local instance is always treated as live.
 ///
 /// Writes an owner row only on the `AcquiredLocal` reclaim / re-acquire /
@@ -782,7 +782,7 @@ UPDATE intake_outbox AS io
  RETURNING *
 "#;
 
-/// Fenced worker-side claim (§3.5.1, P1-B linearization). Node identity (who) is
+/// Fenced runner-side claim (§3.5.1, P1-B linearization). Node identity (who) is
 /// `claimer_instance_id` (target + stamped owner + current active owner, triple
 /// checked plus the generation fence); the lease token (which restart) is
 /// `claim_token`, stored in `claim_owner`.
@@ -911,7 +911,7 @@ pub(crate) async fn sweep_stale_pre_accept_claims_fenced(
 /// Atomically retire a stale pending forwarded route before local recovery.
 /// The UPDATE's `status = 'pending'` predicate and PostgreSQL row lock
 /// serialize this transition with concurrent claims; the advisory lock is not
-/// relied on for legacy admission inserts or worker claims. A zero-row result
+/// relied on for legacy admission inserts or runner claims. A zero-row result
 /// means another actor won the race.
 pub(crate) async fn retire_stale_pending_route_for_local(
     pool: &PgPool,
@@ -1026,7 +1026,7 @@ mod tests {
                  admission_kind, owner_instance_id, owner_generation,
                  claim_owner, claimed_at
              ) VALUES (
-                 COALESCE($6, 'worker-1'), 'leader-1', '[]'::JSONB,
+                 COALESCE($6, 'runner-1'), 'hub-1', '[]'::JSONB,
                  $1, $2, 'user-1', 'hi', 'standard',
                  'agent-x', $3, $4, 1,
                  $5, $6, $7,
@@ -1060,8 +1060,8 @@ mod tests {
         InsertPendingPayload {
             execution_requirements: json!({}),
             attachment_refs: serde_json::json!([]),
-            target_instance_id: "worker-1".to_string(),
-            forwarded_by_instance_id: "leader-1".to_string(),
+            target_instance_id: "runner-1".to_string(),
+            forwarded_by_instance_id: "hub-1".to_string(),
             provider: provider.to_string(),
             required_labels: json!([]),
             channel_id: channel.to_string(),
@@ -1880,7 +1880,7 @@ mod tests {
                  agent_id, provider, status, attempt_no,
                  admission_kind, owner_instance_id, owner_generation, idempotency_key
              ) VALUES (
-                 'node-A', 'leader-1', '[]'::JSONB,
+                 'node-A', 'hub-1', '[]'::JSONB,
                  'chanK1', 'msg-1', 'user-1', 'hi', 'standard',
                  'agent-x', 'claude', 'done', 1,
                  'forwarded', 'node-A', 0, $1
@@ -2008,7 +2008,7 @@ mod tests {
         pg.drop().await;
     }
 
-    /// A local-admission row is never claimed by the worker claim path (P1-b):
+    /// A local-admission row is never claimed by the runner claim path (P1-b):
     /// `admission_kind='local'` is excluded by the candidate SELECT.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn claim_ignores_local_admission_rows() {
@@ -2074,7 +2074,7 @@ mod tests {
         let claimed = claim_pending_for_target_fenced(&pool, "node-W", "tok", "claude")
             .await
             .unwrap();
-        assert!(claimed.is_none(), "local rows are not worker-claimable");
+        assert!(claimed.is_none(), "local rows are not runner-claimable");
 
         pool.close().await;
         pg.drop().await;

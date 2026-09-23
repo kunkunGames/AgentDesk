@@ -4,9 +4,9 @@ use std::sync::{LazyLock, RwLock};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use crate::services::cluster::session_routing::cluster_capabilities_with_worker_api;
+use crate::services::cluster::session_routing::cluster_capabilities_with_runner_api;
 
-static ACTIVE_INTAKE_WORKER_PROVIDERS: LazyLock<RwLock<BTreeSet<String>>> =
+static ACTIVE_INTAKE_RUNNER_PROVIDERS: LazyLock<RwLock<BTreeSet<String>>> =
     LazyLock::new(|| RwLock::new(BTreeSet::new()));
 
 const PRESERVE_ON_CANCEL_V1: &str = "preserve_on_cancel_v1";
@@ -24,18 +24,18 @@ const SCHEDULED_MESSAGE_DISCORD_MENTION_CONSUMER_V1: &str = "discord_mention_con
 static GATEWAY_WAITER_PROVIDERS: LazyLock<RwLock<BTreeSet<String>>> =
     LazyLock::new(|| RwLock::new(BTreeSet::new()));
 
-pub(crate) fn register_intake_worker_provider(provider: &str) {
+pub(crate) fn register_intake_runner_provider(provider: &str) {
     let provider = provider.trim().to_ascii_lowercase();
     if provider.is_empty() {
         return;
     }
-    if let Ok(mut providers) = ACTIVE_INTAKE_WORKER_PROVIDERS.write() {
+    if let Ok(mut providers) = ACTIVE_INTAKE_RUNNER_PROVIDERS.write() {
         providers.insert(provider);
     }
 }
 
-pub(super) fn active_intake_worker_providers() -> Vec<String> {
-    ACTIVE_INTAKE_WORKER_PROVIDERS
+pub(super) fn active_intake_runner_providers() -> Vec<String> {
+    ACTIVE_INTAKE_RUNNER_PROVIDERS
         .read()
         .map(|providers| providers.iter().cloned().collect())
         .unwrap_or_default()
@@ -97,9 +97,9 @@ pub(super) fn capabilities_with_runtime_state(base: &Value) -> Value {
     let mut capabilities = base.as_object().cloned().unwrap_or_default();
     super::readiness::publish(&mut capabilities);
     super::execution_capacity::publish(&mut capabilities);
-    let providers = active_intake_worker_providers();
+    let providers = active_intake_runner_providers();
     capabilities.insert(
-        "intake_worker".to_string(),
+        "intake_runner".to_string(),
         json!({
             "enabled": !providers.is_empty(),
             "providers": providers,
@@ -127,22 +127,22 @@ pub(super) fn capabilities_with_runtime_state(base: &Value) -> Value {
 }
 
 pub(crate) fn node_supports_intake_provider(node: &Value, provider: &str) -> bool {
-    node_intake_worker(node, provider).is_some()
+    node_intake_runner(node, provider).is_some()
 }
 
-/// Returns whether a worker can safely consume this request's protocol shape.
-/// Legacy provider-capable workers remain eligible for non-preserving requests,
+/// Returns whether a runner can safely consume this request's protocol shape.
+/// Legacy provider-capable runners remain eligible for non-preserving requests,
 /// while preserving requests require an explicit versioned feature advertisement.
 pub(crate) fn node_supports_intake_request(
     node: &Value,
     provider: &str,
     preserve_on_cancel: bool,
 ) -> bool {
-    let Some(intake_worker) = node_intake_worker(node, provider) else {
+    let Some(intake_runner) = node_intake_runner(node, provider) else {
         return false;
     };
     !preserve_on_cancel
-        || intake_worker
+        || intake_runner
             .get("features")
             .and_then(Value::as_array)
             .is_some_and(|features| {
@@ -153,16 +153,16 @@ pub(crate) fn node_supports_intake_request(
             })
 }
 
-fn node_intake_worker<'a>(node: &'a Value, provider: &str) -> Option<&'a Value> {
+fn node_intake_runner<'a>(node: &'a Value, provider: &str) -> Option<&'a Value> {
     let provider = provider.trim().to_ascii_lowercase();
     if provider.is_empty() {
         return None;
     }
-    let intake_worker = node.get("capabilities")?.get("intake_worker")?;
-    if intake_worker.get("enabled").and_then(Value::as_bool) != Some(true) {
+    let intake_runner = node.get("capabilities")?.get("intake_runner")?;
+    if intake_runner.get("enabled").and_then(Value::as_bool) != Some(true) {
         return None;
     }
-    intake_worker
+    intake_runner
         .get("providers")
         .and_then(Value::as_array)
         .is_some_and(|providers| {
@@ -171,7 +171,7 @@ fn node_intake_worker<'a>(node: &'a Value, provider: &str) -> Option<&'a Value> 
                 .filter_map(Value::as_str)
                 .any(|candidate| candidate.trim().eq_ignore_ascii_case(&provider))
         })
-        .then_some(intake_worker)
+        .then_some(intake_runner)
 }
 
 #[cfg(test)]
@@ -179,14 +179,14 @@ mod tests {
     use super::*;
 
     fn node(features: Option<Value>) -> Value {
-        let mut intake_worker = serde_json::Map::from_iter([
+        let mut intake_runner = serde_json::Map::from_iter([
             ("enabled".to_string(), Value::Bool(true)),
             ("providers".to_string(), json!(["claude"])),
         ]);
         if let Some(features) = features {
-            intake_worker.insert("features".to_string(), features);
+            intake_runner.insert("features".to_string(), features);
         }
-        json!({ "capabilities": { "intake_worker": intake_worker } })
+        json!({ "capabilities": { "intake_runner": intake_runner } })
     }
 
     #[test]
@@ -213,17 +213,17 @@ mod tests {
     }
 
     #[test]
-    fn non_preserving_request_allows_legacy_provider_worker() {
+    fn non_preserving_request_allows_legacy_provider_runner() {
         assert!(node_supports_intake_request(&node(None), "claude", false));
     }
 
     #[test]
     fn runtime_capability_advertises_preservation_protocol() {
-        register_intake_worker_provider("claude");
+        register_intake_runner_provider("claude");
         let capabilities = capabilities_with_runtime_state(&json!({}));
         assert_eq!(
             capabilities
-                .pointer("/intake_worker/features/0")
+                .pointer("/intake_runner/features/0")
                 .and_then(Value::as_str),
             Some(PRESERVE_ON_CANCEL_V1)
         );
@@ -234,19 +234,19 @@ mod tests {
     }
 }
 
-pub(crate) async fn refresh_worker_node_runtime_capabilities(
+pub(crate) async fn refresh_runner_node_runtime_capabilities(
     pool: &PgPool,
     instance_id: &str,
 ) -> Result<(), String> {
-    let base = cluster_capabilities_with_worker_api(&crate::config::load_graceful().cluster);
+    let base = cluster_capabilities_with_runner_api(&crate::config::load_graceful().cluster);
     let capabilities = capabilities_with_runtime_state(&base);
     sqlx::query(
-        "UPDATE worker_nodes SET capabilities = $2, updated_at = NOW() WHERE instance_id = $1",
+        "UPDATE cluster_nodes SET capabilities = $2, updated_at = NOW() WHERE instance_id = $1",
     )
     .bind(instance_id)
     .bind(capabilities)
     .execute(pool)
     .await
     .map(|_| ())
-    .map_err(|error| format!("refresh worker_node runtime capabilities: {error}"))
+    .map_err(|error| format!("refresh runner_node runtime capabilities: {error}"))
 }

@@ -524,8 +524,8 @@ pub(in crate::services) struct RestartLifecycle {
     pub(in crate::services) shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// Provider-local intake tick activity; the deferred-restart poller uses
     /// it to fence admissions before consuming this provider's shutdown slot.
-    pub(in crate::services) intake_worker_lifecycle:
-        crate::services::cluster::intake_worker::IntakeWorkerLifecycle,
+    pub(in crate::services) intake_runner_lifecycle:
+        crate::services::cluster::intake_runner::IntakeRunnerLifecycle,
     /// Number of turns currently in finalization phase (response sending + cleanup).
     /// Deferred restart must wait until this reaches 0 to avoid killing mid-send turns.
     pub(in crate::services) finalizing_turns: Arc<std::sync::atomic::AtomicUsize>,
@@ -565,9 +565,9 @@ pub(in crate::services) struct RestartLifecycle {
     pub(in crate::services) shutdown_slot_consumed: std::sync::atomic::AtomicBool,
 }
 
-/// #5485 — read-only view of the process-global shutdown flag for workers
+/// #5485 — read-only view of the process-global shutdown flag for runners
 /// that only *observe* shutdown (intake poll loop, voice
-/// sensitivity/progress/rejoin workers), so they cannot flip the flag for the
+/// sensitivity/progress/rejoin runners), so they cannot flip the flag for the
 /// whole process.
 ///
 /// [`ShutdownReader::load`] and `Clone` are the entire surface — no `Deref`,
@@ -649,9 +649,9 @@ pub(in crate::services::discord) mod restart_lifecycle_tests {
 
     const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
 
-    /// #5485 S2a: stop a test-spawned voice worker through owner state — the
+    /// #5485 S2a: stop a test-spawned voice runner through owner state — the
     /// PCM harness holds a `ShutdownReader`, never a writable `Arc` of its own.
-    pub(in crate::services::discord) fn stop_pcm_worker_for_test(r: &super::RestartLifecycle) {
+    pub(in crate::services::discord) fn stop_pcm_runner_for_test(r: &super::RestartLifecycle) {
         r.shutting_down.store(true, Ordering::Relaxed);
     }
 

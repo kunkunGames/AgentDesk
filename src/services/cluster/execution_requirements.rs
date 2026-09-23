@@ -134,7 +134,7 @@ impl ExecutionRequirements {
         }
         let mut reasons = self.explain(node, chrono::Utc::now().timestamp_millis());
         if !node
-            .pointer("/capabilities/intake_worker/features")
+            .pointer("/capabilities/intake_runner/features")
             .and_then(Value::as_array)
             .is_some_and(|features| {
                 features
@@ -180,7 +180,7 @@ pub(crate) async fn for_channel(
     ExecutionRequirements::parse(value.unwrap_or_else(|| serde_json::json!({})))
 }
 
-pub(crate) fn validate_worker(
+pub(crate) fn validate_runner(
     row: &crate::db::intake_outbox::IntakeOutboxRow,
 ) -> Result<(), String> {
     let requirements = ExecutionRequirements::parse(row.execution_requirements.clone())?;

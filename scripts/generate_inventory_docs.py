@@ -53,8 +53,8 @@ GIANT_FILE_ISSUE_RATCHET_WRITER = (
 # `any(test, …)` (compiles when the other option is set) — are rejected.
 
 # `#[cfg(...)]` attribute immediately before a (optionally attributed, optionally
-# `pub`) `mod <name> {` declaration. The cfg body is captured for structural
-# evaluation; the `mod` open brace anchors the test-module body.
+# `pub`) `mod <name>` declaration. The cfg body is captured for structural
+# evaluation; the delimiter distinguishes inline bodies from file modules.
 # The predicate stays inside a single attribute (`[^]]`), and only further
 # attributes or whitespace may sit between the cfg and the `mod` keyword — so an
 # inline `#[cfg(test)]` guarding a function does not spuriously bind to a later
@@ -62,7 +62,7 @@ GIANT_FILE_ISSUE_RATCHET_WRITER = (
 _CFG_MOD_RE = re.compile(
     r"#\[cfg\((?P<predicate>[^]]*?)\)\]"
     r"\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?"
-    r"mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{",
+    r"mod\s+[A-Za-z_][A-Za-z0-9_]*\s*(?P<delimiter>[{;])",
 )
 
 
@@ -145,7 +145,7 @@ TOP_LEVEL_MODULE_PURPOSES = {
     "reconcile.rs": "Boot-time reconciliation for persisted state and dispatch-runtime drift.",
     "manual_intervention.rs": "Manual intervention parsing and helpers shared by Discord reply/requeue flows.",
     "runtime_layout/": "Managed runtime layout, memory-path migration, shared prompt sync, and skill deployment.",
-    "server/": "Axum server boot, routes, workers, background loops, and WebSocket broadcast.",
+    "server/": "Axum server boot, routes, runners, background loops, and WebSocket broadcast.",
     "services/": "Core runtime services: provider runners, Discord bot, queueing, memory, and platform helpers.",
     "supervisor/": "Runtime supervisor signals and recovery decisions for orphaned or stalled work.",
     "ui/": "Compatibility shims for persisted UI/session types used by the Discord runtime.",
@@ -201,8 +201,8 @@ class RouteEntry:
 
 
 @dataclass(frozen=True)
-class WorkerEntry:
-    worker: str
+class RunnerEntry:
+    runner: str
     kind: str
     target: str
     source: str
@@ -230,7 +230,7 @@ def line_count(text: str) -> int:
 
 
 def test_line_count(text: str) -> int:
-    """Count lines that live inside ``#[cfg(test)] mod`` blocks.
+    """Count ``#[cfg(test)] mod`` declarations and their inline bodies.
 
     Whole ``*_tests.rs`` files are already excluded from the production set by
     :func:`is_test_file`; this splits the remaining files so the giant-file
@@ -242,18 +242,19 @@ def test_line_count(text: str) -> int:
 
 
 def test_line_numbers(text: str) -> set[int]:
-    """Line numbers covered by ``#[cfg(test)] mod`` blocks (1-based)."""
+    """Lines covered by test-only module declarations and bodies (1-based)."""
 
     total = line_count(text)
     test_lines: set[int] = set()
     for match in _CFG_MOD_RE.finditer(text):
         if not cfg_requires_test(match.group("predicate")):
             continue
-        brace = text.rindex("{", match.start(), match.end())
-        try:
-            _body, end = scan_balanced(text, brace, "{", "}")
-        except ParseError:
-            continue
+        end = match.end() - 1
+        if match.group("delimiter") == "{":
+            try:
+                _body, end = scan_balanced(text, end, "{", "}")
+            except ParseError:
+                continue
         start_line = offset_to_line(text, match.start())
         end_line = offset_to_line(text, end)
         for line in range(start_line, end_line + 1):
@@ -1291,6 +1292,7 @@ def build_giant_registrations(
     *,
     allow_overdue: bool = False,
     evaluation_date: date | None = None,
+    candidate_modules: dict[str, int] | None = None,
 ) -> list[GiantFileRegistration]:
     """Validate the registry against measured prod-giants and build rows.
 
@@ -1456,6 +1458,11 @@ def build_giant_registrations(
 
     unregistered = sorted(set(prod_giants) - seen)
     for path in unregistered:
+        # A strict candidate snapshot can prove a missing baseline registration
+        # was repaired by shrinking the same file. Deletion and renaming cannot.
+        candidate_loc = (candidate_modules or {}).get(path)
+        if candidate_loc is not None and 0 <= candidate_loc < GIANT_FILE_THRESHOLD:
+            continue
         problems.append(
             f"unregistered giant: {path!r} has {prod_giants[path]} prod lines "
             f"(>= {GIANT_FILE_THRESHOLD}) but is missing from "
@@ -1518,7 +1525,8 @@ def build_giant_registrations(
     return registrations
 
 
-def giant_file_snapshot(root: Path, *, evaluation_date: date | None = None) -> dict[str, object]:
+def giant_file_snapshot(root: Path, *, evaluation_date: date | None = None,
+                        candidate_modules: dict[str, int] | None = None) -> dict[str, object]:
     """Evaluate structured giant truth; only proven-retirement debt is collected."""
     root = root.resolve()
     rooted_paths = {
@@ -1533,7 +1541,8 @@ def giant_file_snapshot(root: Path, *, evaluation_date: date | None = None) -> d
         globals().update(rooted_paths)
         modules = collect_modules()
         registrations = build_giant_registrations(modules, allow_overdue=True,
-                                                   evaluation_date=evaluation_date)
+                                                   evaluation_date=evaluation_date,
+                                                   candidate_modules=candidate_modules)
     finally:
         globals().update(previous)
     effective_date = evaluation_date or today_utc()
@@ -1543,6 +1552,10 @@ def giant_file_snapshot(root: Path, *, evaluation_date: date | None = None) -> d
     return {
         "modules": {item.file_path: item.prod_line_count for item in modules},
         "registrations": metadata,
+        "repaired_unregistered": sorted(
+            item.file_path for item in modules
+            if item.prod_line_count >= GIANT_FILE_THRESHOLD and item.file_path not in metadata
+        ),
         "overdue": sorted(
             item.file_path
             for item in registrations
@@ -1796,7 +1809,7 @@ def preceding_comment_block(text: str, offset: int) -> str:
     return " ".join(comments)
 
 
-def find_worker_target(inner: str) -> str:
+def find_runner_target(inner: str) -> str:
     awaited_targets = re.findall(r"([A-Za-z_][A-Za-z0-9_:]*)\s*\([^;\n]*?\)\.await", inner, re.DOTALL)
     awaited_targets = [target for target in awaited_targets if not target.endswith("tick")]
     if awaited_targets:
@@ -1804,7 +1817,7 @@ def find_worker_target(inner: str) -> str:
     block_on_match = re.search(r"block_on\(\s*([A-Za-z_][A-Za-z0-9_:]*)\s*\(", inner)
     if block_on_match is not None:
         return block_on_match.group(1)
-    raise ParseError(f"could not infer worker target from block: {strip_wrapping_whitespace(inner)!r}")
+    raise ParseError(f"could not infer runner target from block: {strip_wrapping_whitespace(inner)!r}")
 
 
 def find_thread_name(prefix: str) -> str | None:
@@ -1812,20 +1825,20 @@ def find_thread_name(prefix: str) -> str | None:
     return match.group(1) if match else None
 
 
-def collect_workers() -> list[WorkerEntry]:
-    registry_path = REPO_ROOT / "src" / "server" / "worker_registry.rs"
+def collect_runners() -> list[RunnerEntry]:
+    registry_path = REPO_ROOT / "src" / "server" / "runner_registry.rs"
     text = read_text(registry_path)
-    workers: list[WorkerEntry] = []
+    runners: list[RunnerEntry] = []
 
     array_match = re.search(
-        r"pub\(crate\)\s+const\s+WORKER_SPECS\s*:[^=]*=\s*\[(?P<body>.*?)\n\];",
+        r"pub\(crate\)\s+const\s+RUNNER_SPECS\s*:[^=]*=\s*\[(?P<body>.*?)\n\];",
         text,
         re.DOTALL,
     )
     if array_match is None:
-        raise ParseError("could not locate WORKER_SPECS definition")
+        raise ParseError("could not locate RUNNER_SPECS definition")
 
-    spec_re = re.compile(r"WorkerSpec\s*\{(?P<body>.*?)\n\s*\}", re.DOTALL)
+    spec_re = re.compile(r"RunnerSpec\s*\{(?P<body>.*?)\n\s*\}", re.DOTALL)
     kind_labels = {
         "TokioTask": "tokio::spawn",
         "DedicatedThread": "std::thread::spawn",
@@ -1849,7 +1862,7 @@ def collect_workers() -> list[WorkerEntry]:
     def capture(body: str, pattern: str, field: str) -> str:
         match = re.search(pattern, body)
         if match is None:
-            raise ParseError(f"missing {field} in WORKER_SPECS entry: {strip_wrapping_whitespace(body)!r}")
+            raise ParseError(f"missing {field} in RUNNER_SPECS entry: {strip_wrapping_whitespace(body)!r}")
         return match.group(1)
 
     array_body = array_match.group("body")
@@ -1857,22 +1870,22 @@ def collect_workers() -> list[WorkerEntry]:
         body = match.group("body")
         full_offset = array_match.start("body") + match.start()
         line = offset_to_line(text, full_offset)
-        worker = capture(body, r'name:\s*"([^"]+)"', "name")
+        runner = capture(body, r'name:\s*"([^"]+)"', "name")
         target = capture(body, r'target:\s*"([^"]+)"', "target")
-        kind = kind_labels[capture(body, r"kind:\s*WorkerKind::([A-Za-z0-9_]+)", "kind")]
-        stage = stage_labels[capture(body, r"start_stage:\s*WorkerStartStage::([A-Za-z0-9_]+)", "start_stage")]
+        kind = kind_labels[capture(body, r"kind:\s*RunnerKind::([A-Za-z0-9_]+)", "kind")]
+        stage = stage_labels[capture(body, r"start_stage:\s*RunnerStartStage::([A-Za-z0-9_]+)", "start_stage")]
         start_order = capture(body, r"start_order:\s*([0-9]+)", "start_order")
         restart = restart_labels[
             capture(
                 body,
-                r"restart_policy:\s*WorkerRestartPolicy::([A-Za-z0-9_]+)",
+                r"restart_policy:\s*RunnerRestartPolicy::([A-Za-z0-9_]+)",
                 "restart_policy",
             )
         ]
         shutdown = shutdown_labels[
             capture(
                 body,
-                r"shutdown_policy:\s*WorkerShutdownPolicy::([A-Za-z0-9_]+)",
+                r"shutdown_policy:\s*RunnerShutdownPolicy::([A-Za-z0-9_]+)",
                 "shutdown_policy",
             )
         ]
@@ -1880,9 +1893,9 @@ def collect_workers() -> list[WorkerEntry]:
         owner = capture(body, r'owner:\s*"([^"]+)"', "owner")
         health_owner = capture(body, r'health_owner:\s*"([^"]+)"', "health_owner")
         notes = capture(body, r'notes:\s*"([^"]*)"', "notes")
-        workers.append(
-            WorkerEntry(
-                worker=worker,
+        runners.append(
+            RunnerEntry(
+                runner=runner,
                 kind=kind,
                 target=f"`{target}`",
                 source=format_path_with_line(registry_path, line),
@@ -1893,8 +1906,8 @@ def collect_workers() -> list[WorkerEntry]:
             )
         )
 
-    workers.sort(key=lambda item: int(item.source.rsplit(":", 1)[-1].rstrip("`")))
-    return workers
+    runners.sort(key=lambda item: int(item.source.rsplit(":", 1)[-1].rstrip("`")))
+    return runners
 
 
 def render_ascii_tree(root: Path) -> list[str]:
@@ -2046,21 +2059,21 @@ def render_route_inventory(entries: list[RouteEntry]) -> str:
     return "\n".join(lines)
 
 
-def render_worker_inventory(entries: list[WorkerEntry]) -> str:
+def render_runner_inventory(entries: list[RunnerEntry]) -> str:
     lines = [
-        "# Bootstrap Worker Inventory",
+        "# Bootstrap Runner Inventory",
         "",
         "> Generated by `python3 scripts/generate_inventory_docs.py`. Do not edit manually.",
         "",
-        "- Scope: supervised worker specs registered in `server::worker_registry::WORKER_SPECS`.",
-        f"- Workers: `{len(entries)}`",
+        "- Scope: supervised runner specs registered in `server::runner_registry::RUNNER_SPECS`.",
+        f"- Runners: `{len(entries)}`",
         "",
-        "| Worker | Kind | Target | Source | Notes |",
+        "| Runner | Kind | Target | Source | Notes |",
         "| --- | --- | --- | --- | --- |",
     ]
     for entry in entries:
         lines.append(
-            f"| {entry.worker} | `{entry.kind}` | {entry.target} | {entry.source} | {entry.notes} |"
+            f"| {entry.runner} | `{entry.kind}` | {entry.target} | {entry.source} | {entry.notes} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -2086,13 +2099,13 @@ def generated_documents(*, allow_overdue: bool = False) -> dict[Path, str]:
     module_entries = collect_modules()
     giant_registrations = build_giant_registrations(module_entries, allow_overdue=allow_overdue)
     route_inventory = generated_route_inventory()
-    worker_entries = collect_workers()
+    runner_entries = collect_runners()
     return {
         ARCHITECTURE_DOC: render_architecture_doc(),
         GENERATED_DOCS_DIR / "module-inventory.md": render_module_inventory(module_entries),
         GIANT_FILE_REGISTRY_DOC: render_giant_file_registry(giant_registrations),
         GENERATED_DOCS_DIR / "route-inventory.md": route_inventory,
-        GENERATED_DOCS_DIR / "worker-inventory.md": render_worker_inventory(worker_entries),
+        GENERATED_DOCS_DIR / "runner-inventory.md": render_runner_inventory(runner_entries),
     }
 
 

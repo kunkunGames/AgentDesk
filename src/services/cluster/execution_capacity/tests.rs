@@ -7,7 +7,7 @@ fn payload(node: &str, channel: &str) -> InsertPendingPayload {
         execution_requirements: json!({}),
         attachment_refs: json!([]),
         target_instance_id: node.into(),
-        forwarded_by_instance_id: "leader".into(),
+        forwarded_by_instance_id: "hub".into(),
         provider: "claude".into(),
         required_labels: json!([]),
         channel_id: channel.into(),
@@ -33,7 +33,7 @@ async fn execution_capacity_atomic_reservations_execution_and_fenced_expiry_pg()
     let fixture = TestPostgresDb::create().await;
     let pool = fixture.connect_and_migrate().await;
     for node in ["mac", "windows"] {
-        sqlx::query("INSERT INTO worker_nodes(instance_id,last_heartbeat_at,capabilities) VALUES($1,NOW(),$2)")
+        sqlx::query("INSERT INTO cluster_nodes(instance_id,last_heartbeat_at,capabilities) VALUES($1,NOW(),$2)")
             .bind(node).bind(json!({"execution_capacity":{"version":1,"slots":2}})).execute(&pool).await.unwrap();
     }
     let mut jobs = tokio::task::JoinSet::new();
@@ -63,7 +63,7 @@ async fn execution_capacity_atomic_reservations_execution_and_fenced_expiry_pg()
     store::acquire(&pool, "mac", "claude", channel, first)
         .await
         .unwrap();
-    let nodes = super::super::node_registry::list_worker_nodes(&pool, 30)
+    let nodes = super::super::node_registry::list_cluster_nodes(&pool, 30)
         .await
         .unwrap();
     let mac = nodes.iter().find(|n| n["instance_id"] == "mac").unwrap();
@@ -192,7 +192,7 @@ async fn execution_capacity_atomic_reservations_execution_and_fenced_expiry_pg()
 fn execution_capacity_ranking_uses_ratio_fairness_and_preserves_legacy_selector() {
     let node = |id: &str, used: u64, slots: u64, last: Option<&str>| {
         json!({
-            "instance_id":id,"status":"online","labels":["worker"],
+            "instance_id":id,"status":"online","labels":["runner"],
             "execution_occupied":used,"last_execution_assignment_at":last,
             "capabilities":{"execution_capacity":{"version":1,"slots":slots}}
         })
@@ -205,12 +205,12 @@ fn execution_capacity_ranking_uses_ratio_fairness_and_preserves_legacy_selector(
     ];
     rank(&mut nodes);
     assert_eq!(nodes.len(), 2);
-    let candidates = super::super::intake_routing::candidates_from_worker_nodes_json(&nodes);
+    let candidates = super::super::intake_routing::candidates_from_cluster_nodes_json(&nodes);
     let selection =
-        super::super::intake_routing::pick_intake_target(&candidates, &["worker".into()], "leader");
+        super::super::intake_routing::pick_intake_target(&candidates, &["runner".into()], "hub");
     assert_eq!(
         selection,
-        super::super::intake_routing::IntakeRouteTarget::Worker {
+        super::super::intake_routing::IntakeRouteTarget::Runner {
             instance_id: "z".into()
         }
     );

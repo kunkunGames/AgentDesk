@@ -2,7 +2,7 @@ use super::*;
 use crate::services::discord::gateway::{DiscordGateway, HeadlessGateway};
 
 #[test]
-fn worker_rest_transport_delivers_without_gateway_queue_chaining() {
+fn runner_rest_transport_delivers_without_gateway_queue_chaining() {
     let shared = crate::services::discord::make_shared_data_for_tests();
     let gateway = DiscordGateway::new(
         Arc::new(serenity::Http::new("test-token")),
@@ -17,7 +17,7 @@ fn worker_rest_transport_delivers_without_gateway_queue_chaining() {
 }
 
 #[tokio::test]
-async fn rest_worker_terminal_edits_once_without_a_headless_duplicate() {
+async fn rest_runner_terminal_edits_once_without_a_headless_duplicate() {
     let mut driver = TerminalDeliveryDriver::new(ReplaceBehaviour::Edited, 1);
     driver.gateway = Arc::new(DriverGateway {
         chain_locally: false,

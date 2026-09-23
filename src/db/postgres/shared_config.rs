@@ -1,5 +1,5 @@
-//! Leader-owned configuration synchronization, separate from schema migration.
-//! Workers validate the shared baseline without applying their local YAML.
+//! Hub-owned configuration synchronization, separate from schema migration.
+//! Runners validate the shared baseline without applying their local YAML.
 
 use super::{connect_for_startup, register_repo, sync_agents_from_config_pg};
 use crate::config::{ClusterRole, Config};
@@ -8,7 +8,7 @@ use sqlx::PgPool;
 use std::collections::BTreeSet;
 
 pub async fn startup_reseed(pool: &PgPool, config: &Config) -> Result<(), String> {
-    // Startup runs before leader election. A worker's local paths, port and reset
+    // Startup runs before hub election. A runner's local paths, port and reset
     // flags must never become the shared configuration, even on the first boot.
     if !shared_config_sync_enabled(config) {
         let initialized: bool = sqlx::query_scalar(
@@ -16,7 +16,7 @@ pub async fn startup_reseed(pool: &PgPool, config: &Config) -> Result<(), String
         )
         .fetch_one(pool)
         .await
-        .map_err(|error| format!("check leader-owned shared configuration: {error}"))?;
+        .map_err(|error| format!("check hub-owned shared configuration: {error}"))?;
         if !initialized {
             return Err(
                 "shared configuration is not initialized; start a node configured as \
@@ -27,7 +27,7 @@ pub async fn startup_reseed(pool: &PgPool, config: &Config) -> Result<(), String
         }
         tracing::info!(
             role = %config.cluster.role,
-            "[startup] using leader-owned shared configuration; skipping all local YAML reseeding"
+            "[startup] using hub-owned shared configuration; skipping all local YAML reseeding"
         );
         return Ok(());
     }

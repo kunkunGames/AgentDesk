@@ -2,7 +2,7 @@
 
 Use one native AgentDesk artifact per OS/CPU target. Runtime roles select the
 modules that start; a runner does not need a separate executable or scheduler.
-See [execution only mode](worker-runtime-profile.md), [display terminology](node-terminology.md), and
+See [execution only mode](runner-runtime-profile.md), [display terminology](node-terminology.md), and
 [remote dashboard authentication](remote-dashboard-auth.md).
 
 ## Evidence and freshness

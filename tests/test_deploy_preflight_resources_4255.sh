@@ -325,7 +325,7 @@ assert_out_contains "rust-analyzer surfaced as advisory" "advisory" _preflight_r
 assert_out_contains "advisory names rust-analyzer" "rust-analyzer" _preflight_resource_contention
 reset_clean_stubs
 # (b) long-lived but BURSTY mdworker: 2h elapsed, only 6m CPU → ratio 0.05.
-STUB_HIGHCPU="$(printf '777\t95.0\t02:00:00\t06:00\tmdworker')"
+STUB_HIGHCPU="$(printf '777\t95.0\t02:00:00\t06:00\tmdrunner')"
 assert_rc "bursty mdworker (2h elapsed, ratio 0.05) → proceed" 0 _preflight_resource_contention
 assert_out_contains "mdworker surfaced as advisory" "advisory" _preflight_resource_contention
 reset_clean_stubs

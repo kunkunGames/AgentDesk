@@ -13,7 +13,7 @@ use super::metrics;
 use super::turn_lifecycle;
 use super::{
     AgentQualityEvent, CounterBucket, CounterDelta, CounterKey, InvariantViolation, QueuedEvent,
-    QueuedQualityEvent, WorkerMessage, runtime,
+    QueuedQualityEvent, RunnerMessage, runtime,
 };
 
 pub fn emit_turn_started(
@@ -784,8 +784,8 @@ pub fn emit_agent_quality_event(event: AgentQualityEvent) {
         ),
     );
 
-    if let Some(sender) = super::worker::worker_sender() {
-        let _ = sender.send(WorkerMessage::QualityEvent(queued));
+    if let Some(sender) = super::runner::runner_sender() {
+        let _ = sender.send(RunnerMessage::QualityEvent(queued));
     }
 }
 
@@ -850,8 +850,8 @@ pub(super) fn emit_event(
         payload_json,
     };
 
-    if let Some(sender) = super::worker::worker_sender() {
-        let _ = sender.send(WorkerMessage::Event(queued));
+    if let Some(sender) = super::runner::runner_sender() {
+        let _ = sender.send(RunnerMessage::Event(queued));
     }
 }
 

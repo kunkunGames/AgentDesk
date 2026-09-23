@@ -2935,7 +2935,7 @@ fn completion_footer_running_background_subagent_animates_until_notification_don
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "bgworker",
+                "subagent_type": "bgrunner",
                 "description": "Long background job",
                 "run_in_background": true
             })
@@ -2952,7 +2952,7 @@ fn completion_footer_running_background_subagent_animates_until_notification_don
     let running_block = running.block.expect("running subagent should render");
     assert!(running.has_unfinished_entries);
     assert!(running_block.contains("Subagents"));
-    assert!(running_block.contains("bgworker Long background job ⠸"));
+    assert!(running_block.contains("bgrunner Long background job ⠸"));
     assert!(!running_block.contains('✓'));
 
     events.push_status_events(
@@ -2962,7 +2962,7 @@ fn completion_footer_running_background_subagent_animates_until_notification_don
     let done = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠼");
     let done_block = done.block.expect("finished subagent should stay visible");
     assert!(!done.has_unfinished_entries);
-    assert!(done_block.contains("bgworker Long background job"));
+    assert!(done_block.contains("bgrunner Long background job"));
     assert!(done_block.contains("all done"));
     assert!(done_block.contains('✓'));
     assert!(!done_block.contains('⠼'));
@@ -3763,7 +3763,7 @@ fn completion_footer_evicted_subagent_does_not_survive_migration_carry_over() {
     events.push_status_event(
         channel_id,
         StatusEvent::SubagentStart {
-            subagent_type: Some("bgworker".to_string()),
+            subagent_type: Some("bgrunner".to_string()),
             desc: Some("Finished bg agent".to_string()),
             agent_id: None,
             tool_use_id: Some("toolu_bg_done".to_string()),
@@ -3773,7 +3773,7 @@ fn completion_footer_evicted_subagent_does_not_survive_migration_carry_over() {
     events.push_status_event(
         channel_id,
         StatusEvent::SubagentStart {
-            subagent_type: Some("bgworker".to_string()),
+            subagent_type: Some("bgrunner".to_string()),
             desc: Some("Running bg agent".to_string()),
             agent_id: None,
             tool_use_id: Some("toolu_bg_run".to_string()),
@@ -3858,7 +3858,7 @@ fn footer_residual_entries_carry_to_next_turn_and_finished_entries_do_not() {
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "bgworker",
+                "subagent_type": "bgrunner",
                 "description": "Carry agent task",
                 "run_in_background": true
             })
@@ -3875,7 +3875,7 @@ fn footer_residual_entries_carry_to_next_turn_and_finished_entries_do_not() {
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "bgworker",
+                "subagent_type": "bgrunner",
                 "description": "Finished agent task",
                 "run_in_background": true
             })
@@ -3901,7 +3901,7 @@ fn footer_residual_entries_carry_to_next_turn_and_finished_entries_do_not() {
 
     let live = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     assert!(live.contains("Bash Carry bash task"));
-    assert!(live.contains("bgworker Carry agent task"));
+    assert!(live.contains("bgrunner Carry agent task"));
     assert!(!live.contains("Finished bash task"));
     assert!(!live.contains("Finished agent task"));
 
@@ -3909,7 +3909,7 @@ fn footer_residual_entries_carry_to_next_turn_and_finished_entries_do_not() {
     let footer_block = footer.block.expect("carried residual footer should render");
     assert!(footer.has_unfinished_entries);
     assert!(footer_block.contains("Bash Carry bash task ⠸"));
-    assert!(footer_block.contains("bgworker Carry agent task ⠸"));
+    assert!(footer_block.contains("bgrunner Carry agent task ⠸"));
     assert!(!footer_block.contains("Finished bash task"));
     assert!(!footer_block.contains("Finished agent task"));
 
@@ -3932,7 +3932,7 @@ fn footer_residual_entries_carry_to_next_turn_and_finished_entries_do_not() {
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "bgworker",
+                "subagent_type": "bgrunner",
                 "description": "Carry agent task replay",
                 "run_in_background": true
             })
@@ -3986,7 +3986,7 @@ fn carried_residual_entries_finalize_by_exact_tool_use_id_on_latest_state() {
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "bgworker",
+                "subagent_type": "bgrunner",
                 "description": "Exact carried agent",
                 "run_in_background": true
             })
@@ -4910,7 +4910,7 @@ fn status_panel_subagent_summary_attaches_only_to_matching_slot() {
         channel_id,
         status_events_from_tool_use_with_id(
             "Task",
-            &json!({"subagent_type": "worker", "description": "Still running"}).to_string(),
+            &json!({"subagent_type": "runner", "description": "Still running"}).to_string(),
             Some("toolu_running"),
         ),
     );
@@ -4945,14 +4945,14 @@ fn status_panel_subagent_summary_attaches_only_to_matching_slot() {
     );
 
     // #4367: the finished subagent is hidden from the live panel, but the footer
-    // renders BOTH the finished (finisher) and still-running (worker) slots, so
+    // renders BOTH the finished (finisher) and still-running (runner) slots, so
     // verify summary attribution there.
     let footer = events.render_completion_footer(channel_id, &ProviderKind::Claude, "⠸");
     let block = footer
         .block
         .expect("subagents should render in the completion footer");
     let finisher_line = footer_line_containing(&block, "finisher Finishing work");
-    let worker_line = footer_line_containing(&block, "worker Still running");
+    let runner_line = footer_line_containing(&block, "runner Still running");
 
     // The matching subagent gets the Done summary and is marked done.
     assert!(
@@ -4968,12 +4968,12 @@ fn status_panel_subagent_summary_attaches_only_to_matching_slot() {
     // done/fail marker. The unrelated block + the aggregate must never mis-route
     // here via the last-unfinished fallback.
     assert!(
-        !worker_line.contains("Done ("),
-        "running subagent must not get a stray Done summary, got: {worker_line}"
+        !runner_line.contains("Done ("),
+        "running subagent must not get a stray Done summary, got: {runner_line}"
     );
     assert!(
-        !worker_line.contains('✓') && !worker_line.contains('✗'),
-        "running subagent must stay running (no marker), got: {worker_line}"
+        !runner_line.contains('✓') && !runner_line.contains('✗'),
+        "running subagent must stay running (no marker), got: {runner_line}"
     );
 }
 
@@ -4993,7 +4993,7 @@ fn status_panel_background_subagent_not_marked_done_on_launch_ack() {
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "bgworker",
+                "subagent_type": "bgrunner",
                 "description": "Long background job",
                 "run_in_background": true
             })
@@ -5013,7 +5013,7 @@ fn status_panel_background_subagent_not_marked_done_on_launch_ack() {
         events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     let bg_line = rendered_running
         .lines()
-        .find(|line| line.contains("bgworker Long background job"))
+        .find(|line| line.contains("bgrunner Long background job"))
         .unwrap_or_else(|| panic!("background subagent slot missing in: {rendered_running}"));
     assert!(
         !bg_line.contains('✓') && !bg_line.contains('✗'),
@@ -5031,7 +5031,7 @@ fn status_panel_background_subagent_not_marked_done_on_launch_ack() {
     let block = footer
         .block
         .expect("completed background subagent should render in the completion footer");
-    let bg_done_line = footer_line_containing(&block, "bgworker Long background job");
+    let bg_done_line = footer_line_containing(&block, "bgrunner Long background job");
     assert!(
         bg_done_line.contains('✓'),
         "background subagent must be ✓ after a terminal task_notification, got: {bg_done_line}"
@@ -5051,7 +5051,7 @@ fn status_events_json_async_launch_ack_does_not_close_background_subagent() {
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "bgworker",
+                "subagent_type": "bgrunner",
                 "description": "Launch ack record reconstruction",
                 "run_in_background": true
             })
@@ -5090,7 +5090,7 @@ fn status_events_json_async_launch_ack_does_not_close_background_subagent() {
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     let line = rendered
         .lines()
-        .find(|line| line.contains("bgworker Launch ack record reconstruction"))
+        .find(|line| line.contains("bgrunner Launch ack record reconstruction"))
         .unwrap_or_else(|| panic!("background subagent slot missing in: {rendered}"));
     assert!(
         !line.contains('✓') && !line.contains('✗') && !line.contains("Done ("),
@@ -5243,7 +5243,7 @@ fn status_panel_async_completion_with_accounting_still_finalizes_subagent() {
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "asyncworker",
+                "subagent_type": "asyncrunner",
                 "description": "Completion accounting"
             })
             .to_string(),
@@ -5277,7 +5277,7 @@ fn status_panel_async_completion_with_accounting_still_finalizes_subagent() {
     let block = footer
         .block
         .expect("completed subagent should render in the completion footer");
-    let line = footer_line_containing(&block, "asyncworker Completion accounting");
+    let line = footer_line_containing(&block, "asyncrunner Completion accounting");
     assert!(
         line.contains("Done (12 tools · 5k tokens · 30s)") && line.contains('✓'),
         "completion with accounting must still finalize, got: {line}"
@@ -5294,7 +5294,7 @@ fn status_panel_foreground_completion_without_agent_id_still_finalizes_subagent(
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "fgworker",
+                "subagent_type": "fgrunner",
                 "description": "No agent id completion"
             })
             .to_string(),
@@ -5327,7 +5327,7 @@ fn status_panel_foreground_completion_without_agent_id_still_finalizes_subagent(
     let block = footer
         .block
         .expect("completed subagent should render in the completion footer");
-    let line = footer_line_containing(&block, "fgworker No agent id completion");
+    let line = footer_line_containing(&block, "fgrunner No agent id completion");
     assert!(
         line.contains("Done (3 tools · 1.5k tokens · 20s)") && line.contains('✓'),
         "foreground completion without agentId must still finalize, got: {line}"
@@ -5348,7 +5348,7 @@ fn status_panel_background_ack_only_unmatched_id_waits_for_matching_completion()
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "bgworker",
+                "subagent_type": "bgrunner",
                 "description": "Background fallback guard",
                 "run_in_background": true
             })
@@ -5372,7 +5372,7 @@ fn status_panel_background_ack_only_unmatched_id_waits_for_matching_completion()
         events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     let running_line = rendered_running
         .lines()
-        .find(|line| line.contains("bgworker Background fallback guard"))
+        .find(|line| line.contains("bgrunner Background fallback guard"))
         .unwrap_or_else(|| panic!("background subagent slot missing in: {rendered_running}"));
     assert!(
         !running_line.contains('✓') && !running_line.contains('✗'),
@@ -5401,7 +5401,7 @@ fn status_panel_background_ack_only_unmatched_id_waits_for_matching_completion()
     let block = footer
         .block
         .expect("completed background subagent should render in the completion footer");
-    let done_line = footer_line_containing(&block, "bgworker Background fallback guard");
+    let done_line = footer_line_containing(&block, "bgrunner Background fallback guard");
     assert!(
         done_line.contains("Done (3 tools · 1.2k tokens · 42s)"),
         "matching summary completion must attach accounting, got: {done_line}"
@@ -5425,7 +5425,7 @@ fn status_panel_ack_only_unmatched_id_does_not_fallback_to_any_slot() {
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "bgworker",
+                "subagent_type": "bgrunner",
                 "description": "Still background",
                 "run_in_background": true
             })
@@ -5437,7 +5437,7 @@ fn status_panel_ack_only_unmatched_id_does_not_fallback_to_any_slot() {
         channel_id,
         status_events_from_tool_use_with_id(
             "Task",
-            &json!({"subagent_type": "fgworker", "description": "Still foreground"}).to_string(),
+            &json!({"subagent_type": "fgrunner", "description": "Still foreground"}).to_string(),
             Some("toolu_fg"),
         ),
     );
@@ -5454,7 +5454,7 @@ fn status_panel_ack_only_unmatched_id_does_not_fallback_to_any_slot() {
     );
 
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    for expected in ["bgworker Still background", "fgworker Still foreground"] {
+    for expected in ["bgrunner Still background", "fgrunner Still foreground"] {
         let line = rendered
             .lines()
             .find(|line| line.contains(expected))
@@ -5476,7 +5476,7 @@ fn status_panel_foreground_subagent_summary_completion_still_marks_done() {
         channel_id,
         status_events_from_tool_use_with_id(
             "Task",
-            &json!({"subagent_type": "fgworker", "description": "Summary completion"}).to_string(),
+            &json!({"subagent_type": "fgrunner", "description": "Summary completion"}).to_string(),
             Some("toolu_fg_summary"),
         ),
     );
@@ -5502,7 +5502,7 @@ fn status_panel_foreground_subagent_summary_completion_still_marks_done() {
     let block = footer
         .block
         .expect("completed subagent should render in the completion footer");
-    let line = footer_line_containing(&block, "fgworker Summary completion");
+    let line = footer_line_containing(&block, "fgrunner Summary completion");
     assert!(
         line.contains("Done (2 tools · 900 tokens · 11s)"),
         "foreground summary completion must keep Done summary, got: {line}"
@@ -5529,7 +5529,7 @@ fn status_panel_background_subagent_failed_launch_marked_failed() {
         status_events_from_tool_use_with_id(
             "Task",
             &json!({
-                "subagent_type": "bgworker",
+                "subagent_type": "bgrunner",
                 "description": "Doomed background job",
                 "run_in_background": true
             })
@@ -5551,7 +5551,7 @@ fn status_panel_background_subagent_failed_launch_marked_failed() {
     let block = footer
         .block
         .expect("failed background subagent should render in the completion footer");
-    let bg_line = footer_line_containing(&block, "bgworker Doomed background job");
+    let bg_line = footer_line_containing(&block, "bgrunner Doomed background job");
     assert!(
         bg_line.contains('✗'),
         "failed background launch must finalize as ✗, got: {bg_line}"
@@ -5574,7 +5574,7 @@ fn status_panel_foreground_subagent_marked_done_on_tool_result() {
         channel_id,
         status_events_from_tool_use_with_id(
             "Task",
-            &json!({"subagent_type": "fgworker", "description": "Quick job"}).to_string(),
+            &json!({"subagent_type": "fgrunner", "description": "Quick job"}).to_string(),
             Some("toolu_fg"),
         ),
     );
@@ -5589,7 +5589,7 @@ fn status_panel_foreground_subagent_marked_done_on_tool_result() {
     let block = footer
         .block
         .expect("completed subagent should render in the completion footer");
-    let fg_line = footer_line_containing(&block, "fgworker Quick job");
+    let fg_line = footer_line_containing(&block, "fgrunner Quick job");
     assert!(
         fg_line.contains('✓'),
         "foreground subagent must be ✓ on its tool_result, got: {fg_line}"
@@ -5787,7 +5787,7 @@ fn status_panel_unmatched_summary_end_is_dropped_not_misrouted() {
         channel_id,
         status_events_from_tool_use_with_id(
             "Task",
-            &json!({"subagent_type": "worker", "description": "Long task"}).to_string(),
+            &json!({"subagent_type": "runner", "description": "Long task"}).to_string(),
             Some("toolu_real"),
         ),
     );
@@ -5810,17 +5810,17 @@ fn status_panel_unmatched_summary_end_is_dropped_not_misrouted() {
     );
 
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    let worker_line = rendered
+    let runner_line = rendered
         .lines()
-        .find(|line| line.contains("worker Long task"))
-        .unwrap_or_else(|| panic!("worker slot missing in: {rendered}"));
+        .find(|line| line.contains("runner Long task"))
+        .unwrap_or_else(|| panic!("runner slot missing in: {rendered}"));
     assert!(
-        !worker_line.contains("Done ("),
-        "unmatched summary must not land on the running slot, got: {worker_line}"
+        !runner_line.contains("Done ("),
+        "unmatched summary must not land on the running slot, got: {runner_line}"
     );
     assert!(
-        !worker_line.contains('✓') && !worker_line.contains('✗'),
-        "unmatched summary-bearing end must not close the slot, got: {worker_line}"
+        !runner_line.contains('✓') && !runner_line.contains('✗'),
+        "unmatched summary-bearing end must not close the slot, got: {runner_line}"
     );
 }
 
@@ -7702,7 +7702,7 @@ fn task_notification_xml_idless_terminal_closes_unique_agent_id_slot() {
         channel_id,
         StatusEvent::SubagentStart {
             subagent_type: Some("agent".to_string()),
-            desc: Some("Async 4396 worker".to_string()),
+            desc: Some("Async 4396 runner".to_string()),
             agent_id: Some(agent_id.to_string()),
             tool_use_id: Some("toolu_4396_async".to_string()),
             background: true,
@@ -8912,7 +8912,7 @@ fn rehydration_end_after_rehydrate_flips_check_and_evicts() {
     let channel_id = ChannelId::new(3_402_002);
     let transcript = write_transcript(&[
         transcript_subagent_start("toolu_sa", "long subagent"),
-        transcript_background_bash_start("toolu_bg", "bg worker"),
+        transcript_background_bash_start("toolu_bg", "bg runner"),
     ]);
     events.rehydrate_slots_from_transcript_tail_for_footer_mode(
         channel_id,
@@ -9442,7 +9442,7 @@ fn stuck_background_subagent_slot_dropped_on_turn_boundary_reconciliation() {
     events.push_status_event(
         channel_id,
         StatusEvent::SubagentStart {
-            subagent_type: Some("bgworker".to_string()),
+            subagent_type: Some("bgrunner".to_string()),
             desc: Some("stuck subagent".to_string()),
             agent_id: None,
             tool_use_id: Some("toolu_stuck_subagent_boundary".to_string()),
@@ -9452,7 +9452,7 @@ fn stuck_background_subagent_slot_dropped_on_turn_boundary_reconciliation() {
     events.push_status_event(
         channel_id,
         StatusEvent::SubagentStart {
-            subagent_type: Some("bgworker".to_string()),
+            subagent_type: Some("bgrunner".to_string()),
             desc: Some("fresh subagent".to_string()),
             agent_id: None,
             tool_use_id: Some("toolu_fresh_subagent_boundary".to_string()),
@@ -9519,7 +9519,7 @@ fn stuck_background_subagent_slot_force_aborted_and_evicted() {
     events.push_status_event(
         channel_id,
         StatusEvent::SubagentStart {
-            subagent_type: Some("bgworker".to_string()),
+            subagent_type: Some("bgrunner".to_string()),
             desc: Some("stuck subagent".to_string()),
             agent_id: None,
             tool_use_id: Some("toolu_stuck_subagent".to_string()),
@@ -9581,7 +9581,7 @@ fn fresh_background_subagent_slot_preserved_by_ttl_sweep() {
     events.push_status_event(
         channel_id,
         StatusEvent::SubagentStart {
-            subagent_type: Some("bgworker".to_string()),
+            subagent_type: Some("bgrunner".to_string()),
             desc: Some("fresh subagent".to_string()),
             agent_id: None,
             tool_use_id: Some("toolu_fresh_subagent".to_string()),
@@ -9627,7 +9627,7 @@ fn finished_background_subagent_slot_untouched_by_ttl_sweep() {
     events.push_status_event(
         channel_id,
         StatusEvent::SubagentStart {
-            subagent_type: Some("bgworker".to_string()),
+            subagent_type: Some("bgrunner".to_string()),
             desc: Some("finished subagent".to_string()),
             agent_id: None,
             tool_use_id: Some("toolu_finished_subagent".to_string()),
@@ -9693,7 +9693,7 @@ fn stuck_background_subagent_swept_on_periodic_panel_render_tick() {
         events.push_status_event(
             channel_id,
             StatusEvent::SubagentStart {
-                subagent_type: Some("bgworker".to_string()),
+                subagent_type: Some("bgrunner".to_string()),
                 desc: Some(desc.to_string()),
                 agent_id: None,
                 tool_use_id: Some(tool_use_id.to_string()),
@@ -9763,13 +9763,13 @@ fn subagent_activity_refreshes_ttl_clock_so_live_slots_survive_render_sweep() {
     let events = PlaceholderLiveEvents::default();
     let channel_id = ChannelId::new(4_396_005);
     for (desc, tool_use_id) in [
-        ("id-keyed live worker", "toolu_4396_live_a"),
-        ("event-touched live worker", "toolu_4396_live_b"),
+        ("id-keyed live runner", "toolu_4396_live_a"),
+        ("event-touched live runner", "toolu_4396_live_b"),
     ] {
         events.push_status_event(
             channel_id,
             StatusEvent::SubagentStart {
-                subagent_type: Some("bgworker".to_string()),
+                subagent_type: Some("bgrunner".to_string()),
                 desc: Some(desc.to_string()),
                 agent_id: None,
                 tool_use_id: Some(tool_use_id.to_string()),

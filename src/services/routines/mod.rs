@@ -4,7 +4,7 @@ pub mod action;
 /// This module is intentionally small at this stage. It exposes only
 /// `RoutineStore` exposes PG-backed claim/finish/recovery transactions.
 /// `RoutineScriptLoader` and `RoutineAction` are the ORDER-P0-002 foundation;
-/// the worker tick loop and `/api/routines` route integration use the typed
+/// the runner tick loop and `/api/routines` route integration use the typed
 /// runtime/store boundary exposed here.
 ///
 /// SQLite users: this module is never instantiated when `pg_pool` is `None`,

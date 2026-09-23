@@ -10,7 +10,7 @@ use super::super::{SharedData, inflight, runtime_store, tui_direct_abort_marker,
 pub(in crate::services::discord) const PENDING_START_POLL: Duration = Duration::from_millis(100);
 
 /// Backstop matching `turn_finalizer::GATE_BACKSTOP` (8s). After this single
-/// wait window expires WITHOUT the prior turn finalizing, the worker does NOT
+/// wait window expires WITHOUT the prior turn finalizing, the runner does NOT
 /// blindly claim (that would overwrite a still-LIVE prior inflight and resurrect
 /// the original #3154 wrong-turn-finalize / `response_sent_offset` regression).
 /// Instead it re-checks at the claim instant whether the prior inflight is truly
@@ -21,7 +21,7 @@ pub(in crate::services::discord) const PENDING_START_BACKSTOP: Duration = Durati
 /// Bounded escalation cap. Each cycle is one `PENDING_START_BACKSTOP` wait
 /// window during which the prior turn never finalized AND, at the claim instant,
 /// a FOREIGN prior inflight was still live (so claiming would overwrite it).
-/// After this many such cycles the worker ABORTS the synthetic start safely
+/// After this many such cycles the runner ABORTS the synthetic start safely
 /// (surfaces an observability event + deletes the durable record) rather than
 /// either overwriting a live prior turn or leaking the record forever. The
 /// provider prompt itself is never resubmitted; only the synthetic OWNERSHIP
@@ -29,7 +29,7 @@ pub(in crate::services::discord) const PENDING_START_BACKSTOP: Duration = Durati
 pub(in crate::services::discord) const PENDING_START_MAX_BACKSTOP_CYCLES: u32 = 4;
 
 /// On a transient claim failure (`claimed == false`: another turn briefly owns
-/// the mailbox, or an inflight save failed) the worker MUST NOT delete the
+/// the mailbox, or an inflight save failed) the runner MUST NOT delete the
 /// durable record (that would lose a Discord-submitted prompt — the original
 /// turn-loss bug). It re-defers and retries, bounded by this cap, so a wedged
 /// claim path cannot spin forever.
@@ -51,7 +51,7 @@ pub(in crate::services::discord) const RESTART_ORPHAN_COMMITTED_GRACE_SECS: i64 
 /// string-serialized so a forward/backward dcserver swap reads it tolerantly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub(in crate::services::discord) enum PendingStartState {
-    /// Persisted; worker has not yet completed the claim.
+    /// Persisted; runner has not yet completed the claim.
     #[default]
     Waiting,
 }
@@ -107,9 +107,9 @@ impl TuiDirectPendingStart {
 
 static PRESENT: LazyLock<Mutex<HashMap<(String, u64), u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static ACTIVE_WORKERS: LazyLock<Mutex<HashMap<(String, u64), u32>>> =
+static ACTIVE_RUNNERS: LazyLock<Mutex<HashMap<(String, u64), u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static PRECLAIMED_ACTIVE_WORKERS: LazyLock<Mutex<HashMap<(String, u64), u32>>> =
+static PRECLAIMED_ACTIVE_RUNNERS: LazyLock<Mutex<HashMap<(String, u64), u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PRESENCE_RECONCILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -135,15 +135,15 @@ fn clear_present(provider: &str, channel_id: u64) {
         .remove(&(provider.to_string(), channel_id));
 }
 
-pub(super) struct ActiveWorkerGuard {
+pub(super) struct ActiveRunnerGuard {
     provider: String,
     channel_id: u64,
 }
 
-impl ActiveWorkerGuard {
+impl ActiveRunnerGuard {
     pub(super) fn new(provider: &str, channel_id: u64) -> Self {
-        let mut workers = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
-        *workers
+        let mut runners = ACTIVE_RUNNERS.lock().unwrap_or_else(|e| e.into_inner());
+        *runners
             .entry((provider.to_string(), channel_id))
             .or_insert(0) += 1;
         Self {
@@ -160,20 +160,20 @@ impl ActiveWorkerGuard {
     }
 }
 
-impl Drop for ActiveWorkerGuard {
+impl Drop for ActiveRunnerGuard {
     fn drop(&mut self) {
-        let mut workers = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = workers.get_mut(&(self.provider.clone(), self.channel_id)) {
+        let mut runners = ACTIVE_RUNNERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = runners.get_mut(&(self.provider.clone(), self.channel_id)) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                workers.remove(&(self.provider.clone(), self.channel_id));
+                runners.remove(&(self.provider.clone(), self.channel_id));
             }
         }
     }
 }
 
-fn active_worker_present(provider: &str, channel_id: u64) -> bool {
-    ACTIVE_WORKERS
+fn active_runner_present(provider: &str, channel_id: u64) -> bool {
+    ACTIVE_RUNNERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(provider.to_string(), channel_id))
@@ -182,14 +182,14 @@ fn active_worker_present(provider: &str, channel_id: u64) -> bool {
         > 0
 }
 
-fn preclaim_active_worker(provider: &str, channel_id: u64) {
+fn preclaim_active_runner(provider: &str, channel_id: u64) {
     {
-        let mut workers = ACTIVE_WORKERS.lock().unwrap_or_else(|e| e.into_inner());
-        *workers
+        let mut runners = ACTIVE_RUNNERS.lock().unwrap_or_else(|e| e.into_inner());
+        *runners
             .entry((provider.to_string(), channel_id))
             .or_insert(0) += 1;
     }
-    let mut preclaimed = PRECLAIMED_ACTIVE_WORKERS
+    let mut preclaimed = PRECLAIMED_ACTIVE_RUNNERS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     *preclaimed
@@ -197,8 +197,8 @@ fn preclaim_active_worker(provider: &str, channel_id: u64) {
         .or_insert(0) += 1;
 }
 
-fn take_preclaimed_active_worker(provider: &str, channel_id: u64) -> Option<ActiveWorkerGuard> {
-    let mut preclaimed = PRECLAIMED_ACTIVE_WORKERS
+fn take_preclaimed_active_runner(provider: &str, channel_id: u64) -> Option<ActiveRunnerGuard> {
+    let mut preclaimed = PRECLAIMED_ACTIVE_RUNNERS
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let count = preclaimed.get_mut(&(provider.to_string(), channel_id))?;
@@ -206,12 +206,12 @@ fn take_preclaimed_active_worker(provider: &str, channel_id: u64) -> Option<Acti
     if *count == 0 {
         preclaimed.remove(&(provider.to_string(), channel_id));
     }
-    Some(ActiveWorkerGuard::from_preclaimed(provider, channel_id))
+    Some(ActiveRunnerGuard::from_preclaimed(provider, channel_id))
 }
 
-pub(super) fn active_worker_guard_for_spawn(provider: &str, channel_id: u64) -> ActiveWorkerGuard {
-    take_preclaimed_active_worker(provider, channel_id)
-        .unwrap_or_else(|| ActiveWorkerGuard::new(provider, channel_id))
+pub(super) fn active_runner_guard_for_spawn(provider: &str, channel_id: u64) -> ActiveRunnerGuard {
+    take_preclaimed_active_runner(provider, channel_id)
+        .unwrap_or_else(|| ActiveRunnerGuard::new(provider, channel_id))
 }
 
 /// GATE probe consulted by the watcher no-inflight suppression and the idle
@@ -256,24 +256,24 @@ pub(in crate::services::discord) fn pending_synthetic_start_blocks_idle_kickoff(
 
 /// Re-mark a record present during restart restore. [`load_all`] reads the
 /// durable store but does not touch the in-memory index; this restores the gate
-/// state before the respawned worker's first poll. The worker's terminal
+/// state before the respawned runner's first poll. The runner's terminal
 /// [`delete`] balances it.
 pub(in crate::services::discord) fn mark_present_on_restore(provider: &str, channel_id: u64) {
     let _guard = PRESENCE_RECONCILE_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     mark_present(provider, channel_id);
-    preclaim_active_worker(provider, channel_id);
+    preclaim_active_runner(provider, channel_id);
 }
 
 #[cfg(test)]
 pub(in crate::services::discord) fn reset_present_for_tests() {
     PRESENT.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    ACTIVE_WORKERS
+    ACTIVE_RUNNERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
-    PRECLAIMED_ACTIVE_WORKERS
+    PRECLAIMED_ACTIVE_RUNNERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
@@ -315,7 +315,7 @@ pub(in crate::services::discord) fn persist(record: &TuiDirectPendingStart) -> R
 }
 
 /// Delete a pending-start record AFTER the inflight save succeeds (or when the
-/// worker gives up). Idempotent.
+/// runner gives up). Idempotent.
 pub(in crate::services::discord) fn delete(record: &TuiDirectPendingStart) {
     let _guard = PRESENCE_RECONCILE_LOCK
         .lock()
@@ -365,7 +365,7 @@ pub(in crate::services::discord) fn load_all() -> Vec<TuiDirectPendingStart> {
         }
     }
     // P2-1: `read_dir` yields entries in an arbitrary (filesystem) order. The
-    // detached workers serialize per (provider, channel) under `channel_lock`,
+    // detached runners serialize per (provider, channel) under `channel_lock`,
     // so the ORDER in which we spawn same-channel records decides which acquires
     // the lock first — i.e. the FIFO drain order after a restart. Sort by the
     // persisted observed/creation timestamps so intra-channel FIFO matches the
@@ -388,7 +388,7 @@ pub(super) fn records_for_channel(provider: &str, channel_id: u64) -> Vec<TuiDir
 }
 
 fn channel_records_are_abandoned_locked(provider: &str, channel_id: u64) -> bool {
-    if active_worker_present(provider, channel_id) {
+    if active_runner_present(provider, channel_id) {
         return false;
     }
     let records = records_for_channel(provider, channel_id);
@@ -427,7 +427,7 @@ pub(in crate::services::discord) fn clear_abandoned_synthetic_start_presence(
 // Pure decision functions (truth-table tested — no I/O, no clock)
 // ---------------------------------------------------------------------------
 
-/// Inputs to [`prior_turn_finalized`]. Captured by the worker each poll from
+/// Inputs to [`prior_turn_finalized`]. Captured by the runner each poll from
 /// inflight/mailbox/runtime-binding state so the decision is pure and testable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::services::discord) struct PriorTurnView {
@@ -461,7 +461,7 @@ pub(in crate::services::discord) fn prior_turn_finalized(view: PriorTurnView) ->
 }
 
 /// Backstop-instant collision guard (P1-1). After a backstop wait window
-/// expired without the prior turn finalizing, the worker re-reads the view at
+/// expired without the prior turn finalizing, the runner re-reads the view at
 /// the claim instant. It may ONLY proceed to claim if doing so would not
 /// overwrite a still-LIVE FOREIGN prior inflight. A prior inflight that is OUR
 /// OWN anchor (crash-restore) is adoptable, so it never blocks.
@@ -469,7 +469,7 @@ pub(in crate::services::discord) fn prior_turn_finalized(view: PriorTurnView) ->
 /// Returns `true` when claiming is safe at the backstop instant (the foreign
 /// prior inflight is gone / was only ever our own). Returns `false` when a
 /// foreign prior inflight is STILL live — claiming now would resurrect the
-/// original #3154 overwrite bug, so the worker must keep deferring (bounded).
+/// original #3154 overwrite bug, so the runner must keep deferring (bounded).
 pub(in crate::services::discord) fn backstop_claim_is_safe(view: PriorTurnView) -> bool {
     // The ONLY thing the backstop relaxes is the mailbox-blocking and
     // runtime-binding waits (a wedged-but-present prior turn / a transiently
@@ -479,7 +479,7 @@ pub(in crate::services::discord) fn backstop_claim_is_safe(view: PriorTurnView) 
 }
 
 /// Decide whether [`crate::services::discord::tui_prompt_relay::relay_observed_prompt`] must DEFER the synthetic turn-start
-/// off the observer loop (persist a record + spawn the worker) instead of
+/// off the observer loop (persist a record + spawn the runner) instead of
 /// claiming inline.
 ///
 /// Defer when the prior turn is NOT finalized — i.e. claiming inline now would
@@ -493,16 +493,16 @@ pub(in crate::services::discord) fn should_defer_synthetic_turn_start(
 }
 
 // ---------------------------------------------------------------------------
-// Detached worker
+// Detached runner
 // ---------------------------------------------------------------------------
 
-/// The claim action the worker runs once the prior turn is finalized. Provided
+/// The claim action the runner runs once the prior turn is finalized. Provided
 /// by [`crate::services::discord::tui_prompt_relay`] (where `claim_tui_direct_synthetic_turn` is
 /// private). Returns `true` when an inflight was saved (claimed) AND the claim's
 /// `relay_owner` was adopted into the in-memory lease (so the observer-side
 /// BridgeAdapter tail stops once the watcher owns the turn — P1-3); `false` on a
 /// transient failure (another turn briefly owns the mailbox, or an inflight save
-/// failed), in which case the worker re-defers and retries WITHOUT deleting the
+/// failed), in which case the runner re-defers and retries WITHOUT deleting the
 /// durable record (P1-2 — never lose a Discord-submitted prompt).
 pub(in crate::services::discord) type ClaimFn = Box<
     dyn for<'a> Fn(
@@ -514,9 +514,9 @@ pub(in crate::services::discord) type ClaimFn = Box<
         + Sync,
 >;
 
-/// One worker poll's observation: the pure decision [`PriorTurnView`] plus the
+/// One runner poll's observation: the pure decision [`PriorTurnView`] plus the
 /// live FOREIGN prior inflight's identity at the read instant (`None` when no
-/// row exists or the row is our own anchor). The worker threads the LATEST
+/// row exists or the row is our own anchor). The runner threads the LATEST
 /// observed identity into the ABORT cleanup as the marker's last-view identity
 /// — the PRIMARY pin since #3296 codex r3 ([`super::pin_abort_foreign_identity`]):
 /// it survives the row vanishing before the cleanup's own read AND it cannot
@@ -530,7 +530,7 @@ pub(in crate::services::discord) struct PriorTurnObservation {
 /// Build the per-poll [`PriorTurnObservation`]. Provided by
 /// [`crate::services::discord::tui_prompt_relay`] (it owns inflight/mailbox/runtime-binding
 /// access). Returns `None` when the view cannot be computed yet (e.g. mailbox
-/// unavailable) — treated as "not finalized" so the worker keeps waiting.
+/// unavailable) — treated as "not finalized" so the runner keeps waiting.
 pub(in crate::services::discord) type ViewFn = Box<
     dyn for<'a> Fn(
             &'a Arc<SharedData>,
@@ -541,13 +541,13 @@ pub(in crate::services::discord) type ViewFn = Box<
         + Sync,
 >;
 
-/// #3282/#3296: Discord-side reconcile hook the worker runs on the terminal
+/// #3282/#3296: Discord-side reconcile hook the runner runs on the terminal
 /// backstop ABORT (`backstop_abort_foreign_inflight_live`). The input was
 /// already provider-submitted by this point, so the anchor KEEPS its `⏳`; the
 /// hook records a durable aborted-anchor marker
 /// ([`tui_direct_abort_marker`]) so a later prior-owner terminal commit
 /// flips it `⏳ → ✅`, or the TTL'd sweep flips it `⏳ → ⚠` when nothing ever
-/// covered it. The third argument is the worker's LAST-VIEW foreign inflight
+/// covered it. The third argument is the runner's LAST-VIEW foreign inflight
 /// identity (codex r2 — see [`PriorTurnObservation`]). Provided by
 /// [`crate::services::discord::tui_prompt_relay`].
 pub(in crate::services::discord) type AbortCleanupFn = Box<
@@ -560,7 +560,7 @@ pub(in crate::services::discord) type AbortCleanupFn = Box<
         + Sync,
 >;
 
-/// #3982: the worker's per-escalation-cycle orphan-reclaim attempt, consulted in
+/// #3982: the runner's per-escalation-cycle orphan-reclaim attempt, consulted in
 /// the `BackstopForeignInflightLive` branch BEFORE the terminal abort. The
 /// backstop can only observe an inflight row; it cannot tell a genuinely live
 /// FOREIGN turn from a producer-dead `SessionBoundRelay` orphan born after its
@@ -571,11 +571,11 @@ pub(in crate::services::discord) type AbortCleanupFn = Box<
 /// never-delivered), downgrades its relay owner to `None` via the
 /// identity-guarded `downgrade_orphaned_session_bound_relay_owner_locked`.
 ///
-/// Returns `true` ONLY when the owner was downgraded — the worker then
+/// Returns `true` ONLY when the owner was downgraded — the runner then
 /// re-evaluates immediately (`continue`): the next view's ownerless-stale filter
 /// drops the now-`None` row, so the deferred claim proceeds instead of aborting.
 /// Returns `false` for a genuinely live turn (not orphan-shaped), an
-/// identity/lifecycle mismatch, or an I/O failure → the worker keeps its EXISTING
+/// identity/lifecycle mismatch, or an I/O failure → the runner keeps its EXISTING
 /// bounded escalation/abort (no new infinite spin). Provided by
 /// [`crate::services::discord::tui_prompt_relay`] (it owns inflight access); it NEVER gates on the
 /// proven-stale `get_producer` oracle — the authoritative guard is the in-lock
@@ -762,7 +762,7 @@ pub(super) fn restart_orphan_pane_ready_for_input(
 
 /// #3303 — after a SUCCESSFUL deferred claim, record a
 /// [`tui_direct_abort_marker`] marker of kind `DeferredClaim` pinned to
-/// the worker's OWN synthetic turn identity (`user_msg_id == anchor`, the
+/// the runner's OWN synthetic turn identity (`user_msg_id == anchor`, the
 /// freshly-claimed row's `started_at`).
 ///
 /// Why: the claim hands the turn to the watcher, but the observed #3303
@@ -787,7 +787,7 @@ pub(super) fn restart_orphan_pane_ready_for_input(
 /// * **Fail-open** — every miss above (and a failed marker write) only warns:
 ///   the claim, the durable-record delete, and the turn proceed exactly as
 ///   before #3303.
-/// #3350: the marker-record chokepoint SHARED by the deferred worker (#3303,
+/// #3350: the marker-record chokepoint SHARED by the deferred runner (#3303,
 /// via the thin [`super::record_deferred_claim_marker_if_watcher_owned`] wrapper) and
 /// the INLINE synthetic claim (`tui_prompt_relay`). Both claim paths must
 /// leave the same durable `DeferredClaim` marker, or an inline-claimed turn

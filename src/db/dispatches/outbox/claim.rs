@@ -5,7 +5,7 @@ use super::diagnostics::wait_reason_from_routing_diagnostics;
 use super::model::{DispatchOutboxClaimCandidate, StaleDispatchOutboxClaimOwnerCandidate};
 
 /// Age (seconds) after which a claimed-but-unfinished dispatch outbox row is
-/// reclaimed by another worker and re-driven. Exposed `pub(crate)` so the #3861
+/// reclaimed by another runner and re-driven. Exposed `pub(crate)` so the #3861
 /// dedup-durability invariant in the delivery guard can assert at compile time
 /// that this threshold stays `<=` the delivery reservation TTL (a reclaim firing
 /// after the reservation expired but before the `notified` anchor lands could
@@ -103,7 +103,7 @@ pub(crate) async fn select_stale_dispatch_outbox_claim_owner_candidates_pg(
             wn.last_heartbeat_at AS stale_owner_last_heartbeat_at
          FROM dispatch_outbox o
          LEFT JOIN task_dispatches td ON td.id = o.dispatch_id
-         LEFT JOIN worker_nodes wn ON wn.instance_id = o.claim_owner
+         LEFT JOIN cluster_nodes wn ON wn.instance_id = o.claim_owner
          WHERE o.status = 'pending'
            AND o.claim_owner IS NOT NULL
            AND (

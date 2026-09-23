@@ -16,7 +16,7 @@ migrations/postgres/** text eol=lf
 # maintainability-audit.md, pg-audit-checklist.md, policy-db-inventory.md) are
 # hand-authored / emitted by a different generator and must never be clobbered.
 docs/generated/route-inventory.md merge=regen-inventory
-docs/generated/worker-inventory.md merge=regen-inventory
+docs/generated/runner-inventory.md merge=regen-inventory
 
 # #5071 T4-B2a: the relay-obligation golden corpus is byte-exact fixture DATA,
 # and one case (`malformed_and_nonobject.jsonl`) is deliberately not valid

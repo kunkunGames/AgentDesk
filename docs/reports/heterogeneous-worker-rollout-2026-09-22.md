@@ -1,7 +1,7 @@
 # Mac mini leader / Windows worker 적용 및 실기기 검증
 
-기준일: 2026-09-22. 설계 기준은 [이기종 worker 도입 검토](../design/heterogeneous-worker-cluster-implementation-review.md),
-운영 계약은 [worker 프로필](../operations/worker-runtime-profile.md),
+기준일: 2026-09-22. 설계 기준은 [이기종 worker 도입 검토](../design/heterogeneous-runner-cluster-implementation-review.md),
+운영 계약은 [worker 프로필](../operations/runner-runtime-profile.md),
 [실행 용량](../operations/execution-capacity.md),
 [에이전트별 기본 실행 노드](../operations/agent-execution-node.md),
 [릴리스 패키징](../ci/release-packaging.md)이다.

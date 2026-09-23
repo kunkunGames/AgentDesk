@@ -33,23 +33,21 @@ pub(crate) async fn claim_pending_dispatch_outbox_batch_with_cluster_config_pg(
     cluster_config: &crate::config::ClusterConfig,
 ) -> Vec<DispatchOutboxRow> {
     let lease_ttl_secs = cluster_config.lease_ttl_secs.max(1);
-    let mut worker_nodes = match crate::services::cluster::node_registry::list_worker_nodes(
-        pool,
-        lease_ttl_secs,
-    )
-    .await
-    {
-        Ok(nodes) => nodes,
-        Err(error) => {
-            tracing::warn!(
-                claim_owner,
-                error,
-                "[dispatch-outbox] failed to list worker nodes for routing"
-            );
-            Vec::new()
-        }
-    };
-    let owner_node = worker_nodes
+    let mut cluster_nodes =
+        match crate::services::cluster::node_registry::list_cluster_nodes(pool, lease_ttl_secs)
+            .await
+        {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                tracing::warn!(
+                    claim_owner,
+                    error,
+                    "[dispatch-outbox] failed to list runner nodes for routing"
+                );
+                Vec::new()
+            }
+        };
+    let owner_node = cluster_nodes
         .iter()
         .find(|node| node.get("instance_id").and_then(|value| value.as_str()) == Some(claim_owner))
         .cloned();
@@ -100,7 +98,7 @@ pub(crate) async fn claim_pending_dispatch_outbox_batch_with_cluster_config_pg(
         if let Some(required) = effective_required.as_ref() {
             let owner_decision =
                 capability_decision_for_claim_owner(owner_node.as_ref(), claim_owner, required);
-            let routing_decision = routing_engine.route(&worker_nodes, required, &dispatch);
+            let routing_decision = routing_engine.route(&cluster_nodes, required, &dispatch);
             let selected = routing_decision.selected_instance_id();
             let preference_mismatch = selected.is_some() && selected != Some(claim_owner);
             let owner_constraint_blocked = routing_decision
@@ -162,7 +160,7 @@ pub(crate) async fn claim_pending_dispatch_outbox_batch_with_cluster_config_pg(
             let required = json!({});
             let owner_decision =
                 capability_decision_for_claim_owner(owner_node.as_ref(), claim_owner, &required);
-            let routing_decision = routing_engine.route(&worker_nodes, &required, &dispatch);
+            let routing_decision = routing_engine.route(&cluster_nodes, &required, &dispatch);
             let owner_constraint_blocked = routing_decision
                 .candidate_for_instance(claim_owner)
                 .is_some_and(|candidate| !candidate.is_available());
@@ -225,7 +223,7 @@ pub(crate) async fn claim_pending_dispatch_outbox_batch_with_cluster_config_pg(
             };
 
         pending.push(candidate.into_outbox_row(claim_owner.to_string(), claimed_at));
-        increment_active_dispatch_count(&mut worker_nodes, claim_owner);
+        increment_active_dispatch_count(&mut cluster_nodes, claim_owner);
         if pending.len() >= 5 {
             break;
         }
@@ -245,7 +243,7 @@ pub(crate) async fn reassign_stale_dispatch_outbox_claim_owners_with_cluster_con
     cluster_config: &crate::config::ClusterConfig,
 ) -> Result<usize, String> {
     let stale_threshold_secs = stale_claim_owner_threshold_secs(cluster_config);
-    let worker_nodes = crate::services::cluster::node_registry::list_worker_nodes(
+    let cluster_nodes = crate::services::cluster::node_registry::list_cluster_nodes(
         pool,
         stale_threshold_secs as u64,
     )
@@ -285,7 +283,7 @@ pub(crate) async fn reassign_stale_dispatch_outbox_claim_owners_with_cluster_con
         let (new_owner, routing_decision) = if let Some(required) = effective_required.as_ref() {
             let dispatch =
                 RoutingDispatch::new(candidate.dispatch_id.clone(), None, Some(required.clone()));
-            let routing_decision = routing_engine.route(&worker_nodes, required, &dispatch);
+            let routing_decision = routing_engine.route(&cluster_nodes, required, &dispatch);
             let new_owner = eligible_reassignment_owner(&routing_decision, required);
             (new_owner, Some(routing_decision))
         } else {
@@ -428,8 +426,8 @@ fn routing_constraints_configured_for_unqualified_dispatch(
             })
 }
 
-fn increment_active_dispatch_count(worker_nodes: &mut [Value], instance_id: &str) {
-    let Some(node) = worker_nodes
+fn increment_active_dispatch_count(cluster_nodes: &mut [Value], instance_id: &str) {
+    let Some(node) = cluster_nodes
         .iter_mut()
         .find(|node| node.get("instance_id").and_then(Value::as_str) == Some(instance_id))
     else {
@@ -460,7 +458,7 @@ pub(crate) fn capability_decision_for_claim_owner(
         .unwrap_or_else(|| CapabilityRouteDecision {
             instance_id: Some(claim_owner.to_string()),
             eligible: false,
-            reasons: vec!["claim owner is not registered in worker_nodes".to_string()],
+            reasons: vec!["claim owner is not registered in cluster_nodes".to_string()],
         })
 }
 
@@ -492,7 +490,7 @@ fn merge_offline_claim_owner_reason(
     owner_node: Option<&Value>,
     lease_ttl_secs: u64,
 ) {
-    // An owner absent from `worker_nodes` already says so through
+    // An owner absent from `cluster_nodes` already says so through
     // `capability_decision_for_claim_owner`; only the online check was missing.
     let Some(node) = owner_node else {
         return;
@@ -506,7 +504,7 @@ fn merge_offline_claim_owner_reason(
     }
     decision.eligible = false;
     decision.reasons.push(format!(
-        "claim owner worker node is not online (status '{status}'; {lease_ttl_secs}s heartbeat lease)"
+        "claim owner runner node is not online (status '{status}'; {lease_ttl_secs}s heartbeat lease)"
     ));
 }
 
@@ -594,7 +592,7 @@ mod tests {
         assert_eq!(decision.instance_id.as_deref(), Some("missing-node"));
         assert_eq!(
             decision.reasons,
-            vec!["claim owner is not registered in worker_nodes".to_string()]
+            vec!["claim owner is not registered in cluster_nodes".to_string()]
         );
     }
 
@@ -634,7 +632,7 @@ mod tests {
             decision.reasons,
             vec![
                 "claim owner is not preferred route owner; selected mac-book-release".to_string(),
-                "claim owner worker node is not online (status 'offline'; 30s heartbeat lease)"
+                "claim owner runner node is not online (status 'offline'; 30s heartbeat lease)"
                     .to_string(),
             ]
         );
@@ -667,20 +665,20 @@ mod tests {
         assert!(!unregistered.eligible);
         assert_eq!(
             unregistered.reasons,
-            vec!["claim owner is not registered in worker_nodes".to_string()]
+            vec!["claim owner is not registered in cluster_nodes".to_string()]
         );
     }
 
     #[test]
     fn routing_diagnostics_contains_required_payload() {
         let decision = CapabilityRouteDecision {
-            instance_id: Some("worker-a".to_string()),
+            instance_id: Some("runner-a".to_string()),
             eligible: false,
             reasons: vec!["missing required label mac-book".to_string()],
         };
         let required = json!({"labels": ["mac-book"]});
         let route_nodes = vec![json!({
-            "instance_id": "worker-a",
+            "instance_id": "runner-a",
             "status": "online",
             "labels": ["mac-book"],
             "capabilities": {},
@@ -696,7 +694,7 @@ mod tests {
             ),
         );
         let diagnostics = routing_diagnostics(
-            "worker-a",
+            "runner-a",
             &decision,
             Some(&required),
             Some(&required),
@@ -704,7 +702,7 @@ mod tests {
             &route_decision,
         );
 
-        assert_eq!(diagnostics["claim_owner"], "worker-a");
+        assert_eq!(diagnostics["claim_owner"], "runner-a");
         assert_eq!(diagnostics["decision"]["eligible"], false);
         assert_eq!(diagnostics["required_capabilities"], required);
         assert_eq!(diagnostics["effective_required_capabilities"], required);
@@ -734,7 +732,7 @@ mod tests {
         ));
 
         config.blackout_windows.insert(
-            "worker-a".to_string(),
+            "runner-a".to_string(),
             vec![crate::config::ClusterBlackoutWindowConfig {
                 start: "23:00".to_string(),
                 end: "23:30".to_string(),
@@ -761,27 +759,27 @@ mod tests {
         };
 
         let claimed_at = chrono::Utc::now();
-        let row = candidate.into_outbox_row("worker-a".to_string(), claimed_at);
+        let row = candidate.into_outbox_row("runner-a".to_string(), claimed_at);
         assert_eq!(row.0, 7);
         assert_eq!(row.1, "dispatch-7");
         assert_eq!(row.2, "notify");
         assert_eq!(row.6, 2);
         assert_eq!(row.7, Some(json!({"providers": ["codex"]})));
-        assert_eq!(row.8, "worker-a");
+        assert_eq!(row.8, "runner-a");
         assert_eq!(row.9, claimed_at);
     }
 
     #[test]
     fn increment_active_dispatch_count_updates_matching_node_only() {
-        let mut worker_nodes = vec![
+        let mut cluster_nodes = vec![
             json!({"instance_id": "node-a", "active_dispatch_count": 1}),
             json!({"instance_id": "node-b", "active_dispatch_count": 4}),
         ];
 
-        increment_active_dispatch_count(&mut worker_nodes, "node-a");
+        increment_active_dispatch_count(&mut cluster_nodes, "node-a");
 
-        assert_eq!(worker_nodes[0]["active_dispatch_count"], 2);
-        assert_eq!(worker_nodes[1]["active_dispatch_count"], 4);
+        assert_eq!(cluster_nodes[0]["active_dispatch_count"], 2);
+        assert_eq!(cluster_nodes[1]["active_dispatch_count"], 4);
     }
 
     #[test]
@@ -918,18 +916,18 @@ mod tests {
             }
         }
 
-        async fn seed_worker_node(
+        async fn seed_runner_node(
             pool: &PgPool,
             instance_id: &str,
             labels: serde_json::Value,
             heartbeat_age_secs: i64,
         ) {
             sqlx::query(
-                "INSERT INTO worker_nodes (
+                "INSERT INTO cluster_nodes (
                 instance_id, hostname, process_id, role, effective_role, status,
                 labels, capabilities, last_heartbeat_at, started_at, updated_at
              ) VALUES (
-                $1, $1, 100, 'auto', 'worker', 'online',
+                $1, $1, 100, 'auto', 'runner', 'online',
                 $2, '{\"providers\":[\"codex\"]}'::jsonb,
                 NOW() - ($3::BIGINT * INTERVAL '1 second'), NOW(), NOW()
              )",
@@ -939,7 +937,7 @@ mod tests {
             .bind(heartbeat_age_secs)
             .execute(pool)
             .await
-            .expect("seed worker node");
+            .expect("seed runner node");
         }
 
         async fn seed_pending_outbox_row(
@@ -985,12 +983,12 @@ mod tests {
                 .execute(pool)
                 .await
                 .expect("reset dispatch_outbox");
-            sqlx::query("DELETE FROM worker_nodes")
+            sqlx::query("DELETE FROM cluster_nodes")
                 .execute(pool)
                 .await
-                .expect("reset worker_nodes");
+                .expect("reset cluster_nodes");
             for (instance_id, labels, heartbeat_age_secs) in nodes {
-                seed_worker_node(pool, instance_id, labels.clone(), *heartbeat_age_secs).await;
+                seed_runner_node(pool, instance_id, labels.clone(), *heartbeat_age_secs).await;
             }
             seed_pending_outbox_row(pool, dispatch_id, required_capabilities).await;
 
@@ -1046,8 +1044,8 @@ mod tests {
                 return;
             };
             let pool = pg_db.connect_and_migrate().await;
-            seed_worker_node(&pool, "mac-mini-release", json!(["mac-mini"]), 600).await;
-            seed_worker_node(&pool, "mac-book-release", json!(["mac-mini"]), 0).await;
+            seed_runner_node(&pool, "mac-mini-release", json!(["mac-mini"]), 600).await;
+            seed_runner_node(&pool, "mac-book-release", json!(["mac-mini"]), 0).await;
             seed_pending_outbox_row(
                 &pool,
                 "dispatch-offline-owner",
@@ -1079,7 +1077,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(
                 reasons.iter().any(|reason| *reason
-                    == "claim owner worker node is not online (status 'offline'; 30s heartbeat lease)"),
+                    == "claim owner runner node is not online (status 'offline'; 30s heartbeat lease)"),
                 "skip reason must name the offline owner node; got {reasons:?}"
             );
             assert!(
@@ -1201,7 +1199,7 @@ mod tests {
                     claim_owner: Some("mac-book-release".to_string()),
                     wait_reason: None,
                 },
-                "owner missing from worker_nodes must still skip"
+                "owner missing from cluster_nodes must still skip"
             );
 
             let capability_mismatch = run_claim_scenario(
@@ -1293,8 +1291,8 @@ mod tests {
                 return;
             };
             let pool = pg_db.connect_and_migrate().await;
-            seed_worker_node(&pool, "stale-node", json!(["mac-book"]), 45).await;
-            seed_worker_node(&pool, "mac-mini-release", json!(["mac-mini"]), 0).await;
+            seed_runner_node(&pool, "stale-node", json!(["mac-book"]), 45).await;
+            seed_runner_node(&pool, "mac-mini-release", json!(["mac-mini"]), 0).await;
 
             sqlx::query(
                 "INSERT INTO dispatch_outbox (
@@ -1352,8 +1350,8 @@ mod tests {
                 return;
             };
             let pool = pg_db.connect_and_migrate().await;
-            seed_worker_node(&pool, "stale-node", json!(["mac-book"]), 45).await;
-            seed_worker_node(&pool, "mac-mini-release", json!(["mac-mini"]), 0).await;
+            seed_runner_node(&pool, "stale-node", json!(["mac-book"]), 45).await;
+            seed_runner_node(&pool, "mac-mini-release", json!(["mac-mini"]), 0).await;
 
             sqlx::query(
                 "INSERT INTO dispatch_outbox (

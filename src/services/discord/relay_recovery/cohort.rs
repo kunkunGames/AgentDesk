@@ -174,11 +174,11 @@ mod tests {
 
     /// One plausible guild's epoch base for both id fixtures below.
     const SNOWFLAKE_BASE: u64 = 1_234_567_890_123_456_789;
-    /// Width of a snowflake's worker + process + sequence fields; everything
+    /// Width of a snowflake's runner + process + sequence fields; everything
     /// above it is the timestamp.
     const LOW_22_MASK: u64 = (1 << 22) - 1;
 
-    /// Discord snowflakes strided by `2^22` (worker/process/sequence field
+    /// Discord snowflakes strided by `2^22` (runner/process/sequence field
     /// width), so each sample advances only the TIMESTAMP field while the low
     /// bits hold still — the harder shape for the hash, since every bit the
     /// modulo could key on sits in the high half. `low_bit_ids` complements.

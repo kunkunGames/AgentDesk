@@ -48,8 +48,8 @@ async fn seed(
            target_instance_id,forwarded_by_instance_id,channel_id,user_msg_id,
            request_owner_id,user_text,turn_kind,agent_id,status,claim_owner,
            spawned_at,dispatched_at)
-         VALUES('worker','leader',$1,$1,'user','hello','standard','agent',$2,
-                'dispatch-worker',$3,CASE WHEN $2='dispatched' THEN $3 ELSE NULL END)
+         VALUES('runner','hub',$1,$1,'user','hello','standard','agent',$2,
+                'dispatch-runner',$3,CASE WHEN $2='dispatched' THEN $3 ELSE NULL END)
          RETURNING id",
     )
     .bind(key)

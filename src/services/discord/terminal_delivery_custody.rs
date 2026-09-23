@@ -1,4 +1,4 @@
-//! #5521: retain a detached terminal episode until the existing worker settles it.
+//! #5521: retain a detached terminal episode until the existing runner settles it.
 //! The sibling directory is outside old inflight/receipt writers and reapers.
 //! Payload interpretation, receipt checks and publication remain in turn_bridge.
 

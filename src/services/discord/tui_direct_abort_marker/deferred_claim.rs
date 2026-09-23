@@ -2,7 +2,7 @@
 //!
 //! ## Why this exists
 //! When a deferred synthetic turn-start CLAIM succeeds
-//! (`tui_direct_pending_start::run_worker`, `claimed == true`), the normal
+//! (`tui_direct_pending_start::run_runner`, `claimed == true`), the normal
 //! `⏳ → ✅` flip is owned by the watcher relay's terminal commit path for the
 //! synthetic turn. The observed #3303 failure modes break that ownership:
 //! the commit pass never runs for the synthetic turn (the claim seeded the
@@ -12,7 +12,7 @@
 //! reconciler owned it.
 //!
 //! ## Mechanism
-//! The worker records a [`MarkerOrigin::DeferredClaim`] marker (BEFORE it
+//! The runner records a [`MarkerOrigin::DeferredClaim`] marker (BEFORE it
 //! deletes the durable pending-start record, so a crash in between re-records
 //! idempotently on the restart re-claim) pinning its OWN synthetic turn
 //! identity: `user_msg_id == anchor_message_id` plus the freshly-claimed

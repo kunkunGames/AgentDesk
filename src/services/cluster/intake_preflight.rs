@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::intake_worker_capabilities::node_supports_intake_provider;
+use super::intake_runner_capabilities::node_supports_intake_provider;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,7 +52,7 @@ pub(crate) struct TargetProbeSnapshot {
     pub disk_free_bytes: u64,
     pub memory_available_bytes: u64,
     pub recent_db_pool_errors: u64,
-    pub worker_poller_ready: bool,
+    pub runner_poller_ready: bool,
     pub terminal_relay_ready: bool,
     pub standby_relay_ready: bool,
     pub intake_outbox_operator_ready: bool,
@@ -71,7 +71,7 @@ pub(crate) enum PreflightReasonCode {
     ProviderUnsupported,
     TargetOffline,
     ProviderIntakeUnavailable,
-    WorkerPollerUnavailable,
+    RunnerPollerUnavailable,
     ReleaseShaMismatch,
     ConfigSchemaMismatch,
     ProviderBinaryVersionMismatch,
@@ -226,7 +226,7 @@ pub(crate) fn evaluate_target_preflight(
         &mut failures,
         target_node.get("status").and_then(Value::as_str) == Some("online"),
         PreflightReasonCode::TargetOffline,
-        || "target worker-node lease is not online".to_string(),
+        || "target runner-node lease is not online".to_string(),
     );
     push_failure(
         &mut failures,
@@ -241,9 +241,9 @@ pub(crate) fn evaluate_target_preflight(
     );
     push_failure(
         &mut failures,
-        snapshot.worker_poller_ready,
-        PreflightReasonCode::WorkerPollerUnavailable,
-        || "target intake worker poller probe failed".to_string(),
+        snapshot.runner_poller_ready,
+        PreflightReasonCode::RunnerPollerUnavailable,
+        || "target intake runner poller probe failed".to_string(),
     );
     push_failure(
         &mut failures,
@@ -445,7 +445,7 @@ mod tests {
             "instance_id": "mac-mini-release",
             "status": "online",
             "capabilities": {
-                "intake_worker": {"enabled": true, "providers": ["claude"]},
+                "intake_runner": {"enabled": true, "providers": ["claude"]},
                 "intake_preflight": {
                     "release_sha": "abc123",
                     "config_schema": "7",
@@ -460,7 +460,7 @@ mod tests {
                     "disk_free_bytes": 100,
                     "memory_available_bytes": 200,
                     "recent_db_pool_errors": 1,
-                    "worker_poller_ready": true,
+                    "runner_poller_ready": true,
                     "terminal_relay_ready": true,
                     "standby_relay_ready": true,
                     "intake_outbox_operator_ready": true,
@@ -491,13 +491,13 @@ mod tests {
             (
                 "provider",
                 PreflightReasonCode::ProviderIntakeUnavailable,
-                Box::new(|n| n["capabilities"]["intake_worker"]["providers"] = json!(["codex"])),
+                Box::new(|n| n["capabilities"]["intake_runner"]["providers"] = json!(["codex"])),
             ),
             (
                 "poller",
-                PreflightReasonCode::WorkerPollerUnavailable,
+                PreflightReasonCode::RunnerPollerUnavailable,
                 Box::new(|n| {
-                    n["capabilities"]["intake_preflight"]["worker_poller_ready"] = json!(false)
+                    n["capabilities"]["intake_preflight"]["runner_poller_ready"] = json!(false)
                 }),
             ),
             (
@@ -799,7 +799,7 @@ mod tests {
             let mut policy = policy();
             policy.provider = provider.to_string();
             let mut node = ready_node();
-            node["capabilities"]["intake_worker"]["providers"] = json!([provider]);
+            node["capabilities"]["intake_runner"]["providers"] = json!([provider]);
 
             let passing = serde_json::to_value(evaluate_target_preflight(&node, &policy)).unwrap();
             assert_eq!(passing["provider"], provider);
@@ -825,7 +825,7 @@ mod tests {
         let mut policy = policy();
         policy.provider = "gemini".to_string();
         let mut node = ready_node();
-        node["capabilities"]["intake_worker"]["providers"] = json!(["gemini"]);
+        node["capabilities"]["intake_runner"]["providers"] = json!(["gemini"]);
         let report = evaluate_target_preflight(&node, &policy);
 
         assert_eq!(report.verdict, PreflightVerdict::Fail);

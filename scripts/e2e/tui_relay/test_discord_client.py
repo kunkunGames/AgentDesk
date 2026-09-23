@@ -480,7 +480,7 @@ class DiscordClientFetchMessages(unittest.TestCase):
 
     def test_post_operations_do_not_retry_rate_limits(self):
         client = DiscordClient(
-            base_url="http://offline.invalid", handoff_to_agent="worker", handoff_from_agent="driver",
+            base_url="http://offline.invalid", handoff_to_agent="runner", handoff_from_agent="driver",
         )
         for operation in (client.send, client.send_control, client.send_prompt):
             with self.subTest(operation=operation):

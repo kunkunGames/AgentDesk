@@ -2,7 +2,7 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [ValidatePattern('^[A-Za-z0-9_.-]+$')]
-    [string]$TaskName = 'AgentDeskWorker',
+    [string]$TaskName = 'AgentDeskRelease',
     [ValidatePattern('^[A-Za-z0-9_.-]+$')]
     [string]$DatabaseSshAlias,
     [ValidateRange(1024, 65535)]

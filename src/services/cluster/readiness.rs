@@ -37,7 +37,6 @@ pub(crate) struct ExecutionProbe {
     pub expires_at_ms: i64,
     pub os: String,
     pub arch: String,
-    #[serde(serialize_with = "crate::config::RuntimeProfile::serialize_registry")]
     pub runtime_profile: crate::config::RuntimeProfile,
     pub release: Value,
     pub providers: BTreeMap<String, ProviderEvidence>,
@@ -58,7 +57,7 @@ pub(crate) fn evidence(node: &Value, now: i64) -> Result<ExecutionProbe, &'stati
         .pointer("/capabilities/execution_readiness")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .ok_or("execution_evidence_missing")?;
-    if probe.schema != 1 || probe.boot_id.is_empty() {
+    if probe.schema != 2 || probe.boot_id.is_empty() {
         return Err("execution_evidence_protocol");
     }
     if probe.observed_at_ms > now.saturating_add(5_000)
@@ -168,7 +167,7 @@ fn with_forwarding(mut report: ReadinessReport, node: &Value) -> ReadinessReport
 
 pub(crate) fn attach_diagnostics(node: &mut Value) {
     let providers = node
-        .pointer("/capabilities/intake_worker/providers")
+        .pointer("/capabilities/intake_runner/providers")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -203,7 +202,7 @@ pub(crate) fn record_poller_progress(provider: &str) {
 }
 
 pub(crate) fn publish(capabilities: &mut serde_json::Map<String, Value>) {
-    capabilities.insert("execution_readiness_version".into(), json!(1));
+    capabilities.insert("execution_readiness_version".into(), json!(2));
     capabilities.insert(
         "execution_readiness".into(),
         SNAPSHOT
@@ -246,7 +245,7 @@ fn collect(config: &Config) -> ExecutionProbe {
     let observed_at_ms = chrono::Utc::now().timestamp_millis();
     let catalog = crate::services::discord::org_schema::provider_auth_catalog();
     let mut providers = BTreeMap::new();
-    for id in super::intake_worker_capabilities::active_intake_worker_providers() {
+    for id in super::intake_runner_capabilities::active_intake_runner_providers() {
         let Some(kind) = ProviderKind::from_str(&id) else {
             continue;
         };
@@ -333,7 +332,7 @@ fn collect(config: &Config) -> ExecutionProbe {
     }
     let root = crate::config::runtime_root().unwrap_or_else(|| config.data.dir.clone());
     ExecutionProbe {
-        schema: 1,
+        schema: 2,
         boot_id: BOOT_ID.clone(),
         observed_at_ms,
         expires_at_ms: observed_at_ms.saturating_add(PROBE_TTL_MS),

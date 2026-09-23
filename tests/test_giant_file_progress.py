@@ -20,8 +20,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 PROGRESS = importlib.import_module("giant_file_progress")
 ROOT_FILE = "src/services/discord/turn_finalizer.rs"
 CHILD_FILE = "src/services/discord/turn_finalizer/terminal_handler.rs"
-SURVIVOR = "src/server/worker_registry.rs"
-SURVIVOR_CHILD = "src/server/worker_registry/slice.rs"
+SURVIVOR = "src/server/runner_registry.rs"
+SURVIVOR_CHILD = "src/server/runner_registry/slice.rs"
 PIN_FILE = "tests/test_delivery_journal_raw_writer.py"
 META_ROOT = ("shrink", "discord-finalizer", "2026-08-31", "#4712", "")
 META_SURVIVOR = ("shrink", "server-runtime", "2026-08-31", "#4710", "")
@@ -224,6 +224,8 @@ class GiantFileProgressTest(unittest.TestCase):
         root_production = PROGRESS.production_line_numbers(base_files[root], 1200)
         self.assertNotIn(1201, root_production)
         self.assertEqual(PROGRESS.production_line_numbers(candidate_files[child], 0), set())
+        file_module = "#[cfg(test)]\nmod fixture;\npub fn production() {}\n"
+        self.assertEqual(PROGRESS.production_line_numbers(file_module, 1), {3})
         with self.movement_repository(base_files, candidate_files) as (base_ref, candidate_ref):
             ledger = PROGRESS.movement_ledger(
                 base_ref, candidate_ref, {root}, {root: [child]},
@@ -637,7 +639,8 @@ class GuardRepinTest(unittest.TestCase):
             if args[0] == "rev-list": return "merge base head\n"
             if args[0] == "diff" and binary: return patch
             raise AssertionError(args)
-        def snapshot(root, evaluation_date=None): return candidate if root.name == "candidate" else base
+        def snapshot(root, evaluation_date=None, candidate_modules=None):
+            return candidate if root.name == "candidate" else base
         env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "itismyfield/AgentDesk",
                "GFP_HEAD_REPOSITORY": "itismyfield/AgentDesk", "GFP_CANDIDATE_SHA": "merge",
                "GFP_BASE_SHA": "base", "GFP_HEAD_SHA": "head"}
@@ -717,7 +720,7 @@ class GiantFileLedgerRepairTest(unittest.TestCase):
 
     def test_r2_03_measured_5744_retired_paths_allow_transition_cleanup(self):
         # Re-measured at base 5a3d16ef765b / head 769f7f0dd700: no source diff.
-        retired = {"src/server/worker_registry.rs": 483,
+        retired = {"src/server/runner_registry.rs": 483,
                    "src/services/discord/outbound/turn_output_controller.rs": 996,
                    "src/services/discord/tui_direct_pending_start.rs": 933,
                    "src/services/discord/turn_finalizer.rs": 860}
@@ -910,13 +913,59 @@ class GiantFileLedgerIntegrationTest(unittest.TestCase):
             roots = [Path(directory) / name for name in ("base", "candidate")]
             for root, files in zip(roots, (before, after)):
                 self.write(root, files)
-            snapshots = [G.giant_file_snapshot(root, evaluation_date=now.date()) for root in roots]
+            candidate = G.giant_file_snapshot(roots[1], evaluation_date=now.date())
+            base = G.giant_file_snapshot(roots[0], evaluation_date=now.date(),
+                                         candidate_modules=candidate["modules"])
+            snapshots = [base, candidate]
             facts = {"changed": {path for path in before.keys() | after.keys() if before.get(path) != after.get(path)},
                      "ledger_base": P.load_ledger(roots[0]), "ledger_candidate": P.load_ledger(roots[1]),
                      "rename_copy": False, "additions": 4, "bootstrap": False,
                      "moved": {}, "children": {}, "numstat": {}, "statuses": {}, "registry_exact": False,
                      "authority_equal": True, "registry_equal": before[P.REGISTRY] == after[P.REGISTRY]}
             return P.pr_evaluation(*snapshots, facts)
+
+    def test_unregistered_base_giant_repaired_by_same_file_shrink(self):
+        before = self.files()
+        before[OTHER] = "pub fn production() {}\n" * 1009
+        after = dict(before, **{OTHER: "pub fn production() {}\n" * 960})
+        self.assertEqual(self.evaluate(before, after), ("pr_ordinary_no_regression", []))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(G, "now_utc", return_value=NOW):
+            root = Path(directory)
+            self.write(root, before)
+            with self.assertRaisesRegex(G.ParseError, "unregistered giant"):
+                G.giant_file_snapshot(root, evaluation_date=NOW.date())
+            snapshot = G.giant_file_snapshot(root, evaluation_date=NOW.date(),
+                                             candidate_modules={OTHER: 960})
+            self.assertEqual(snapshot["repaired_unregistered"], [OTHER])
+
+    def test_base_repair_does_not_allow_deleted_or_renamed_file(self):
+        before = self.files()
+        before[OTHER] = "pub fn production() {}\n" * 1009
+        for renamed in (False, True):
+            after = dict(before)
+            del after[OTHER]
+            if renamed:
+                after[RETIRED] = "pub fn production() {}\n" * 960
+            with self.subTest(renamed=renamed), self.assertRaisesRegex(G.ParseError, "unregistered giant"):
+                self.evaluate(before, after)
+
+    def test_base_repair_keeps_candidate_giant_checks_strict(self):
+        before = self.files()
+        before[OTHER] = "pub fn production() {}\n" * 1009
+        for same_file_lines, new_file_lines in ((1000, 0), (960, 1000)):
+            after = dict(before, **{OTHER: "pub fn production() {}\n" * same_file_lines})
+            if new_file_lines:
+                after[RETIRED] = "pub fn production() {}\n" * new_file_lines
+            with self.subTest(lines=(same_file_lines, new_file_lines)), self.assertRaisesRegex(G.ParseError, "unregistered giant"):
+                self.evaluate(before, after)
+
+    def test_base_repair_does_not_hide_other_registry_errors(self):
+        before = self.files(deadline="not-a-date")
+        before[OTHER] = "pub fn production() {}\n" * 1009
+        after = self.files()
+        after[OTHER] = "pub fn production() {}\n" * 960
+        with self.assertRaisesRegex(G.ParseError, "calendar-valid"):
+            self.evaluate(before, after)
 
     def test_r2_01_state_and_ratchet_changes_cannot_delete_live_transition(self):
         before = self.files(state="closed", transition=True)
@@ -1249,7 +1298,7 @@ class GiantFileCandidateBaseTest(unittest.TestCase):
                "GFP_HEAD_SHA": head or self.head}
         # This fixture isolates provenance, archive/diff selection and evidence;
         # real inventory parsing remains covered by the existing integration tests.
-        def snapshot(root, evaluation_date=None):
+        def snapshot(root, evaluation_date=None, candidate_modules=None):
             return {"overdue": ["src/fixture.rs"],
                     "modules": {"src/fixture.rs": len((root / "src/fixture.rs").read_text().splitlines())},
                     "registrations": {"src/fixture.rs": META_ROOT}}

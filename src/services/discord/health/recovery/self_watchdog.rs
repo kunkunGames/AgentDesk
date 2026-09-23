@@ -76,7 +76,7 @@ pub(crate) const STARTUP_GRACE: Duration = Duration::from_secs(30);
 ///
 /// [`crate::services::hang_forensics::verdict`] tabulates all seven values and
 /// the two caveats they cannot carry: `runtime=scheduling` means **one** of
-/// `runtime_workers=` was free, and `db_in_flight=` is process-wide, so
+/// `runtime_runners=` was free, and `db_in_flight=` is process-wide, so
 /// `handler_blocked_on_db` names *a* stuck health request, not this one.
 ///
 /// Must be called from inside the tokio runtime it is meant to watch: the first

@@ -2,7 +2,7 @@
 """Per-file exact-count allowlist for intake-outbox `done` writers (#5071 T2).
 
 WHY THIS EXISTS, AND WHY IT LANDS BEFORE T2. #5071 T2 moves the `done`
-transition from the intake worker to the terminal-receipt owner. Before that
+transition from the intake runner to the terminal-receipt owner. Before that
 move, the current writer call location must be reviewable: a behaviour change
 with no gate underneath it protects nothing. This script changes no production
 behaviour; it records the production call sites that exist before the move.
@@ -13,7 +13,7 @@ WHAT IS PINNED. The scope is deliberately the legacy
 writer, and the receipt-backed
 `crate::db::intake_outbox_delivery_proof::settle_intake_done_from_receipt`
 writer.
-EPIC #5071 says the worker's `Ok` stamp becomes `dispatched` and that only the
+EPIC #5071 says the runner's `Ok` stamp becomes `dispatched` and that only the
 terminal-receipt holder drives `done`; it does not move `claimed`, `accepted`,
 or `spawned`. Pinning those other lifecycle transitions here would block T2-
 unrelated work. `EXPECTED_CALL_SITES` names the writer symbol and the owning
@@ -204,7 +204,7 @@ def production_call_sites(
 def expected_call_sites(root: Path) -> dict[str, dict[str, int]]:
     """Activate the proof-writer pin only when its exact future module exists."""
     return {
-        "mark_done": {"src/services/cluster/intake_worker.rs": 1},
+        "mark_done": {"src/services/cluster/intake_runner.rs": 1},
         "mark_done_from_delivery_proof": (
             {PROOF_OWNER: 1} if (root / PROOF_OWNER).is_file() else {}
         ),

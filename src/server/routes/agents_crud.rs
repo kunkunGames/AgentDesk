@@ -987,7 +987,7 @@ pub(super) async fn list_sessions(
             ));
         }
     };
-    let worker_nodes = match crate::server::cluster::list_worker_nodes(
+    let cluster_nodes = match crate::server::cluster::list_cluster_nodes(
         pool,
         state.config.cluster.lease_ttl_secs.max(1),
     )
@@ -995,7 +995,7 @@ pub(super) async fn list_sessions(
     {
         Ok(nodes) => nodes,
         Err(error) => {
-            tracing::warn!("failed to list worker nodes for session owner routing: {error}");
+            tracing::warn!("failed to list runner nodes for session owner routing: {error}");
             Vec::new()
         }
     };
@@ -1021,7 +1021,7 @@ pub(super) async fn list_sessions(
     crate::server::cluster_session_routing::enrich_session_owner_routing(
         &mut sessions,
         local_instance_id,
-        &worker_nodes,
+        &cluster_nodes,
     );
 
     Ok((StatusCode::OK, Json(json!({ "sessions": sessions }))))

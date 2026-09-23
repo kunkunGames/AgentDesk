@@ -26,10 +26,10 @@
 //!   * F2 — a per-pane fill-cycle GENERATION (a single process-global monotonic
 //!     `u64`, owned in exactly one place under the leaf lock). Every crossing
 //!     that consumes the armed flag stamps the pane with a fresh generation; a
-//!     queued worker carries the generation it was spawned for and proceeds only
+//!     queued runner carries the generation it was spawned for and proceeds only
 //!     on an exact match. Because the counter is globally monotonic and never
 //!     reused, a same-name pane recreated after [`clear_for_tmux`] gets a
-//!     strictly greater generation, so a stale worker can never match a NEW
+//!     strictly greater generation, so a stale runner can never match a NEW
 //!     pane's `Some(false)` (closes the armed-bool ABA), and a late
 //!     [`rearm_for_retry`] cannot clobber a newer crossing's consumed flag.
 //!   * F3 — the pre-send recheck re-reads the freshest observed OCCUPANCY (also
@@ -108,7 +108,7 @@ struct CompactTriggerState {
     /// Monotonic fill-cycle counter. Only ever increases (one bump per consume),
     /// so no two crossings — across any pane, or a recreated same-name pane —
     /// ever share a generation. Generation `0` is reserved for a never-consumed
-    /// pane, which no spawned worker ever carries.
+    /// pane, which no spawned runner ever carries.
     next_generation: u64,
 }
 
@@ -129,7 +129,7 @@ static COMPACT_TRIGGER_STATE: LazyLock<Mutex<CompactTriggerState>> = LazyLock::n
 /// jitter around the threshold does not. The inject check consumes the flag
 /// optimistically the moment we decide to fire and stamps the pane with a fresh
 /// generation, so two near-simultaneous completion observations cannot both
-/// inject and a queued worker is bound to exactly its crossing. A non-confirmed
+/// inject and a queued runner is bound to exactly its crossing. A non-confirmed
 /// send restores the flag via [`rearm_for_retry`] so a later turn retries while
 /// usage stays high.
 ///
@@ -167,7 +167,7 @@ fn observe_and_decide_with_source(
                 || entry.last_window_source != Some(window_source))
         {
             // A model/window or proof-source switch starts a distinct fill cycle.
-            // Invalidate the prior worker before this observation can consume a
+            // Invalidate the prior runner before this observation can consume a
             // fresh generation, including fallback-to-proven transitions at 1M.
             entry.armed = true;
             entry.generation = 0;
@@ -189,7 +189,7 @@ fn observe_and_decide_with_source(
     if armed && occupied >= threshold.effective_tokens {
         // Optimistically consume the flag and stamp a fresh generation so
         // concurrent completion observations do not double-inject and the queued
-        // worker is bound to THIS crossing. Restored by `rearm_for_retry` on a
+        // runner is bound to THIS crossing. Restored by `rearm_for_retry` on a
         // non-confirmed send; re-armed naturally by the drop branch after a real
         // compact.
         let generation = state.next_generation.wrapping_add(1);
@@ -204,7 +204,7 @@ fn observe_and_decide_with_source(
 }
 
 /// Observable pre-send revalidation, performed under the composer lock right
-/// before the tmux mutation. A queued worker proceeds only when the pane is:
+/// before the tmux mutation. A queued runner proceeds only when the pane is:
 ///   * still present AND still disarmed for `generation` — no observable
 ///     occupancy drop re-armed it and no NEW crossing (a different generation)
 ///     superseded it, and no teardown/policy-clear removed it (F2 ABA close),
@@ -231,10 +231,10 @@ fn pane_still_disarmed_for_send(
 
 /// Restore the armed flag after a non-confirmed send so a later turn-completion
 /// retries `/compact` while usage stays high — observable retry. Generation-gated
-/// (F2): the restore only lands while the pane is still on the worker's crossing
-/// `generation`, so a stale worker cannot clobber a NEWER crossing's consumed
+/// (F2): the restore only lands while the pane is still on the runner's crossing
+/// `generation`, so a stale runner cannot clobber a NEWER crossing's consumed
 /// flag. Idempotent and resurrection-safe: a pane the teardown path already
-/// removed stays removed, so a late worker cannot revive a stale entry.
+/// removed stays removed, so a late runner cannot revive a stale entry.
 fn rearm_for_retry(pane: &CompactPaneKey, generation: u64) {
     let mut guard = COMPACT_TRIGGER_STATE
         .lock()
@@ -248,7 +248,7 @@ fn rearm_for_retry(pane: &CompactPaneKey, generation: u64) {
 
 /// Invalidate a consumed cycle when its captured Managed authority was revoked
 /// before mutation. The generation and context-window match make this a
-/// compare-and-set: a stale worker cannot re-arm or clear a newer cycle. Resetting
+/// compare-and-set: a stale runner cannot re-arm or clear a newer cycle. Resetting
 /// the matched generation lets the next eligible Managed observation at already
 /// high occupancy consume a fresh globally unique generation.
 fn invalidate_after_authority_rejection(
@@ -273,7 +273,7 @@ fn invalidate_after_authority_rejection(
 /// Run the observable pre-send recheck and, if the world is unchanged, the
 /// compact submit — both inside a single per-pane composer critical section. The
 /// composer lock (not the leaf state lock) is the only lock held across the tmux
-/// mutation, so a queued worker may wait behind another composer mutation but
+/// mutation, so a queued runner may wait behind another composer mutation but
 /// never carries the leaf state lock into `submit`. `None` means the pre-send
 /// recheck bailed (stale/torn-down/below-threshold) and no mutation was
 /// attempted.
@@ -441,8 +441,8 @@ pub(in crate::services) fn maybe_inject_compact_with_source(
         return;
     };
 
-    // The flag was just consumed, so at most one blocking worker exists per
-    // crossing. This worker holds ONLY the per-pane composer lock across the tmux
+    // The flag was just consumed, so at most one blocking runner exists per
+    // crossing. This runner holds ONLY the per-pane composer lock across the tmux
     // mutation (never the leaf state lock) and performs no turn-readiness wait. It
     // carries `generation` so the pre-send recheck binds it to THIS crossing.
     tokio::task::spawn_blocking(move || {
@@ -500,10 +500,10 @@ pub(crate) fn clear_for_tmux(tmux_session_name: &str) {
     if tmux_session_name.is_empty() {
         return;
     }
-    // Removal alone invalidates every stale worker: because `next_generation` is
+    // Removal alone invalidates every stale runner: because `next_generation` is
     // global-monotonic and never reset here, a same-name pane recreated after
     // this clear re-inserts as `PaneArmState::fresh` (generation 0) and its first
-    // crossing consumes a strictly greater generation than any prior worker holds.
+    // crossing consumes a strictly greater generation than any prior runner holds.
     COMPACT_TRIGGER_STATE
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -581,9 +581,9 @@ mod tests {
 
     /// Mutation guard: the window-change invalidation in `observe_and_decide`.
     /// Changing context windows must issue a distinct generation, reject the old
-    /// queued worker at the composer barrier, and ignore its later retry re-arm.
+    /// queued runner at the composer barrier, and ignore its later retry re-arm.
     #[test]
-    fn window_switch_invalidates_old_worker_and_starts_a_fresh_cycle() {
+    fn window_switch_invalidates_old_runner_and_starts_a_fresh_cycle() {
         let _guard = state_test_guard();
         let pane = pane();
         let old_threshold = threshold_for(1_000_000);
@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(last_window_tokens(&pane), Some(800_000));
         assert!(
             !pane_still_disarmed_for_send(&pane, old_generation, old_threshold),
-            "a worker bound to the prior window must fail the composer barrier"
+            "a runner bound to the prior window must fail the composer barrier"
         );
         rearm_for_retry(&pane, old_generation);
         assert_eq!(
@@ -674,7 +674,7 @@ mod tests {
     }
 
     /// Mutation guard: ignoring proof source when the numeric window remains 1M
-    /// lets the fallback worker survive and prevents a fresh proven generation.
+    /// lets the fallback runner survive and prevents a fresh proven generation.
     #[test]
     fn fallback_to_proven_transition_invalidates_old_generation() {
         let _guard = state_test_guard();
@@ -810,14 +810,14 @@ mod tests {
     /// recheck). After the latch is consumed for a crossing, an observed
     /// occupancy drop re-arms the pane (a compaction landed). Reverting the
     /// recheck to `true` (or to `matches!(get, Some(_))`, ignoring the disarmed
-    /// bool) makes the final assert fail — the queued worker would send a STALE
+    /// bool) makes the final assert fail — the queued runner would send a STALE
     /// second `/compact` after the context was already reset.
     #[test]
     fn pre_send_recheck_bails_when_occupancy_drop_rearmed_the_pane() {
         let _guard = state_test_guard();
         let pane = pane();
         let threshold = threshold_for(1_000_000);
-        // Cross → consume; the queued worker would still see the pane disarmed.
+        // Cross → consume; the queued runner would still see the pane disarmed.
         let generation = observe_and_decide(&pane, 500_000, threshold).expect("crossing injects");
         assert!(pane_still_disarmed_for_send(&pane, generation, threshold));
         // A later completion observes a compaction (occupancy drop) → re-arm.
@@ -854,7 +854,7 @@ mod tests {
     }
 
     /// F2 mutation guard: the `generation == generation` match in both
-    /// `pane_still_disarmed_for_send` and `rearm_for_retry`. A worker queued for
+    /// `pane_still_disarmed_for_send` and `rearm_for_retry`. A runner queued for
     /// an OLD crossing must neither send nor re-arm after `clear_for_tmux` + a NEW
     /// same-name crossing re-issued the same `Some(false)` armed value under a
     /// strictly greater generation (the armed-bool ABA). Reverting either
@@ -862,7 +862,7 @@ mod tests {
     /// recheck would pass, or the stale re-arm would clobber the new crossing's
     /// consumed flag back to `true`.
     #[test]
-    fn stale_generation_worker_neither_sends_nor_rearms_after_pane_recreated() {
+    fn stale_generation_runner_neither_sends_nor_rearms_after_pane_recreated() {
         let _guard = state_test_guard();
         let pane = pane();
         let threshold = threshold_for(1_000_000);
@@ -877,7 +877,7 @@ mod tests {
             old_generation, new_generation,
             "a recreated pane's crossing must get a fresh generation"
         );
-        // The stale worker must NOT send for the new pane's crossing...
+        // The stale runner must NOT send for the new pane's crossing...
         assert!(!pane_still_disarmed_for_send(
             &pane,
             old_generation,
@@ -890,7 +890,7 @@ mod tests {
             Some(false),
             "a stale-generation re-arm must be a no-op for a newer crossing"
         );
-        // The current-generation worker remains valid.
+        // The current-generation runner remains valid.
         assert!(pane_still_disarmed_for_send(
             &pane,
             new_generation,
@@ -899,8 +899,8 @@ mod tests {
     }
 
     /// Mutation guard: the `None` (teardown) arm of `pane_still_disarmed_for_send`.
-    /// A pane torn down while a worker was queued must not send. Reverting the
-    /// recheck lets the worker send into a recreated/absent pane.
+    /// A pane torn down while a runner was queued must not send. Reverting the
+    /// recheck lets the runner send into a recreated/absent pane.
     #[test]
     fn pre_send_recheck_bails_after_teardown_clear() {
         let _guard = state_test_guard();
@@ -912,13 +912,13 @@ mod tests {
         assert!(!pane_still_disarmed_for_send(&pane, generation, threshold));
     }
 
-    /// The worker is parked behind the physical pane's composer lock. While it is
+    /// The runner is parked behind the physical pane's composer lock. While it is
     /// parked, the live turn authority changes from the captured Managed identity
     /// to ExternalInput or ExternalAdopted. The post-lock authority recheck must
-    /// reject the stale worker before the submit closure can mutate the composer.
+    /// reject the stale runner before the submit closure can mutate the composer.
     #[cfg(unix)]
     #[test]
-    fn queued_worker_revalidates_live_turn_authority_after_composer_barrier() {
+    fn queued_runner_revalidates_live_turn_authority_after_composer_barrier() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, mpsc};
         use std::time::Duration;
@@ -944,23 +944,23 @@ mod tests {
             let sends = Arc::new(AtomicUsize::new(0));
             let (queued_tx, queued_rx) = mpsc::channel();
             let (outcome_tx, outcome_rx) = mpsc::channel();
-            let worker_pane = pane.clone();
-            let worker_authority = Arc::clone(&authority_is_managed);
-            let worker_sends = Arc::clone(&sends);
+            let runner_pane = pane.clone();
+            let runner_authority = Arc::clone(&authority_is_managed);
+            let runner_sends = Arc::clone(&sends);
 
             crate::services::claude_tui::composer_lock::with_composer_mutation_lock(
                 &pane.tmux_session_name,
                 || {
-                    let worker = std::thread::spawn(move || {
-                        queued_tx.send(()).expect("signal queued compact worker");
+                    let runner = std::thread::spawn(move || {
+                        queued_tx.send(()).expect("signal queued compact runner");
                         let outcome = submit_under_composer_lock(
-                            &worker_pane,
+                            &runner_pane,
                             generation,
                             threshold,
                             &expected_turn,
-                            |_| worker_authority.load(Ordering::SeqCst),
+                            |_| runner_authority.load(Ordering::SeqCst),
                             || {
-                                worker_sends.fetch_add(1, Ordering::SeqCst);
+                                runner_sends.fetch_add(1, Ordering::SeqCst);
                                 CompactSubmitOutcome::AcceptedOrQueued
                             },
                         );
@@ -968,19 +968,19 @@ mod tests {
                     });
                     queued_rx
                         .recv_timeout(Duration::from_millis(250))
-                        .expect("worker must queue behind the held composer lock");
+                        .expect("runner must queue behind the held composer lock");
                     assert!(outcome_rx.recv_timeout(Duration::from_millis(25)).is_err());
                     authority_is_managed.store(false, Ordering::SeqCst);
-                    worker
+                    runner
                 },
             )
             .join()
-            .expect("compact worker thread");
+            .expect("compact runner thread");
 
             assert_eq!(
                 outcome_rx.recv_timeout(Duration::from_millis(250)).unwrap(),
                 None,
-                "{external_source:?} must reject the queued worker"
+                "{external_source:?} must reject the queued runner"
             );
             assert_eq!(
                 sends.load(Ordering::SeqCst),
@@ -1045,7 +1045,7 @@ mod tests {
         let threshold = threshold_for(1_000_000);
         let generation = observe_and_decide(&pane, 700_000, threshold).expect("crossing injects");
         assert_eq!(armed_state(&pane), Some(false));
-        // Simulate the worker's ambiguous-after-mutation outcome.
+        // Simulate the runner's ambiguous-after-mutation outcome.
         rearm_for_retry(&pane, generation);
         assert_eq!(armed_state(&pane), Some(true));
         // Usage still high and no compaction observed → retry next turn.
@@ -1053,7 +1053,7 @@ mod tests {
     }
 
     /// A pane the teardown path removed must not be resurrected by a late
-    /// worker's re-arm. Mutation guard: the `if let Some(..)` presence check in
+    /// runner's re-arm. Mutation guard: the `if let Some(..)` presence check in
     /// `rearm_for_retry`. Reverting it to an unconditional insert re-creates a
     /// stale entry, so the `armed_state(&pane).is_none()` assertion fails.
     #[test]
@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     /// Degrade-safe no-inject paths never touch the armed flag and never spawn a
-    /// worker (so these are safe to call without a Tokio runtime): a non-Claude
+    /// runner (so these are safe to call without a Tokio runtime): a non-Claude
     /// provider, an unresolvable window, and a zero/disabled percent.
     #[test]
     fn maybe_inject_degrades_safely_without_touching_the_flag() {

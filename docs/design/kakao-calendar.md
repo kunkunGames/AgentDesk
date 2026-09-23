@@ -20,7 +20,7 @@ optional credential persistence. Message templates retain their own landing-URL
 validation. Calendar-specific validation, API transport and durable synchronization
 are separate modules. The secret-file atomic primitive has no Discord dependency.
 
-Existing route registration, worker lifecycle, request fingerprinting, PostgreSQL
+Existing route registration, runner lifecycle, request fingerprinting, PostgreSQL
 migrations, test fixtures and inventory generators are reused. Calendar intent
 does not reuse the message outbox's delivery FK, recipient counts or terminal
 payload lifetime. This is the boundary that permits calendar evolution without
@@ -53,9 +53,9 @@ These are assessments of the pinned source, not claims of observed production in
 | F09 secret helper limits | Confirmed capability gap | Added descriptor-relative, no-follow private-directory atomic writer; existing writers keep their contracts. |
 | F10 HTTP dedupe TTL | Unsuitable for remote create safety | Calendar request keys persist independently of HTTP TTL and survive tombstones. Same-key concurrency and conflicting payloads are tested in PostgreSQL. |
 | F11 claimed identity headers | Existing trust boundary | Every calendar handler requires the actual configured operator Bearer token. No local/no-token bypass; claimed headers do not authorize. Helper tests cover rejection. |
-| F12 leader versus credential owner | Existing operational limitation | Calendar rejects cluster mode and requires one Unix credential owner with a locked private store. Multi-node failover is not claimed. |
+| F12 hub versus credential owner | Existing operational limitation | Calendar rejects cluster mode and requires one Unix credential owner with a locked private store. Multi-node failover is not claimed. |
 | F13 missing transport coverage | Confirmed coverage gap | Added mock create/update/delete, identity/consent shape, parallel stale-401, transient refresh and bounded ambiguous-response tests. |
-| F14 generated inventories | Applicable | Regenerated env, route, worker, architecture and test manifests using repository scripts. |
+| F14 generated inventories | Applicable | Regenerated env, route, runner, architecture and test manifests using repository scripts. |
 | F15 zero-success message summary | Confirmed branch defect | Classifies zero success as failure, true partial separately, malformed totals as unknown; unit regression test. |
 | F16 message dispatch time fence | Confirmed missing checks | SQL now checks live lease and delivery deadline; PostgreSQL regression exercises each expiry and valid dispatch. |
 | F17 stale 401 duplicate refresh | Confirmed missing generation check | Refresh compares the generation rejected by the provider under the account mutex; concurrent old-401 test observes one refresh. |

@@ -19,7 +19,7 @@ about the generated report or its generator.
   committed markdown freshness drift is not the hard failure and does not need
   to be committed in unrelated PRs.
 - `ci-nightly.yml` regenerates all inventory views, then reports drift only for
-  the tracked outputs: `ARCHITECTURE.md`, route inventory, and worker inventory.
+  the tracked outputs: `ARCHITECTURE.md`, route inventory, and runner inventory.
   The warning points contributors to the weekly refresh workflow or to a local
   regeneration command.
 - `python3 scripts/audit_maintainability.py --check` is still allowed to fail

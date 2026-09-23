@@ -657,6 +657,11 @@
       "version": 128
     },
     {
+      "path": "migrations/postgres/0129_hub_runner_names.sql",
+      "version": 129,
+      "sha256": "eff36cd91664cec811193d2665cdc95cc9904bb9af782f212716d384c52e1cf7"
+    },
+    {
       "path": "migrations/postgres/0130_relay_dead_letter_redelivery_attempts.sql",
       "sha256": "de5a5c2cf7ff88fa38dc638e3472e21b478572eef77cecfe8182df9736be9e9e",
       "version": 130

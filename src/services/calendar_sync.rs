@@ -1,18 +1,18 @@
 //! Managed calendar orchestration. One target executor handles every consenting account.
 pub(crate) mod model;
 mod recovery;
-mod worker;
+mod runner;
 use crate::db::calendar_sync::{self as db, Binding, CalendarDbError, Receipt};
 use crate::services::kakao::{KakaoError, account};
 use model::EventContent;
 pub(crate) use recovery::{Recovery, recover};
+pub(crate) use runner::calendar_loop;
+#[cfg(test)]
+pub(crate) use runner::execute as execute_for_test;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
-pub(crate) use worker::calendar_loop;
-#[cfg(test)]
-pub(crate) use worker::execute as execute_for_test;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CalendarError {

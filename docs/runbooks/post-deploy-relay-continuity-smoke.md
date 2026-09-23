@@ -51,7 +51,7 @@ The wrapper rejects live success unless both `E-9` and `E-19` report
 
 ## Live Smoke
 
-Run this only against the dedicated TUI E2E worker channels:
+Run this only against the dedicated TUI E2E runner channels:
 
 ```bash
 python3 scripts/e2e/post_deploy_relay_continuity.py \

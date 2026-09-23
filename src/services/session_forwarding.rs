@@ -122,7 +122,7 @@ async fn resolve_forward_target_from_nodes(
     state: &ForwardCallerContext,
     owner_instance_id: Option<&str>,
     local_instance_id: Option<&str>,
-    worker_nodes: &[Value],
+    cluster_nodes: &[Value],
     required_capability: &str,
 ) -> ForwardResolution {
     let owner_instance_id = owner_instance_id
@@ -156,26 +156,26 @@ async fn resolve_forward_target_from_nodes(
         return ForwardResolution::Local;
     }
 
-    let Some(node) = worker_nodes
+    let Some(node) = cluster_nodes
         .iter()
         .find(|node| node.get("instance_id").and_then(Value::as_str) == Some(owner))
     else {
         return unavailable(
-            "worker_node_missing",
-            "session owner worker node is missing",
+            "runner_node_missing",
+            "session owner runner node is missing",
             Some(owner),
         );
     };
     if node.get("status").and_then(Value::as_str) != Some("online") {
         return unavailable(
-            "worker_node_stale",
-            "session owner worker node is stale",
+            "runner_node_stale",
+            "session owner runner node is stale",
             Some(owner),
         );
     }
     let Some(advertised_origin) = node.get("api_base_url").and_then(Value::as_str) else {
         return unavailable(
-            "worker_api_base_url_missing",
+            "runner_api_base_url_missing",
             "session owner API origin advertisement is missing",
             Some(owner),
         );
@@ -262,7 +262,7 @@ async fn resolve_forward_target_with_capability(
         return ForwardResolution::Local;
     }
 
-    let worker_nodes = match crate::services::cluster::node_registry::list_worker_nodes(
+    let cluster_nodes = match crate::services::cluster::node_registry::list_cluster_nodes(
         pool,
         state.config.cluster.lease_ttl_secs,
     )
@@ -272,13 +272,13 @@ async fn resolve_forward_target_with_capability(
         Err(error) => {
             tracing::warn!(
                 owner_instance_id,
-                category = "worker_nodes_unavailable",
+                category = "cluster_nodes_unavailable",
                 error = %error,
                 "[session-forwarding] target registry lookup failed"
             );
             return unavailable(
-                "worker_nodes_unavailable",
-                "worker node registry is unavailable for session forwarding",
+                "cluster_nodes_unavailable",
+                "runner node registry is unavailable for session forwarding",
                 owner_instance_id,
             );
         }
@@ -288,7 +288,7 @@ async fn resolve_forward_target_with_capability(
         state,
         owner_instance_id,
         local_instance_id,
-        &worker_nodes,
+        &cluster_nodes,
         required_capability,
     )
     .await
@@ -887,7 +887,7 @@ mod tests {
         let mut config = crate::config::Config::default();
         if let Some(origin) = origin {
             config.cluster.nodes.insert(
-                "worker-a".to_string(),
+                "runner-a".to_string(),
                 crate::config::ClusterNodeConfig {
                     trusted_forward_origin: Some(origin.to_string()),
                     ..crate::config::ClusterNodeConfig::default()
@@ -897,7 +897,7 @@ mod tests {
         super::ForwardCallerContext {
             pg_pool: None,
             config: std::sync::Arc::new(config),
-            cluster_instance_id: Some("leader".to_string()),
+            cluster_instance_id: Some("hub".to_string()),
         }
     }
 
@@ -908,7 +908,7 @@ mod tests {
             resolve_forward_target_from_nodes(
                 &state,
                 None,
-                Some("leader"),
+                Some("hub"),
                 &[],
                 "session_forwarding",
             )
@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(
             resolve_forward_target_from_nodes(
                 &state,
-                Some("worker-a"),
+                Some("runner-a"),
                 None,
                 &[],
                 "session_forwarding",
@@ -929,8 +929,8 @@ mod tests {
         assert_eq!(
             resolve_forward_target_from_nodes(
                 &state,
-                Some("leader"),
-                Some("leader"),
+                Some("hub"),
+                Some("hub"),
                 &[],
                 "session_forwarding",
             )
@@ -944,8 +944,8 @@ mod tests {
         let state = resolution_state(None);
         let resolution = resolve_forward_target_from_nodes(
             &state,
-            Some("worker-a\r\nx-injected"),
-            Some("leader"),
+            Some("runner-a\r\nx-injected"),
+            Some("hub"),
             &[],
             "session_forwarding",
         )
@@ -958,8 +958,8 @@ mod tests {
 
         let resolution = resolve_forward_target_from_nodes(
             &state,
-            Some("worker-a"),
-            Some("leader\r\nx-injected"),
+            Some("runner-a"),
+            Some("hub\r\nx-injected"),
             &[],
             "session_forwarding",
         )
@@ -975,15 +975,15 @@ mod tests {
     async fn resolve_forward_target_returns_trusted_foreign_owner() {
         let state = resolution_state(Some("https://203.0.113.10:8791"));
         let nodes = vec![json!({
-            "instance_id": "worker-a",
+            "instance_id": "runner-a",
             "status": "online",
             "api_base_url": "https://203.0.113.10:8791",
             "capabilities": {"agentdesk_api": {"session_forwarding": true}}
         })];
         let resolution = resolve_forward_target_from_nodes(
             &state,
-            Some("worker-a"),
-            Some("leader"),
+            Some("runner-a"),
+            Some("hub"),
             &nodes,
             "session_forwarding",
         )
@@ -991,45 +991,39 @@ mod tests {
         let ForwardResolution::Forward(target) = resolution else {
             panic!("expected trusted foreign target");
         };
-        assert_eq!(target.owner_instance_id(), "worker-a");
+        assert_eq!(target.owner_instance_id(), "runner-a");
     }
 
     #[test]
     fn forwarded_header_is_detected_and_receiver_fence_is_exact() {
         let mut headers = HeaderMap::new();
         assert!(!is_forwarded_request(&headers));
-        headers.insert(
-            "x-agentdesk-forwarded-by",
-            HeaderValue::from_static("leader"),
-        );
+        headers.insert("x-agentdesk-forwarded-by", HeaderValue::from_static("hub"));
         assert!(is_forwarded_request(&headers));
-        assert!(enforce_receiver_fence(&headers, Some("worker-a"), Some("worker-a")).is_err());
+        assert!(enforce_receiver_fence(&headers, Some("runner-a"), Some("runner-a")).is_err());
         headers.insert(
             "x-agentdesk-session-owner",
-            HeaderValue::from_static("worker-a"),
+            HeaderValue::from_static("runner-a"),
         );
-        assert!(enforce_receiver_fence(&headers, Some("worker-a"), Some("worker-a")).is_ok());
+        assert!(enforce_receiver_fence(&headers, Some("runner-a"), Some("runner-a")).is_ok());
         headers.insert(
             "x-agentdesk-forwarded-by",
-            HeaderValue::from_bytes(b"leader\xff").expect("opaque forwarded-by header"),
+            HeaderValue::from_bytes(b"hub\xff").expect("opaque forwarded-by header"),
         );
-        assert!(enforce_receiver_fence(&headers, Some("worker-a"), Some("worker-a")).is_err());
-        headers.insert(
-            "x-agentdesk-forwarded-by",
-            HeaderValue::from_static("leader"),
-        );
-        assert!(enforce_receiver_fence(&headers, Some("worker-a"), Some("worker-b")).is_err());
+        assert!(enforce_receiver_fence(&headers, Some("runner-a"), Some("runner-a")).is_err());
+        headers.insert("x-agentdesk-forwarded-by", HeaderValue::from_static("hub"));
+        assert!(enforce_receiver_fence(&headers, Some("runner-a"), Some("runner-b")).is_err());
         headers.insert(
             "x-agentdesk-session-owner",
-            HeaderValue::from_static("worker/a"),
+            HeaderValue::from_static("runner/a"),
         );
-        assert!(enforce_receiver_fence(&headers, Some("worker/a"), Some("worker/a")).is_err());
+        assert!(enforce_receiver_fence(&headers, Some("runner/a"), Some("runner/a")).is_err());
         headers.insert(
             "x-agentdesk-session-owner",
-            HeaderValue::from_static("worker-a"),
+            HeaderValue::from_static("runner-a"),
         );
         let (_, Json(body)) =
-            enforce_receiver_fence(&headers, Some("worker-b"), Some("worker-a")).unwrap_err();
+            enforce_receiver_fence(&headers, Some("runner-b"), Some("runner-a")).unwrap_err();
         assert_eq!(
             body["code"].as_str(),
             Some("session_forward_owner_conflict")
@@ -1037,7 +1031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_json_response_preserves_worker_auth_failure_status() {
+    async fn forward_json_response_preserves_runner_auth_failure_status() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -1058,7 +1052,7 @@ mod tests {
                 .expect("write response");
         });
 
-        let target = test_target("worker-a", &format!("http://{addr}"));
+        let target = test_target("runner-a", &format!("http://{addr}"));
         let (status, Json(body)) = forward_json_response(
             target
                 .request(reqwest::Method::GET, "/probe")
@@ -1077,27 +1071,27 @@ mod tests {
     async fn stale_capability_and_missing_trust_config_fail_before_forwarding() {
         let mut config = crate::config::Config::default();
         config.cluster.nodes.insert(
-            "worker-a".to_string(),
+            "runner-a".to_string(),
             crate::config::ClusterNodeConfig {
-                trusted_forward_origin: Some("https://worker.example:8791".to_string()),
+                trusted_forward_origin: Some("https://runner.example:8791".to_string()),
                 ..crate::config::ClusterNodeConfig::default()
             },
         );
         let state = super::ForwardCallerContext {
             pg_pool: None,
             config: std::sync::Arc::new(config.clone()),
-            cluster_instance_id: Some("leader".to_string()),
+            cluster_instance_id: Some("hub".to_string()),
         };
         let stale = vec![json!({
-            "instance_id": "worker-a",
+            "instance_id": "runner-a",
             "status": "offline",
-            "api_base_url": "https://worker.example:8791",
+            "api_base_url": "https://runner.example:8791",
             "capabilities": {"agentdesk_api": {"session_forwarding": true}}
         })];
         let resolution = resolve_forward_target_from_nodes(
             &state,
-            Some("worker-a"),
-            Some("leader"),
+            Some("runner-a"),
+            Some("hub"),
             &stale,
             "session_forwarding",
         )
@@ -1105,19 +1099,19 @@ mod tests {
         assert!(matches!(
             resolution,
             super::ForwardResolution::Unavailable { ref body, .. }
-                if body["code"] == "worker_node_stale"
+                if body["code"] == "runner_node_stale"
         ));
 
         let online_without_capability = vec![json!({
-            "instance_id": "worker-a",
+            "instance_id": "runner-a",
             "status": "online",
-            "api_base_url": "https://worker.example:8791",
+            "api_base_url": "https://runner.example:8791",
             "capabilities": {"agentdesk_api": {"session_forwarding": false}}
         })];
         let resolution = resolve_forward_target_from_nodes(
             &state,
-            Some("worker-a"),
-            Some("leader"),
+            Some("runner-a"),
+            Some("hub"),
             &online_without_capability,
             "session_forwarding",
         )
@@ -1132,18 +1126,18 @@ mod tests {
         let state = super::ForwardCallerContext {
             pg_pool: None,
             config: std::sync::Arc::new(config),
-            cluster_instance_id: Some("leader".to_string()),
+            cluster_instance_id: Some("hub".to_string()),
         };
         let online = vec![json!({
-            "instance_id": "worker-a",
+            "instance_id": "runner-a",
             "status": "online",
-            "api_base_url": "https://worker.example:8791",
+            "api_base_url": "https://runner.example:8791",
             "capabilities": {"agentdesk_api": {"session_forwarding": true}}
         })];
         let resolution = resolve_forward_target_from_nodes(
             &state,
-            Some("worker-a"),
-            Some("leader"),
+            Some("runner-a"),
+            Some("hub"),
             &online,
             "session_forwarding",
         )
@@ -1160,7 +1154,7 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.server.auth_token = Some("must-not-be-sent".to_string());
         config.cluster.nodes.insert(
-            "worker-a".to_string(),
+            "runner-a".to_string(),
             crate::config::ClusterNodeConfig {
                 trusted_forward_origin: Some("http://203.0.113.10:8791".to_string()),
                 allow_private_forwarding: true,
@@ -1171,10 +1165,10 @@ mod tests {
         let state = super::ForwardCallerContext {
             pg_pool: None,
             config: std::sync::Arc::new(config),
-            cluster_instance_id: Some("leader".to_string()),
+            cluster_instance_id: Some("hub".to_string()),
         };
         let nodes = vec![json!({
-            "instance_id": "worker-a",
+            "instance_id": "runner-a",
             "status": "online",
             "api_base_url": "http://203.0.113.10:8791",
             "capabilities": {"agentdesk_api": {"session_forwarding": true}}
@@ -1182,8 +1176,8 @@ mod tests {
 
         let resolution = resolve_forward_target_from_nodes(
             &state,
-            Some("worker-a"),
-            Some("leader"),
+            Some("runner-a"),
+            Some("hub"),
             &nodes,
             "session_forwarding",
         )
@@ -1239,9 +1233,9 @@ mod tests {
         let state = super::ForwardCallerContext {
             pg_pool: None,
             config: std::sync::Arc::new(config),
-            cluster_instance_id: Some("leader".to_string()),
+            cluster_instance_id: Some("hub".to_string()),
         };
-        let target = test_target("worker-a", &format!("http://{redirect_addr}"));
+        let target = test_target("runner-a", &format!("http://{redirect_addr}"));
         let (status, _) = super::forward_cancel_turn(&state, &target, "42", false).await;
         redirect.await.expect("redirect server task");
         assert_eq!(status, axum::http::StatusCode::FOUND);
@@ -1264,7 +1258,7 @@ mod tests {
             config: std::sync::Arc::new(config),
             cluster_instance_id: Some("bad\nheader".to_string()),
         };
-        let target = test_target("worker-a", &format!("http://{addr}"));
+        let target = test_target("runner-a", &format!("http://{addr}"));
         let (status, Json(body)) = super::forward_cancel_turn(&state, &target, "42", false).await;
         assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["code"], "session_forward_headers_invalid");
@@ -1317,8 +1311,8 @@ mod tests {
             let read = socket.read(&mut buffer).await.expect("read request");
             let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
             assert!(request.contains("authorization: bearer secret-token"));
-            assert!(request.contains("x-agentdesk-forwarded-by: leader"));
-            assert!(request.contains("x-agentdesk-session-owner: worker-a"));
+            assert!(request.contains("x-agentdesk-forwarded-by: hub"));
+            assert!(request.contains("x-agentdesk-session-owner: runner-a"));
             let body = r#"{"ok":true}"#;
             let response = format!(
                 concat!(
@@ -1340,9 +1334,9 @@ mod tests {
         let state = super::ForwardCallerContext {
             pg_pool: None,
             config: std::sync::Arc::new(config),
-            cluster_instance_id: Some("leader".to_string()),
+            cluster_instance_id: Some("hub".to_string()),
         };
-        let target = test_target("worker-a", &format!("http://{addr}"));
+        let target = test_target("runner-a", &format!("http://{addr}"));
 
         let (status, Json(body)) = super::forward_cancel_turn(&state, &target, "42", false).await;
         server.await.expect("test server task");
@@ -1352,7 +1346,7 @@ mod tests {
 
     #[test]
     fn cancel_retry_accepts_ack_and_authenticated_structured_not_found() {
-        let target = test_target("worker-a", "http://worker-a.local:8791");
+        let target = test_target("runner-a", "http://runner-a.local:8791");
         assert_eq!(
             classify_cancel_forward_response(
                 axum::http::StatusCode::OK,
@@ -1370,8 +1364,8 @@ mod tests {
                     "code": "not_found",
                     "context": {
                         "channel_id": "42",
-                        "expected_owner_instance_id": "worker-a",
-                        "receiver_instance_id": "worker-a"
+                        "expected_owner_instance_id": "runner-a",
+                        "receiver_instance_id": "runner-a"
                     },
                 }),
                 &target,
@@ -1392,7 +1386,7 @@ mod tests {
 
     #[test]
     fn cancel_retry_reloads_owner_only_for_conflict() {
-        let target = test_target("worker-a", "http://worker-a.local:8791");
+        let target = test_target("runner-a", "http://runner-a.local:8791");
         assert_eq!(
             classify_cancel_forward_response(
                 axum::http::StatusCode::CONFLICT,
@@ -1465,14 +1459,14 @@ mod tests {
             "cancel-owner-thread",
             None,
             Some("101"),
-            Some("worker-a"),
+            Some("runner-a"),
             "turn_active",
         )
         .await;
 
         assert_eq!(
             load_cancel_owner(&pool, "101").await.expect("load owner"),
-            Some("worker-a".to_string())
+            Some("runner-a".to_string())
         );
         pg_db.drop().await;
     }
@@ -1486,14 +1480,14 @@ mod tests {
             "cancel-owner-runtime",
             Some("102"),
             None,
-            Some("worker-b"),
+            Some("runner-b"),
             "turn_active",
         )
         .await;
 
         assert_eq!(
             load_cancel_owner(&pool, "102").await.expect("load owner"),
-            Some("worker-b".to_string())
+            Some("runner-b".to_string())
         );
         pg_db.drop().await;
     }
@@ -1507,7 +1501,7 @@ mod tests {
             "cancel-owner-disconnected",
             Some("103"),
             None,
-            Some("worker-c"),
+            Some("runner-c"),
             "disconnected",
         )
         .await;
@@ -1549,7 +1543,7 @@ mod tests {
             "cancel-owner-old",
             Some("105"),
             None,
-            Some("worker-old"),
+            Some("runner-old"),
             "turn_active",
         )
         .await;
@@ -1563,14 +1557,14 @@ mod tests {
             "cancel-owner-new",
             Some("105"),
             None,
-            Some("worker-new"),
+            Some("runner-new"),
             "turn_active",
         )
         .await;
 
         assert_eq!(
             load_cancel_owner(&pool, "105").await.expect("load owner"),
-            Some("worker-new".to_string())
+            Some("runner-new".to_string())
         );
         pg_db.drop().await;
     }
@@ -1584,7 +1578,7 @@ mod tests {
             "contains-106",
             Some("999"),
             None,
-            Some("worker-wrong"),
+            Some("runner-wrong"),
             "turn_active",
         )
         .await;
@@ -1605,7 +1599,7 @@ mod tests {
             "cancel-owner-unrelated",
             Some("107"),
             None,
-            Some("worker-unrelated"),
+            Some("runner-unrelated"),
             "turn_active",
         )
         .await;
@@ -1626,7 +1620,7 @@ mod tests {
             "host:AgentDesk-claude-110",
             None,
             None,
-            Some("worker-key"),
+            Some("runner-key"),
             "turn_active",
         )
         .await;
@@ -1636,7 +1630,7 @@ mod tests {
             .expect("load selected session")
             .expect("session-key fallback selection");
         assert_eq!(selected.session_key, "host:AgentDesk-claude-110");
-        assert_eq!(selected.owner_instance_id.as_deref(), Some("worker-key"));
+        assert_eq!(selected.owner_instance_id.as_deref(), Some("runner-key"));
         assert_eq!(selected.match_rank, 1);
         let status: String = sqlx::query_scalar(
             "SELECT status FROM sessions WHERE session_key = 'host:AgentDesk-claude-110'",
@@ -1657,7 +1651,7 @@ mod tests {
             "host:AgentDesk-claude-1100",
             None,
             None,
-            Some("worker-overlap"),
+            Some("runner-overlap"),
             "turn_active",
         )
         .await;
@@ -1689,7 +1683,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO sessions
              (session_key, agent_id, provider, status, instance_id, last_heartbeat)
-             VALUES ('owner-provider-fallback', 'cancel-agent-111', 'claude', 'turn_active', 'worker-provider', NOW())",
+             VALUES ('owner-provider-fallback', 'cancel-agent-111', 'claude', 'turn_active', 'runner-provider', NOW())",
         )
         .execute(&pool)
         .await
@@ -1702,7 +1696,7 @@ mod tests {
         assert_eq!(selected.session_key, "owner-provider-fallback");
         assert_eq!(
             selected.owner_instance_id.as_deref(),
-            Some("worker-provider")
+            Some("runner-provider")
         );
         assert_eq!(selected.requested_provider.as_deref(), Some("claude"));
         assert_eq!(selected.match_rank, 2);

@@ -6,14 +6,14 @@ dedicated Discord channel. The legacy single-pair smoke against
 
 ## Cells
 
-| Cell           | Provider | Runtime    | Worker agent            | Channel                  |
+| Cell           | Provider | Runtime    | Runner agent            | Channel                  |
 | -------------- | -------- | ---------- | ----------------------- | ------------------------ |
 | `claude-pipe`  | claude   | `pipe`     | `adk-claude-pipe-e2e`   | `adk-claude-pipe-e2e`    |
 | `claude-tui`   | claude   | `tui`      | `adk-claude-tui-e2e`    | `adk-claude-tui-e2e`     |
 | `codex-pipe`   | codex    | `pipe`     | `adk-codex-pipe-e2e`    | `adk-codex-pipe-e2e`     |
 | `codex-tui`    | codex    | `tui`      | `adk-codex-tui-e2e`     | `adk-codex-tui-e2e`      |
 
-The four worker channels above plus the orchestrator channel
+The four runner channels above plus the orchestrator channel
 `adk-e2e-orchestrator` (five channels total) all live under the dedicated
 `ADK E2E` Discord category. Channel IDs are looked up from `agentdesk.yaml`
 — no hard-coded ids in scripts or docs.
@@ -229,7 +229,7 @@ Remaining exact gaps:
   by `E-25`; `E-27` is the `unsupported-known-gap` row for the safe parser
   injection or real runtime stream lane.
 - Live tool-command coverage is not claimed for `codex-pipe` or `codex-tui`;
-  `E-28` is the `unsupported-known-gap` row because those worker roles cannot
+  `E-28` is the `unsupported-known-gap` row because those runner roles cannot
   execute shell/tool commands in the current E2E contract.
 
 ## Driver
@@ -265,7 +265,7 @@ files (`/tmp/agentdesk-e2e-relay.<cell>.lease`) let cells run in parallel from
 separate operator sessions. The top-level report includes `agent_mode_totals`
 `coverage_class_totals`, `coverage_class_violations`, and
 `real_provider_contacted`; individual scenario rows include the provider,
-runtime, worker agent, channel id, run id, raw failure attribution,
+runtime, runner agent, channel id, run id, raw failure attribution,
 `coverage_class_actual`, and whether a real provider was contacted.
 
 Post-deploy relay continuity uses a narrower operational wrapper around the
@@ -372,7 +372,7 @@ matrix), runs `scripts/e2e/run_multi_provider_matrix.py` or the single-cell
 driver from `/Users/itismyfield/.adk/release/workspaces/agentdesk`, and writes
 a one-line status per cell into the thread.
 
-The orchestrator drives worker channels from outside the workers. Workers must
+The orchestrator drives runner channels from outside the runners. Runners must
 not run `run_tui_relay.py` against their own channel; doing so makes their
 mailbox busy and can recursively start nested E2E runs.
 

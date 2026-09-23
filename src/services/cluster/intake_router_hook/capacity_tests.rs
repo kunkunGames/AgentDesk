@@ -1,5 +1,5 @@
 use super::pg_tests::{
-    ctx_for_channel, seed_agent_with_preference, seed_worker_node_with_capabilities,
+    ctx_for_channel, seed_agent_with_preference, seed_runner_node_with_capabilities,
 };
 use super::*;
 use crate::db::auto_queue::test_support::TestPostgresDb;
@@ -23,13 +23,13 @@ async fn execution_capacity_routes_concurrent_channels_without_overflow_pg() {
     let fixture = TestPostgresDb::create().await;
     let pool = fixture.connect_and_migrate().await;
     for node in ["a-windows", "z-linux"] {
-        seed_worker_node_with_capabilities(
+        seed_runner_node_with_capabilities(
             &pool,
             node,
-            json!(["worker"]),
+            json!(["runner"]),
             "online",
             json!({
-                "intake_worker":{"enabled":true,"providers":["claude"]},
+                "intake_runner":{"enabled":true,"providers":["claude"]},
                 "execution_capacity":{"version":1,"slots":1}
             }),
         )
@@ -40,7 +40,7 @@ async fn execution_capacity_routes_concurrent_channels_without_overflow_pg() {
             &pool,
             &format!("agent-{n}"),
             &format!("830{n}"),
-            json!(["worker"]),
+            json!(["runner"]),
         )
         .await;
     }

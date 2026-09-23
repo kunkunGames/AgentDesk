@@ -260,10 +260,10 @@ pub fn run_from_args() -> Result<()> {
     // A failure-marker handoff restarts this executable as a short-lived writer.
     // Dispatch it before Clap so no public/hidden CLI surface is needed and the
     // writer can outlive the one-shot hook relay process that launched it.
-    if let Some(worker_result) =
-        services::claude_tui::hook_relay::run_failure_marker_worker_from_env()
+    if let Some(runner_result) =
+        services::claude_tui::hook_relay::run_failure_marker_runner_from_env()
     {
-        return worker_result.map_err(anyhow::Error::msg);
+        return runner_result.map_err(anyhow::Error::msg);
     }
     match cli::args::parse() {
         cli::args::ParseOutcome::Command { command, json } => cli::execute(command, json),

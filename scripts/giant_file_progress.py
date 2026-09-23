@@ -19,7 +19,7 @@ REGISTRY = "scripts/giant_file_registry.toml"
 EVALUATOR = "scripts/giant_file_progress.py"
 METADATA = "scripts/giant_file_issue_metadata.json"
 GENERATED_DOCS = frozenset({"ARCHITECTURE.md", "docs/generated/route-inventory.md",
-                            "docs/generated/worker-inventory.md"})
+                            "docs/generated/runner-inventory.md"})
 GUARD_REPIN_ALLOWED = frozenset({
     "scripts/check_delivery_journal_raw_writer.py",
     "scripts/check_durable_frontier_writer_call_sites.py",
@@ -220,18 +220,7 @@ _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 def production_line_numbers(text: str, production_loc: int) -> set[int]:
     if production_loc == 0:
         return set()
-    test_lines: set[int] = set()
-    for match in inventory._CFG_MOD_RE.finditer(text):
-        if not inventory.cfg_requires_test(match.group("predicate")):
-            continue
-        brace = text.rindex("{", match.start(), match.end())
-        try:
-            _body, end = inventory.scan_balanced(text, brace, "{", "}")
-        except inventory.ParseError:
-            continue
-        test_lines.update(range(inventory.offset_to_line(text, match.start()),
-                                inventory.offset_to_line(text, end) + 1))
-    return set(range(1, inventory.line_count(text) + 1)) - test_lines
+    return set(range(1, inventory.line_count(text) + 1)) - inventory.test_line_numbers(text)
 
 def movement_ledger(base: str, candidate: str, progress_roots: set[str],
                     children: dict[str, list[str]], base_loc: dict[str, int],
@@ -622,7 +611,9 @@ def main() -> int:
             if event == "pull_request":
                 base_root = Path(temporary) / "base"
                 base_root.mkdir(); archive(base_sha, base_root)
-                base = inventory.giant_file_snapshot(base_root, evaluation_date=today)
+                base = inventory.giant_file_snapshot(
+                    base_root, evaluation_date=today, candidate_modules=candidate["modules"])
+                payload["repaired_base_registrations"] = base.get("repaired_unregistered", [])
                 facts = diff_facts(base_sha, candidate_sha)
                 if facts["changed"] and facts["changed"] <= LEDGER:
                     facts.update(ledger_base=load_ledger(base_root, snapshot="base"),

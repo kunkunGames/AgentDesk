@@ -26,7 +26,7 @@ async fn seed(
          (id,target,content,bot,source,status,reason_code,session_key,retry_count,error,
           claimed_at,claim_owner,next_attempt_at,sent_at,dedupe_key,dedupe_expires_at)
          VALUES($1,$2,$3,'notify',$4,$5,'catch_up_too_old',$6,5,'terminal failure',
-                NOW()-INTERVAL '5 minutes','old-worker',NOW()+INTERVAL '15 minutes',
+                NOW()-INTERVAL '5 minutes','old-runner',NOW()+INTERVAL '15 minutes',
                 CASE WHEN $5='sent' THEN NOW() ELSE NULL END,$7,NOW()-INTERVAL '1 minute')",
     )
     .bind(id)
@@ -314,12 +314,12 @@ async fn retired_source_is_terminal_not_unknown_pg() {
     assert_eq!(audit_count(&pool).await, 1);
 }
 
-async fn claim_worker(pool: PgPool, id: i64, owner: &'static str) -> Option<String> {
+async fn claim_runner(pool: PgPool, id: i64, owner: &'static str) -> Option<String> {
     for _ in 0..100 {
         let claimed = sqlx::query_scalar::<_, String>(
             "UPDATE message_outbox SET status='processing',claim_owner=$2,claimed_at=NOW() WHERE id=$1 AND status='pending' RETURNING claim_owner",
         )
-        .bind(id).bind(owner).fetch_optional(&pool).await.expect("worker claim race");
+        .bind(id).bind(owner).fetch_optional(&pool).await.expect("runner claim race");
         if claimed.is_some() {
             return claimed;
         }
@@ -329,8 +329,8 @@ async fn claim_worker(pool: PgPool, id: i64, owner: &'static str) -> Option<Stri
 }
 
 #[tokio::test]
-async fn worker_claim_race_has_one_owner_and_no_double_claim_pg() {
-    let Some(pool) = pool("agentdesk_message_outbox_redrive_worker_race").await else {
+async fn runner_claim_race_has_one_owner_and_no_double_claim_pg() {
+    let Some(pool) = pool("agentdesk_message_outbox_redrive_runner_race").await else {
         return;
     };
     seed(
@@ -341,17 +341,17 @@ async fn worker_claim_race_has_one_owner_and_no_double_claim_pg() {
         "channel:70",
         "notice",
         "session:70",
-        Some("worker-key"),
+        Some("runner-key"),
     )
     .await;
-    let (redrive, worker_a, worker_b) = tokio::join!(
-        redrive_failed_rows(&pool, &[70], "worker-race-key", "worker race proof", false),
-        claim_worker(pool.clone(), 70, "worker-a"),
-        claim_worker(pool.clone(), 70, "worker-b"),
+    let (redrive, runner_a, runner_b) = tokio::join!(
+        redrive_failed_rows(&pool, &[70], "runner-race-key", "runner race proof", false),
+        claim_runner(pool.clone(), 70, "runner-a"),
+        claim_runner(pool.clone(), 70, "runner-b"),
     );
     assert_eq!(redrive.unwrap()[0].outcome, "redriven");
     assert_eq!(
-        [worker_a, worker_b]
+        [runner_a, runner_b]
             .iter()
             .filter(|owner| owner.is_some())
             .count(),
@@ -361,8 +361,8 @@ async fn worker_claim_race_has_one_owner_and_no_double_claim_pg() {
         sqlx::query_scalar("SELECT claim_owner FROM message_outbox WHERE id=70")
             .fetch_one(&pool)
             .await
-            .expect("load final worker owner");
-    assert!(matches!(owner.as_deref(), Some("worker-a" | "worker-b")));
+            .expect("load final runner owner");
+    assert!(matches!(owner.as_deref(), Some("runner-a" | "runner-b")));
 }
 
 #[tokio::test]

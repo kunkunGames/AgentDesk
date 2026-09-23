@@ -948,7 +948,7 @@ pub(crate) fn install_policy_interrupt_handler(
 ) {
     runtime.set_interrupt_handler(Some(Box::new(move || {
         if stop.as_ref().is_some_and(|flag| {
-            flag.load(Ordering::Acquire) && hot_reload_worker_interrupts_enabled()
+            flag.load(Ordering::Acquire) && hot_reload_runner_interrupts_enabled()
         }) {
             return true;
         }
@@ -967,33 +967,33 @@ thread_local! {
     ///
     /// QuickJS interrupt handlers are installed on the whole runtime, not on
     /// an individual context. The policy engine's main context shares that
-    /// runtime with the hot-reload worker, so the shutdown stop flag must only
-    /// interrupt bytecode when the handler is invoked on the worker thread.
-    static HOT_RELOAD_WORKER_INTERRUPT_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// runtime with the hot-reload runner, so the shutdown stop flag must only
+    /// interrupt bytecode when the handler is invoked on the runner thread.
+    static HOT_RELOAD_RUNNER_INTERRUPT_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-struct HotReloadWorkerInterruptScope {
+struct HotReloadRunnerInterruptScope {
     previous: bool,
 }
 
-impl HotReloadWorkerInterruptScope {
+impl HotReloadRunnerInterruptScope {
     fn enter() -> Self {
-        let previous = HOT_RELOAD_WORKER_INTERRUPT_SCOPE.with(|cell| cell.replace(true));
+        let previous = HOT_RELOAD_RUNNER_INTERRUPT_SCOPE.with(|cell| cell.replace(true));
         Self { previous }
     }
 }
 
-impl Drop for HotReloadWorkerInterruptScope {
+impl Drop for HotReloadRunnerInterruptScope {
     fn drop(&mut self) {
-        HOT_RELOAD_WORKER_INTERRUPT_SCOPE.with(|cell| cell.set(self.previous));
+        HOT_RELOAD_RUNNER_INTERRUPT_SCOPE.with(|cell| cell.set(self.previous));
     }
 }
 
-fn hot_reload_worker_interrupts_enabled() -> bool {
-    HOT_RELOAD_WORKER_INTERRUPT_SCOPE.with(|cell| cell.get())
+fn hot_reload_runner_interrupts_enabled() -> bool {
+    HOT_RELOAD_RUNNER_INTERRUPT_SCOPE.with(|cell| cell.get())
 }
 
-fn join_hot_reload_worker_with_timeout(
+fn join_hot_reload_runner_with_timeout(
     handle: std::thread::JoinHandle<()>,
     timeout: Duration,
 ) -> bool {
@@ -1001,7 +1001,7 @@ fn join_hot_reload_worker_with_timeout(
     loop {
         if handle.is_finished() {
             if handle.join().is_err() {
-                tracing::warn!("policy hot-reload worker panicked during shutdown");
+                tracing::warn!("policy hot-reload runner panicked during shutdown");
             }
             return true;
         }
@@ -1010,7 +1010,7 @@ fn join_hot_reload_worker_with_timeout(
         if elapsed >= timeout {
             tracing::error!(
                 timeout_ms = timeout.as_millis(),
-                "policy hot-reload worker did not stop before shutdown deadline; detaching thread"
+                "policy hot-reload runner did not stop before shutdown deadline; detaching thread"
             );
             drop(handle);
             return false;
@@ -1025,17 +1025,17 @@ fn join_hot_reload_worker_with_timeout(
 ///
 /// Owns both the filesystem watcher and the background thread join handle.
 /// Dropping the guard:
-///   1. Sets `stop` so the worker exits its next iteration even if no event
+///   1. Sets `stop` so the runner exits its next iteration even if no event
 ///      arrives. The same `stop` flag is also wired into a QuickJS interrupt
-///      handler installed on the runtime, scoped to the worker thread, so an
-///      in-flight `eval` inside the worker (e.g. a hot-reloaded policy that
+///      handler installed on the runtime, scoped to the runner thread, so an
+///      in-flight `eval` inside the runner (e.g. a hot-reloaded policy that
 ///      ran an infinite loop) is aborted promptly instead of holding shutdown
 ///      forever. Main-engine evals sharing the runtime are not interrupted.
-///   2. Drops the watcher (closes its event channel → worker returns from
+///   2. Drops the watcher (closes its event channel → runner returns from
 ///      `recv_timeout` with `Disconnected`).
-///   3. Joins the worker thread with a bounded grace period so the common
+///   3. Joins the runner thread with a bounded grace period so the common
 ///      case still drops its captured `Context` before the engine drops the
-///      shared QuickJS `Runtime`. If the worker is stuck inside native code,
+///      shared QuickJS `Runtime`. If the runner is stuck inside native code,
 ///      shutdown logs and detaches instead of blocking indefinitely (#2386).
 pub struct HotReloadGuard {
     watcher: Option<RecommendedWatcher>,
@@ -1061,20 +1061,20 @@ impl HotReloadGuard {
     ///
     /// Shutdown proceeds in three steps:
     ///   1. Set `stop`. The QuickJS interrupt handler tied to this flag
-    ///      promptly aborts any in-flight worker-thread JS bytecode (e.g. a
+    ///      promptly aborts any in-flight runner-thread JS bytecode (e.g. a
     ///      runaway `while(true){}` in a hot-reloaded policy) without aborting
     ///      main-engine evals on the shared runtime.
     ///   2. Drop the watcher so its event channel disconnects.
-    ///   3. Join the worker with a bounded grace period. If the worker is
+    ///   3. Join the runner with a bounded grace period. If the runner is
     ///      stuck inside native code where QuickJS interrupts cannot fire,
     ///      log the stuck `policy-hot-reload` thread and detach rather than
     ///      wedging process shutdown indefinitely (#2386).
     pub fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
-        // Drop the watcher first so the worker's mpsc channel disconnects.
+        // Drop the watcher first so the runner's mpsc channel disconnects.
         self.watcher.take();
         if let Some(handle) = self.join.take() {
-            join_hot_reload_worker_with_timeout(handle, HOT_RELOAD_SHUTDOWN_JOIN_TIMEOUT);
+            join_hot_reload_runner_with_timeout(handle, HOT_RELOAD_SHUTDOWN_JOIN_TIMEOUT);
         }
     }
 }
@@ -1087,7 +1087,7 @@ impl Drop for HotReloadGuard {
 
 /// Start watching the policies directory for changes.
 /// Returns a guard that must be kept alive for the lifetime of the engine
-/// and that joins the worker thread on drop.
+/// and that joins the runner thread on drop.
 pub fn start_hot_reload(
     policies_dir: PathBuf,
     ctx: Context,
@@ -1118,13 +1118,13 @@ pub fn start_hot_reload(
     }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_worker = stop.clone();
+    let stop_runner = stop.clone();
     let stop_interrupt = stop.clone();
-    let eval_deadline_worker = eval_deadline.clone();
-    // Install a QuickJS interrupt handler that aborts in-flight worker evals
+    let eval_deadline_runner = eval_deadline.clone();
+    // Install a QuickJS interrupt handler that aborts in-flight runner evals
     // when EITHER the shutdown flag is set OR the per-eval deadline has
     // passed. The handler lives on the shared Runtime, so the shutdown leg is
-    // gated by a thread-local worker marker; otherwise a slow shutdown could
+    // gated by a thread-local runner marker; otherwise a slow shutdown could
     // interrupt main-engine policy hooks running on another context (#2386).
     // The deadline leg remains runtime-wide but is armed only while the
     // bounded eval owns the runtime lock.
@@ -1134,7 +1134,7 @@ pub fn start_hot_reload(
     let join = std::thread::Builder::new()
         .name("policy-hot-reload".into())
         .spawn(move || {
-            let _worker_interrupt_scope = HotReloadWorkerInterruptScope::enter();
+            let _runner_interrupt_scope = HotReloadRunnerInterruptScope::enter();
             // Move `ctx` into a scope we control so we can drop it *before*
             // the thread returns. The HotReloadGuard joins this thread on
             // drop, which means when join() returns the captured `Context`
@@ -1147,12 +1147,12 @@ pub fn start_hot_reload(
             let mut last_reload = Instant::now() - debounce;
 
             loop {
-                if stop_worker.load(Ordering::Acquire) {
+                if stop_runner.load(Ordering::Acquire) {
                     break;
                 }
                 match rx.recv_timeout(Duration::from_millis(250)) {
                     Ok(_event) => {
-                        if stop_worker.load(Ordering::Acquire) {
+                        if stop_runner.load(Ordering::Acquire) {
                             break;
                         }
                         // Debounce: skip if we reloaded recently
@@ -1179,7 +1179,7 @@ pub fn start_hot_reload(
                         match load_policies_from_dir_validated_inner(
                             &ctx,
                             &dir,
-                            Some(&eval_deadline_worker),
+                            Some(&eval_deadline_runner),
                         ) {
                             Ok(new_policies) => {
                                 let count = new_policies.len();
@@ -1377,15 +1377,15 @@ mod tests {
         (runtime, ctx)
     }
 
-    /// #2200 sub-fix 2: dropping `HotReloadGuard` must join the worker
-    /// thread, which releases the worker's `Context` clone *before* the
+    /// #2200 sub-fix 2: dropping `HotReloadGuard` must join the runner
+    /// thread, which releases the runner's `Context` clone *before* the
     /// engine drops the QuickJS `Runtime`. We model the runtime here, hand
-    /// the worker a `Context::full(&runtime)`, drop the guard, and then
+    /// the runner a `Context::full(&runtime)`, drop the guard, and then
     /// assert that the runtime can be dropped without panicking — which it
     /// cannot if any `Context` referencing it is still alive in another
     /// thread.
     #[test]
-    fn hot_reload_guard_joins_worker_before_drop() {
+    fn hot_reload_guard_joins_runner_before_drop() {
         let runtime = Runtime::new().expect("create QuickJS runtime");
         let ctx = Context::full(&runtime).expect("create QuickJS context");
         let store: PolicyStore = Arc::new(Mutex::new(Vec::new()));
@@ -1402,28 +1402,28 @@ mod tests {
         // Dropping the guard must:
         //   1. signal stop,
         //   2. drop the watcher (closes the mpsc),
-        //   3. join the worker thread so its captured Context drops first.
+        //   3. join the runner thread so its captured Context drops first.
         drop(guard);
 
-        // If the worker's Context was still alive at this point, dropping
+        // If the runner's Context was still alive at this point, dropping
         // the runtime here would either deadlock or trip a QuickJS-level
         // assertion. Reaching this line cleanly is the assertion.
         drop(runtime);
     }
 
-    /// #2386: shutdown must not wedge forever if the worker is stuck in a
+    /// #2386: shutdown must not wedge forever if the runner is stuck in a
     /// native operation where QuickJS's bytecode interrupt cannot fire.
-    /// Model that with a worker thread blocked on a channel and assert that
+    /// Model that with a runner thread blocked on a channel and assert that
     /// shutdown detaches after the test-sized bounded grace period.
     #[test]
-    fn hot_reload_guard_shutdown_detaches_stuck_worker_after_deadline() {
+    fn hot_reload_guard_shutdown_detaches_stuck_runner_after_deadline() {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let handle = std::thread::Builder::new()
             .name("policy-hot-reload-test-blocked".into())
             .spawn(move || {
                 let _ = release_rx.recv();
             })
-            .expect("spawn blocked worker");
+            .expect("spawn blocked runner");
 
         let mut guard = HotReloadGuard {
             watcher: None,
@@ -1442,22 +1442,22 @@ mod tests {
         );
         assert!(
             guard.stop.load(Ordering::Acquire),
-            "shutdown should still signal the worker stop flag"
+            "shutdown should still signal the runner stop flag"
         );
         assert!(
             guard.join.is_none(),
             "shutdown should consume the join handle"
         );
 
-        release_tx.send(()).expect("release detached worker");
+        release_tx.send(()).expect("release detached runner");
     }
 
     /// #2200/#2386: shutdown's `stop` flag should still interrupt runaway
     /// JS when the QuickJS interrupt callback is invoked on the hot-reload
-    /// worker thread. The thread-local scope simulates the worker marker
+    /// runner thread. The thread-local scope simulates the runner marker
     /// without relying on filesystem watcher timing.
     #[test]
-    fn hot_reload_worker_stop_interrupts_runaway_eval() {
+    fn hot_reload_runner_stop_interrupts_runaway_eval() {
         let runtime = Runtime::new().expect("create QuickJS runtime");
         let ctx = Context::full(&runtime).expect("create QuickJS context");
         let store: PolicyStore = Arc::new(Mutex::new(Vec::new()));
@@ -1472,7 +1472,7 @@ mod tests {
         .expect("start hot reload");
 
         guard.stop.store(true, Ordering::Release);
-        let _worker_scope = HotReloadWorkerInterruptScope::enter();
+        let _runner_scope = HotReloadRunnerInterruptScope::enter();
 
         let probe_ctx = Context::full(&runtime).expect("create probe context");
         let is_err = probe_ctx.with(|c| {
@@ -1482,9 +1482,9 @@ mod tests {
         });
         drop(probe_ctx);
 
-        assert!(is_err, "worker-scoped stop did not abort runaway eval");
+        assert!(is_err, "runner-scoped stop did not abort runaway eval");
 
-        drop(_worker_scope);
+        drop(_runner_scope);
         guard.shutdown();
         drop(guard);
         drop(runtime);

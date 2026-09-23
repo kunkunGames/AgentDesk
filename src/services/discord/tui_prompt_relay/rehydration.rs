@@ -72,7 +72,7 @@ pub(super) fn pane_is_confirmed_dead_orphaned(
                 // sync `tmux` subprocess probes it drives) only ever runs off
                 // the Tokio executor — the sole async caller dispatches the
                 // whole rehydrate pass via `spawn_blocking` (#3105 codex P2), so
-                // this never stalls an executor worker.
+                // this never stalls an executor runner.
                 std::thread::sleep(delay);
             }
         }

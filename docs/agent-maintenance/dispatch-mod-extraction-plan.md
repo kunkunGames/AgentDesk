@@ -22,7 +22,7 @@ legacy catch-all test suite.
 - Keep caller-owned PG transaction semantics intact for cancellation helpers.
 - `src/dispatch/mod.rs` should end as a small facade/re-export module, not as a
   new home for behavior.
-- No worker-loop or rate-limit/backoff implementation lives in `mod.rs` today;
+- No runner-loop or rate-limit/backoff implementation lives in `mod.rs` today;
   those should not be invented during this split. Worktree/CWD production logic
   already lives in `dispatch_context.rs`; `mod.rs` currently holds many of its
   legacy tests.

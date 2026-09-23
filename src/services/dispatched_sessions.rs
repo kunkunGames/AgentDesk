@@ -338,7 +338,7 @@ pub async fn list_dispatched_sessions(
     if let Some(pool) = state.pg_pool_ref() {
         return match dispatched_sessions_db::list_dispatched_sessions_pg(pool, include_all).await {
             Ok(mut sessions) => {
-                let worker_nodes = match crate::services::cluster::node_registry::list_worker_nodes(
+                let nodes = match crate::services::cluster::node_registry::list_cluster_nodes(
                     pool,
                     state.config.cluster.lease_ttl_secs.max(1),
                 )
@@ -347,7 +347,7 @@ pub async fn list_dispatched_sessions(
                     Ok(nodes) => nodes,
                     Err(error) => {
                         tracing::warn!(
-                            "failed to list worker nodes for dispatched session owner routing: {error}"
+                            "failed to list runner nodes for dispatched session owner routing: {error}"
                         );
                         Vec::new()
                     }
@@ -355,7 +355,7 @@ pub async fn list_dispatched_sessions(
                 crate::services::cluster::session_routing::enrich_session_owner_routing(
                     &mut sessions,
                     state.cluster_instance_id.as_deref(),
-                    &worker_nodes,
+                    &nodes,
                 );
                 Ok((StatusCode::OK, Json(json!({"sessions": sessions}))))
             }

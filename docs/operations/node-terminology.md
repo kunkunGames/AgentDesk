@@ -37,16 +37,16 @@
 필수 실행 조건 및 새 세션의 대체 배정 규칙은
 [우선 실행 장비](agent-execution-node.md)에 설명돼 있다.
 
-## 설치와 호환성
+## 설정과 일괄 전환
 
 허브 장비는 `role: hub`, `runtime_profile: full`을 사용한다.
-실행 전용 장비에는 다음 설정을 사용한다. 기존 `instance_id`는 세션 소유권을
-가리키므로 이름에 `worker`가 포함돼 있더라도 그대로 유지한다.
+실행 전용 장비에는 다음 설정을 사용한다. `instance_id`는 세션 소유권을
+가리키므로 역할과 무관한 장비 이름을 권장한다. 역할을 바꿀 때는 ID를 유지한다.
 
 ```yaml
 cluster:
   enabled: true
-  instance_id: windows-worker-1
+  instance_id: windows-pc
   role: runner
   runtime_profile: runner
   intake_routing:
@@ -54,29 +54,34 @@ cluster:
     mode: enforce
 ```
 
-이전 `role: leader`, `role: worker`, `runtime_profile: worker`는 호환 입력으로
-계속 지원한다. YAML/JSON으로 다시 저장하면 각각 `hub`, `runner`, `runner`가 된다.
+역할은 `hub`, `runner`, `auto`만, 기능 모드는 `full`, `runner`만 허용한다.
+이전 역할·기능 모드 이름의 입력 별칭은 제공하지 않는다.
 역할은 공통 `ClusterRole` 타입으로 검증하며 오타를 `auto`로 취급하지 않는다.
 `runtime_profile: runner`는 활성 클러스터, `role: runner`, 활성 intake routing을
 요구한다. 기능 모드를 생략하면 기존과 같은 `full`이다. `execution_only`는 설정 값이 아니다.
 
-바이너리를 먼저 업데이트하고 새 설정을 적용한다. 구버전 실행 파일로 롤백할 때는
-설정도 배포 전 백업으로 함께 복원한다. 구버전 실행 파일은 새 이름을 인식하지 못한다.
+이 전환은 전체 노드를 함께 중지하고 적용하는 스키마 변경이다. 서로 다른 세대의
+바이너리를 동시에 실행하는 순차 배포는 지원하지 않는다. migration 0129가 등록 테이블을
+`cluster_nodes`, MCP 등록 테이블을 `node_mcp_endpoints`로 바꾸고 역할 값을 변환한다.
+실행 준비 정보는 schema 2를 사용하고 오래된 probe는 삭제한 뒤 각 노드가 다시 수집한다.
+health 모듈 키는 `hub_services`, intake 기능 키는 `intake_runner`다.
+이미 적용한 번호 있는 migration과 과거 검증 보고서는 기록 그대로 보존한다.
 
-순차 배포 중 구버전 장비도 동작하도록 공유 레지스트리의 `role`/`effective_role`과
-schema-1 실행 준비 정보의 `runtime_profile`은 기존 wire 값을 유지한다. 새 노드는
-두 이름을 모두 읽는다. `/api/health.runtime_profile`과 설정 직렬화는 새 값을 사용한다.
-DB 스키마·API 경로·노드 ID·소유권·lease 키는 변경하지 않는다. `modules.leader_services`
-등 기존 health 키도 유지한다. 이 호환 경계는 설정 파일에서 새 이름을 쓰는 것과 독립적이다.
+먼저 DB·설정·runtime 상태를 백업하고 모든 실행을 종료한다. 모든 노드를 중지한 뒤
+같은 버전의 바이너리와 설정을 설치하고 DB migration을 실행한다. Hub를 먼저, Runner를
+나중에 시작한다. 구버전으로 되돌릴 때는 바이너리뿐 아니라 DB 백업과 설정도 함께
+복원해야 한다. 상세 절차는 [구성 및 이동 안내](hub-runner-topology-and-migration.md)를 따른다.
 
-Windows 방화벽 설치에는 `-HubAddress`를 사용한다. 이전 `-LeaderAddress`도 별칭으로
-지원한다. 스크립트 경로, 기존 방화벽 규칙 이름과 예약 작업 이름은 유지하므로
-이미 설치한 규칙이나 작업이 중복 생성되지 않는다.
+Windows 신규 설치에는 `install-windows-runner-firewall.ps1 -HubAddress ...`를 사용한다.
+규칙 이름은 역할과 독립적인 `AgentDeskAPI-TCP-8791`이다. 기존 설치의 규칙 교체는
+`migrate-windows-hub-runner-firewall.ps1`이 실행 파일·포트·허용 Hub 주소를 확인한 후
+새 규칙을 생성·검증하고 이전 규칙을 제거한다. 입력한 설치 경로가 잘못되면 중단한다.
+예약 작업 기본 이름은 `AgentDeskRelease`, DB 터널은 `AgentDeskRelease-DatabaseTunnel`이다.
 
 대시보드의 역할·기능 모드·OS 표시는
 [`nodeLabels.ts`](../../dashboard/src/lib/nodeLabels.ts)를 공통으로 사용한다.
-설정 검증과 공유 레지스트리 변환은
+설정 검증은
 [`cluster_role.rs`](../../src/config/cluster_role.rs)와
 [`runtime_profile.rs`](../../src/config/runtime_profile.rs)에 모은다.
-설치 구성과 활성 기능은 [실행 전용 기능 모드](worker-runtime-profile.md)를 참고한다.
+설치 구성과 활성 기능은 [실행 전용 기능 모드](runner-runtime-profile.md)를 참고한다.
 검증과 실기기 적용 내역은 [변경 보고서](../reports/hub-runner-terminology-2026-09-23.md)에 기록한다.

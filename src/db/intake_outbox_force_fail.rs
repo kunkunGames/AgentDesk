@@ -17,7 +17,7 @@ pub(crate) enum ForceFailError {
     DisallowedStatus { id: i64, status: String },
     #[error(
         "intake_outbox row id={id} has no recorded provider; a retry would insert pending work \
-         that no worker can claim (claim is scoped on intake_outbox.provider since #4349). This \
+         that no runner can claim (claim is scoped on intake_outbox.provider since #4349). This \
          row predates the provider column and its forwarding bot is unknowable — set \
          intake_outbox.provider explicitly before retrying, or leave it terminal"
     )]

@@ -5,18 +5,18 @@
 //! `0052_intake_node_routing.sql`) and a small test module that verifies
 //! the migration applies correctly and the constraints behave as designed.
 //!
-//! Phase 2 adds the claim / transition / sweep helpers that the leader
-//! intake hook (Phase 4) and the worker polling loop (Phase 3) build on.
+//! Phase 2 adds the claim / transition / sweep helpers that the hub
+//! intake hook (Phase 4) and the runner polling loop (Phase 3) build on.
 //! All helpers are pure SQL — no Discord/serenity types, no caches, no
 //! global state — so they can be unit-tested with PG fixtures and reused
-//! by leader and worker code paths without coupling.
+//! by hub and runner code paths without coupling.
 
 use super::intake_outbox_open_status::INTAKE_OUTBOX_OPEN_STATUSES_SQL;
 use super::intake_outbox_status::IntakeOutboxStatus;
 use serde_json::Value;
 use sqlx::PgPool;
 
-/// Owned snapshot of an `intake_outbox` row. The `Phase 3` worker poll
+/// Owned snapshot of an `intake_outbox` row. The `Phase 3` runner poll
 /// claims a row, deserializes the payload columns into this struct, then
 /// hands it to `services::discord::execute_intake_turn_core` after
 /// converting `into_intake_request()`.
@@ -161,7 +161,7 @@ pub(crate) async fn insert_pending(
 }
 
 /// Discriminates the two SQLSTATE 23505 unique-constraint violations
-/// that `insert_pending` can return. Phase 4 (leader hook) uses this
+/// that `insert_pending` can return. Phase 4 (hub hook) uses this
 /// to decide whether to:
 /// - retry the INSERT with a fresh `attempt_no = family_max + 1` (the
 ///   3-tuple constraint races a sweep-driven retry), or
@@ -174,7 +174,7 @@ pub(crate) enum IntakeInsertConflict {
     /// `family_max + 1` and retry.
     DuplicateMessageAttempt,
     /// `intake_outbox_one_open_route_per_channel`: another row for the
-    /// same `channel_id` is already in an OPEN status. The leader
+    /// same `channel_id` is already in an OPEN status. The hub
     /// should fall back to local-route or refuse.
     OpenRoutePerChannel,
 }
@@ -238,15 +238,15 @@ pub(crate) enum FailedPreAcceptSweepOutcome {
 
 pub(crate) async fn sweep_failed_pre_accept_once(
     pool: &PgPool,
-    local_leader: &str,
+    local_hub: &str,
     max_attempts_per_message: u32,
-    worker_lease_ttl_secs: u64,
+    runner_lease_ttl_secs: u64,
     retry_authorization_secs: Option<u64>,
 ) -> Result<FailedPreAcceptSweepOutcome, sqlx::Error> {
     let max_attempts = max_attempts_per_message.clamp(1, i32::MAX as u32) as i32;
-    let stale_after_secs = worker_lease_ttl_secs.max(1) as i64;
+    let stale_after_secs = runner_lease_ttl_secs.max(1) as i64;
     let retry_after_secs = retry_authorization_secs.map(|value| value.max(1) as i64);
-    let _ = local_leader;
+    let _ = local_hub;
     let mut tx = pool.begin().await?;
     // LIMITS: both candidate queries retain `failed_pre_accept` literals, as do
     // the pending claim, claimed stale sweep, and accepted SLA predicates below.
@@ -272,26 +272,26 @@ pub(crate) async fn sweep_failed_pre_accept_once(
                    AND open_row.status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})
            )
            AND EXISTS (
-                SELECT 1 FROM worker_nodes worker
-                 WHERE worker.status = 'online'
-                   AND worker.last_heartbeat_at >= NOW() - ($1::BIGINT * INTERVAL '1 second')
-                   AND jsonb_typeof(worker.capabilities) = 'object'
-                   AND jsonb_typeof(worker.capabilities->'intake_worker') = 'object'
-                   AND jsonb_typeof(worker.capabilities->'intake_worker'->'enabled') = 'boolean'
-                   AND worker.capabilities->'intake_worker'->'enabled' = 'true'::jsonb
-                   AND jsonb_typeof(worker.capabilities->'intake_worker'->'providers') = 'array'
+                SELECT 1 FROM cluster_nodes runner
+                 WHERE runner.status = 'online'
+                   AND runner.last_heartbeat_at >= NOW() - ($1::BIGINT * INTERVAL '1 second')
+                   AND jsonb_typeof(runner.capabilities) = 'object'
+                   AND jsonb_typeof(runner.capabilities->'intake_runner') = 'object'
+                   AND jsonb_typeof(runner.capabilities->'intake_runner'->'enabled') = 'boolean'
+                   AND runner.capabilities->'intake_runner'->'enabled' = 'true'::jsonb
+                   AND jsonb_typeof(runner.capabilities->'intake_runner'->'providers') = 'array'
                    AND EXISTS (
                        SELECT 1
-                         FROM jsonb_array_elements(worker.capabilities->'intake_worker'->'providers')
+                         FROM jsonb_array_elements(runner.capabilities->'intake_runner'->'providers')
                               AS provider_entry(value)
                         WHERE jsonb_typeof(provider_entry.value) = 'string'
                           AND lower(btrim(provider_entry.value #>> '{{}}')) = lower(btrim(parent.provider))
                    )
                    AND (COALESCE(parent.preserve_on_cancel, false) = false OR
-                        (jsonb_typeof(worker.capabilities->'intake_worker'->'features') = 'array' AND
+                        (jsonb_typeof(runner.capabilities->'intake_runner'->'features') = 'array' AND
                          EXISTS (
                              SELECT 1
-                               FROM jsonb_array_elements(worker.capabilities->'intake_worker'->'features')
+                               FROM jsonb_array_elements(runner.capabilities->'intake_runner'->'features')
                                     AS feature_entry(value)
                               WHERE jsonb_typeof(feature_entry.value) = 'string'
                                 AND lower(btrim(feature_entry.value #>> '{{}}')) = 'preserve_on_cancel_v1'
@@ -299,13 +299,13 @@ pub(crate) async fn sweep_failed_pre_accept_once(
                    AND jsonb_typeof(parent.required_labels) = 'array'
                    AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(parent.required_labels) v
                                     WHERE jsonb_typeof(v) <> 'string')
-                   AND jsonb_typeof(worker.labels) = 'array'
-                   AND worker.labels @> parent.required_labels
+                   AND jsonb_typeof(runner.labels) = 'array'
+                   AND runner.labels @> parent.required_labels
                    AND ((parent.admission_kind IN ('local','forwarded')
                          AND parent.owner_instance_id IS NULL AND parent.owner_generation IS NULL)
                         OR (parent.admission_kind = 'forwarded'
                          AND btrim(parent.owner_instance_id) <> '' AND parent.owner_generation >= 0
-                         AND worker.instance_id = parent.owner_instance_id
+                         AND runner.instance_id = parent.owner_instance_id
                          AND EXISTS (
                             SELECT 1 FROM intake_session_owners owner
                              WHERE owner.provider = lower(btrim(parent.provider))
@@ -399,22 +399,22 @@ pub(crate) async fn sweep_failed_pre_accept_once(
             .await?;
     }
 
-    // Re-check the capability snapshot after the source lock. A worker may
+    // Re-check the capability snapshot after the source lock. A runner may
     // have heartbeated a new snapshot between candidate selection and here.
     let targets: Vec<Value> = sqlx::query_scalar(
         r#"
-        SELECT to_jsonb(worker) || jsonb_build_object('api_base_url', worker.capabilities->'agentdesk_api'->>'base_url')
-          FROM worker_nodes worker
-         WHERE worker.status = 'online'
-           AND worker.last_heartbeat_at >= NOW() - ($1::BIGINT * INTERVAL '1 second')
-           AND jsonb_typeof(worker.capabilities) = 'object'
-           AND jsonb_typeof(worker.capabilities->'intake_worker') = 'object'
-           AND jsonb_typeof(worker.capabilities->'intake_worker'->'enabled') = 'boolean'
-           AND worker.capabilities->'intake_worker'->'enabled' = 'true'::jsonb
-           AND jsonb_typeof(worker.capabilities->'intake_worker'->'providers') = 'array'
+        SELECT to_jsonb(runner) || jsonb_build_object('api_base_url', runner.capabilities->'agentdesk_api'->>'base_url')
+          FROM cluster_nodes runner
+         WHERE runner.status = 'online'
+           AND runner.last_heartbeat_at >= NOW() - ($1::BIGINT * INTERVAL '1 second')
+           AND jsonb_typeof(runner.capabilities) = 'object'
+           AND jsonb_typeof(runner.capabilities->'intake_runner') = 'object'
+           AND jsonb_typeof(runner.capabilities->'intake_runner'->'enabled') = 'boolean'
+           AND runner.capabilities->'intake_runner'->'enabled' = 'true'::jsonb
+           AND jsonb_typeof(runner.capabilities->'intake_runner'->'providers') = 'array'
            AND EXISTS (
                SELECT 1
-                 FROM jsonb_array_elements(worker.capabilities->'intake_worker'->'providers')
+                 FROM jsonb_array_elements(runner.capabilities->'intake_runner'->'providers')
                       AS provider_entry(value)
                 WHERE jsonb_typeof(provider_entry.value) = 'string'
                   AND lower(btrim(provider_entry.value #>> '{}')) = lower(btrim($2))
@@ -422,10 +422,10 @@ pub(crate) async fn sweep_failed_pre_accept_once(
            AND (
                COALESCE($3, false) = false
                OR (
-                   jsonb_typeof(worker.capabilities->'intake_worker'->'features') = 'array'
+                   jsonb_typeof(runner.capabilities->'intake_runner'->'features') = 'array'
                    AND EXISTS (
                        SELECT 1
-                         FROM jsonb_array_elements(worker.capabilities->'intake_worker'->'features')
+                         FROM jsonb_array_elements(runner.capabilities->'intake_runner'->'features')
                               AS feature_entry(value)
                         WHERE jsonb_typeof(feature_entry.value) = 'string'
                           AND lower(btrim(feature_entry.value #>> '{}')) = 'preserve_on_cancel_v1'
@@ -435,10 +435,10 @@ pub(crate) async fn sweep_failed_pre_accept_once(
            AND jsonb_typeof($8::JSONB) = 'array'
            AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements($8::JSONB) v
                             WHERE jsonb_typeof(v) <> 'string')
-           AND jsonb_typeof(worker.labels) = 'array'
-           AND worker.labels @> $8::JSONB
+           AND jsonb_typeof(runner.labels) = 'array'
+           AND runner.labels @> $8::JSONB
            AND ((NOT $4 AND $5 IS NULL AND $6 IS NULL) OR ($4
-                AND worker.instance_id = $5
+                AND runner.instance_id = $5
                 AND EXISTS (
                     SELECT 1 FROM intake_session_owners owner
                      WHERE owner.provider = lower(btrim($2))
@@ -447,7 +447,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
                        AND owner.owner_instance_id = $5
                        AND owner.generation = $6
                 )))
-         ORDER BY worker.last_heartbeat_at DESC, worker.instance_id ASC
+         ORDER BY runner.last_heartbeat_at DESC, runner.instance_id ASC
          FOR SHARE
         "#,
     )
@@ -548,16 +548,16 @@ pub(crate) async fn sweep_failed_pre_accept_once(
     })
 }
 
-/// Worker-side claim. Atomically promotes a single `pending` row owned
+/// Runner-side claim. Atomically promotes a single `pending` row owned
 /// by `target_instance_id` and forwarded by a `provider`-matching bot
 /// into `claimed`, and stamps `claim_owner` + `claimed_at`. Uses
-/// `FOR UPDATE SKIP LOCKED` so concurrent worker pollers do not stall
+/// `FOR UPDATE SKIP LOCKED` so concurrent runner pollers do not stall
 /// each other.
 ///
 /// **Provider filter (codex Phase 5 P0 #1):** a single AgentDesk
 /// process can host multiple bot tokens (claude, codex, etc.), each
 /// with its own `run_bot` invocation and its own `Arc<Http>` +
-/// `SharedData`. Without this filter, every bot's worker would share
+/// `SharedData`. Without this filter, every bot's runner would share
 /// the same `target_instance_id` and could claim a row destined for
 /// another provider's runtime — running it with the wrong token,
 /// settings, mailboxes, and placeholder controller.
@@ -618,10 +618,10 @@ pub(crate) async fn claim_pending_for_target(
 }
 
 /// Restart-admission rollback: return exactly one owned pre-accept claim to
-/// `pending` when the worker observes its shutdown fence after claiming but
+/// `pending` when the runner observes its shutdown fence after claiming but
 /// before accepting. This is deliberately not a failure transition: it clears
 /// only claim ownership/timing and leaves retry/error bookkeeping untouched so
-/// the next healthy worker can claim the original attempt.
+/// the next healthy runner can claim the original attempt.
 ///
 /// Returns `Ok(true)` when this owner released this row; `Ok(false)` when the
 /// row or ownership changed first (for example, a stale-claim sweep won).
@@ -646,14 +646,14 @@ pub(crate) async fn return_claimed_to_pending(
     Ok(result.rows_affected() == 1)
 }
 
-/// Transition `claimed → accepted` after the worker has validated cwd
+/// Transition `claimed → accepted` after the runner has validated cwd
 /// and is ready to spawn the turn. Verifies `claim_owner` matches via
-/// the WHERE clause so a stale leader-side sweep cannot accidentally
+/// the WHERE clause so a stale hub-side sweep cannot accidentally
 /// promote someone else's claim.
 ///
 /// Returns `Ok(true)` when the row was updated; `Ok(false)` when the
 /// row was no longer in `claimed` (e.g., a stale-claim sweep beat the
-/// worker to it, or the claim_owner no longer matches). Workers MUST
+/// runner to it, or the claim_owner no longer matches). Runners MUST
 /// abort the turn on `Ok(false)` rather than spawning — proceeding past
 /// a lost claim is the only path that double-emits a Discord turn.
 pub(crate) async fn mark_accepted(
@@ -675,9 +675,9 @@ pub(crate) async fn mark_accepted(
     Ok(result.rows_affected() == 1)
 }
 
-/// Transition `accepted → spawned` once the worker actually begins the
-/// turn. Round-3 P1 #3: the worker MUST advance to spawned promptly so
-/// the leader's `accepted_unspawned_sla` index does not flag a stuck row.
+/// Transition `accepted → spawned` once the runner actually begins the
+/// turn. Round-3 P1 #3: the runner MUST advance to spawned promptly so
+/// the hub's `accepted_unspawned_sla` index does not flag a stuck row.
 ///
 /// Returns `Ok(true)` when the row was updated; `Ok(false)` if the row
 /// was no longer in `accepted` (e.g., operator force-failed via
@@ -701,7 +701,7 @@ pub(crate) async fn mark_spawned(
     Ok(result.rows_affected() == 1)
 }
 
-/// Successful completion: `spawned → done`. Worker calls this on
+/// Successful completion: `spawned → done`. Runner calls this on
 /// `Ok(())` from `execute_intake_turn_core`.
 ///
 /// Returns `Ok(true)` on a real transition. `Ok(false)` with `dispatched`
@@ -729,7 +729,7 @@ pub(crate) async fn mark_done(
 
 /// Pre-accept failure: `claimed → failed_pre_accept`. Bumps
 /// `retry_count` + records `last_error`. Pre-accept failures are
-/// retryable: the leader's failed-pre-accept sweep INSERTs a fresh row
+/// retryable: the hub's failed-pre-accept sweep INSERTs a fresh row
 /// with `attempt_no = family_max + 1` and `parent_outbox_id = id`
 /// (transition 10).
 ///
@@ -793,15 +793,15 @@ pub(crate) async fn mark_failed_post_accept(
     Ok(result.rows_affected() == 1)
 }
 
-/// Leader sweep: rows stuck in `claimed` past `stale_after_secs` (worker
+/// Hub sweep: rows stuck in `claimed` past `stale_after_secs` (runner
 /// died between claim and accept) are demoted back to `pending` so a
-/// healthy worker can re-claim. Idempotent + safe under contention —
+/// healthy runner can re-claim. Idempotent + safe under contention —
 /// uses a WHERE clause that re-checks the stale predicate.
 ///
 /// Returns the number of rows reset. Phase 4 emits this count as a
 /// metric for operator monitoring.
-// reason: leader-sweep maintenance helper exercised by the pg-integration test
-// suite; production sweep wired on the leader path. See #3034.
+// reason: hub-sweep maintenance helper exercised by the pg-integration test
+// suite; production sweep wired on the hub path. See #3034.
 #[allow(dead_code)]
 pub(crate) async fn sweep_stale_pre_accept_claims(
     pool: &PgPool,
@@ -855,12 +855,12 @@ pub(crate) async fn list_recent_rows(
     }
 }
 
-/// Leader sweep that returns rows currently in `accepted` longer than
+/// Hub sweep that returns rows currently in `accepted` longer than
 /// `sla_secs` without reaching `spawned`. Round-3 P1 #3: the operator
 /// alert IS the recovery signal — auto-retry forbidden post-accept.
 /// Returns `(id, accepted_at)` tuples for each row exceeding the SLA.
 // reason: SLA-alert maintenance helper exercised by the pg-integration test
-// suite; production alert path wired on the leader sweep. See #3034.
+// suite; production alert path wired on the hub sweep. See #3034.
 #[allow(dead_code)]
 pub(crate) async fn list_accepted_unspawned_sla(
     pool: &PgPool,
@@ -919,7 +919,7 @@ mod migration_pg_tests {
                 channel_id, user_msg_id, request_owner_id, user_text, turn_kind,
                 agent_id, provider, status, claim_owner
              ) VALUES (
-                'worker-1', 'leader-1',
+                'runner-1', 'hub-1',
                 $1, $1, '100', 'hi', 'foreground',
                 'agent-paired', '', $2, $3
              ) RETURNING id",
@@ -943,12 +943,12 @@ mod migration_pg_tests {
     /// #4349 review round 1 (REJECT): an earlier draft failed *every* open row to
     /// `failed_pre_accept`. `accepted`/`spawned` are POST-accept — the turn may
     /// already have emitted to Discord, and auto-retry is forbidden past
-    /// `accepted` (intake_worker.rs: "a failure is post-accept and is NOT
+    /// `accepted` (intake_runner.rs: "a failure is post-accept and is NOT
     /// auto-retried"). Labelling them pre-accept misclassifies an orphaned turn
     /// as retryable.
     ///
     /// The migration must instead recover `provider` from `claim_owner`
-    /// ("{instance_id}:{provider}") for every row a worker ever held, and
+    /// ("{instance_id}:{provider}") for every row a runner ever held, and
     /// fail-close only what is genuinely unrecoverable — pre-accept rows to
     /// `failed_pre_accept`, post-accept rows to `failed_post_accept`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -964,13 +964,13 @@ mod migration_pg_tests {
         .await
         .expect("seed paired agent"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
 
-        // Worker-held rows. `claim_owner` names the real forwarding bot, and for
+        // Runner-held rows. `claim_owner` names the real forwarding bot, and for
         // the claude ones it disagrees with `agents.provider` ('codex') — which
         // is precisely the #4349 bug.
-        let claimed = seed_legacy_row(&pool, "ch-a", "claimed", Some("worker-1:claude")).await;
-        let accepted = seed_legacy_row(&pool, "ch-b", "accepted", Some("worker-1:claude")).await;
-        let spawned = seed_legacy_row(&pool, "ch-c", "spawned", Some("worker-1:codex")).await;
-        let done = seed_legacy_row(&pool, "ch-d", "done", Some("worker-1:claude")).await;
+        let claimed = seed_legacy_row(&pool, "ch-a", "claimed", Some("runner-1:claude")).await;
+        let accepted = seed_legacy_row(&pool, "ch-b", "accepted", Some("runner-1:claude")).await;
+        let spawned = seed_legacy_row(&pool, "ch-c", "spawned", Some("runner-1:codex")).await;
+        let done = seed_legacy_row(&pool, "ch-d", "done", Some("runner-1:claude")).await;
 
         // `pending` never carries a claim_owner (the sweep nulls it on reset).
         let pending = seed_legacy_row(&pool, "ch-e", "pending", None).await;
@@ -1026,7 +1026,7 @@ mod migration_pg_tests {
         );
 
         // …but retrying it would insert `pending` work with provider='' that no
-        // worker can claim. #4349 review r2: refuse loudly, change nothing.
+        // runner can claim. #4349 review r2: refuse loudly, change nothing.
         let err = force_fail_and_retry_as_new(&pool, orphan_post, "operator: retry")
             .await
             .expect_err("orphan row with no provider must be refused");
@@ -1059,7 +1059,7 @@ mod migration_pg_tests {
             .expect("count unclaimable open rows"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
         assert_eq!(
             unclaimable, 0,
-            "migration must leave no open row that a worker can never claim"
+            "migration must leave no open row that a runner can never claim"
         );
 
         pool.close().await;
@@ -1299,7 +1299,7 @@ mod migration_pg_tests {
                 channel_id, user_msg_id, request_owner_id, request_owner_name,
                 user_text, turn_kind, agent_id, status, attempt_no, dispatched_at
              ) VALUES (
-                'worker-1', 'leader-1', '[]'::JSONB,
+                'runner-1', 'hub-1', '[]'::JSONB,
                 'ch-dispatched', 'msg-clock', 'user-1', 'Tester',
                 'hello', 'standard', 'agent-x', 'dispatched', 1, NOW()
              )",
@@ -1490,7 +1490,7 @@ mod migration_pg_tests {
                 user_text, turn_kind, agent_id,
                 status, attempt_no, parent_outbox_id
              ) VALUES (
-                'leader-1', 'leader-1', '[]'::JSONB,
+                'hub-1', 'hub-1', '[]'::JSONB,
                 'ch-cascade', 'msg-X', 'user-1', 'Tester',
                 'hello', 'standard', 'agent-x',
                 'done', 2, $1
@@ -1560,7 +1560,7 @@ mod migration_pg_tests {
                 user_text, turn_kind, agent_id,
                 status, attempt_no
              ) VALUES (
-                'worker-1', 'leader-1', '[]'::JSONB,
+                'runner-1', 'hub-1', '[]'::JSONB,
                 $1, $2, 'user-1', 'Tester',
                 'hello', 'standard', 'agent-x',
                 $3, $4
@@ -1588,8 +1588,8 @@ mod postgres_tests {
         InsertPendingPayload {
             execution_requirements: json!({}),
             attachment_refs: serde_json::json!([]),
-            target_instance_id: "worker-1".to_string(),
-            forwarded_by_instance_id: "leader-1".to_string(),
+            target_instance_id: "runner-1".to_string(),
+            forwarded_by_instance_id: "hub-1".to_string(),
             provider: "claude".to_string(),
             required_labels: json!(["unreal"]),
             channel_id: channel.to_string(),
@@ -1697,7 +1697,7 @@ mod postgres_tests {
                 channel_id, user_msg_id, request_owner_id, user_text, turn_kind,
                 agent_id, provider, status, attempt_no
              ) VALUES (
-                'worker-1', 'legacy-leader', '[]'::JSONB,
+                'runner-1', 'legacy-hub', '[]'::JSONB,
                 'ch-preserve-legacy', 'msg-legacy', 'user-legacy', 'legacy', 'standard',
                 'agent-x', 'claude', 'pending', 1
              ) RETURNING id",
@@ -1783,13 +1783,13 @@ mod postgres_tests {
             .await
             .expect("seed row 2");
 
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "worker-1.local")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "runner-1.local")
             .await
             .expect("claim")
             .expect("must claim something");
         assert_eq!(claimed.id, id1);
         assert_eq!(claimed.status, IntakeOutboxStatus::Claimed);
-        assert_eq!(claimed.claim_owner.as_deref(), Some("worker-1.local"));
+        assert_eq!(claimed.claim_owner.as_deref(), Some("runner-1.local"));
 
         pool.close().await;
         pg_db.drop().await;
@@ -1801,7 +1801,7 @@ mod postgres_tests {
         let pool = pg_db.connect_and_migrate().await;
         seed_default_test_agent(&pool).await;
 
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "worker-1.local")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "runner-1.local")
             .await
             .expect("claim ok");
         assert!(claimed.is_none());
@@ -1817,24 +1817,24 @@ mod postgres_tests {
         seed_default_test_agent(&pool).await;
 
         let mut other = payload("ch-other", "msg-other");
-        other.target_instance_id = "worker-OTHER".to_string();
+        other.target_instance_id = "runner-OTHER".to_string();
         insert_pending(&pool, &other, 1, None)
             .await
-            .expect("seed for other worker");
+            .expect("seed for other runner");
 
-        // Worker-1 polls — must NOT receive the row destined for worker-OTHER.
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "worker-1.local")
+        // Runner-1 polls — must NOT receive the row destined for runner-OTHER.
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "runner-1.local")
             .await
             .expect("claim ok");
         assert!(claimed.is_none(), "must not steal cross-target rows");
 
-        // worker-OTHER polls — picks it up.
+        // runner-OTHER polls — picks it up.
         let claimed =
-            claim_pending_for_target(&pool, "worker-OTHER", "claude", "worker-OTHER.local")
+            claim_pending_for_target(&pool, "runner-OTHER", "claude", "runner-OTHER.local")
                 .await
                 .expect("claim ok")
-                .expect("worker-OTHER must claim");
-        assert_eq!(claimed.target_instance_id, "worker-OTHER");
+                .expect("runner-OTHER must claim");
+        assert_eq!(claimed.target_instance_id, "runner-OTHER");
 
         pool.close().await;
         pg_db.drop().await;
@@ -1849,7 +1849,7 @@ mod postgres_tests {
         let _id = insert_pending(&pool, &payload("ch-full", "msg-full"), 1, None)
             .await
             .expect("insert pending");
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "owner-1")
             .await
             .expect("claim")
             .expect("row");
@@ -1901,7 +1901,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-owner", "msg-owner"), 1, None)
             .await
             .expect("insert");
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-A")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "owner-A")
             .await
             .expect("claim")
             .expect("row");
@@ -1931,7 +1931,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-cancel-owned", "msg-owned"), 1, None)
             .await
             .expect("insert owned row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
-        let owned = claim_pending_for_target(&pool, "worker-1", "claude", "owner-cancelled")
+        let owned = claim_pending_for_target(&pool, "runner-1", "claude", "owner-cancelled")
             .await
             .expect("claim owned row") // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
             .expect("owned row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
@@ -1939,7 +1939,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-cancel-other", "msg-other"), 1, None)
             .await
             .expect("insert other row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
-        let other = claim_pending_for_target(&pool, "worker-1", "claude", "owner-other")
+        let other = claim_pending_for_target(&pool, "runner-1", "claude", "owner-other")
             .await
             .expect("claim other row") // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
             .expect("other row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
@@ -1948,13 +1948,13 @@ mod postgres_tests {
             !return_claimed_to_pending(&pool, owned.id, "owner-wrong")
                 .await
                 .expect("wrong owner is a no-op"), // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
-            "a different worker must not release this claim"
+            "a different runner must not release this claim"
         );
         assert!(
             return_claimed_to_pending(&pool, owned.id, "owner-cancelled")
                 .await
                 .expect("release owned claim"), // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
-            "the cancelling worker must return its exact row to pending"
+            "the cancelling runner must return its exact row to pending"
         );
 
         let released: (String, Option<String>, bool, i32, Option<String>, bool) = sqlx::query_as(
@@ -1992,13 +1992,13 @@ mod postgres_tests {
         let pool = pg_db.connect_and_migrate().await;
         seed_default_test_agent(&pool).await;
         sqlx::query(
-            "INSERT INTO worker_nodes (instance_id,status,labels,capabilities,last_heartbeat_at)
-             VALUES ('worker-codex','online','[\"unreal\"]',$1,NOW())",
+            "INSERT INTO cluster_nodes (instance_id,status,labels,capabilities,last_heartbeat_at)
+             VALUES ('runner-codex','online','[\"unreal\"]',$1,NOW())",
         )
-        .bind(json!({"intake_worker":{"enabled":true,"providers":["codex"]}}))
+        .bind(json!({"intake_runner":{"enabled":true,"providers":["codex"]}}))
         .execute(&pool)
         .await
-        .expect("seed codex-only worker"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+        .expect("seed codex-only runner"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
 
         let unsupported_id = insert_pending(&pool, &payload("ch-old", "msg-old"), 1, None)
             .await
@@ -2030,7 +2030,7 @@ mod postgres_tests {
         .await
         .expect("fail capable family"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
 
-        let outcome = sweep_failed_pre_accept_once(&pool, "leader-1", 5, 60, None)
+        let outcome = sweep_failed_pre_accept_once(&pool, "hub-1", 5, 60, None)
             .await
             .expect("sweep capable family"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
         let FailedPreAcceptSweepOutcome::Retried {
@@ -2050,7 +2050,7 @@ mod postgres_tests {
         .fetch_one(&pool)
         .await
         .expect("read child"); // agentdesk-audit: allow-unwrap — test assertion
-        assert_eq!(child, ("worker-codex".into(), 2, Some(capable_id)));
+        assert_eq!(child, ("runner-codex".into(), 2, Some(capable_id)));
 
         pool.close().await;
         pg_db.drop().await;
@@ -2062,18 +2062,18 @@ mod postgres_tests {
         let pool = pg_db.connect_and_migrate().await;
         seed_default_test_agent(&pool).await;
         sqlx::query(
-            "INSERT INTO worker_nodes (instance_id,status,labels,capabilities,last_heartbeat_at)
-             VALUES ('worker-shared','online','[\"unreal\"]',$1,NOW())",
+            "INSERT INTO cluster_nodes (instance_id,status,labels,capabilities,last_heartbeat_at)
+             VALUES ('runner-shared','online','[\"unreal\"]',$1,NOW())",
         )
         .bind(json!({
-            "intake_worker": {
+            "intake_runner": {
                 "enabled": true,
                 "providers": ["claude", "codex"]
             }
         }))
         .execute(&pool)
         .await
-        .expect("seed initially capable worker"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+        .expect("seed initially capable runner"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
 
         let rotated_id = insert_pending(&pool, &payload("ch-rotate", "msg-rotate"), 1, None)
             .await
@@ -2112,26 +2112,26 @@ mod postgres_tests {
                 .await
                 .expect("read source before capability race"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
 
-        // Hold an uncommitted worker snapshot update. The sweep's first statement
+        // Hold an uncommitted runner snapshot update. The sweep's first statement
         // sees the prior capable version, then its FOR SHARE re-check waits here.
         let mut capability_update = pool.begin().await.expect("begin capability update"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
         sqlx::query(
-            "UPDATE worker_nodes
+            "UPDATE cluster_nodes
                 SET capabilities=$1, last_heartbeat_at=NOW()
-              WHERE instance_id='worker-shared'",
+              WHERE instance_id='runner-shared'",
         )
-        .bind(json!({"intake_worker":{"enabled":true,"providers":["codex"]}}))
+        .bind(json!({"intake_runner":{"enabled":true,"providers":["codex"]}}))
         .execute(&mut *capability_update)
         .await
         .expect("remove claude capability without committing"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
 
         let sweep_pool = pool.clone();
         let sweep = tokio::spawn(async move {
-            sweep_failed_pre_accept_once(&sweep_pool, "leader-1", 5, 60, None).await
+            sweep_failed_pre_accept_once(&sweep_pool, "hub-1", 5, 60, None).await
         });
 
         // A NOWAIT probe makes the interleaving deterministic: do not release the
-        // worker update until the sweep owns the source row and is at its re-check.
+        // runner update until the sweep owns the source row and is at its re-check.
         let mut source_locked = false;
         for _ in 0..200 {
             let mut probe = pool.begin().await.expect("begin source-lock probe"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
@@ -2158,7 +2158,7 @@ mod postgres_tests {
             capability_update
                 .rollback()
                 .await
-                .expect("release worker after failed probe"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+                .expect("release runner after failed probe"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
             let sweep_result = sweep.await.expect("join sweep after failed probe"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
             panic!("sweep never locked source; result={sweep_result:?}"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
         }
@@ -2190,7 +2190,7 @@ mod postgres_tests {
             "fairness rotation must advance updated_at"
         );
 
-        let next = sweep_failed_pre_accept_once(&pool, "leader-1", 5, 60, None)
+        let next = sweep_failed_pre_accept_once(&pool, "hub-1", 5, 60, None)
             .await
             .expect("run next sweep tick"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
         assert!(
@@ -2203,35 +2203,35 @@ mod postgres_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn issue_5057_pr1_leader_maintenance_inputs_route_to_current_owner() {
+    async fn issue_5057_pr1_hub_maintenance_inputs_route_to_current_owner() {
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         seed_default_test_agent(&pool).await;
         sqlx::query(
-            "INSERT INTO worker_nodes (instance_id,status,labels,capabilities,last_heartbeat_at)
-             VALUES ('stale-worker','online','[\"unreal\"]',$1,NOW()-INTERVAL '30 seconds'),
+            "INSERT INTO cluster_nodes (instance_id,status,labels,capabilities,last_heartbeat_at)
+             VALUES ('stale-runner','online','[\"unreal\"]',$1,NOW()-INTERVAL '30 seconds'),
                     ('fresh-owner','online','[\"unreal\"]',$1,NOW()-INTERVAL '2 seconds')",
         )
-        .bind(json!({"intake_worker":{"enabled":true,"providers":["claude"]}}))
+        .bind(json!({"intake_runner":{"enabled":true,"providers":["claude"]}}))
         .execute(&pool)
         .await
-        .expect("seed maintenance workers"); // agentdesk-audit: allow-unwrap — PG production-entry regression
+        .expect("seed maintenance runners"); // agentdesk-audit: allow-unwrap — PG production-entry regression
         let source = insert_pending(&pool, &payload("ch-entry", "msg-entry"), 1, None)
             .await
             .expect("production insert"); // agentdesk-audit: allow-unwrap — PG production-entry regression
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "legacy-worker")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "legacy-runner")
             .await
             .expect("legacy claim") // agentdesk-audit: allow-unwrap — PG production-entry regression
             .expect("claim row"); // agentdesk-audit: allow-unwrap — PG production-entry regression
         assert!(
-            mark_failed_pre_accept(&pool, claimed.id, "legacy-worker", "retryable")
+            mark_failed_pre_accept(&pool, claimed.id, "legacy-runner", "retryable")
                 .await
                 .expect("fail pre-accept") // agentdesk-audit: allow-unwrap — PG production-entry regression
         );
         assert_eq!(
-            crate::services::cluster::node_registry::run_leader_intake_retry_maintenance_once(
+            crate::services::cluster::node_registry::run_hub_intake_retry_maintenance_once(
                 &pool,
-                "leader-1",
+                "hub-1",
                 10,
                 5,
                 || None
@@ -2240,13 +2240,13 @@ mod postgres_tests {
             .expect("observe maintenance"), // agentdesk-audit: allow-unwrap — GC-without-retry regression
             None
         );
-        let observe: (String, String, i64) = sqlx::query_as("SELECT (SELECT status FROM worker_nodes WHERE instance_id='stale-worker'),status,(SELECT COUNT(*) FROM intake_outbox WHERE parent_outbox_id=$1) FROM intake_outbox WHERE id=$1")
+        let observe: (String, String, i64) = sqlx::query_as("SELECT (SELECT status FROM cluster_nodes WHERE instance_id='stale-runner'),status,(SELECT COUNT(*) FROM intake_outbox WHERE parent_outbox_id=$1) FROM intake_outbox WHERE id=$1")
             .bind(source).fetch_one(&pool).await.expect("observe state"); // agentdesk-audit: allow-unwrap — enforce gate regression
         assert_eq!(observe, ("offline".into(), "failed_pre_accept".into(), 0));
         let outcome =
-            crate::services::cluster::node_registry::run_leader_intake_retry_maintenance_once(
+            crate::services::cluster::node_registry::run_hub_intake_retry_maintenance_once(
                 &pool,
-                "leader-1",
+                "hub-1",
                 10,
                 5,
                 || Some((5, 300)),
@@ -2270,11 +2270,11 @@ mod postgres_tests {
         assert!(
             claim_pending_for_target(&pool, "fresh-owner", "claude", "legacy-child")
                 .await
-                .expect("claim retry child") // agentdesk-audit: allow-unwrap — production worker compatibility
+                .expect("claim retry child") // agentdesk-audit: allow-unwrap — production runner compatibility
                 .is_some()
         );
         let stale: String =
-            sqlx::query_scalar("SELECT status FROM worker_nodes WHERE instance_id='stale-worker'")
+            sqlx::query_scalar("SELECT status FROM cluster_nodes WHERE instance_id='stale-runner'")
                 .fetch_one(&pool)
                 .await
                 .expect("read stale"); // agentdesk-audit: allow-unwrap — PG production-entry regression
@@ -2289,7 +2289,7 @@ mod postgres_tests {
             .expect("race source"); // agentdesk-audit: allow-unwrap — owner-transfer regression
         sqlx::query("UPDATE intake_outbox SET status='failed_pre_accept',admission_kind='forwarded',owner_instance_id='fresh-owner',owner_generation=NULL,completed_at=NOW() WHERE id=$1").bind(race_id).execute(&pool).await.expect("partial stamp"); // agentdesk-audit: allow-unwrap — malformed owner regression
         assert_eq!(
-            sweep_failed_pre_accept_once(&pool, "leader", 5, 5, Some(300))
+            sweep_failed_pre_accept_once(&pool, "hub", 5, 5, Some(300))
                 .await
                 .expect("partial sweep"), // agentdesk-audit: allow-unwrap — malformed owner regression
             FailedPreAcceptSweepOutcome::NoCapableTarget { source_id: race_id }
@@ -2314,13 +2314,13 @@ mod postgres_tests {
             &identity,
             "fresh-owner",
             3,
-            "stale-worker",
+            "stale-runner",
         )
         .await
         .expect("transfer"); // agentdesk-audit: allow-unwrap — owner-transfer regression
         let race_pool = pool.clone();
         let race = tokio::spawn(async move {
-            sweep_failed_pre_accept_once(&race_pool, "leader", 5, 5, Some(300)).await
+            sweep_failed_pre_accept_once(&race_pool, "hub", 5, 5, Some(300)).await
         });
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert!(!race.is_finished());
@@ -2350,7 +2350,7 @@ mod postgres_tests {
         sqlx::query("UPDATE intake_outbox SET status='failed_pre_accept',admission_kind='local',completed_at=NOW()-INTERVAL '301 seconds' WHERE id=$1")
             .bind(expired).execute(&pool).await.expect("expire source"); // agentdesk-audit: allow-unwrap — PG production-entry regression
         assert_eq!(
-            sweep_failed_pre_accept_once(&pool, "leader-1", 5, 5, Some(300))
+            sweep_failed_pre_accept_once(&pool, "hub-1", 5, 5, Some(300))
                 .await
                 .expect("bounded sweep"), // agentdesk-audit: allow-unwrap — PG production-entry regression
             FailedPreAcceptSweepOutcome::Empty
@@ -2361,8 +2361,8 @@ mod postgres_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mark_accepted_returns_false_when_sweep_already_reset_the_claim() {
-        // Race: leader sweep reset the row to `pending` between claim
-        // and accept. Worker MUST see `Ok(false)` so it can abort
+        // Race: hub sweep reset the row to `pending` between claim
+        // and accept. Runner MUST see `Ok(false)` so it can abort
         // instead of spawning a turn behind a no-longer-owned row.
         let pg_db = TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
@@ -2371,7 +2371,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-race", "msg-race"), 1, None)
             .await
             .expect("insert");
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-fast")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "owner-fast")
             .await
             .expect("claim")
             .expect("row");
@@ -2391,7 +2391,7 @@ mod postgres_tests {
             .expect("mark_accepted ok");
         assert!(
             !advanced,
-            "lost claim must report Ok(false) so worker aborts"
+            "lost claim must report Ok(false) so runner aborts"
         );
 
         pool.close().await;
@@ -2451,7 +2451,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-fail", "msg-fail"), 1, None)
             .await
             .expect("insert");
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "owner-1")
             .await
             .expect("claim")
             .expect("row");
@@ -2482,7 +2482,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-postA", "msg-A"), 1, None)
             .await
             .expect("insert A");
-        let row_a = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
+        let row_a = claim_pending_for_target(&pool, "runner-1", "claude", "owner-1")
             .await
             .expect("claim A")
             .expect("row A");
@@ -2503,7 +2503,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-postB", "msg-B"), 1, None)
             .await
             .expect("insert B");
-        let row_b = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
+        let row_b = claim_pending_for_target(&pool, "runner-1", "claude", "owner-1")
             .await
             .expect("claim B")
             .expect("row B");
@@ -2538,7 +2538,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-stale", "msg-stale"), 1, None)
             .await
             .expect("insert stale");
-        let stale = claim_pending_for_target(&pool, "worker-1", "claude", "owner-died")
+        let stale = claim_pending_for_target(&pool, "runner-1", "claude", "owner-died")
             .await
             .expect("claim stale")
             .expect("row stale");
@@ -2553,7 +2553,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-fresh", "msg-fresh"), 1, None)
             .await
             .expect("insert fresh");
-        let fresh = claim_pending_for_target(&pool, "worker-1", "claude", "owner-alive")
+        let fresh = claim_pending_for_target(&pool, "runner-1", "claude", "owner-alive")
             .await
             .expect("claim fresh")
             .expect("row fresh");
@@ -2593,7 +2593,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-sla1", "msg-sla1"), 1, None)
             .await
             .expect("insert sla1");
-        let row1 = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
+        let row1 = claim_pending_for_target(&pool, "runner-1", "claude", "owner-1")
             .await
             .expect("claim")
             .expect("row1");
@@ -2612,7 +2612,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-sla2", "msg-sla2"), 1, None)
             .await
             .expect("insert sla2");
-        let row2 = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
+        let row2 = claim_pending_for_target(&pool, "runner-1", "claude", "owner-1")
             .await
             .expect("claim")
             .expect("row2");
@@ -2630,7 +2630,7 @@ mod postgres_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn force_fail_and_retry_as_new_terminates_stuck_row_and_inserts_attempt_2() {
-        // Phase 5 transition 12: a row stuck in 'spawned' (worker hung
+        // Phase 5 transition 12: a row stuck in 'spawned' (runner hung
         // mid-turn) is force-failed by the operator, and a fresh row
         // is inserted with attempt_no=2 + parent_outbox_id pointing
         // at the stuck row. Both writes happen in one transaction so
@@ -2644,7 +2644,7 @@ mod postgres_tests {
         insert_pending(&pool, &retry_payload, 1, None)
             .await
             .expect("seed");
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "owner-1")
             .await
             .expect("claim")
             .expect("row");
@@ -2706,7 +2706,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-terminal", "msg-terminal"), 1, None)
             .await
             .expect("seed"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "owner-1")
             .await
             .expect("claim") // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
             .expect("row"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] module
@@ -2823,7 +2823,7 @@ mod postgres_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn force_fail_and_retry_as_new_refuses_done_row_to_prevent_double_emit() {
-        // Codex Phase 5 P0 #2: a worker `mark_done` racing with the
+        // Codex Phase 5 P0 #2: a runner `mark_done` racing with the
         // operator CLI could otherwise rewrite a completed row into
         // `failed_post_accept` and trigger a re-execution that
         // double-emits a Discord turn. The helper MUST refuse `done`.
@@ -2834,7 +2834,7 @@ mod postgres_tests {
         insert_pending(&pool, &payload("ch-done", "msg-done"), 1, None)
             .await
             .expect("insert");
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "owner-1")
             .await
             .expect("claim")
             .expect("row");
@@ -2889,7 +2889,7 @@ mod postgres_tests {
             ForceFailError::DisallowedStatus { .. }
         ));
 
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "owner-1")
             .await
             .expect("claim")
             .expect("row");
@@ -2939,9 +2939,9 @@ mod postgres_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn claim_pending_for_target_filters_by_row_provider() {
         // Codex Phase 5 P0 #1: a single AgentDesk process can host
-        // claude AND codex bots; both call `run_intake_worker_loop`
+        // claude AND codex bots; both call `run_intake_runner_loop`
         // with the same `target_instance_id`. The provider filter
-        // ensures a claude bot's worker only claims rows forwarded by
+        // ensures a claude bot's runner only claims rows forwarded by
         // the claude bot and never picks up a codex row (which would
         // run with the wrong Http/SharedData/token).
         //
@@ -2960,7 +2960,7 @@ mod postgres_tests {
         .await
         .expect("seed agents");
 
-        // Insert a row for each provider — both targeted at worker-1.
+        // Insert a row for each provider — both targeted at runner-1.
         let mut claude_payload = payload("ch-claude", "msg-claude");
         claude_payload.agent_id = "agent-claude".to_string();
         claude_payload.provider = "claude".to_string();
@@ -2975,8 +2975,8 @@ mod postgres_tests {
             .await
             .expect("insert codex row");
 
-        // Claude worker polls — must see ONLY the claude row.
-        let claude_claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-claude")
+        // Claude runner polls — must see ONLY the claude row.
+        let claude_claimed = claim_pending_for_target(&pool, "runner-1", "claude", "owner-claude")
             .await
             .expect("claude claim ok")
             .expect("must claim something");
@@ -2984,16 +2984,16 @@ mod postgres_tests {
         assert_eq!(claude_claimed.channel_id, "ch-claude");
 
         // Claude polls again — codex row must STILL be invisible.
-        let again = claim_pending_for_target(&pool, "worker-1", "claude", "owner-claude")
+        let again = claim_pending_for_target(&pool, "runner-1", "claude", "owner-claude")
             .await
             .expect("second claude claim ok");
         assert!(
             again.is_none(),
-            "claude worker must not see codex's pending row"
+            "claude runner must not see codex's pending row"
         );
 
-        // Codex worker polls — picks up the codex row.
-        let codex_claimed = claim_pending_for_target(&pool, "worker-1", "codex", "owner-codex")
+        // Codex runner polls — picks up the codex row.
+        let codex_claimed = claim_pending_for_target(&pool, "runner-1", "codex", "owner-codex")
             .await
             .expect("codex claim ok")
             .expect("must claim something");
@@ -3010,7 +3010,7 @@ mod postgres_tests {
         // while its `discord_channel_cc` is served by the claude bot.
         //
         // Claiming on `agents.provider` handed the claude bot's row to the
-        // codex worker, which then ran the turn with the codex token — a
+        // codex runner, which then ran the turn with the codex token — a
         // Codex reply in a Claude channel. Claim must key on the provider
         // that actually forwarded the row.
         let pg_db = TestPostgresDb::create().await;
@@ -3032,21 +3032,21 @@ mod postgres_tests {
             .await
             .expect("insert cc row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
 
-        // The codex worker shares `target_instance_id`. It must NOT claim
+        // The codex runner shares `target_instance_id`. It must NOT claim
         // this row even though `agents.provider = 'codex'` matches it.
-        let stolen = claim_pending_for_target(&pool, "worker-1", "codex", "owner-codex")
+        let stolen = claim_pending_for_target(&pool, "runner-1", "codex", "owner-codex")
             .await
             .expect("codex claim ok"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
         assert!(
             stolen.is_none(),
-            "codex worker must not claim a row forwarded by the claude bot"
+            "codex runner must not claim a row forwarded by the claude bot"
         );
 
-        // The claude worker claims it, despite `agents.provider = 'codex'`.
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-claude")
+        // The claude runner claims it, despite `agents.provider = 'codex'`.
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "owner-claude")
             .await
             .expect("claude claim ok") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
-            .expect("claude worker must claim its own row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
+            .expect("claude runner must claim its own row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
         assert_eq!(claimed.channel_id, "ch-cc");
         assert_eq!(claimed.provider, "claude");
         assert_eq!(claimed.agent_id, "agent-paired");
@@ -3076,7 +3076,7 @@ mod postgres_tests {
         cc_row.provider = "claude".to_string();
         insert_pending(&pool, &cc_row, 1, None).await.expect("seed"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
 
-        let claimed = claim_pending_for_target(&pool, "worker-1", "claude", "owner-1")
+        let claimed = claim_pending_for_target(&pool, "runner-1", "claude", "owner-1")
             .await
             .expect("claim") // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
             .expect("row"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module

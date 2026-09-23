@@ -63,7 +63,7 @@ pub(super) async fn outbox_alert_target_pg(pg_pool: &PgPool) -> Option<String> {
 /// `kanban_human_alert_channel_id` target and enqueueing one per-incident
 /// operator card — so the outbox drain loop never awaits a pool acquire on the
 /// alert path (#4260 dual r1, codex#1). Never propagates; enqueue failure only
-/// logs. Delivery uses the #4449 announce-first/notify-fallback worker policy.
+/// logs. Delivery uses the #4449 announce-first/notify-fallback runner policy.
 /// Returns the join handle of the spawned card task (`None` when the
 /// recursion guard suppressed it) so tests can await deterministically;
 /// production callers drop it.

@@ -38,7 +38,7 @@ fn gateway_self_fence_publishes_process_restart_marker() {
 }
 
 #[test]
-fn failed_lease_does_not_authorize_worker_or_poller_startup() {
+fn failed_lease_does_not_authorize_runner_or_poller_startup() {
     assert!(!GatewayLeaseOutcome::Failed.starts_provider_runtime());
     assert!(GatewayLeaseOutcome::Standby.starts_provider_runtime());
     assert!(GatewayLeaseOutcome::Proceed(None).starts_provider_runtime());

@@ -48,7 +48,7 @@ fn namespaced_key_for_tmux(
 /// A persisted inflight key is accepted only when its tmux identity matches the
 /// exact inflight tmux or channel binding; legacy/corrupt rows fall through to
 /// those trusted identities. Synthetic watchdog keys are deliberately forbidden
-/// because they hide DM provider ownership from the outbox worker.
+/// because they hide DM provider ownership from the outbox runner.
 async fn canonical_alert_session_key(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -135,7 +135,7 @@ pub(super) async fn notify_suspected_stall_without_cleanup(
         "⚠️ 스톨 의심: 이 세션이 오래 응답이 없어 보입니다{mention}. 워치독은 더 이상 자동 종료하지 않습니다 — 실제로 멈췄다면 취소해 주시고, 정상 작업 중이면 무시하세요. (채널 {channel_id})"
     );
     // `channel:` is the established manual-outbound target contract. The
-    // worker combines it with a provider DM session key to select the Claude or
+    // runner combines it with a provider DM session key to select the Claude or
     // Codex bot; public sessions intentionally keep the configured notify bot.
     let target = format!("channel:{}", channel_id.get());
     let session_key = canonical_alert_session_key(shared, provider, channel_id, inflight).await;

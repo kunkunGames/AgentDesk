@@ -272,7 +272,7 @@ pub(crate) fn enqueue_lifecycle_notification_best_effort(
     content: &str,
 ) -> bool {
     // PG outbox rows are authoritative whenever a pool is configured. The
-    // release worker drains PG only in that mode, so writing a "fallback"
+    // release runner drains PG only in that mode, so writing a "fallback"
     // lifecycle row to SQLite would create an undeliverable ghost message.
     if let Some(pool) = pg_pool {
         let target_owned = target.to_string();
@@ -464,7 +464,7 @@ pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe(
 ///
 /// Callers use this when the outbox reservation and their own state transition
 /// must commit atomically. Keeping the same dedupe identity as the pool helper
-/// makes crash recovery and competing workers converge on one durable row.
+/// makes crash recovery and competing runners converge on one durable row.
 pub(crate) async fn enqueue_outbox_pg_returning_id_with_persistent_dedupe_on_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     message: OutboxMessage<'_>,
@@ -694,7 +694,7 @@ pub(crate) async fn enqueue_outbox_pg_with_ttl(
     )
 }
 
-/// Stage a deduplicated row that outbox workers cannot claim. The caller must
+/// Stage a deduplicated row that outbox runners cannot claim. The caller must
 /// explicitly activate it after its external authority check, or cancel it.
 pub(crate) async fn stage_outbox_pg_with_ttl(
     pool: &PgPool,
@@ -799,7 +799,7 @@ pub(crate) async fn cancel_staged_outbox_pg(pool: &PgPool, id: i64) -> Result<bo
     )
 }
 
-/// Prune terminal outbox history and expired worker-invisible staging rows.
+/// Prune terminal outbox history and expired runner-invisible staging rows.
 ///
 /// A process can die after PostgreSQL commits a `held` row but before the
 /// recovery sidecar records its id. Those rows are never deliverable, and once
@@ -1094,7 +1094,7 @@ mod postgres_source_contract_tests {
     }
 
     #[tokio::test]
-    async fn enqueue_acceptance_matches_worker_loopback_source_gate_pg() {
+    async fn enqueue_acceptance_matches_runner_loopback_source_gate_pg() {
         let Some(pg_db) = crate::dispatch::test_support::DispatchPostgresTestDb::try_create(
             "agentdesk_message_outbox_source_parity",
             "message_outbox enqueue/send parity tests",
@@ -1135,14 +1135,14 @@ mod postgres_source_contract_tests {
                 reason_code: None,
                 session_key: None,
             };
-            let worker_allows = crate::services::discord::outbound::send_gate::is_allowed_send_source_for(
+            let runner_allows = crate::services::discord::outbound::send_gate::is_allowed_send_source_for(
                 source,
                 crate::services::discord::outbound::source_registry::SendCallerClass::LoopbackInternal,
             );
             let enqueue_result = enqueue_outbox_pg_returning_id_with_ttl(&pool, message, 0).await;
             assert_eq!(
                 enqueue_result.is_ok(),
-                worker_allows,
+                runner_allows,
                 "enqueue/send source decision drifted for `{source}`"
             );
         }

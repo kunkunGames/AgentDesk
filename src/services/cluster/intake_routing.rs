@@ -1,11 +1,11 @@
 //! Pure routing decision logic for intake-node-routing
 //! (docs/design/intake-node-routing.md). Given a snapshot of
-//! `worker_nodes` and the agent's `preferred_intake_node_labels`, picks a
+//! `cluster_nodes` and the agent's `preferred_intake_node_labels`, picks a
 //! `target_instance_id` to forward a Discord intake message to — or
-//! returns `Local` if the leader should keep handling it.
+//! returns `Local` if the hub should keep handling it.
 //!
 //! No DB access, no async, no Discord types: easy to unit-test exhaustively
-//! and reason about under contention. Phase 4 wires this into the leader
+//! and reason about under contention. Phase 4 wires this into the hub
 //! intake hook.
 
 use serde_json::Value;
@@ -15,14 +15,14 @@ use serde_json::Value;
 /// or runs the turn locally (when `Local`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum IntakeRouteTarget {
-    /// Run on the local leader. Either the agent has no preference
-    /// (`preferred_intake_node_labels` empty), no eligible worker node
-    /// matched, or the only eligible target is the leader itself.
+    /// Run on the local hub. Either the agent has no preference
+    /// (`preferred_intake_node_labels` empty), no eligible runner node
+    /// matched, or the only eligible target is the hub itself.
     Local { reason: LocalRouteReason },
-    /// Forward to the specified worker instance. The leader inserts a
+    /// Forward to the specified runner instance. The hub inserts a
     /// row into `intake_outbox` with `target_instance_id = instance_id`
-    /// and the worker's poll loop claims it.
-    Worker { instance_id: String },
+    /// and the runner's poll loop claims it.
+    Runner { instance_id: String },
 }
 
 /// Diagnostic enum explaining why `Local` was picked. Phase 4 records
@@ -32,17 +32,17 @@ pub(crate) enum IntakeRouteTarget {
 pub(crate) enum LocalRouteReason {
     /// Agent did not opt in (`preferred_intake_node_labels` empty).
     NoPreference,
-    /// Preferences were set but no worker node had matching labels +
-    /// online status. The intake stays on leader as a safety fallback.
-    NoEligibleWorker,
-    /// The only eligible target IS the leader itself (e.g., leader's
+    /// Preferences were set but no runner node had matching labels +
+    /// online status. The intake stays on hub as a safety fallback.
+    NoEligibleRunner,
+    /// The only eligible target IS the hub itself (e.g., hub's
     /// own labels happen to match the preference).
-    LeaderIsOnlyEligible,
-    /// The eligible leader is the agent's explicitly preferred device.
-    PreferredNodeIsLeader,
+    HubIsOnlyEligible,
+    /// The eligible hub is the agent's explicitly preferred device.
+    PreferredNodeIsHub,
 }
 
-/// Inputs needed by the routing decision. Decoupled from `worker_nodes`
+/// Inputs needed by the routing decision. Decoupled from `cluster_nodes`
 /// JSON shape so the routing fn can be unit-tested without DB fixtures.
 #[derive(Clone, Debug)]
 pub(crate) struct CandidateNode {
@@ -56,14 +56,14 @@ pub(crate) struct CandidateNode {
 }
 
 /// Build `CandidateNode` rows from the JSON snapshot returned by
-/// `crate::services::cluster::node_registry::list_worker_nodes`. Defensive against missing
+/// `crate::services::cluster::node_registry::list_cluster_nodes`. Defensive against missing
 /// fields — bad rows simply do not become candidates.
 ///
-/// `list_worker_nodes` emits the staleness-corrected status under JSON
+/// `list_cluster_nodes` emits the staleness-corrected status under JSON
 /// key `"status"` (the underlying SQL column is `computed_status`). We
 /// read `"status"` first; the legacy `"computed_status"` key is also
 /// accepted as a fallback for tests / non-canonical JSON producers.
-pub(crate) fn candidates_from_worker_nodes_json(nodes: &[Value]) -> Vec<CandidateNode> {
+pub(crate) fn candidates_from_cluster_nodes_json(nodes: &[Value]) -> Vec<CandidateNode> {
     nodes
         .iter()
         .filter_map(|node| {
@@ -99,18 +99,18 @@ pub(crate) fn candidates_from_worker_nodes_json(nodes: &[Value]) -> Vec<Candidat
 /// 1. If `preferred_labels` is empty, return `Local { NoPreference }`.
 /// 2. Filter candidates to those whose `status == "online"` AND whose
 ///    `labels` are a superset of `preferred_labels`.
-/// 3. If `leader_instance_id` is present in the eligible set AND the
-///    leader is the only eligible node, return
-///    `Local { LeaderIsOnlyEligible }`.
-/// 4. If no eligible candidates remain, return `Local { NoEligibleWorker }`.
+/// 3. If `hub_instance_id` is present in the eligible set AND the
+///    hub is the only eligible node, return
+///    `Local { HubIsOnlyEligible }`.
+/// 4. If no eligible candidates remain, return `Local { NoEligibleRunner }`.
 /// 5. Otherwise, deterministically pick the eligible candidate (excluding
-///    the leader) with the lexicographically smallest `instance_id`.
+///    the hub) with the lexicographically smallest `instance_id`.
 ///    Deterministic ordering keeps the decision stable under retries
 ///    and during sweep races.
 pub(crate) fn pick_intake_target(
     candidates: &[CandidateNode],
     preferred_labels: &[String],
-    leader_instance_id: &str,
+    hub_instance_id: &str,
 ) -> IntakeRouteTarget {
     if preferred_labels.is_empty() {
         return IntakeRouteTarget::Local {
@@ -118,7 +118,7 @@ pub(crate) fn pick_intake_target(
         };
     }
 
-    select_matching_intake_target(candidates, preferred_labels, leader_instance_id)
+    select_matching_intake_target(candidates, preferred_labels, hub_instance_id)
 }
 
 /// Every candidate has already passed hard requirements. Preferences may choose
@@ -126,51 +126,51 @@ pub(crate) fn pick_intake_target(
 pub(crate) fn pick_required_intake_target(
     candidates: &[CandidateNode],
     preferred_labels: &[String],
-    leader_instance_id: &str,
+    hub_instance_id: &str,
 ) -> IntakeRouteTarget {
-    let preferred = select_matching_intake_target(candidates, preferred_labels, leader_instance_id);
+    let preferred = select_matching_intake_target(candidates, preferred_labels, hub_instance_id);
     if preferred
         == (IntakeRouteTarget::Local {
-            reason: LocalRouteReason::NoEligibleWorker,
+            reason: LocalRouteReason::NoEligibleRunner,
         })
     {
-        select_matching_intake_target(candidates, &[], leader_instance_id)
+        select_matching_intake_target(candidates, &[], hub_instance_id)
     } else {
         preferred
     }
 }
 
 /// The caller supplies only ready, compatible nodes with available capacity.
-/// A primary device takes precedence over labels, including a preferred leader.
+/// A primary device takes precedence over labels, including a preferred hub.
 /// If absent from that set, reuse the normal compatible fallback selection.
 pub(crate) fn pick_preferred_node_target(
     candidates: &[CandidateNode],
     preferred_node: &str,
     preferred_labels: &[String],
-    leader_instance_id: &str,
+    hub_instance_id: &str,
 ) -> IntakeRouteTarget {
     if candidates
         .iter()
         .any(|c| c.instance_id == preferred_node && c.status == "online")
     {
-        if preferred_node == leader_instance_id {
+        if preferred_node == hub_instance_id {
             IntakeRouteTarget::Local {
-                reason: LocalRouteReason::PreferredNodeIsLeader,
+                reason: LocalRouteReason::PreferredNodeIsHub,
             }
         } else {
-            IntakeRouteTarget::Worker {
+            IntakeRouteTarget::Runner {
                 instance_id: preferred_node.to_owned(),
             }
         }
     } else {
-        pick_required_intake_target(candidates, preferred_labels, leader_instance_id)
+        pick_required_intake_target(candidates, preferred_labels, hub_instance_id)
     }
 }
 
 fn select_matching_intake_target(
     candidates: &[CandidateNode],
     preferred_labels: &[String],
-    leader_instance_id: &str,
+    hub_instance_id: &str,
 ) -> IntakeRouteTarget {
     let eligible: Vec<&CandidateNode> = candidates
         .iter()
@@ -179,13 +179,13 @@ fn select_matching_intake_target(
 
     if eligible.is_empty() {
         return IntakeRouteTarget::Local {
-            reason: LocalRouteReason::NoEligibleWorker,
+            reason: LocalRouteReason::NoEligibleRunner,
         };
     }
 
     let chosen = eligible
         .into_iter()
-        .filter(|c| c.instance_id != leader_instance_id)
+        .filter(|c| c.instance_id != hub_instance_id)
         .min_by(|a, b| {
             a.capacity_rank
                 .cmp(&b.capacity_rank)
@@ -193,12 +193,12 @@ fn select_matching_intake_target(
         });
 
     if let Some(chosen) = chosen {
-        IntakeRouteTarget::Worker {
+        IntakeRouteTarget::Runner {
             instance_id: chosen.instance_id.clone(),
         }
     } else {
         IntakeRouteTarget::Local {
-            reason: LocalRouteReason::LeaderIsOnlyEligible,
+            reason: LocalRouteReason::HubIsOnlyEligible,
         }
     }
 }
@@ -225,8 +225,8 @@ mod tests {
 
     #[test]
     fn empty_preference_routes_local_with_no_preference_reason() {
-        let nodes = vec![node("worker-1", "online", &["unreal"])];
-        let result = pick_intake_target(&nodes, &[], "leader-1");
+        let nodes = vec![node("runner-1", "online", &["unreal"])];
+        let result = pick_intake_target(&nodes, &[], "hub-1");
         assert_eq!(
             result,
             IntakeRouteTarget::Local {
@@ -236,82 +236,82 @@ mod tests {
     }
 
     #[test]
-    fn no_matching_worker_routes_local_with_no_eligible_reason() {
+    fn no_matching_runner_routes_local_with_no_eligible_reason() {
         let nodes = vec![
-            node("worker-1", "online", &["api"]),
-            node("worker-2", "offline", &["unreal"]),
+            node("runner-1", "online", &["api"]),
+            node("runner-2", "offline", &["unreal"]),
         ];
         let preferred = vec!["unreal".to_string()];
-        let result = pick_intake_target(&nodes, &preferred, "leader-1");
+        let result = pick_intake_target(&nodes, &preferred, "hub-1");
         assert_eq!(
             result,
             IntakeRouteTarget::Local {
-                reason: LocalRouteReason::NoEligibleWorker
+                reason: LocalRouteReason::NoEligibleRunner
             }
         );
     }
 
     #[test]
-    fn single_matching_online_worker_is_picked() {
+    fn single_matching_online_runner_is_picked() {
         let nodes = vec![
-            node("worker-1", "online", &["unreal", "macbook"]),
-            node("leader-1", "online", &["mini"]),
+            node("runner-1", "online", &["unreal", "macbook"]),
+            node("hub-1", "online", &["mini"]),
         ];
         let preferred = vec!["unreal".to_string()];
-        let result = pick_intake_target(&nodes, &preferred, "leader-1");
+        let result = pick_intake_target(&nodes, &preferred, "hub-1");
         assert_eq!(
             result,
-            IntakeRouteTarget::Worker {
-                instance_id: "worker-1".to_string()
+            IntakeRouteTarget::Runner {
+                instance_id: "runner-1".to_string()
             }
         );
     }
 
     #[test]
-    fn multiple_eligible_workers_are_picked_deterministically() {
+    fn multiple_eligible_runners_are_picked_deterministically() {
         let nodes = vec![
-            node("worker-zeta", "online", &["unreal"]),
-            node("worker-alpha", "online", &["unreal"]),
-            node("worker-mid", "online", &["unreal"]),
+            node("runner-zeta", "online", &["unreal"]),
+            node("runner-alpha", "online", &["unreal"]),
+            node("runner-mid", "online", &["unreal"]),
         ];
         let preferred = vec!["unreal".to_string()];
-        let result = pick_intake_target(&nodes, &preferred, "leader-1");
+        let result = pick_intake_target(&nodes, &preferred, "hub-1");
         assert_eq!(
             result,
-            IntakeRouteTarget::Worker {
-                instance_id: "worker-alpha".to_string()
+            IntakeRouteTarget::Runner {
+                instance_id: "runner-alpha".to_string()
             }
         );
     }
 
     #[test]
-    fn offline_worker_is_excluded_even_when_labels_match() {
+    fn offline_runner_is_excluded_even_when_labels_match() {
         let nodes = vec![
-            node("worker-1", "offline", &["unreal"]),
-            node("worker-2", "online", &["api"]),
+            node("runner-1", "offline", &["unreal"]),
+            node("runner-2", "online", &["api"]),
         ];
         let preferred = vec!["unreal".to_string()];
-        let result = pick_intake_target(&nodes, &preferred, "leader-1");
-        assert_eq!(
-            result,
-            IntakeRouteTarget::Local {
-                reason: LocalRouteReason::NoEligibleWorker
-            }
-        );
-    }
-
-    #[test]
-    fn leader_only_eligible_returns_leader_is_only_eligible() {
-        let nodes = vec![
-            node("leader-1", "online", &["unreal"]),
-            node("worker-1", "online", &["api"]),
-        ];
-        let preferred = vec!["unreal".to_string()];
-        let result = pick_intake_target(&nodes, &preferred, "leader-1");
+        let result = pick_intake_target(&nodes, &preferred, "hub-1");
         assert_eq!(
             result,
             IntakeRouteTarget::Local {
-                reason: LocalRouteReason::LeaderIsOnlyEligible
+                reason: LocalRouteReason::NoEligibleRunner
+            }
+        );
+    }
+
+    #[test]
+    fn hub_only_eligible_returns_hub_is_only_eligible() {
+        let nodes = vec![
+            node("hub-1", "online", &["unreal"]),
+            node("runner-1", "online", &["api"]),
+        ];
+        let preferred = vec!["unreal".to_string()];
+        let result = pick_intake_target(&nodes, &preferred, "hub-1");
+        assert_eq!(
+            result,
+            IntakeRouteTarget::Local {
+                reason: LocalRouteReason::HubIsOnlyEligible
             }
         );
     }
@@ -319,95 +319,95 @@ mod tests {
     #[test]
     fn multi_label_requirement_needs_all_to_match() {
         let nodes = vec![
-            node("worker-1", "online", &["unreal", "macbook"]),
-            node("worker-2", "online", &["unreal"]),
+            node("runner-1", "online", &["unreal", "macbook"]),
+            node("runner-2", "online", &["unreal"]),
         ];
         let preferred = vec!["unreal".to_string(), "macbook".to_string()];
-        let result = pick_intake_target(&nodes, &preferred, "leader-1");
+        let result = pick_intake_target(&nodes, &preferred, "hub-1");
         assert_eq!(
             result,
-            IntakeRouteTarget::Worker {
-                instance_id: "worker-1".to_string()
+            IntakeRouteTarget::Runner {
+                instance_id: "runner-1".to_string()
             }
         );
     }
 
     #[test]
-    fn candidates_from_worker_nodes_json_skips_malformed_rows() {
-        // `list_worker_nodes` emits the staleness-corrected status under
+    fn candidates_from_cluster_nodes_json_skips_malformed_rows() {
+        // `list_cluster_nodes` emits the staleness-corrected status under
         // the JSON key "status" (SQL alias was `computed_status` — we
         // assert both shapes work below).
         let json_nodes = vec![
-            json!({"instance_id": "worker-1", "status": "online", "labels": ["unreal"]}),
+            json!({"instance_id": "runner-1", "status": "online", "labels": ["unreal"]}),
             json!({"status": "online"}), // missing instance_id
-            json!({"instance_id": "worker-2", "status": "offline", "labels": []}),
-            json!({"instance_id": "worker-3", "labels": ["api"]}), // missing status defaults to offline
+            json!({"instance_id": "runner-2", "status": "offline", "labels": []}),
+            json!({"instance_id": "runner-3", "labels": ["api"]}), // missing status defaults to offline
         ];
-        let candidates = candidates_from_worker_nodes_json(&json_nodes);
+        let candidates = candidates_from_cluster_nodes_json(&json_nodes);
         assert_eq!(candidates.len(), 3);
-        assert_eq!(candidates[0].instance_id, "worker-1");
+        assert_eq!(candidates[0].instance_id, "runner-1");
         assert_eq!(candidates[0].status, "online");
         assert_eq!(candidates[0].labels, vec!["unreal".to_string()]);
         assert_eq!(candidates[2].status, "offline");
     }
 
     #[test]
-    fn candidates_from_worker_nodes_json_accepts_legacy_computed_status_key() {
+    fn candidates_from_cluster_nodes_json_accepts_legacy_computed_status_key() {
         // Some test fixtures and non-canonical JSON producers still emit
         // the field as `computed_status`. The adapter falls back so we
         // do not silently classify them as offline.
         let json_nodes = vec![json!({
-            "instance_id": "worker-legacy",
+            "instance_id": "runner-legacy",
             "computed_status": "online",
             "labels": ["unreal"],
         })];
-        let candidates = candidates_from_worker_nodes_json(&json_nodes);
+        let candidates = candidates_from_cluster_nodes_json(&json_nodes);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].status, "online");
     }
 
     #[test]
-    fn pick_intake_target_routes_to_worker_for_real_list_worker_nodes_shape() {
+    fn pick_intake_target_routes_to_runner_for_real_list_cluster_nodes_shape() {
         // Regression for the round-1 codex blocker: ensure the JSON shape
-        // emitted by `services::cluster::node_registry::list_worker_nodes` (which uses the
+        // emitted by `services::cluster::node_registry::list_cluster_nodes` (which uses the
         // key `"status"`, not `"computed_status"`) actually drives the
-        // routing decision instead of falling through to NoEligibleWorker.
+        // routing decision instead of falling through to NoEligibleRunner.
         let json_nodes = vec![
             json!({
-                "instance_id": "leader-1",
+                "instance_id": "hub-1",
                 "status": "online",
                 "labels": ["mini"],
             }),
             json!({
-                "instance_id": "worker-mac-book",
+                "instance_id": "runner-mac-book",
                 "status": "online",
                 "labels": ["unreal", "macbook"],
             }),
         ];
-        let candidates = candidates_from_worker_nodes_json(&json_nodes);
+        let candidates = candidates_from_cluster_nodes_json(&json_nodes);
         let preferred = vec!["unreal".to_string()];
-        let result = pick_intake_target(&candidates, &preferred, "leader-1");
+        let result = pick_intake_target(&candidates, &preferred, "hub-1");
         assert_eq!(
             result,
-            IntakeRouteTarget::Worker {
-                instance_id: "worker-mac-book".to_string()
+            IntakeRouteTarget::Runner {
+                instance_id: "runner-mac-book".to_string()
             }
         );
     }
 
     #[test]
-    fn worker_with_extra_labels_still_satisfies_subset_requirement() {
+    fn runner_with_extra_labels_still_satisfies_subset_requirement() {
         let nodes = vec![node(
-            "worker-1",
+            "runner-1",
             "online",
             &["unreal", "macbook", "gpu", "metal"],
         )];
         let preferred = vec!["unreal".to_string()];
-        let result = pick_intake_target(&nodes, &preferred, "leader-1");
+        let result = pick_intake_target(&nodes, &preferred, "hub-1");
         assert_eq!(
             result,
-            IntakeRouteTarget::Worker {
-                instance_id: "worker-1".to_string()
+            IntakeRouteTarget::Runner {
+                instance_id: "runner-1".to_string()
             }
         );
     }

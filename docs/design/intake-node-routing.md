@@ -1,4 +1,4 @@
-# Intake-Message Routing to Worker Nodes — Design
+# Intake-Message Routing to Runner Nodes — Design
 
 > Status: **Draft v5** — codex-reviewed (rounds 1 + 2 + 3 + 4),
 > addressing same-target no-op message drop, family-attempt cap
@@ -16,10 +16,10 @@
 ## Planned handoff target preflight (#4779)
 
 Before a generation-fenced owner transfer, the coordinator evaluates the target
-`worker_nodes` record and its `capabilities.intake_preflight` probe snapshot with
+`cluster_nodes` record and its `capabilities.intake_preflight` probe snapshot with
 `services::cluster::intake_preflight::evaluate_target_preflight`. The structured
 report exposes an explicit `pass`/`fail` verdict and stable reason codes for
-Claude/Codex node/provider worker readiness, release
+Claude/Codex node/provider runner readiness, release
 SHA and config-schema parity, provider binary/credential/quota/access probes,
 workspace policy, disk/memory, recent DB-pool errors, terminal and standby relay,
 and the intake-outbox operator surface. Missing evidence fails closed.
@@ -39,18 +39,18 @@ The AgentDesk Discord control plane has a hard asymmetry between
 *dispatches* and *intake messages*:
 
 - **Dispatches** (agent → agent task hand-off) flow through
-  `dispatch_outbox` and are claimed by any worker matching the
-  `cluster.dispatch_routing` policy. Mac-book worker handles many of
+  `dispatch_outbox` and are claimed by any runner matching the
+  `cluster.dispatch_routing` policy. Mac-book runner handles many of
   these today.
 - **Intake messages** (humans typing in a Discord channel) are
   received by whichever node holds the bot's `IDENTIFY` lease.
-  Discord rate-limits IDENTIFY *per token*, so only the leader (mac-mini
+  Discord rate-limits IDENTIFY *per token*, so only the hub (mac-mini
   in our cluster) ever IDENTIFYs (validated by retro #1984).
-  Intake therefore always spawns its tmux turn on the leader.
+  Intake therefore always spawns its tmux turn on the hub.
 
 Requirement: **for selected agents/channels, route the intake turn
-to a preferred worker node** so heavy work (Unreal builds, GAS state
-queries, MCP runs) does not pin the leader's CPU.
+to a preferred runner node** so heavy work (Unreal builds, GAS state
+queries, MCP runs) does not pin the hub's CPU.
 
 This document is the up-front design before any code changes; we
 explicitly avoid PoC iteration in favor of a single coherent rollout.
@@ -60,37 +60,37 @@ Draft v2 incorporates codex round-1 review findings (Appendix A).
 
 1. Per-agent (or per-channel) `preferred_intake_node_labels` config
    that mirrors the existing `cluster.dispatch_routing` shape.
-2. When the leader receives an intake message and a healthy worker
-   matches the agent's preferred labels, the leader forwards the work
-   item via PG and the worker spawns the tmux turn locally. The
-   leader's central admission path does not grant a local-execution permit.
-3. When owner lookup proves `NoOwner` and no matching worker is online,
-   intake stays on the leader. A stale or conflicting owner never uses this
+2. When the hub receives an intake message and a healthy runner
+   matches the agent's preferred labels, the hub forwards the work
+   item via PG and the runner spawns the tmux turn locally. The
+   hub's central admission path does not grant a local-execution permit.
+3. When owner lookup proves `NoOwner` and no matching runner is online,
+   intake stays on the hub. A stale or conflicting owner never uses this
    availability fallback.
-4. Worker-side turn output reaches Discord through the worker's own
+4. Runner-side turn output reaches Discord through the runner's own
    `serenity::http::Http` REST client (the bot token already lives on
-   every node; only IDENTIFY is leader-only).
+   every node; only IDENTIFY is hub-only).
 5. Resumption of an existing session must respect node affinity: if a
-   `sessions` row for this channel already has `instance_id = worker`,
-   subsequent intake messages forward to that worker as long as that
-   worker is online and fresh.
+   `sessions` row for this channel already has `instance_id = runner`,
+   subsequent intake messages forward to that runner as long as that
+   runner is online and fresh.
 
 ## Non-goals
 
 - Auto-provisioning agent worktrees / repo clones across nodes.
   Operator is responsible for keeping `~/.adk/release/workspaces/<agent-id>/`
   and the user's repo paths (e.g. `~/CookingHeart`) consistent on
-  every node that might be a routing target. Worker-side spawn will
+  every node that might be a routing target. Runner-side spawn will
   validate `cwd` existence and fail-soft (mark outbox row `failed` →
-  leader fallback).
+  hub fallback).
 - Cross-node tmux migration. Once a turn has spawned on node X, it
   finishes on node X.
-- Leader-less operation. We always assume one IDENTIFY-holding leader.
+- Hub-less operation. We always assume one IDENTIFY-holding hub.
 - Reworking the dispatch path. This design is additive to
   `dispatch_outbox`; it does not change dispatch claiming, scoring,
   or fallback behaviour.
 - **Multi-primary PostgreSQL.** Design assumes a single linearizable
-  PG primary that both leader and workers read/write. Sharded or
+  PG primary that both hub and runners read/write. Sharded or
   geo-replicated PG is out of scope; we will reject the configuration
   at startup if cluster is configured against multiple primaries.
 
@@ -107,12 +107,12 @@ Draft v2 incorporates codex round-1 review findings (Appendix A).
   (`platform/tmux.rs:67`)
 
 The intake path is **completely cluster-unaware today**: there is no
-inspection of `cluster.instance_id`, `worker_nodes`, or session-owner
+inspection of `cluster.instance_id`, `cluster_nodes`, or session-owner
 affinity inside `discord/router/`.
 
-### Worker-side gateway state (codex blocker 1)
+### Runner-side gateway state (codex blocker 1)
 
-Non-leader nodes skip Discord gateway startup when the gateway lease
+Non-hub nodes skip Discord gateway startup when the gateway lease
 is held elsewhere
 (`src/services/discord/runtime_bootstrap.rs:810`).
 `cached_serenity_ctx` is only populated after a real gateway client
@@ -121,31 +121,31 @@ expects a live `serenity::Context` and later constructs a
 `DiscordGateway` around it (`message_handler.rs:1795,4123`).
 
 **A "skip routing" flag is therefore not enough** to run the existing
-function on a worker. We need a refactor that separates
+function on a runner. We need a refactor that separates
 "REST-only turn core" from "gateway-context-dependent intake work."
 
 ### Cluster primitives we will reuse
 
 | Primitive | Source | Reused for |
 |---|---|---|
-| `worker_nodes` table (labels JSONB, last_heartbeat_at, status) | `migrations/postgres/0029_worker_nodes.sql` | Health + label match |
-| `lease_ttl_secs` staleness (default 180s) | `src/server/cluster.rs:165` | Stale worker exclusion |
+| `cluster_nodes` table (labels JSONB, last_heartbeat_at, status) | `migrations/postgres/0029_worker_nodes.sql` | Health + label match |
+| `lease_ttl_secs` staleness (default 180s) | `src/server/cluster.rs:165` | Stale runner exclusion |
 | `cluster.dispatch_routing` policy shape | `src/config.rs:731-788` | Mirror for `intake_routing` |
 | `RoutingEngine::route()` capability matching | `src/services/dispatches/outbox_claiming.rs:75-99` | Same label scoring fn |
 | `FOR UPDATE SKIP LOCKED` claim pattern | `src/db/dispatches/outbox/claim.rs:38,108` | Same SQL idiom |
 | Adaptive 500ms→5s polling backoff | `src/services/dispatches/outbox_queue.rs:397` | Same loop tempo |
 | `sessions.instance_id` column (already exists) | `migrations/postgres/0040_sessions_instance_id.sql` | Affinity routing |
 | `session_owner_routing_status()` foreign-detection | `src/server/cluster_session_routing.rs:51-115` | Reuse verbatim |
-| `serenity::http::Http` REST client | `src/services/discord/gateway.rs:95` | Worker-side response posting |
-| `credential::read_bot_token()` | `src/credential.rs:1-25` | Worker-side token (no IDENTIFY needed for REST) |
+| `serenity::http::Http` REST client | `src/services/discord/gateway.rs:95` | Runner-side response posting |
+| `credential::read_bot_token()` | `src/credential.rs:1-25` | Runner-side token (no IDENTIFY needed for REST) |
 
 ### Confirmed feasibility constraints
 
-1. Worker can call Discord REST without IDENTIFY — token loads from
+1. Runner can call Discord REST without IDENTIFY — token loads from
    the credential store on every node. (Validated by reading the
    existing `HttpOutboundClient` in `services/discord/outbound/transport.rs`.)
 2. `tmux_runtime::create_session()` fails fast if `cwd` is missing —
-   worker can detect this and bail to leader without losing the
+   runner can detect this and bail to hub without losing the
    message.
 3. `sessions.instance_id` already pins each session to the spawn
    node; cross-node identity is a routing concern, not a schema gap.
@@ -197,7 +197,7 @@ CREATE TABLE IF NOT EXISTS intake_outbox (
     status            TEXT NOT NULL DEFAULT 'pending',
     claim_owner       TEXT,           -- echoes target_instance_id once claimed
     claimed_at        TIMESTAMPTZ,    -- claim transition
-    accepted_at       TIMESTAMPTZ,    -- worker accepted (after ALL retryable validation)
+    accepted_at       TIMESTAMPTZ,    -- runner accepted (after ALL retryable validation)
     spawned_at        TIMESTAMPTZ,    -- tmux session created
     completed_at      TIMESTAMPTZ,
     last_error        TEXT,
@@ -249,17 +249,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS intake_outbox_one_open_route_per_channel
     ON intake_outbox (channel_id)
     WHERE status IN ('pending', 'claimed', 'accepted', 'spawned');
 
--- Worker poll: only own target.
-CREATE INDEX IF NOT EXISTS idx_intake_outbox_worker_pending
+-- Runner poll: only own target.
+CREATE INDEX IF NOT EXISTS idx_intake_outbox_runner_pending
     ON intake_outbox (target_instance_id, status, created_at)
     WHERE status = 'pending';
 
--- Leader sweep: stale claims that never reached `accepted`.
+-- Hub sweep: stale claims that never reached `accepted`.
 CREATE INDEX IF NOT EXISTS idx_intake_outbox_pre_accept_sweep
     ON intake_outbox (status, claimed_at)
     WHERE status = 'claimed';
 
--- Round-3 P0 #2: leader sweep for `failed_pre_accept` rows that
+-- Round-3 P0 #2: hub sweep for `failed_pre_accept` rows that
 -- still have retry budget. Autonomous capability-aware selection is enforce-only,
 -- recency-bounded, and rechecks required labels plus stamped owner generations.
 CREATE INDEX IF NOT EXISTS idx_intake_outbox_failed_pre_accept_sweep
@@ -291,7 +291,7 @@ CREATE TRIGGER trg_intake_outbox_touch_updated_at
     FOR EACH ROW EXECUTE FUNCTION intake_outbox_touch_updated_at();
 ```
 
-**Column note: no Discord token in the outbox.** The worker loads
+**Column note: no Discord token in the outbox.** The runner loads
 its own bot token via `credential::read_bot_token()` at startup;
 nothing token-shaped is ever serialized into PG.
 
@@ -306,11 +306,11 @@ cross-node routing (see "Pending uploads" below).
 Every transition is a **compare-and-set** UPDATE. The DB-level CHECK
 constraint above blocks illegal terminal status values; the WHERE
 clauses below enforce legal *transitions*. Sweeps use
-`FOR UPDATE SKIP LOCKED` so concurrent leader/worker sweeps never
+`FOR UPDATE SKIP LOCKED` so concurrent hub/runner sweeps never
 contend.
 
 ```sql
--- 1. Leader: insert a forwarded intake. The partial unique index
+-- 1. Hub: insert a forwarded intake. The partial unique index
 --    blocks a second open row per channel.
 INSERT INTO intake_outbox (
     target_instance_id, forwarded_by_instance_id, required_labels,
@@ -321,10 +321,10 @@ INSERT INTO intake_outbox (
 ) VALUES (..., 'pending')
 -- ON CONFLICT (channel_id) WHERE status IN ('pending','claimed',
 --   'accepted','spawned') is not directly expressible; instead we
--- catch the unique-violation in the leader path and re-evaluate.
+-- catch the unique-violation in the hub path and re-evaluate.
 ;
 
--- 2. Worker: claim a pending row addressed to me. Single row, locked.
+-- 2. Runner: claim a pending row addressed to me. Single row, locked.
 SELECT id, channel_id, user_msg_id, ... -- full payload
   FROM intake_outbox
  WHERE target_instance_id = $local
@@ -343,11 +343,11 @@ UPDATE intake_outbox
 RETURNING id;
 -- If RETURNING is empty, somebody else won. Re-poll.
 
--- 3. Worker: accept (only after every retryable validation
+-- 3. Runner: accept (only after every retryable validation
 --    succeeds: cwd present, agent workspace ready, etc.).
 --    Accepting AFTER any user-visible side effect (placeholder
 --    POST, mailbox enqueue, reaction add) is forbidden — see
---    §"Worker-side state machine details" for ordering.
+--    §"Runner-side state machine details" for ordering.
 UPDATE intake_outbox
    SET status = 'accepted',
        accepted_at = NOW()
@@ -356,7 +356,7 @@ UPDATE intake_outbox
    AND claim_owner = $local
 RETURNING id;
 
--- 4. Worker: spawned (tmux session created, turn_bridge attached).
+-- 4. Runner: spawned (tmux session created, turn_bridge attached).
 UPDATE intake_outbox
    SET status = 'spawned',
        spawned_at = NOW()
@@ -365,7 +365,7 @@ UPDATE intake_outbox
    AND claim_owner = $local
 RETURNING id;
 
--- 5. Worker: terminal success.
+-- 5. Runner: terminal success.
 UPDATE intake_outbox
    SET status = 'done',
        completed_at = NOW()
@@ -374,9 +374,9 @@ UPDATE intake_outbox
    AND claim_owner = $local
 RETURNING id;
 
--- 6a. Worker: pre-accept retryable failure (cwd missing, workspace
+-- 6a. Runner: pre-accept retryable failure (cwd missing, workspace
 --     unprovisioned, transient DB / token issue before any
---     user-visible side effect). Leader sweep can spawn a fresh
+--     user-visible side effect). Hub sweep can spawn a fresh
 --     attempt via transition 10 (capped by max_attempts_per_message).
 UPDATE intake_outbox
    SET status = 'failed_pre_accept',
@@ -387,9 +387,9 @@ UPDATE intake_outbox
    AND claim_owner = $local
 RETURNING id, retry_count;
 
--- 6b. Worker: post-accept terminal failure (turn execution failure
+-- 6b. Runner: post-accept terminal failure (turn execution failure
 --     after we already posted a placeholder / changed user-visible
---     state). Leader sweep does NOT auto-retry. Manual via CLI.
+--     state). Hub sweep does NOT auto-retry. Manual via CLI.
 UPDATE intake_outbox
    SET status = 'failed_post_accept',
        last_error = $2,
@@ -399,10 +399,10 @@ UPDATE intake_outbox
    AND claim_owner = $local
 RETURNING id;
 
--- 7. Leader: pre-claim takeover. Re-target to leader's own
+-- 7. Hub: pre-claim takeover. Re-target to hub's own
 --    instance_id; reset claim metadata. Bound by retry_count.
 UPDATE intake_outbox
-   SET target_instance_id = $local_leader,
+   SET target_instance_id = $local_hub,
        claim_owner = NULL,
        claimed_at = NULL,
        retry_count = retry_count + 1,
@@ -414,7 +414,7 @@ UPDATE intake_outbox
    AND created_at < NOW() - ($pre_claim_timeout * INTERVAL '1 second')
 RETURNING id;
 
--- 8. Leader: stale-claim recovery (worker died after claim, before
+-- 8. Hub: stale-claim recovery (runner died after claim, before
 --    accept). The claim was BEFORE any user-visible side effect, so
 --    re-pinging is safe.
 UPDATE intake_outbox
@@ -430,7 +430,7 @@ UPDATE intake_outbox
    AND retry_count < $max_retries
 RETURNING id;
 
--- 9. Leader: retry-budget exhausted while still in pre-accept
+-- 9. Hub: retry-budget exhausted while still in pre-accept
 --    statuses. Mark as terminal failure (still pre-accept means no
 --    user-visible state change occurred; CLI can request a fresh
 --    attempt via transition 10).
@@ -444,7 +444,7 @@ UPDATE intake_outbox
    AND status IN ('pending', 'claimed')
 RETURNING id;
 
--- 10. Leader sweep / CLI: spawn a fresh attempt from a terminal
+-- 10. Hub sweep / CLI: spawn a fresh attempt from a terminal
 --     failed_pre_accept row. Round-3 P0 #2 fix: prose said
 --     failed_pre_accept was retryable but no SQL transitioned it.
 --
@@ -496,7 +496,7 @@ INSERT INTO intake_outbox (
     attempt_no, parent_outbox_id, retry_count
 )
 SELECT
-    $local_leader, $local_leader, required_labels,
+    $local_hub, $local_hub, required_labels,
     channel_id, user_msg_id, request_owner_id, request_owner_name,
     user_text, reply_context, has_reply_boundary, dm_hint, turn_kind,
     merge_consecutive, reply_to_user_message, defer_watcher_resume,
@@ -554,7 +554,7 @@ INSERT INTO intake_outbox (
     wait_for_completion, agent_id, status,
     attempt_no, parent_outbox_id, retry_count
 )
-SELECT $local_leader, $local_leader, required_labels,
+SELECT $local_hub, $local_hub, required_labels,
        channel_id, user_msg_id, request_owner_id, request_owner_name,
        user_text, reply_context, has_reply_boundary, dm_hint, turn_kind,
        merge_consecutive, reply_to_user_message, defer_watcher_resume,
@@ -567,7 +567,7 @@ RETURNING id, attempt_no;
 
 COMMIT;
 
--- 11. Leader sweep: SLA on `accepted` not reaching `spawned`.
+-- 11. Hub sweep: SLA on `accepted` not reaching `spawned`.
 --     Round-3 P1 #3: `accepted` should normally last seconds. If
 --     >`accepted_unspawned_sla_secs` (default 120s) without a
 --     `spawned_at`, surface as a fast operator alert; the row stays
@@ -656,15 +656,15 @@ that attempt; the next attempt is a new row with `parent_outbox_id`
 linking it to the previous one. Operators reading the audit chain
 (via the `idx_intake_outbox_parent` index) see the full history of
 "this user message was forwarded to mac-book, failed cwd validation,
-retried as attempt 2 on leader, succeeded."
+retried as attempt 2 on hub, succeeded."
 
 #### C. Config: `cluster.intake_routing`
 
 ```yaml
 cluster:
   intake_routing:
-    # Hard kill switch. Leave false until worker nodes have been restarted
-    # with the intake worker consumer enabled at least once.
+    # Hard kill switch. Leave false until runner nodes have been restarted
+    # with the intake runner consumer enabled at least once.
     enabled: true
     # observe: emit decision events but do NOT INSERT outbox rows.
     # enforce: actually forward.
@@ -675,13 +675,13 @@ cluster:
     owner_authority_channel_ids:
       - "123456789012345678"
     # Pre-claim takeover threshold. After this many seconds without
-    # reaching `claimed` (= worker SELECT FOR UPDATE), leader atomically
+    # reaching `claimed` (= runner SELECT FOR UPDATE), hub atomically
     # retires the pending row under the channel advisory lock, then runs
     # locally. Fresh pending and spawned/accepted rows are NEVER stolen.
     forward_pre_claim_timeout_secs: 12
     # Stale claim recovery. After this many seconds in 'claimed'
     # without reaching 'accepted', re-mark pending so another node
-    # can pick up. Tuned > worker startup grace.
+    # can pick up. Tuned > runner startup grace.
     stale_claim_recovery_secs: 60
 ```
 
@@ -703,12 +703,12 @@ fail-safe at the admission boundary.
 
 Operational reload note: `owner_authority_channel_ids` is read from the runtime
 config snapshot for every intake decision, so allowlist edits are reflected by
-planner telemetry without a restart. Worker consumers are spawned when the effective mode
+planner telemetry without a restart. Runner consumers are spawned when the effective mode
 is `observe` or `enforce`. Start from `enabled: true, mode: "observe"` and
 restart once to put consumers on standby; then observe→enforce rollback/promote
 changes are read by the hook and `/node` from the runtime config snapshot. A
-disabled→enabled rollout should be treated as restart-required so workers are
-definitely present before the leader inserts outbox rows.
+disabled→enabled rollout should be treated as restart-required so runners are
+definitely present before the hub inserts outbox rows.
 
 Future outbox-sweep tunables still tracked by this design but not part of the
 #3749 runtime authority yet:
@@ -733,14 +733,14 @@ cluster:
 
 We deliberately **drop `default_preferred_labels`** (codex round-1
 recommendation): cluster-wide preference would route ALL agents'
-intake to a worker, which is too coarse for the rollout. Per-agent
+intake to a runner, which is too coarse for the rollout. Per-agent
 opt-in only.
 
 ### Decision flow
 
 ```
                         ┌──────────────────────────────────┐
-       Discord intake → │ leader: central intake admission │
+       Discord intake → │ hub: central intake admission │
                         └─────────────┬────────────────────┘
                                       ▼
                   ┌───────────────────────────────────────┐
@@ -749,7 +749,7 @@ opt-in only.
                                   ▼
         ┌─────────────────────────────────────────────────────┐
         │ resolve_intake_target(agent, session, cluster_cfg, │
-        │                       local_instance, workers)     │
+        │                       local_instance, runners)     │
         └────────────────────┬────────────────────────────────┘
                              ▼
             ┌───────────────────────────────────┐
@@ -758,7 +758,7 @@ opt-in only.
             └───────────────────────────────────┘
                              OR
             ┌───────────────────────────────────────────────┐
-            │ target == ForwardToWorker { instance_id, ... }:
+            │ target == ForwardToRunner { instance_id, ... }:
             │   if cluster.mode == observe:                 │
             │     emit `intake_routing_decision` event only │
             │     and continue local handling               │
@@ -768,7 +768,7 @@ opt-in only.
             │       OPEN = status IN ('pending','claimed',   │
             │       'accepted','spawned'). Round-3 P1 #4 fix.│
             │     INSERT INTO intake_outbox (target_instance │
-            │       _id = worker, status='pending',          │
+            │       _id = runner, status='pending',          │
             │       attempt_no = 1, parent_outbox_id = NULL).│
             │       Partial unique index is the durable      │
             │       guard; advisory lock is liveness only.   │
@@ -778,7 +778,7 @@ opt-in only.
             │     no turn spawn locally                      │
             └───────────────────────────────────────────────┘
 
-                  Worker (mac-book) polling loop:
+                  Runner (mac-book) polling loop:
                     SELECT id FROM intake_outbox
                      WHERE target_instance_id = $local AND status='pending'
                      ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
@@ -786,8 +786,8 @@ opt-in only.
                        claimed_at=NOW() (transition 2)
                     → validate cwd / agent workspace exists
                        on failure: status='failed_pre_accept' (transition 6a);
-                                   leader sweep transition 10 spawns
-                                   a fresh attempt on leader
+                                   hub sweep transition 10 spawns
+                                   a fresh attempt on hub
                     → UPDATE status='accepted', accepted_at=NOW()
                        (transition 3 — only after ALL retryable
                         validation done, before any user-visible
@@ -811,35 +811,35 @@ c) Live serenity event handle wiring
 d) REST-safe operations (post placeholder, edit reaction, mailbox
    enqueue, turn spawn, dispatched session lifecycle)
 
-The forwardable subset is (a)+(d). Worker has no (b)/(c).
+The forwardable subset is (a)+(d). Runner has no (b)/(c).
 
 **Refactor strategy** (Phase 2-pre, see implementation phases):
 
 1. Audit `handle_text_message` for every direct use of
    `serenity::Context`. Each call site classifies as either
    "REST equivalent exists" (replaceable with `serenity::http::Http`)
-   or "true gateway dependency" (must stay leader-side).
+   or "true gateway dependency" (must stay hub-side).
 2. Extract `execute_intake_turn_core(deps: IntakeDeps, payload: IntakePayload) -> Result<()>`,
    where `IntakeDeps` carries only what the REST-safe path needs:
    `Arc<serenity::http::Http>`, `Arc<SharedData>`, provider, token,
    PG pool, instance_id.
-3. Every leader producer builds an owned `IntakeSubmission` and calls the
+3. Every hub producer builds an owned `IntakeSubmission` and calls the
    central admission module. Only its non-constructible local permit can enter
    the private `handle_text_message` body; forwarded, duplicate, blocked, and
    deferred outcomes never execute locally.
-4. Worker's `handle_forwarded_intake` builds `IntakeDeps` from its own
+4. Runner's `handle_forwarded_intake` builds `IntakeDeps` from its own
    gateway-less HTTP client + bot token and calls `execute_intake_turn_core`
    directly. This post-claim boundary is the intentional admission bypass, so
-   a worker cannot recursively create another outbox row.
+   a runner cannot recursively create another outbox row.
 
 This refactor PR ships independently and is verified by all
-existing intake tests passing on the leader path.
+existing intake tests passing on the hub path.
 
 If the audit finds a true gateway dependency in the intake path that
 cannot be REST-replaced (e.g. live presence subscription), we
 either:
-- a) keep that logic leader-side and have the worker emit a PG row
-  asking leader to perform that side effect, or
+- a) keep that logic hub-side and have the runner emit a PG row
+  asking hub to perform that side effect, or
 - b) declare the affected feature unsupported on forwarded intakes
   and prove no current agent uses it.
 
@@ -850,7 +850,7 @@ Whichever applies will be documented as part of the Phase 2-pre PR.
 ```rust
 enum IntakeTarget {
     Local,
-    ForwardToWorker {
+    ForwardToRunner {
         instance_id: String,    // codex blocker 2: instance-locked
         labels_at_decision: Vec<String>,
             // diagnostics only; claim does not match on labels
@@ -870,48 +870,48 @@ Decision tree (evaluation order is important):
    live foreign owner is forwarded to that exact instance. The owner
    wins over `/node` and preferred labels.
 4. **Stale/conflicting-owner guard**: an owner missing a fresh,
-   provider-capable worker advertisement, or two live owners, blocks
+   provider-capable runner advertisement, or two live owners, blocks
    intake. It never falls through to local or preference placement;
    only an explicit session stop/clear makes a new placement safe.
 5. **Text-only routed pilot**: raw attachments or queued `pending_uploads`
    carry gateway-local filesystem paths, not portable references. Any decision
    that would route to a foreign live owner, explicit `/node` target, or
-   preferred-label worker blocks before an outbox insert. A local live owner
+   preferred-label runner blocks before an outbox insert. A local live owner
    may handle an upload locally. If no foreign route is selected (for example,
-   no eligible worker or no preference), normal local intake behavior remains
+   no eligible runner or no preference), normal local intake behavior remains
    unchanged; this pilot does not make attachments portable across nodes.
 6. **Explicit `/node`**: only after owner lookup proves `NoOwner`.
    An unavailable explicit target blocks rather than silently falling
    through. `/node` does not migrate an existing tmux session.
 7. **Per-agent preference**: `agents.preferred_intake_node_labels`
-   non-empty → match against online fresh workers. If local matches
-   → `Local`. If a foreign worker matches → forward.
+   non-empty → match against online fresh runners. If local matches
+   → `Local`. If a foreign runner matches → forward.
 8. **No match** → `Local` (safe because owner lookup proved no owner).
 
 ### Per-channel ordering lock (codex round-2 P1 #5)
 
 The DB-level partial unique index from §B is the **durable**
 guarantee — only one open route per channel exists at any time. The
-advisory lock is a **liveness aid** that lets concurrent leader
+advisory lock is a **liveness aid** that lets concurrent hub
 inserts serialize cleanly instead of all but one failing with
 unique-violation.
 
 **Critical-section discipline**: the advisory lock window must be
-small. All slow lookups (worker_nodes label match, session
+small. All slow lookups (cluster_nodes label match, session
 inspection, decision evaluation) happen *outside* the transaction.
-Inside the locked transaction the leader only:
+Inside the locked transaction the hub only:
 
 1. Re-reads the current open route for the channel (single indexed
    SELECT against the partial unique index).
-2. Re-validates the chosen worker is still online + fresh.
+2. Re-validates the chosen runner is still online + fresh.
 3. INSERTs the new row, or no-ops if an open route already points
    at the same target.
 
 ```rust
-// Pseudocode for the leader insert path.
+// Pseudocode for the hub insert path.
 // Pre-computed outside the txn (no lock).
 let candidate_target = resolve_intake_target(...).await?;
-let worker_snapshot   = load_eligible_workers().await?;
+let runner_snapshot   = load_eligible_runners().await?;
 
 // Short critical section.
 let mut tx = pool.begin().await?;
@@ -925,7 +925,7 @@ match (existing_open, candidate_target) {
     // delivery of the same Discord event we already routed.
     // Different user_msg_id on the same channel must NOT be silently
     // dropped here.
-    (Some(open), ForwardToWorker { instance_id, .. })
+    (Some(open), ForwardToRunner { instance_id, .. })
         if open.target_instance_id == instance_id
             && open.user_msg_id == new_msg.user_msg_id => {
         /* idempotent retransmission: do nothing */
@@ -935,8 +935,8 @@ match (existing_open, candidate_target) {
     // Running it locally would split ordering and possibly the tmux.
     (Some(open), _) => return Ok(IntakeOutcome::DeferredOpenRoute(open.target_instance_id)),
     // Fresh channel: insert.
-    (None, ForwardToWorker { instance_id, .. })
-        if still_eligible(&worker_snapshot, &instance_id) => {
+    (None, ForwardToRunner { instance_id, .. })
+        if still_eligible(&runner_snapshot, &instance_id) => {
         insert_outbox_row(&mut tx, ...).await?;
     }
     _ => return Ok(IntakeOutcome::Local),
@@ -954,15 +954,15 @@ index is correctness; the advisory lock is to avoid log noise from
 unique-violation rollback under burst load. Either alone is
 sufficient for correctness.
 
-### Worker-side state machine details (codex blocker 3 + round-2 P0 #2)
+### Runner-side state machine details (codex blocker 3 + round-2 P0 #2)
 
 ```
-pending ──worker SELECT FOR UPDATE──▶ claimed ──validation OK──▶ accepted ──tmux──▶ spawned ──turn end──▶ done
+pending ──runner SELECT FOR UPDATE──▶ claimed ──validation OK──▶ accepted ──tmux──▶ spawned ──turn end──▶ done
    │                                     │                          │                  │
    │                                     │ validation FAIL          │ run FAIL         │ run FAIL
    │                                     ▼                          ▼                  ▼
-   │   ┌── leader pre-claim takeover  failed_pre_accept     failed_post_accept   failed_post_accept
-   │   │   (re-target to leader,           (retryable)          (terminal/manual)
+   │   ┌── hub pre-claim takeover  failed_pre_accept     failed_post_accept   failed_post_accept
+   │   │   (re-target to hub,           (retryable)          (terminal/manual)
    │   │   bump retry, stay pending)
    │
    ▼
@@ -971,19 +971,19 @@ pending (retried)
 
 **Critical invariant** (round-2 P0 #2 fix): `accepted` is reached
 **only after all retryable validations succeed AND before any
-user-visible side effect**. Concretely, the worker performs in
+user-visible side effect**. Concretely, the runner performs in
 order:
 
 1. Validate cwd / agent workspace exists.
 2. Validate any agent-specific preconditions (provider runtime
    reachable, CLI binary present, tmux available).
 3. Atomically transition `claimed → accepted` via the SQL in §B-bis.
-4. **Only after `accepted`** does the worker call
+4. **Only after `accepted`** does the runner call
    `execute_intake_turn_core`, which posts placeholders, edits
    reactions, enqueues mailbox, etc.
 
 This ordering means `failed_pre_accept` rows never have associated
-user-visible state, so leader sweep can safely re-target them
+user-visible state, so hub sweep can safely re-target them
 without duplicating anything.
 
 Conversely, if any failure happens *after* the accepted transition,
@@ -991,27 +991,27 @@ it's `failed_post_accept` and is terminal until an operator
 explicitly intervenes via CLI.
 
 **Pre-claim phase** (`pending`):
-- Pre-claim takeover by leader IS allowed after
-  `forward_pre_claim_timeout_secs` (default 12s). Leader rewrites
-  `target_instance_id = local_leader_id`, leaves `status='pending'`,
-  bumps `retry_count`. Leader's own poll then claims it.
+- Pre-claim takeover by hub IS allowed after
+  `forward_pre_claim_timeout_secs` (default 12s). Hub rewrites
+  `target_instance_id = local_hub_id`, leaves `status='pending'`,
+  bumps `retry_count`. Hub's own poll then claims it.
 - Bounded by `max_retries` (default 3); on exhaustion, transition
   9 in §B-bis promotes to `failed_pre_accept` for operator action.
 
 **Claimed phase** (`claimed`):
-- Worker has SELECTed FOR UPDATE and UPDATEd to claimed.
-- Worker now runs the validation steps above. **No user-visible
+- Runner has SELECTed FOR UPDATE and UPDATEd to claimed.
+- Runner now runs the validation steps above. **No user-visible
   side effects yet.**
 - If validation fails → transition 6a → `failed_pre_accept`.
-- If worker dies before reaching `accepted` (process kill, panic
-  in validation), `claimed_at` becomes stale → leader sweep
+- If runner dies before reaching `accepted` (process kill, panic
+  in validation), `claimed_at` becomes stale → hub sweep
   (`stale_claim_recovery_secs`, default 60s) → transition 8 resets
   to `pending`.
 
 **Accepted phase** (`accepted`):
-- Worker has validated everything that can be validated cheaply and
+- Runner has validated everything that can be validated cheaply and
   is about to begin user-visible work. **No other node may UPDATE
-  this row's status until the worker writes `spawned`,
+  this row's status until the runner writes `spawned`,
   `done`, or `failed_post_accept`** — auto-retry forbidden.
 - Round-3 P1 #3 fast SLA: a row stuck in `accepted` past
   `accepted_unspawned_sla_secs` (default 120s) without
@@ -1023,14 +1023,14 @@ explicitly intervenes via CLI.
 - Tmux session created, turn_bridge running.
 - Completion callback writes `done`; panic / process death leaves
   `spawned` indefinitely. A row stuck in `spawned` past 24h with
-  no completion triggers a slow operator alert (worker-side panic
+  no completion triggers a slow operator alert (runner-side panic
   suspected). Same CLI tooling as `accepted` stuck.
 
 **Failure terminals**:
-- `failed_pre_accept`: retry-eligible. **Leader sweep applies
+- `failed_pre_accept`: retry-eligible. **Hub sweep applies
   transition 10 to INSERT a fresh attempt** with `attempt_no =
   family_max + 1`, `parent_outbox_id` linked, `target_instance_id =
-  local_leader`. Capped by `max_attempts_per_message`. Transitions
+  local_hub`. Capped by `max_attempts_per_message`. Transitions
   7 and 8 only operate on still-OPEN rows (`pending`/`claimed`)
   and are unrelated to `failed_pre_accept` recovery — round-3 P0
   fix added transition 10 specifically for that lane. CLI
@@ -1043,15 +1043,15 @@ explicitly intervenes via CLI.
 
 **Why this split matters**: under v2 a single `failed` status
 created the contradiction codex flagged — the doc allowed retry
-after worker death (in flight cwd validation) but forbade it after
+after runner death (in flight cwd validation) but forbade it after
 spawn. v3 makes the boundary explicit at the schema level.
 
 ### Pending uploads (codex round-1 recommendation)
 
-If the intake message has Discord attachments, leader downloads them
+If the intake message has Discord attachments, hub downloads them
 during `handle_text_message` (today) and stores temp paths in
 `shared.pending_uploads`. **These local paths are not portable to
-worker.**
+runner.**
 
 The routed pilot is explicitly text-only. A local live owner may handle
 uploads locally. When a foreign owner, explicit `/node`, or preferred-label
@@ -1064,27 +1064,27 @@ forever. Stale/conflicting owner blocks take precedence. No local absolute uploa
 path is written to `intake_outbox`.
 
 Full attachment portability remains out of scope: either stage bytes through a
-durable object/payload store or let the worker securely re-download the Discord
+durable object/payload store or let the runner securely re-download the Discord
 CDN attachment from its canonical URL.
 
-### Worker → Discord response
+### Runner → Discord response
 
-No new component; the worker uses its own `serenity::http::Http`
+No new component; the runner uses its own `serenity::http::Http`
 client built from the locally-loaded bot token (path identical to
-leader). Existing turn-bridge output streaming, reaction toggling,
-and queued-card edits all use the worker's local Http client — no
+hub). Existing turn-bridge output streaming, reaction toggling,
+and queued-card edits all use the runner's local Http client — no
 PG hop needed for the response.
 
-### Hook semantics on the worker (codex round-1 recommendation)
+### Hook semantics on the runner (codex round-1 recommendation)
 
-For features that are leader-only by current design (e.g. some
+For features that are hub-only by current design (e.g. some
 gateway-context-dependent flow we discover during the Phase 2-pre
-audit), the worker's intake handler must NOT emit them — but only
+audit), the runner's intake handler must NOT emit them — but only
 those.
 
 **Crucially**, hooks like `OnDispatchCompleted` (the JS policy hook
 made authoritative for phase-gate state in #1980) MUST fire normally
-on the worker if the forwarded turn happens to complete a dispatch.
+on the runner if the forwarded turn happens to complete a dispatch.
 The hook is gated on the dispatch terminal write, not on whether the
 turn was forwarded. The Phase 2-pre refactor preserves this: the
 hook fires from `dispatch_status::set_dispatch_status_on_pg_with_sync`
@@ -1094,22 +1094,22 @@ which is REST-safe and identical on both sides.
 
 | Mode | Detection | Action |
 |---|---|---|
-| Worker offline (stale heartbeat) | leader-side `worker_nodes.last_heartbeat_at` check at `resolve_intake_target` | route falls through to `Local` |
-| Worker dies before claim | row stays `pending` past `forward_pre_claim_timeout_secs` (12s) | **Transition 7 is not implemented in the current runtime.** The current guard moves the stale row to `failed_pre_accept`; no local re-target/attempt INSERT occurs, and no automatic consumer currently re-drives this state. Tracked by issue #5057. |
-| Worker dies in `claimed` (cwd validation in flight) | row stuck `claimed` past `stale_claim_recovery_secs` (60s) | transition 8: leader resets to `pending`, increments retry; on exhaustion → `failed_pre_accept` + alert |
-| Worker validation fails (cwd missing, workspace unprovisioned) | worker writes `failed_pre_accept` via transition 6a | leader sweep applies transition 10 to INSERT a fresh attempt with `target_instance_id = local_leader` (linked via `parent_outbox_id`). If `attempt_no >= max_attempts_per_message`, transition 10 refuses → operator alert; further retries require `retry-as-new` via transition 12 |
-| Worker dies in `accepted` | accepted_at > `accepted_unspawned_sla_secs` (default 120s) without `spawned_at` (transition 11) | fast operator alert; **no auto recovery** (round-2 P0 #2). Operator runs `force-fail <row>` (terminal failure) or `retry-as-new <row>` (transition 12, fresh row leader-targeted) |
-| Worker dies in `spawned` | row stuck without `done` > 24h | operator alert; **no auto recovery** (round-2 P0 #2). Operator runs `force-fail <row>` (terminal failure) or `retry-as-new <row>` (fresh row, leader-targeted) |
-| Worker post-accept turn failure (provider error, panic in tmux) | worker writes `failed_post_accept` via transition 6b | terminal; operator decides via CLI |
-| Discord token revoked on worker (REST 401) | worker writes `failed_post_accept` (we already POSTed placeholder under that token) | terminal; operator rotates token + `retry-as-new` |
+| Runner offline (stale heartbeat) | hub-side `cluster_nodes.last_heartbeat_at` check at `resolve_intake_target` | route falls through to `Local` |
+| Runner dies before claim | row stays `pending` past `forward_pre_claim_timeout_secs` (12s) | **Transition 7 is not implemented in the current runtime.** The current guard moves the stale row to `failed_pre_accept`; no local re-target/attempt INSERT occurs, and no automatic consumer currently re-drives this state. Tracked by issue #5057. |
+| Runner dies in `claimed` (cwd validation in flight) | row stuck `claimed` past `stale_claim_recovery_secs` (60s) | transition 8: hub resets to `pending`, increments retry; on exhaustion → `failed_pre_accept` + alert |
+| Runner validation fails (cwd missing, workspace unprovisioned) | runner writes `failed_pre_accept` via transition 6a | hub sweep applies transition 10 to INSERT a fresh attempt with `target_instance_id = local_hub` (linked via `parent_outbox_id`). If `attempt_no >= max_attempts_per_message`, transition 10 refuses → operator alert; further retries require `retry-as-new` via transition 12 |
+| Runner dies in `accepted` | accepted_at > `accepted_unspawned_sla_secs` (default 120s) without `spawned_at` (transition 11) | fast operator alert; **no auto recovery** (round-2 P0 #2). Operator runs `force-fail <row>` (terminal failure) or `retry-as-new <row>` (transition 12, fresh row hub-targeted) |
+| Runner dies in `spawned` | row stuck without `done` > 24h | operator alert; **no auto recovery** (round-2 P0 #2). Operator runs `force-fail <row>` (terminal failure) or `retry-as-new <row>` (fresh row, hub-targeted) |
+| Runner post-accept turn failure (provider error, panic in tmux) | runner writes `failed_post_accept` via transition 6b | terminal; operator decides via CLI |
+| Discord token revoked on runner (REST 401) | runner writes `failed_post_accept` (we already POSTed placeholder under that token) | terminal; operator rotates token + `retry-as-new` |
 | PG pool/owner query unavailable in `Enforce` | central admission dependency guard | block local execution and emit a throttled operator-facing notice; retry after PG/owner visibility recovers |
 | Pending uploads on message | owner-aware admission | local owner/`NoOwner` runs local. Nonportable attachments are blocked before any outbox INSERT on foreign-owner routes **and** on `/node`/preferred-label foreign targets. A live nonportable attachment returns `Blocked`; a queued nonportable attachment (surfaced at `QueuedDrain`) is notified and terminated via `RejectedNonPortableAttachment` (consumed, **not** front-requeued) so it cannot loop |
-| Active session pinned to stale foreign worker | owner classification | block local/label fallback; operator stops/clears the old session before retry |
+| Active session pinned to stale foreign runner | owner classification | block local/label fallback; operator stops/clears the old session before retry |
 | Single-PG-primary assumption violated | startup self-check at boot | refuse to start with intake_routing.enabled=true; log error |
 | Two same-channel forward attempts (round-2 P0 #1) | partial unique index `intake_outbox_one_open_route_per_channel` | same `(channel_id, user_msg_id)` is an idempotent skip; a distinct message returns `DeferredOpenRoute` and is preserved/retried, never executed locally |
-| Two leader instances both decide to forward (e.g. failover transition) | partial unique index | same as above; only one wins |
-| `observe → enforce` flip mid-flight | leader snapshots config inside the short insert transaction | inserts that began under `observe` complete locally; first insert under `enforce` writes a row |
-| `enforce → observe` rollback (incident) | leader snapshots config; new intakes go `Local` | already-inserted rows in `pending`/`claimed` continue per the state machine — they are not cancelled by config flip. Operator may run `force-fail` to drain. `accepted`/`spawned` rows always finish on the worker. |
+| Two hub instances both decide to forward (e.g. failover transition) | partial unique index | same as above; only one wins |
+| `observe → enforce` flip mid-flight | hub snapshots config inside the short insert transaction | inserts that began under `observe` complete locally; first insert under `enforce` writes a row |
+| `enforce → observe` rollback (incident) | hub snapshots config; new intakes go `Local` | already-inserted rows in `pending`/`claimed` continue per the state machine — they are not cancelled by config flip. Operator may run `force-fail` to drain. `accepted`/`spawned` rows always finish on the runner. |
 
 The general principle: **never let a forwarded intake make the user
 wait longer than they would have without forwarding, and never run
@@ -1125,13 +1125,13 @@ failures). New event types:
   - agent_id, channel_id, target_instance_id (forward only)
   - reason: `kill_switch` | `single_node` | `pending_uploads` | `affinity_match` | `stale_affinity_fallback` | `agent_preference_match` | `no_label_match`
 
-- `intake_forward_claimed` — worker → leader visibility
-- `intake_forward_accepted` — worker has validated and started
+- `intake_forward_claimed` — runner → hub visibility
+- `intake_forward_accepted` — runner has validated and started
 - `intake_forward_spawned` — turn_bridge attached
 - `intake_forward_completed` — terminal status (done | failed)
-- `intake_forward_recovery` — leader sweep took over a stale row
+- `intake_forward_recovery` — hub sweep took over a stale row
   (with reason: `pre_claim_timeout` | `stale_claim` | `cwd_missing` |
-  `worker_failed`)
+  `runner_failed`)
 
 Daily aggregation gives operators a per-agent latency / fallback
 rate that drives Phase 7 promotion decisions.
@@ -1148,12 +1148,12 @@ Discord operator alerts (24h dedupe, mirror of #1994's
   (default 120s) without `spawned_at` — round-3 P1 #3 fast-SLA
   detector. Auto-retry forbidden, so the alert IS the recovery
   signal.
-- A row stays in `spawned` past 24h without `done` (worker-side
+- A row stays in `spawned` past 24h without `done` (runner-side
   panic suspected).
 
 ## Implementation phases
 
-Each phase ships as its own PR and merges independently. The leader
+Each phase ships as its own PR and merges independently. The hub
 hook is **gated behind the effective `cluster.intake_routing` mode**.
 Absent config defaults to disabled; once `enabled=true`, the mode default is
 `observe` so Phase 4 emits decisions but does not actually forward until the
@@ -1232,26 +1232,26 @@ for queued-turn dispatch with that same live context.
   - **REST-replaceable** (e.g. `ctx.http`-driven attachment download,
     user lookup): swap to `deps.http`.
   - **Gateway-only** (e.g. live presence): list with file:line and
-    decide per call site whether to (a) split into a leader-side
+    decide per call site whether to (a) split into a hub-side
     companion call invoked over PG, or (b) declare the dependent
     feature unsupported on forwarded intakes (with proof no current
     agent uses it).
 - Update the recursive callback at `gateway.rs:495` to take
   `IntakeDeps` instead of `LiveDiscordTurnContext`.
-- Still no behaviour change for the leader; tests must pass.
+- Still no behaviour change for the hub; tests must pass.
 
-#### Phase 2-pre.3 — Worker-callable surface
+#### Phase 2-pre.3 — Runner-callable surface
 - Extract `execute_intake_turn_core(deps: IntakeDeps, payload: IntakePayload) -> Result<()>`.
-- Leader's `handle_text_message` becomes a wrapper that builds
+- Hub's `handle_text_message` becomes a wrapper that builds
   `IntakeDeps` from `serenity::Context` and `IntakePayload` from
   the message + reaction state, then calls the core.
-- Worker's later `handle_forwarded_intake` (Phase 3) builds
+- Runner's later `handle_forwarded_intake` (Phase 3) builds
   `IntakeDeps` from its local HTTP client and `IntakePayload` from
   the deserialized outbox row.
 - **Still no Phase 4 routing hook**; Phase 2-pre.3 only provides
   the callable surface.
 
-Each sub-phase merges independently; tests for the leader intake
+Each sub-phase merges independently; tests for the hub intake
 path must pass after each. Phase 2 (routing primitives) does not
 depend on 2-pre.3 specifically — it can ship in parallel with
 2-pre.1/2 since it touches different files.
@@ -1275,19 +1275,19 @@ depend on 2-pre.3 specifically — it can ship in parallel with
   branches of the state machine; PG tests on outbox claim,
   state transitions, advisory lock contention.
 
-### Phase 3 — Worker polling loop
-- `src/services/intake_outbox/worker_loop.rs` — poll-claim-handle
+### Phase 3 — Runner polling loop
+- `src/services/intake_outbox/runner_loop.rs` — poll-claim-handle
   pattern matching `dispatch_outbox_loop`. Adaptive 500ms→5s backoff.
-- Worker invokes `handle_forwarded_intake()` which builds
+- Runner invokes `handle_forwarded_intake()` which builds
   `IntakeDeps` from its local HTTP client and calls
   `execute_intake_turn_core` from Phase 2-pre.
-- Leader also runs the loop (for pre-claim takeover and stale
+- Hub also runs the loop (for pre-claim takeover and stale
   recovery sweep).
 - Tests: PG-backed test stages a row, runs one poll iteration,
   verifies state transitions and that a mock REST handler runs.
 
-### Phase 4 — Leader hook in `observe` mode
-- Insert `resolve_intake_target` call into the leader-side
+### Phase 4 — Hub hook in `observe` mode
+- Insert `resolve_intake_target` call into the hub-side
   `handle_text_message` after session-load, before mailbox enqueue.
 - In `observe` mode, emit `intake_routing_decision` event and continue
   local handling. **No outbox row is INSERTed; no behaviour change
@@ -1298,11 +1298,11 @@ depend on 2-pre.3 specifically — it can ship in parallel with
 - Operators run for 1 week minimum to confirm decision distribution
   matches expectations before any flip.
 
-### Phase 5 — Leader hook in `enforce` mode + ops surface
+### Phase 5 — Hub hook in `enforce` mode + ops surface
 - Flip `cluster.intake_routing.mode` to `enforce` after Phase 4
   observation. (Config-only change; no code change.)
 - Add operator CLI (`agentdesk cluster intake_routing <subcmd>`):
-  - `status` — current mode, per-agent labels, eligible workers,
+  - `status` — current mode, per-agent labels, eligible runners,
     recent decision distribution, in-flight outbox row counts per
     state.
   - `outbox-status [--channel <id>] [--state <s>]` — list outbox
@@ -1317,7 +1317,7 @@ depend on 2-pre.3 specifically — it can ship in parallel with
     only (no user-visible state change occurred). Runs SQL
     transition 10 in §B-bis: INSERTs a fresh row with
     `attempt_no = MAX + 1`, `parent_outbox_id = $row_id`,
-    `target_instance_id = local_leader`, `status = 'pending'`.
+    `target_instance_id = local_hub`, `status = 'pending'`.
     Refuses if the source row is `pending`/`claimed` (use
     `force-fail` first), `accepted`/`spawned` (use `retry-as-new`),
     or already `done`. Refuses if `attempt_no >=
@@ -1329,7 +1329,7 @@ depend on 2-pre.3 specifically — it can ship in parallel with
        if already terminal).
     2. INSERTs a fresh row with `attempt_no = family_max + 1`
        linked via `parent_outbox_id`, `target_instance_id =
-       local_leader`, `status='pending'`.
+       local_hub`, `status='pending'`.
     Within the transaction's unique-index check, the INSERT sees
     the source row's prior UPDATE (out of the OPEN partial index
     predicate) before evaluating the new row, so the constraint
@@ -1355,17 +1355,17 @@ For incident response when `enforce` mode causes problems:
    `ADK_INTAKE_ROUTING_MODE=observe` as an emergency override. Confirm
    `/api/health.intake_routing.mode == "observe"` and inspect `source`
    (`yaml` or `env_override`) before sending more traffic.
-2. New intakes go `Local` immediately once the leader sees observe mode.
+2. New intakes go `Local` immediately once the hub sees observe mode.
    If the process was started with `cluster.intake_routing.enabled=false`,
    restart with `enabled=true, mode=observe` before later promoting back to
-   enforce so worker consumers are present.
+   enforce so runner consumers are present.
 3. **In-flight rows are NOT auto-cancelled.** State machine
    continues:
    - `pending`/`claimed` rows continue per the normal sweep flow.
-     If a worker happens to pick up a `pending` row after the
+     If a runner happens to pick up a `pending` row after the
      rollback, that's fine — it was already a forward decision
-     made under the old config and the worker is honoring it.
-   - `accepted`/`spawned` rows always finish on the worker.
+     made under the old config and the runner is honoring it.
+   - `accepted`/`spawned` rows always finish on the runner.
 4. If the operator wants to drain the in-flight queue immediately,
    the procedure is **two-step per row** (round-5 P2 #3 fix —
    `retry-local` refuses `pending`/`claimed` rows by spec):
@@ -1373,8 +1373,8 @@ For incident response when `enforce` mode causes problems:
       lists pending rows.
    b. For each row to drain: `force-fail <row_id>` (writes
       `failed_post_accept` + audit) followed by `retry-as-new <row_id>`
-      (transition 12 — fresh attempt on leader). Skip rows that
-      have already started executing on a worker (`accepted` /
+      (transition 12 — fresh attempt on hub). Skip rows that
+      have already started executing on a runner (`accepted` /
       `spawned`); they are left to finish.
 5. The flip is auditable via `intake_routing_decision` events
    showing `mode: observe` from the flip moment.
@@ -1386,7 +1386,7 @@ For incident response when `enforce` mode causes problems:
   - Outbox failure rate (alert)
   - Pre-claim takeover rate
   - Accepted-stuck rate
-  - End-to-end latency comparison vs leader-only baseline
+  - End-to-end latency comparison vs hub-only baseline
 - Roll out to other heavy agents (TAD, AD) only after ch-td baseline
   is stable.
 
@@ -1396,16 +1396,16 @@ For incident response when `enforce` mode causes problems:
 |---|---|
 | Unit (Rust) | `resolve_intake_target` decision tree (7 rules); `execute_intake_turn_core` REST-safe path under faked deps |
 | PG (Rust) | outbox INSERT with advisory lock contention; instance-locked claim; pre-claim sweep; stale-claim recovery; stale-spawned alert; state machine forward / illegal transitions |
-| Integration (Rust) | leader observe→enforce flip; observe emits decisions but no rows; enforce inserts row, worker poll picks up, mock Discord HTTP, status reaches `done`; pre-claim timeout takeover; cwd missing on worker → leader fallback |
+| Integration (Rust) | hub observe→enforce flip; observe emits decisions but no rows; enforce inserts row, runner poll picks up, mock Discord HTTP, status reaches `done`; pre-claim timeout takeover; cwd missing on runner → hub fallback |
 | Operational | `/cluster intake_routing status` matches PG truth |
-| Regression | All existing intake tests pass after Phase 2-pre refactor (leader behaviour unchanged) |
+| Regression | All existing intake tests pass after Phase 2-pre refactor (hub behaviour unchanged) |
 
 Codex high-effort review at every phase boundary.
 
 ## Rollout / kill switch
 
 - `cluster.intake_routing.enabled = false` ships as the safe default.
-  Operators opt in with `enabled=true, mode=observe`, restart once so worker
+  Operators opt in with `enabled=true, mode=observe`, restart once so runner
   consumers are present, and flip `mode` to `enforce` only after observation
   looks healthy.
 - Per-agent opt-in: `agents.preferred_intake_node_labels = '[]'` (the
@@ -1419,8 +1419,8 @@ Codex high-effort review at every phase boundary.
 
 1. **Phase 2-pre.2 audit outcome**: if the `serenity::Context` audit
    finds gateway-only call sites we cannot REST-replace, the
-   leader-side companion call route is fragile (worker → PG → leader
-   side-effect → response → worker). Alternative: declare those
+   hub-side companion call route is fragile (runner → PG → hub
+   side-effect → response → runner). Alternative: declare those
    features unsupported on forwarded intakes and require operators
    to opt-out the agent from forwarding when they need that feature.
    Decision needed before Phase 2-pre.2 lands.
@@ -1433,8 +1433,8 @@ Codex high-effort review at every phase boundary.
 
 3. **`stale_claim_recovery_secs = 60s`** vs `forward_pre_claim_timeout_secs = 12s`:
    the gap exists because cwd validation can take a few seconds on
-   a cold worker. Is 60s right, or should it be tighter (30s) given
-   our workers are usually warm?
+   a cold runner. Is 60s right, or should it be tighter (30s) given
+   our runners are usually warm?
 
 4. **Stale-spawned 24h threshold**: arbitrary. Should it be tied to
    the existing `dispatch_outbox` stale threshold (300s for stolen
@@ -1461,8 +1461,8 @@ Codex high-effort review at every phase boundary.
 9. **Same-channel different-user_msg_id during forwarded turn in
    flight**: round-4 fix returns `Local` for the late-arriving
    message (no silent drop). But this means the user's second
-   message goes to the leader while the first is still running on
-   the worker — they see two responses arriving from different
+   message goes to the hub while the first is still running on
+   the runner — they see two responses arriving from different
    nodes. Is that operationally fine, or do we need a queued-
    successor model that holds the second message until the first
    completes? Leaning toward "fine for v1; pilot data will tell."
@@ -1476,13 +1476,13 @@ Phase 1 lands.
 
 Codex identified **3 architectural blockers** in v1:
 
-1. **`handle_text_message` not worker-safe.** Worker has no
-   `cached_serenity_ctx` because IDENTIFY is leader-only. v2
+1. **`handle_text_message` not runner-safe.** Runner has no
+   `cached_serenity_ctx` because IDENTIFY is hub-only. v2
    addresses with explicit Phase 2-pre refactor extracting
    `execute_intake_turn_core(IntakeDeps, IntakePayload)`.
 
 2. **Outbox claim by labels alone is wrong.** Could let any
-   same-labeled worker claim. v2 introduces `target_instance_id` as
+   same-labeled runner claim. v2 introduces `target_instance_id` as
    the ownership key; `required_labels` becomes diagnostics.
 
 3. **Timeout stealing can duplicate live turns.** v1 had a single
@@ -1495,16 +1495,16 @@ Plus several non-blocking but adopted recommendations:
 
 - Single PG primary assumption made explicit (non-goal + startup
   self-check).
-- Stale foreign-worker affinity → fall through to `Local` rather
+- Stale foreign-runner affinity → fall through to `Local` rather
   than auto re-pick (codex's "step 4 too aggressive" point).
 - Drop `default_preferred_labels`. Per-agent opt-in only.
 - `mode: observe | enforce` for dark-launch.
 - Pre-claim timeout 5s → 12s.
-- Pending uploads stay leader-routed in v1.
+- Pending uploads stay hub-routed in v1.
 - Per-channel `pg_advisory_xact_lock` at INSERT.
 - `OnDispatchCompleted` and similar dispatch-completion hooks fire
-  normally on worker; only true gateway-context features get
-  worker-side suppression after the Phase 2-pre audit.
+  normally on runner; only true gateway-context features get
+  runner-side suppression after the Phase 2-pre audit.
 
 ---
 
@@ -1541,7 +1541,7 @@ addresses:
    lines and has a recursive callback from `gateway.rs:495` that
    hard-requires `LiveDiscordTurnContext`. v3 splits Phase 2-pre
    into 3 sub-phases (dependency extraction → REST-only refactor →
-   worker-callable surface).
+   runner-callable surface).
 
 5. **Advisory lock scope**: v3 specifies pre-computation outside the
    transaction; lock window contains only the open-route re-read +
@@ -1551,7 +1551,7 @@ addresses:
    `retry-local` (pre-accept guarded), and `retry-as-new` (operator
    confirms idempotency).
 
-7. **`observe → enforce` flip semantics**: v3 specifies leader
+7. **`observe → enforce` flip semantics**: v3 specifies hub
    snapshots config inside the short insert transaction; rollback
    procedure documented in Phase 5.
 
@@ -1561,7 +1561,7 @@ addresses:
   third-party tools.
 - Schema preserves operator-runnable plain SQL (no SQL functions).
 - Round-2 P2 (no distributed barrier needed for `observe→enforce`
-  if workers don't interpret mode) accepted as-is.
+  if runners don't interpret mode) accepted as-is.
 
 ---
 
@@ -1583,7 +1583,7 @@ addresses:
 
 ### P1 issues
 
-2. **`failed_pre_accept` retry SQL gap**: prose said leader sweep
+2. **`failed_pre_accept` retry SQL gap**: prose said hub sweep
    could re-pick `failed_pre_accept`, but transitions 7/8 only
    operated on `pending`/`claimed`. v4 adds transition 10 as the
    missing CAS link, gated by `max_attempts_per_message`.
@@ -1594,7 +1594,7 @@ addresses:
    the alert IS the recovery signal.
 
 4. **Stale prose alignment**: the decision-flow diagram and the
-   worker polling pseudocode still referenced `status='failed'`
+   runner polling pseudocode still referenced `status='failed'`
    and the legacy state set without `pending`. v4 updates both to
    reference the canonical names + transition numbers and reads
    the OPEN set as `('pending','claimed','accepted','spawned')`
@@ -1629,7 +1629,7 @@ addresses:
    this branch and be silently dropped. v5 narrows the no-op
    condition to the same `(channel_id, user_msg_id)` and returns
    `Local` for distinct user_msg_id (so the late message proceeds
-   on the leader rather than disappearing).
+   on the hub rather than disappearing).
 
 2. **`max_attempts_per_message` cap unenforced**: v4 gated transition
    10 on `parent.attempt_no < cap`, but the inserted row used
@@ -1652,7 +1652,7 @@ addresses:
    appears.
 
 4. **Stale post-accept SLA prose**: v4 still had `accepted/spawned
-   > 24h` in the worker-side state machine and the failure-mode
+   > 24h` in the runner-side state machine and the failure-mode
    table, contradicting the new `accepted_unspawned_sla_secs`
    (120s) for `accepted` and the existing 24h for `spawned`. v5
    splits these explicitly: `accepted` uses the fast SLA via

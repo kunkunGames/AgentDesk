@@ -1,7 +1,7 @@
 use super::*;
 
 /// Per-message inputs of `handle_text_message` bundled into a single
-/// owned struct. Phase 2-pre.3 of intake-node-routing: lets worker-side
+/// owned struct. Phase 2-pre.3 of intake-node-routing: lets runner-side
 /// callers (`execute_intake_turn_core`) accept a single deserialized
 /// row from `intake_outbox` instead of a long positional parameter list.
 ///
@@ -12,14 +12,14 @@ use super::*;
 /// Adding a column to `intake_outbox` means adding a field here.
 #[derive(Clone, Debug)]
 pub(crate) struct IntakeRequest {
-    /// Worker rows carry their claimed `intake_outbox` primary key. Every other
-    /// producer carries `None`: a leader-local request is admitted only after any
+    /// Runner rows carry their claimed `intake_outbox` primary key. Every other
+    /// producer carries `None`: a hub-local request is admitted only after any
     /// stale pending route is retired, so no live outbox row remains to own the
     /// turn (the `None` is correct, but the reason is the retirement, not an
-    /// absence of any row); and a worker request that loses the mailbox or
+    /// absence of any row); and a runner request that loses the mailbox or
     /// session-transition race is re-queued as an `Intervention`, which does not
     /// carry this id, so its later queued-drain reconstruction is `None`. The id
-    /// is therefore sealed only along the direct worker path
+    /// is therefore sealed only along the direct runner path
     /// (`InflightTurnState` into the headless delivery argument struct); the
     /// requeue path is outside that seal. This is harmless today because delivery
     /// does not yet consume the id (it is parked). Binding the requeue /
@@ -44,16 +44,16 @@ pub(crate) struct IntakeRequest {
     pub preserve_on_cancel: bool,
 }
 
-/// Worker-callable entry point for executing an intake turn. Phase 2-pre.3
-/// of intake-node-routing: this is the public surface a worker node will
+/// Runner-callable entry point for executing an intake turn. Phase 2-pre.3
+/// of intake-node-routing: this is the public surface a runner node will
 /// invoke after claiming an `intake_outbox` row from its target queue. Pass
-/// the runtime primitives the worker has (`Arc<Http>`, `Arc<SharedData>`,
+/// the runtime primitives the runner has (`Arc<Http>`, `Arc<SharedData>`,
 /// bot token) plus the deserialized message payload; the function constructs
 /// `IntakeDeps` with `cache: None` and `ctx_for_chained_dispatch: None`
-/// (workers have no live gateway shard) and delegates to the existing
+/// (runners have no live gateway shard) and delegates to the existing
 /// intake body.
 ///
-/// Leader producers use `router::intake_dispatch`; a claimed worker bypasses
+/// Hub producers use `router::intake_dispatch`; a claimed runner bypasses
 /// admission so it cannot recursively create another outbox row.
 pub(crate) async fn execute_intake_turn_core(
     http: &Arc<serenity::http::Http>,
@@ -74,7 +74,7 @@ pub(crate) async fn execute_intake_turn_core(
         request,
         false,
         uploads,
-        // Worker dispatch has no in-process gate carry-forward; it re-resolves
+        // Runner dispatch has no in-process gate carry-forward; it re-resolves
         // the durable announcement row for its `user_msg_id` (#3905).
         None,
     )

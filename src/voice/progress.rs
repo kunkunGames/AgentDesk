@@ -399,7 +399,7 @@ mod tests {
             "tool:Grep pattern".to_string(),
             "tool:Bash cargo test".to_string(),
             "tool:Skill github".to_string(),
-            "tool:Agent worker".to_string(),
+            "tool:Agent runner".to_string(),
         ];
 
         assert_eq!(

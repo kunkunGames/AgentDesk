@@ -35,11 +35,11 @@
 //!
 //! The observability emit in step 1 is **not** covered by that guarantee and is
 //! deliberately at-most-once. `CancelTransitionMeta::emit` hands the event to an
-//! in-process worker channel and discards the result
-//! (`observability/emit.rs`: `if let Some(sender) = worker_sender() { let _ =
-//! sender.send(..) }`), so the event is silently dropped when the worker is not
+//! in-process runner channel and discards the result
+//! (`observability/emit.rs`: `if let Some(sender) = runner_sender() { let _ =
+//! sender.send(..) }`), so the event is silently dropped when the runner is not
 //! running, when the channel send fails, or when the process dies before the
-//! worker flushes its queue to PostgreSQL.
+//! runner flushes its queue to PostgreSQL.
 //!
 //! `emitted = TRUE` is committed **before** `emit()` is called, and a failed
 //! mark aborts the drain before any emit fires. That ordering is what makes the
@@ -55,7 +55,7 @@
 //!    the durable flag makes `!task.emitted` false for every later replay, so
 //!    each event fires exactly once;
 //! 3. the mark commits and the process dies before `emit()` runs (or before the
-//!    observability worker flushes its queue) → those events are lost, and no
+//!    observability runner flushes its queue) → those events are lost, and no
 //!    replay will re-fire them. `pending_emits` can hold more than one event and
 //!    the flag covers the whole vector, so this case includes a **partial** loss:
 //!    the process can die after emitting entry 1 of 3, and entries 2 and 3 are

@@ -14,8 +14,8 @@
 //!     belt-and-suspenders that mops up any that predate the guard or escape it.
 //!
 //! Wrapped by the pool-less `server::maintenance::ProgressTtsCacheSweepJob` and
-//! run through the leader-only `worker_registry::MaintenanceScheduler` — like
-//! `voice.turn_link_gc`, voice-runtime housekeeping belongs on the leader so N
+//! run through the hub-only `runner_registry::MaintenanceScheduler` — like
+//! `voice.turn_link_gc`, voice-runtime housekeeping belongs on the hub so N
 //! cluster nodes do not each spin a redundant sweeper.
 
 use std::path::PathBuf;
@@ -70,7 +70,7 @@ impl Config {
 }
 
 /// Run one sweep pass. The sweeps are synchronous `std::fs`, so they run on a
-/// `spawn_blocking` thread to stay off the scheduler's async worker. Errors in
+/// `spawn_blocking` thread to stay off the scheduler's async runner. Errors in
 /// the sweeps themselves are swallowed (logged at debug) so a single bad entry
 /// never fails the maintenance job; only a join failure is surfaced.
 pub async fn run(config: Config) -> Result<()> {

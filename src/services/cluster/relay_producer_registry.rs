@@ -139,7 +139,7 @@ impl RelayProducerRegistry {
 static GLOBAL: OnceLock<Arc<RelayProducerRegistry>> = OnceLock::new();
 
 /// Returns the process-wide registry. Idempotent — first call initializes,
-/// subsequent calls return the same `Arc`. Safe to call from any worker.
+/// subsequent calls return the same `Arc`. Safe to call from any runner.
 pub fn global_relay_producer_registry() -> Arc<RelayProducerRegistry> {
     GLOBAL
         .get_or_init(|| Arc::new(RelayProducerRegistry::new()))

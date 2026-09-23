@@ -105,7 +105,7 @@ PR 코드 실행에 배포용 SSH 키나 운영 설정을 제공하지 않는다
 artifact를 받아 drain → 설치 → migration/기동 → health/readiness 확인을 수행한다.
 Mac은 기존 `deploy-release.sh`의 서비스·drain 계약을 재사용한다. Windows는 아래의
 사용자 작업 스케줄러 경로를 사용할 수 있다. 실제 두 장비의 적용·테스트 완료 여부는
-[클러스터 구현 검토](../design/heterogeneous-worker-cluster-implementation-review.md)에 기록한다.
+[클러스터 구현 검토](../design/heterogeneous-runner-cluster-implementation-review.md)에 기록한다.
 
 Mac 배포 시 `AGENTDESK_POST_DEPLOY_SMOKE_SCOPE=api`를 지정하면 기존 drain·migration·
 서비스 교체·API·복구 상태 검증을 유지하면서 실제 provider turn과 Discord 테스트 메시지를
@@ -140,13 +140,13 @@ SSH alias를 지정하면 PostgreSQL 터널도 별도 작업으로 등록한다.
 설치 경로의 재시작은 `Stop-ScheduledTask`와 `Start-ScheduledTask`로 관리한다.
 
 Windows 방화벽이 API 수신을 차단하면 관리자 PowerShell에서 패키지의
-`scripts/install-windows-worker-firewall.ps1`을 한 번 실행한다. 실행 노드 실행 계정에는
+`scripts/install-windows-runner-firewall.ps1`을 한 번 실행한다. 실행 노드 실행 계정에는
 관리자 권한이 필요하지 않다. 규칙은 실행 파일·TCP 포트·허브 IP 주소로 범위를
 제한한다. 다른 관리자 계정에서 실행할 수 있으므로 runtime 경로를 명시한다.
 
 ```powershell
-.\scripts\install-windows-worker-firewall.ps1 -RuntimeRoot 'C:\Users\worker\.adk\release' -HubAddress '192.168.1.147' -WhatIf
-.\scripts\install-windows-worker-firewall.ps1 -RuntimeRoot 'C:\Users\worker\.adk\release' -HubAddress '192.168.1.147'
+.\scripts\install-windows-runner-firewall.ps1 -RuntimeRoot 'C:\Users\runner\.adk\release' -HubAddress '192.168.1.147' -WhatIf
+.\scripts\install-windows-runner-firewall.ps1 -RuntimeRoot 'C:\Users\runner\.adk\release' -HubAddress '192.168.1.147'
 ```
 
 포트는 실행 노드의 `server.port`와 같아야 한다. 허브의 고정 IP가 바뀌면 같은 명령을

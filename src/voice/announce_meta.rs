@@ -12,7 +12,7 @@ use super::prompt::VoiceTranscriptAnnouncement;
 const ANNOUNCEMENT_META_TTL: Duration = Duration::from_secs(30);
 /// Durable voice transcript announcement metadata can outlive the short
 /// process-local TTL because intake may be queued to another process or sit
-/// behind an active turn before worker execution.
+/// behind an active turn before runner execution.
 pub(crate) const DURABLE_ANNOUNCEMENT_META_TTL_SECS: i64 = 24 * 60 * 60;
 /// Keep voice routing metadata available through long background turns.
 const HANDOFF_META_TTL: Duration = Duration::from_secs(24 * 60 * 60);

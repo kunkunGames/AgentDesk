@@ -478,7 +478,7 @@ button hits the manual outbound API, which is covered under §3.A
 - `src/services/discord/outbound/source_registry.rs` and
   `src/services/message_outbox.rs`: the caller truth table, complete producer
   contract, enqueue/send parity, and forbidden-source zero-row tests prevent
-  authorization drift between staging and worker delivery (#4424).
+  authorization drift between staging and runner delivery (#4424).
 
 - `src/services/discord/outbound/delivery.rs`:
   `v3_split_duplicate_preserves_ordered_chunk_metadata` verifies static v3

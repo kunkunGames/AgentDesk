@@ -272,7 +272,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/cluster/nodes",
             "cluster",
-            "Protected multinode worker registry view with configured/effective role, heartbeat, labels, and capabilities.",
+            "Protected multinode runner registry view with configured/effective role, heartbeat, labels, and capabilities.",
         )
         .with_example(
             json!({}),
@@ -287,7 +287,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
                     "instance_id": "mac-mini",
                     "hostname": "mac-mini",
                     "role": "auto",
-                    "effective_role": "leader",
+                    "effective_role": "hub",
                     "status": "online",
                     "labels": ["mac-mini"],
                     "capabilities": {"providers": ["codex"]}
@@ -328,7 +328,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/cluster/routing-diagnostics",
             "cluster",
-            "Explain which multinode workers satisfy a required capability set and why excluded workers do not match.",
+            "Explain which multinode runners satisfy a required capability set and why excluded runners do not match.",
         )
         .with_example(
             json!({"required": "{\"labels\":[\"mac-book\"],\"providers\":[\"codex\"],\"mcp\":{\"filesystem\":{\"healthy\":true}}}"}),
@@ -364,7 +364,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/cluster/resource-locks",
             "cluster",
-            "List active multinode resource locks used to serialize exclusive worker resources such as Unreal editor/test execution.",
+            "List active multinode resource locks used to serialize exclusive runner resources such as Unreal editor/test execution.",
         )
         .with_example(
             json!({"include_expired": false}),
@@ -462,7 +462,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/cluster/resource-locks/reclaim-expired",
             "cluster",
-            "Delete expired resource locks so crashed workers do not permanently hold exclusive resources.",
+            "Delete expired resource locks so crashed runners do not permanently hold exclusive resources.",
         )
         .with_example(json!({}), json!({"reclaimed": 1}))
         .with_curl("curl -X POST http://localhost:8787/api/cluster/resource-locks/reclaim-expired"),
@@ -618,7 +618,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/cluster/task-dispatches/claim",
             "cluster",
-            "Atomically claim pending task_dispatches for a worker with PG row locking, capability-match diagnostics, and named semaphore routing constraints. Named semaphore acquire happens in this claim transaction after route owner selection; dispatch terminal statuses release holdings, and expired holdings are reclaimed before each claim.",
+            "Atomically claim pending task_dispatches for a runner with PG row locking, capability-match diagnostics, and named semaphore routing constraints. Named semaphore acquire happens in this claim transaction after route owner selection; dispatch terminal statuses release holdings, and expired holdings are reclaimed before each claim.",
         )
         .with_example(
             json!({

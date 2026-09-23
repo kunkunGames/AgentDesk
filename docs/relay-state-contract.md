@@ -27,7 +27,7 @@ explicitly says otherwise.
 This is the release acceptance contract, not a claim that the target authority
 already exists. The **required target** assigns every accepted Discord source
 message ID exactly one immutable terminal intake disposition: `Steered` or
-`DurablyQueued`. `DurablyQueued` survives completion, worker replacement,
+`DurablyQueued`. `DurablyQueued` survives completion, runner replacement,
 shutdown, and restart until eventual drain; drain does not add or rewrite the
 intake disposition. Current production cannot claim this guarantee because it
 has no canonical disposition authority.

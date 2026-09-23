@@ -1,11 +1,11 @@
-//! Persisted turn and queue recovery shared by Gateway and REST worker runtimes.
+//! Persisted turn and queue recovery shared by Gateway and REST runner runtimes.
 use super::*;
 
-pub(super) async fn restore_worker_queues(shared: &Arc<SharedData>, provider: &ProviderKind) {
+pub(super) async fn restore_runner_queues(shared: &Arc<SharedData>, provider: &ProviderKind) {
     let Some(http) = shared.serenity_http_or_token_fallback() else {
         tracing::error!(
             provider = provider.as_str(),
-            "worker queue recovery needs Discord REST credentials"
+            "runner queue recovery needs Discord REST credentials"
         );
         return;
     };

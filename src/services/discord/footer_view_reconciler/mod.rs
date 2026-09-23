@@ -499,7 +499,7 @@ mod tests {
         shared.ui.placeholder_live_events.push_status_event(
             channel_id,
             StatusEvent::SubagentStart {
-                subagent_type: Some("bgworker".to_string()),
+                subagent_type: Some("bgrunner".to_string()),
                 desc: Some("Review".to_string()),
                 agent_id: None,
                 tool_use_id: Some(format!("toolu_agent_{}", channel_id.get())),

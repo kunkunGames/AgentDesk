@@ -3,7 +3,7 @@
 > Last refreshed: 2026-08-15 (against #5071 T2-W S-W3 intake-delivery sweep).
 
 ### Audited touches
-- 2026-08-15 (#5071 T2-W S-W3): framework setup is per bot, but an active-task latch permits one process sweep and resets on task exit; per-tick panic containment lets the same loop continue after a tick panic. The latch reset permits a later bootstrap call to restart a dead loop, but there is no task-exit detector or automatic respawn. The first sweep waits two minutes so startup recovery and session restoration can publish their state. The sweep is PG-lease-free: `FOR UPDATE SKIP LOCKED` plus terminal CAS gives dispatched one winner, and spawned uses the same CAS property. Leader-only is a load recommendation, not a correctness requirement. Before settlement it checks every channel-matching durable session whose status is `turn_active`, regardless of `active_dispatch_id`: a heartbeat fresh within 30 seconds is live, while a NULL heartbeat or one whose absence has not exceeded the state cutoff is ambiguous. Both results defer. The settlement transaction then locks the intake row followed by every existing durable session row for its channel with `FOR SHARE`, re-evaluates freshness under those locks, and only then performs the terminal CAS. Existing-row heartbeat/status writers therefore serialize with the terminal decision through commit. PostgreSQL cannot row-lock a missing session row: a turn with no durable row, or an existing active shape whose status is not `turn_active`, is read as Absent and may settle. Both state cutoffs therefore mean heartbeat-absence time. Both open stamp-debt states restart the sweep after downgrade/restart. §6.1의 미회수·오회수 창: (1) `dispatched_at IS NULL` 인 `dispatched` 행, `spawned_at IS NULL` 인 `spawned` 행 → operator CLI 전용. (2) cutoff 이전 구간 → 자동 회수 없음. cutoff 를 줄이면 진행 중인 긴 턴을 `unknown` 으로 오종결한다. 이 트레이드오프는 제거되지 않는다. (3) sweep 루프가 뜨지 않은 상태(스키마 결함으로 probe 실패 + debt 존재) → sweep 은 뜨되 매 틱 SQL 실패 → `error!`. operator CLI 가 유일한 탈출구. (4) `PreservedForRetry` 로 열어 둔 행 중 재배달이 끝내 실패한 것 → cutoff 후 sweep 이 `unknown` 으로 종결. (5) sweep 배치 한도(`normalize_limit` 1..=500)를 초과하는 백로그 → 다음 틱으로 이월. 실제 `warn!` 으로 잘린 수를 남긴다. (6) 세션 행이 `turn_active` 이고 heartbeat가 NULL이면 ambiguous로 보류되어 session GC TTL까지 회수가 늦어질 수 있다. (7) sweep task가 루프 자체에서 종료되면 다음 bootstrap spawn 시도까지 미회수 상태가 지속된다. (8) durable 행 부재 턴과 비-`turn_active` 활성 형태는 Absent 로 읽혀 cutoff 후 오정산될 수 있다. 행 부재 상태에서는 잠글 대상도 없으므로 이 창은 닫히지 않는다. (9) writer 장기 트랜잭션이 sessions 행 배타락을 보유하면 해당 행 정산은 3초 `lock_timeout`으로 bounded 지연되고 ambiguous로 건너뛴다; writer가 반복해서 오래 점유하면 그 행은 매 tick skip되고 다른 후보는 계속 처리된다. Restore 열거는 captured-full-response, ordinary output-completed, worktree-failure 두 경로와 completed-during-downtime을 포함한 실측이며 완전성 증명이 아니다; 미열거 경로의 최종 회수자는 상태 sweep이다. Production O-payload의 `intake_outbox_id` binding writer는 0건이라 journal 판정은 사실상 `Unknown`이다. `Unknown`은 배달 실패의 증거가 아니다.
+- 2026-08-15 (#5071 T2-W S-W3): framework setup is per bot, but an active-task latch permits one process sweep and resets on task exit; per-tick panic containment lets the same loop continue after a tick panic. The latch reset permits a later bootstrap call to restart a dead loop, but there is no task-exit detector or automatic respawn. The first sweep waits two minutes so startup recovery and session restoration can publish their state. The sweep is PG-lease-free: `FOR UPDATE SKIP LOCKED` plus terminal CAS gives dispatched one winner, and spawned uses the same CAS property. Hub-only is a load recommendation, not a correctness requirement. Before settlement it checks every channel-matching durable session whose status is `turn_active`, regardless of `active_dispatch_id`: a heartbeat fresh within 30 seconds is live, while a NULL heartbeat or one whose absence has not exceeded the state cutoff is ambiguous. Both results defer. The settlement transaction then locks the intake row followed by every existing durable session row for its channel with `FOR SHARE`, re-evaluates freshness under those locks, and only then performs the terminal CAS. Existing-row heartbeat/status writers therefore serialize with the terminal decision through commit. PostgreSQL cannot row-lock a missing session row: a turn with no durable row, or an existing active shape whose status is not `turn_active`, is read as Absent and may settle. Both state cutoffs therefore mean heartbeat-absence time. Both open stamp-debt states restart the sweep after downgrade/restart. §6.1의 미회수·오회수 창: (1) `dispatched_at IS NULL` 인 `dispatched` 행, `spawned_at IS NULL` 인 `spawned` 행 → operator CLI 전용. (2) cutoff 이전 구간 → 자동 회수 없음. cutoff 를 줄이면 진행 중인 긴 턴을 `unknown` 으로 오종결한다. 이 트레이드오프는 제거되지 않는다. (3) sweep 루프가 뜨지 않은 상태(스키마 결함으로 probe 실패 + debt 존재) → sweep 은 뜨되 매 틱 SQL 실패 → `error!`. operator CLI 가 유일한 탈출구. (4) `PreservedForRetry` 로 열어 둔 행 중 재배달이 끝내 실패한 것 → cutoff 후 sweep 이 `unknown` 으로 종결. (5) sweep 배치 한도(`normalize_limit` 1..=500)를 초과하는 백로그 → 다음 틱으로 이월. 실제 `warn!` 으로 잘린 수를 남긴다. (6) 세션 행이 `turn_active` 이고 heartbeat가 NULL이면 ambiguous로 보류되어 session GC TTL까지 회수가 늦어질 수 있다. (7) sweep task가 루프 자체에서 종료되면 다음 bootstrap spawn 시도까지 미회수 상태가 지속된다. (8) durable 행 부재 턴과 비-`turn_active` 활성 형태는 Absent 로 읽혀 cutoff 후 오정산될 수 있다. 행 부재 상태에서는 잠글 대상도 없으므로 이 창은 닫히지 않는다. (9) writer 장기 트랜잭션이 sessions 행 배타락을 보유하면 해당 행 정산은 3초 `lock_timeout`으로 bounded 지연되고 ambiguous로 건너뛴다; writer가 반복해서 오래 점유하면 그 행은 매 tick skip되고 다른 후보는 계속 처리된다. Restore 열거는 captured-full-response, ordinary output-completed, worktree-failure 두 경로와 completed-during-downtime을 포함한 실측이며 완전성 증명이 아니다; 미열거 경로의 최종 회수자는 상태 sweep이다. Production O-payload의 `intake_outbox_id` binding writer는 0건이라 journal 판정은 사실상 `Unknown`이다. `Unknown`은 배달 실패의 증거가 아니다.
 - 2026-08-15 (#5071 T2-W S-W1 r2): Discord bootstrap owns one
   intake-delivery capability cache per bot instance. Each node subscribes to
   live configuration and independently resolves and installs its local cache;
@@ -19,7 +19,7 @@
   delay ACCESS EXCLUSIVE DDL for the duration of the query. The command lists
   every dispatched row, including a legacy NULL clock.
   `provider_nonempty` reuses the exact force-fail provider guard but is not a
-  worker-readiness verdict; dispatched remains refused by the operator-retry
+  runner-readiness verdict; dispatched remains refused by the operator-retry
   classifier. This slice adds no writer, periodic job, capability wiring, or
   settlement authority.
 - 2026-08-13 (#5071 T2-W S-R2c B2): `runtime_bootstrap` now declares a
@@ -151,35 +151,35 @@
   bootstrap stale-queued-placeholder delete helper (it now receives `SharedData`
   so each card is re-decided by `placeholder_controller::queued_card_gate`). The
   decision reads this node's in-process mailbox snapshot and the per-channel
-  `queued_placeholders_persist_lock`, both already worker-local. No lease,
-  leader check, durable intent, cross-node fencing, or ownership assumption is
+  `queued_placeholders_persist_lock`, both already runner-local. No lease,
+  hub check, durable intent, cross-node fencing, or ownership assumption is
   added or changed; a second node bootstrapping the same channel would reach its
   own verdict exactly as it reached its own delete decision before.
 - 2026-08-03 (#5057): failed pre-accept retry selection now matches the Rust intake capability contract and rotates no-capable sources without changing terminal status or error.
 > Source: [`docs/agent-maintenance/index.md`](index.md). Use this page before
-> moving any AgentDesk runtime, worker, dispatch, provider, MCP, merge, or test
+> moving any AgentDesk runtime, runner, dispatch, provider, MCP, merge, or test
 > execution path from one dcserver node to multiple nodes.
 >
 > Last refreshed: 2026-07-31 (against PR #5048 stale-route recovery changes).
 >
-> Last refreshed: 2026-07-05 (#4089 — `worker_registry.rs` exposes the local RateLimitSync leader-worker active flag (`rate_limit_sync_active`) so the claude-accounts switch endpoint can report whether the receiving node performs usage collection. Read-only exposure: leader election, lease, and singleton ownership assumptions are unchanged; the Keychain auth switch itself is node-local by design (MVP), so non-leader switches surface `rate_limit_sync_not_active_on_this_node` instead of racing the leader loop.)
+> Last refreshed: 2026-07-05 (#4089 — `runner_registry.rs` exposes the local RateLimitSync hub-runner active flag (`rate_limit_sync_active`) so the claude-accounts switch endpoint can report whether the receiving node performs usage collection. Read-only exposure: hub election, lease, and singleton ownership assumptions are unchanged; the Keychain auth switch itself is node-local by design (MVP), so non-hub switches surface `rate_limit_sync_not_active_on_this_node` instead of racing the hub loop.)
 >
-> Last refreshed: 2026-07-11 (#4424 — message_outbox source authorization and leader-owned durable failed-row recovery).
+> Last refreshed: 2026-07-11 (#4424 — message_outbox source authorization and hub-owned durable failed-row recovery).
 >
-> Last refreshed: 2026-07-11 (manual: scheduled-message leader worker ownership and touch gate).
+> Last refreshed: 2026-07-11 (manual: scheduled-message hub runner ownership and touch gate).
 >
-> Last refreshed: 2026-07-21 (#4515 — worker-local restart budgets and the node-local fatal-exit ledger do not change worker ownership. The ledger serializes in-process read-modify-write operations and atomically replaces a node-local runtime-root file; it is deliberately not cluster-shared authority. Leader-only workers and PostgreSQL lease assumptions remain unchanged.)
+> Last refreshed: 2026-07-21 (#4515 — runner-local restart budgets and the node-local fatal-exit ledger do not change runner ownership. The ledger serializes in-process read-modify-write operations and atomically replaces a node-local runtime-root file; it is deliberately not cluster-shared authority. Hub-only runners and PostgreSQL lease assumptions remain unchanged.)
 >
-> Last refreshed: 2026-09-01 (#5676 — the declarative `WORKER_SPECS`
-> ownership/scope inventory remains in `server/worker_registry.rs` for the
-> generator contract; worker construction, startup staging, restart supervision,
-> and shutdown moved to `server/worker_registry/registry.rs`, while read-only
-> worker status moved to `server/worker_registry/status.rs`. This is a structural
-> split only; leader/worker classifications, lease assumptions, and runtime
+> Last refreshed: 2026-09-01 (#5676 — the declarative `RUNNER_SPECS`
+> ownership/scope inventory remains in `server/runner_registry.rs` for the
+> generator contract; runner construction, startup staging, restart supervision,
+> and shutdown moved to `server/runner_registry/registry.rs`, while read-only
+> runner status moved to `server/runner_registry/status.rs`. This is a structural
+> split only; hub/runner classifications, lease assumptions, and runtime
 > ownership are unchanged.)
 >
-> PR #3456 made the worker-lifecycle log fields now housed in
-> `src/server/worker_registry/registry.rs`
+> PR #3456 made the runner-lifecycle log fields now housed in
+> `src/server/runner_registry/registry.rs`
 > consistent: every started / stopped / future-exited / self-fenced /
 > supervisor-shutdown tracing event now emits the same structured spec fields
 > (stage, order, restart, shutdown, owner, health, responsibility, notes), so
@@ -193,7 +193,7 @@
 - Treat every surface below as single-node until its listed invariants and tests
   are implemented. A PostgreSQL table alone is not enough; every side effect
   needs an explicit owner, lease, idempotency key, or node-local routing rule.
-- "leader" means the node that owns cluster-wide side effects. "worker" means a
+- "hub" means the node that owns cluster-wide side effects. "runner" means a
   node that may execute provider CLI, local tools, tmux sessions, MCP calls, and
   node-local telemetry.
 
@@ -204,11 +204,11 @@
 - feature: `multinode / discord_gateway_singleton`
 - canonical_modules: `src/services/discord/runtime_bootstrap.rs` preserves the
   bootstrap call order; `runtime_bootstrap/gateway_runtime.rs` builds the
-  Serenity client and enters the leader gateway event loop;
+  Serenity client and enters the hub gateway event loop;
   `runtime_bootstrap/gateway_lease.rs` owns gateway lease acquisition,
   keepalive, and self-fencing; `runtime_bootstrap/shutdown.rs` owns SIGTERM
   persistence and gateway backend execution; `runtime_bootstrap/intake.rs` owns
-  the standby intake-worker spawn.
+  the standby intake-runner spawn.
 - legacy_modules: none. The current gateway owner is the active dcserver process
   for that provider.
 - do_not_edit_without_migration_plan:
@@ -218,87 +218,87 @@
   `src/services/discord/runtime_bootstrap/shutdown.rs` lease/shutdown paths,
   especially watcher cancellation on gateway lease loss.
 - active_callsite_coverage: single-node runtime with an existing gateway lease.
-  It does not yet define cluster role discovery, worker heartbeats, or a
-  capability registry for non-gateway workers.
+  It does not yet define cluster role discovery, runner heartbeats, or a
+  capability registry for non-gateway runners.
 - 2026-05-18 audit note (#2558): stale thread-session GC in
-  `runtime_bootstrap` now calls the leader runtime's Postgres pool directly
+  `runtime_bootstrap` now calls the hub runtime's Postgres pool directly
   instead of looping back through the internal HTTP cleanup route. The singleton
   assumption remains unchanged: the task is still spawned from the leased
   gateway runtime.
 - 2026-06-12 audit note (#3089 S0; updated #3560): `runtime_bootstrap` only
   initializes the `single_message_panel` flag for startup logging. Since #3560
   the flag is default-ON (opt-out via `AGENTDESK_SINGLE_MESSAGE_PANEL=0|false`).
-  Gateway lease, startup order, worker ownership, and singleton assumptions are
+  Gateway lease, startup order, runner ownership, and singleton assumptions are
   unchanged.
 - 2026-06-17 audit note (#3548): PR analyzer hygiene guard work is confined to
-  `scripts/analyze_prs.py`; gateway lease, startup order, worker ownership, and
+  `scripts/analyze_prs.py`; gateway lease, startup order, runner ownership, and
   singleton assumptions are unchanged.
 - 2026-06-17 audit note (#3546): SQLite rowid compatibility work is confined to
-  `src/engine/ops/db_ops.rs`; gateway lease, startup order, worker ownership,
+  `src/engine/ops/db_ops.rs`; gateway lease, startup order, runner ownership,
   and singleton assumptions are unchanged.
-- invariants: `singleton_on_leader`,
+- invariants: `singleton_on_hub`,
   `heartbeat_capability_registry_routing`.
 - allowed_changes: `bugfix` only before #876/#877. New gateway, reconnect,
-  watcher, or command-router behavior must state whether it is leader-only or
-  worker-local.
-- tests: leader failover, worker heartbeat expiry, and two-node Discord gateway
+  watcher, or command-router behavior must state whether it is hub-only or
+  runner-local.
+- tests: hub failover, runner heartbeat expiry, and two-node Discord gateway
   regression from #884.
 - related_issues: #876, #877, #884.
 
-### `multinode / supervised_workers_singleton`
+### `multinode / supervised_runners_singleton`
 
-- feature: `multinode / supervised_workers_singleton`
-- canonical_modules: `src/server/worker_registry.rs:193` defines the supervised
-  worker inventory; `src/server/worker_registry/registry.rs` owns construction,
-  startup staging, and supervision, including the `dispatch_outbox_loop` worker
-  arm. `src/server/worker_registry/status.rs` owns read-only active-worker status.
+- feature: `multinode / supervised_runners_singleton`
+- canonical_modules: `src/server/runner_registry.rs:193` defines the supervised
+  runner inventory; `src/server/runner_registry/registry.rs` owns construction,
+  startup staging, and supervision, including the `dispatch_outbox_loop` runner
+  arm. `src/server/runner_registry/status.rs` owns read-only active-runner status.
   `src/server/mod.rs:201` creates the
   registry, `src/server/mod.rs:207` runs boot-only steps, and
-  `src/server/mod.rs:208` starts workers after boot reconcile. The
+  `src/server/mod.rs:208` starts runners after boot reconcile. The
   `ScheduledMessages` spec registers `scheduled_message_loop` as
-  `WorkerExecutionScope::LeaderOnly`; its durable claim/recovery implementation
+  `RunnerExecutionScope::HubOnly`; its durable claim/recovery implementation
   lives in `src/services/scheduled_messages.rs` and
   `src/db/scheduled_messages.rs`.
-- legacy_modules: none. Workers are centrally registered, but most entries still
+- legacy_modules: none. Runners are centrally registered, but most entries still
   assume that every server process may start its local loop.
 - do_not_edit_without_migration_plan: the inventory in
-  `src/server/worker_registry.rs`, lifecycle execution in
-  `src/server/worker_registry/registry.rs`, status exposure in
-  `src/server/worker_registry/status.rs`, and the worker starts in
+  `src/server/runner_registry.rs`, lifecycle execution in
+  `src/server/runner_registry/registry.rs`, status exposure in
+  `src/server/runner_registry/status.rs`, and the runner starts in
   `src/server/mod.rs`. Scheduled-message ownership changes must
   review `src/services/scheduled_messages.rs`,
   `src/db/scheduled_messages.rs`, and the `ScheduledMessages` registry spec
-  together; do not make the loop worker-local without a replacement ownership
+  together; do not make the loop runner-local without a replacement ownership
   and Discord side-effect plan.
 - active_callsite_coverage: partial. Cluster identity and heartbeat are persisted
-  through `src/server/cluster.rs`; `src/server/worker_registry.rs` classifies
-  supervised workers as `leader_only` or `worker_local`, and
-  `src/server/worker_registry/registry.rs` applies that scope before startup.
+  through `src/server/cluster.rs`; `src/server/runner_registry.rs` classifies
+  supervised runners as `hub_only` or `runner_local`, and
+  `src/server/runner_registry/registry.rs` applies that scope before startup.
   `policy_tick_loop` already uses a PG advisory lock at
   `src/server/mod.rs:297`, and `github_sync_loop` uses one at
-  `src/server/mod.rs:2798`; leader lease loss still needs per-loop self-fencing
+  `src/server/mod.rs:2798`; hub lease loss still needs per-loop self-fencing
   before every side effect is considered failover-safe. Scheduled messages are
-  leader-started and additionally fence each delivery attempt with a Postgres
+  hub-started and additionally fence each delivery attempt with a Postgres
   lease, a per-attempt `claim_token`, and a durable fire-slot uniqueness key.
-  #5142: the `policy-tick` worker now also receives the process `HealthRegistry`
-  (`src/server/worker_registry.rs`, `policy_tick_loop` in `src/server/mod.rs`).
-  This does not change the worker's classification — it stays `leader_only`
+  #5142: the `policy-tick` runner now also receives the process `HealthRegistry`
+  (`src/server/runner_registry.rs`, `policy_tick_loop` in `src/server/mod.rs`).
+  This does not change the runner's classification — it stays `hub_only`
   behind the existing PG advisory lock — but it does mean the tick's auto-queue
   cleanup replay performs provider-runtime teardown
   (`clear_provider_channel_runtime`) against *this node's* registry. That
-  teardown is node-local by construction: a leader can only tear down runtimes it
+  teardown is node-local by construction: a hub can only tear down runtimes it
   hosts, so a replayed cleanup whose slot threads belong to another node still
   converges the PostgreSQL state (session ids, slot tokens, slot-thread bindings)
   while the remote node's in-memory runtime is left to its own recovery path. The
   durable rows in `auto_queue_run_cleanup_tasks` are claimed with
   `FOR UPDATE SKIP LOCKED` plus a lease, so two nodes draining concurrently
   cannot double-run a task.
-- invariants: `singleton_on_leader`, `pg_lease_backed_claim`.
-- allowed_changes: `bugfix` for existing workers. `new_feature` workers must add
-  a leader-only, lease-backed, or worker-local classification in the same change.
-  Any scheduled-message worker/service ownership change must refresh this page
+- invariants: `singleton_on_hub`, `pg_lease_backed_claim`.
+- allowed_changes: `bugfix` for existing runners. `new_feature` runners must add
+  a hub-only, lease-backed, or runner-local classification in the same change.
+  Any scheduled-message runner/service ownership change must refresh this page
   in the same change.
-- tests: leader failover, duplicate singleton worker suppression, and the #884
+- tests: hub failover, duplicate singleton runner suppression, and the #884
   chaos suite.
 - related_issues: #876, #877, #878, #884.
 
@@ -315,10 +315,10 @@
 - active_callsite_coverage: single-node policy engine. The current flow assumes
   one automation owner is allowed to run `git push`, `gh issue edit`, `gh issue
   create`, and `gh pr merge --auto`.
-- invariants: `singleton_on_leader`,
+- invariants: `singleton_on_hub`,
   `merge_gate_tested_head_sha_phase_evidence`.
 - allowed_changes: `bugfix` only before #877/#883. Any new merge/review side
-  effect must be leader-only and must preserve tested head SHA checks.
+  effect must be hub-only and must preserve tested head SHA checks.
 - tests: merge gate tested-head-SHA regression, required phase-evidence
   regression, and two-node duplicate-merge prevention.
 - related_issues: #877, #881, #882, #883, #884.
@@ -354,13 +354,13 @@
   this path.
 - 2026-07-15 audited touch (#4553): config-gated Claude gateway-proxy env is
   injected only when launching the provider process on its owning node. This is
-  **worker-local** per-session launch state; it adds no leader, lease, durable
+  **runner-local** per-session launch state; it adds no hub, lease, durable
   routing, or cross-node ownership authority.
 - invariants: `heartbeat_capability_registry_routing`,
   `resource_locks_before_exclusive_editor_test`.
 - allowed_changes: `bugfix`, or `new_feature` only when routed through the
   capability registry planned by #879.
-- tests: node-local routing, worker heartbeat expiry, and provider-session
+- tests: node-local routing, runner heartbeat expiry, and provider-session
   failover/recovery assertions.
 - related_issues: #876, #879, #880, #884.
 
@@ -384,14 +384,14 @@
 - invariants: `heartbeat_capability_registry_routing`.
 - allowed_changes: `bugfix`; `new_feature` only with explicit provider/node
   capability routing.
-- tests: node-local MCP routing, credential-change behavior on a worker node, and
-  expired-worker routing rejection.
+- tests: node-local MCP routing, credential-change behavior on a runner node, and
+  expired-runner routing rejection.
 - related_issues: #876, #879, #884.
 
 ### `multinode / dispatch_outbox`
 
 - feature: `multinode / dispatch_outbox`
-- canonical_modules: `src/server/worker_registry.rs:206` registers the worker,
+- canonical_modules: `src/server/runner_registry.rs:206` registers the runner,
   `src/server/routes/dispatches/outbox.rs:248` claims PostgreSQL rows with
   `FOR UPDATE SKIP LOCKED`, `src/server/routes/dispatches/outbox.rs:596`
   processes a batch, `src/server/routes/dispatches/outbox.rs:654` relies on the
@@ -405,10 +405,10 @@
 - active_callsite_coverage: partial. The PostgreSQL claim path prevents two
   consumers from processing the same pending row concurrently, but #878 still
   owns explicit PG lease/idempotency semantics for multinode delivery.
-- invariants: `pg_lease_backed_claim`, `singleton_on_leader`.
+- invariants: `pg_lease_backed_claim`, `singleton_on_hub`.
 - allowed_changes: `bugfix` before #878; `new_feature` only if the new action has
   an idempotency key and a tested lease/claim story.
-- tests: duplicate outbox claim prevention, retry idempotency, leader failover
+- tests: duplicate outbox claim prevention, retry idempotency, hub failover
   while rows are processing, and two-node Discord delivery dedupe.
 - related_issues: #877, #878, #884.
 
@@ -432,24 +432,24 @@
 - invariants: `heartbeat_capability_registry_routing`.
 - allowed_changes: `bugfix`; cluster-visible memory changes must use a durable
   store or clearly document node-local semantics.
-- tests: local-cache isolation across workers, telemetry capture per node, and
-  worker restart without stale capability routing.
+- tests: local-cache isolation across runners, telemetry capture per node, and
+  runner restart without stale capability routing.
 - related_issues: #876, #879, #884.
 
 ## Single-Node Assumptions
 
 | assumption | owning module | current risk |
 | --- | --- | --- |
-| Discord gateway singleton | `src/services/discord/runtime_bootstrap.rs`, `src/services/discord/runtime_bootstrap/gateway_lease.rs`, `src/services/discord/runtime_bootstrap/shutdown.rs` | Two nodes starting a gateway for the same provider can duplicate command intake, watcher startup, and shutdown cleanup unless #877 fences gateway ownership to the leader. |
-| Supervised workers singleton | `src/server/worker_registry.rs:151`, `src/server/mod.rs:202`, `src/server/mod.rs:209` | Cluster-enabled worker nodes skip `leader_only` supervised workers unless they hold the startup leader lease; lease-loss self-fencing for already-running loops remains follow-up work. |
+| Discord gateway singleton | `src/services/discord/runtime_bootstrap.rs`, `src/services/discord/runtime_bootstrap/gateway_lease.rs`, `src/services/discord/runtime_bootstrap/shutdown.rs` | Two nodes starting a gateway for the same provider can duplicate command intake, watcher startup, and shutdown cleanup unless #877 fences gateway ownership to the hub. |
+| Supervised runners singleton | `src/server/runner_registry.rs:151`, `src/server/mod.rs:202`, `src/server/mod.rs:209` | Cluster-enabled runner nodes skip `hub_only` supervised runners unless they hold the startup hub lease; lease-loss self-fencing for already-running loops remains follow-up work. |
 | Merge/review side effects local | removed (`policies/merge-automation.js`, #5716 slice B) | Historical: duplicate policy runners could race direct pushes, PR auto-merge, review notifications, and worktree cleanup. No automated merge surface remains. |
-| GitHub issue/body mutation local | `src/github/mod.rs:166`, `src/github/mod.rs:218`, `src/github/dod.rs:122`, `src/server/routes/github.rs:275` | Multiple nodes can create, close, comment, or edit issue bodies unless calls are leader-only or idempotent. |
+| GitHub issue/body mutation local | `src/github/mod.rs:166`, `src/github/mod.rs:218`, `src/github/dod.rs:122`, `src/server/routes/github.rs:275` | Multiple nodes can create, close, comment, or edit issue bodies unless calls are hub-only or idempotent. |
 | Tmux/provider sessions local | `src/services/discord/mod.rs:538`, `src/services/discord/router/message_handler.rs:1420`, `src/services/claude.rs:1166`, `src/services/claude.rs:1300` | Live provider state depends on local tmux panes, FIFOs, output files, watcher handles, and wrapper processes. |
 | MCP routing local | `src/services/mcp_config.rs:34`, `src/services/mcp_config.rs:71`, `src/services/memory/memento.rs:262`, `src/services/discord/mcp_credential_watcher.rs:349` | MCP availability, config mutation, cached MCP session IDs, and credential watcher notifications are node/provider local. |
-| `dispatch_outbox` local retry loop | `src/server/worker_registry.rs:206`, `src/server/routes/dispatches/outbox.rs:248`, `src/server/routes/dispatches/outbox.rs:596`, `src/server/routes/dispatches/outbox.rs:719` | Current PG claim narrows duplicate row processing, but multinode delivery still needs explicit lease/idempotency tests before multiple nodes drain it. |
+| `dispatch_outbox` local retry loop | `src/server/runner_registry.rs:206`, `src/server/routes/dispatches/outbox.rs:248`, `src/server/routes/dispatches/outbox.rs:596`, `src/server/routes/dispatches/outbox.rs:719` | Current PG claim narrows duplicate row processing, but multinode delivery still needs explicit lease/idempotency tests before multiple nodes drain it. |
 | Memory/cache local | `src/services/memory/local.rs:10`, `src/services/memory/memento_throttle.rs:128`, `src/services/memory/memento_throttle.rs:175`, `src/services/observability/metrics.rs:238` | Process-local recall, dedupe, and telemetry caches must not be treated as cluster truth. |
 
-## Leader-Only Side Effects
+## Hub-Only Side Effects
 
 - GitHub merge and auto-merge: removed with `policies/merge-automation.js`
   in #5716 slice B; no automated merge surface remains.
@@ -459,14 +459,14 @@
 - Singleton policy ticks and global hook side effects: `src/server/mod.rs:284`,
   `src/server/mod.rs:297`, `src/server/mod.rs:367`,
   `src/server/mod.rs:379`.
-- Global cleanup and maintenance jobs registered as supervised workers:
-  `src/server/worker_registry.rs:177`, `src/server/worker_registry.rs:206`,
-  `src/server/worker_registry.rs:219`.
+- Global cleanup and maintenance jobs registered as supervised runners:
+  `src/server/runner_registry.rs:177`, `src/server/runner_registry.rs:206`,
+  `src/server/runner_registry.rs:219`.
 - `dispatch_outbox` delivery if the action is not proven lease-backed and
   idempotent: `src/server/routes/dispatches/outbox.rs:248`,
   `src/server/routes/dispatches/outbox.rs:654`.
 
-## Worker-Local Side Effects
+## Runner-Local Side Effects
 
 - Provider CLI and tmux execution: `src/services/claude.rs:1166`,
   `src/services/claude.rs:1300`, `src/services/codex_tmux_wrapper.rs:139`,
@@ -475,7 +475,7 @@
   `src/services/mcp_config.rs:128`, `src/services/memory/memento.rs:275`,
   `src/services/discord/mcp_credential_watcher.rs:349`.
 - Local resource locks for exclusive editor/test execution: #880 owns the durable
-  lock implementation; the lock acquisition is worker-local but must be recorded
+  lock implementation; the lock acquisition is runner-local but must be recorded
   in PG before the local tool starts.
 - Deterministic test phase evidence: #881 starts at
   `src/server/test_phase_runs.rs`, `migrations/postgres/0033_test_phase_runs.sql`,
@@ -487,18 +487,18 @@
   `src/services/observability/mod.rs:460`, `src/services/observability/metrics.rs:238`.
 - #3262 Claude auto-compact `/compact` injection trigger state:
   `src/services/claude_compact_trigger.rs`. The once-per-fill-cycle "armed" latch
-  is a **worker-local** process-global `LazyLock<Mutex<HashMap<channel_id, bool>>>`
+  is a **runner-local** process-global `LazyLock<Mutex<HashMap<channel_id, bool>>>`
   and the injection drives the node-local tmux pane via
   `claude_tui::input::send_followup_prompt`. A channel's live tmux session is
-  pinned to a single worker (see `tmux_provider_sessions`), so the per-channel
-  latch never needs cross-node coordination; a worker restart simply re-arms the
+  pinned to a single runner (see `tmux_provider_sessions`), so the per-channel
+  latch never needs cross-node coordination; a runner restart simply re-arms the
   channel (re-injecting at most one redundant `/compact` is harmless and idle-gated).
 
 - #4234/#4235/#4236 voice connection lifecycle registries:
   `src/services/discord/voice_lifecycle.rs`. Three process-static singletons —
   `lifecycle_router()` (`DashMap<provider, UnboundedSender<ReconnectRequest>>`),
   `rejoin_inflight()` (`DashSet<(provider, guild)>`), and the pre-existing
-  `voice_occupancy()` in `commands/voice.rs` — are all **worker-local**. A guild's
+  `voice_occupancy()` in `commands/voice.rs` — are all **runner-local**. A guild's
   songbird voice connection is pinned to whichever node's bot token holds it
   (Discord allows one voice connection per bot-token per guild), so the rejoin
   supervisor, its in-flight guard, and the occupancy desired-state map never need
@@ -508,19 +508,19 @@
 
 ## Required Invariants
 
-### `singleton_on_leader`
+### `singleton_on_hub`
 
-- Only the elected/leased leader may run cluster-wide side effects: Discord
+- Only the elected/leased hub may run cluster-wide side effects: Discord
   gateway, GitHub merge/issue mutation, singleton policy ticks, global cleanup,
   and any unleased outbox delivery.
 - Current anchors: gateway lease keepalive at
   `src/services/discord/runtime_bootstrap/gateway_lease.rs`, policy tick advisory lock at
   `src/server/mod.rs:301`, GitHub sync advisory lock at `src/server/mod.rs:2818`,
-  server cluster leader lease bootstrap at `src/server/cluster.rs`, and
-  leader-only worker self-fence at `src/server/worker_registry.rs:522`.
-- Enablement condition: every supervised worker in
-  `src/server/worker_registry.rs:151` is classified as leader-only,
-  lease-backed multi-consumer, or worker-local.
+  server cluster hub lease bootstrap at `src/server/cluster.rs`, and
+  hub-only runner self-fence at `src/server/runner_registry.rs:522`.
+- Enablement condition: every supervised runner in
+  `src/server/runner_registry.rs:151` is classified as hub-only,
+  lease-backed multi-consumer, or runner-local.
 
 ### `pg_lease_backed_claim`
 
@@ -538,35 +538,35 @@
 
 - Any exclusive editor, simulator, or hardware-bound test must acquire a durable
   `resource_locks` record before launching local work, and must release or expire
-  that record on worker death.
+  that record on runner death.
 - Current anchors: auto-queue slots already use PG compare-and-set style claims
   through `src/db/auto_queue/claim.rs:316` and release ownership through
   `src/db/auto_queue/slots.rs:98`; slot cleanup clears local runtime state
   through `src/services/auto_queue/runtime.rs:146`; #880 owns the missing
   resource-lock table and API.
-- Enablement condition: two workers contending for the same Unreal editor/test
+- Enablement condition: two runners contending for the same Unreal editor/test
   resource cannot run the exclusive phase concurrently.
 
 ### `heartbeat_capability_registry_routing`
 
-- The dispatcher must route provider, MCP, and tool work only to live workers
+- The dispatcher must route provider, MCP, and tool work only to live runners
   that advertised the required capability. Expired heartbeats must remove the
-  worker from routing before new work is assigned.
-- Current anchors: `worker_nodes` stores `labels` and `capabilities` through
+  runner from routing before new work is assigned.
+- Current anchors: `cluster_nodes` stores `labels` and `capabilities` through
   `src/server/cluster.rs`; provider execution context carries node-local details at
   `src/services/discord/router/message_handler.rs:1420`; MCP capability checks
   are local in `src/services/mcp_config.rs:34`; tmux watcher state is in-process
   at `src/services/discord/mod.rs:538`.
-- `intake_worker.features` advertises versioned request protocols. A preserving
+- `intake_runner.features` advertises versioned request protocols. A preserving
   request (`preserve_on_cancel=true`) requires `preserve_on_cancel_v1`; a
-  non-preserving request may still use a legacy provider-capable worker. The same
+  non-preserving request may still use a legacy provider-capable runner. The same
   request-aware eligibility check applies to preferred-label selection, explicit
   `/node` routing, and durable foreign session owners. A live foreign owner that
   lacks the request protocol remains live but is fenced as incompatible rather
-  than being reclassified as stale. New workers continue decoding a legacy
+  than being reclassified as stale. New runners continue decoding a legacy
   producer's nullable preservation field as false.
-- Enablement condition: #876/#879 add worker heartbeats, capability rows, and a
-  dispatcher path that rejects stale workers.
+- Enablement condition: #876/#879 add runner heartbeats, capability rows, and a
+  dispatcher path that rejects stale runners.
 
 ### `merge_gate_tested_head_sha_phase_evidence`
 
@@ -582,14 +582,14 @@
 
 | issue | invariant coverage |
 | --- | --- |
-| #876 `[multinode 1] worker_nodes + cluster role/heartbeat bootstrap` | `singleton_on_leader`, `heartbeat_capability_registry_routing` |
-| #877 `[multinode 2] leader-only singleton fence for supervised workers and merge side effects` | `singleton_on_leader` |
-| #878 `[multinode 3] task_dispatches / dispatch_outbox PG lease claim + idempotency` | `pg_lease_backed_claim`, `singleton_on_leader` |
-| #879 `[multinode 4] worker capability registry + node-local MCP routing` | `heartbeat_capability_registry_routing` |
+| #876 `[multinode 1] cluster_nodes + cluster role/heartbeat bootstrap` | `singleton_on_hub`, `heartbeat_capability_registry_routing` |
+| #877 `[multinode 2] hub-only singleton fence for supervised runners and merge side effects` | `singleton_on_hub` |
+| #878 `[multinode 3] task_dispatches / dispatch_outbox PG lease claim + idempotency` | `pg_lease_backed_claim`, `singleton_on_hub` |
+| #879 `[multinode 4] runner capability registry + node-local MCP routing` | `heartbeat_capability_registry_routing` |
 | #880 `[multinode 5] Unreal resource_locks for exclusive editor/test execution` | `resource_locks_before_exclusive_editor_test`, `heartbeat_capability_registry_routing` |
 | #881 `[multinode 6] Unreal test_phase_runs + deterministic phase runner` | `resource_locks_before_exclusive_editor_test`, `merge_gate_tested_head_sha_phase_evidence` — evidence store/API and lock-backed start/complete runner API added |
 | #882 `[multinode 7] issue_specs + Issue-as-Spec / phase-plan generation` | `merge_gate_tested_head_sha_phase_evidence` |
-| #883 `[multinode 8] merge gate: required phase evidence + tested head SHA` | `merge_gate_tested_head_sha_phase_evidence`, `singleton_on_leader` |
+| #883 `[multinode 8] merge gate: required phase evidence + tested head SHA` | `merge_gate_tested_head_sha_phase_evidence`, `singleton_on_hub` |
 | #884 `[multinode 9] two-node nightly regression / chaos suite for MacBook + Mac mini` | all invariants |
 
 ## Tests Required Before Enablement
@@ -597,19 +597,19 @@
 - Two-node nightly regression (#884): CI runs `multinode_regression::` plus
   merge-gate policy tests nightly; the physical MacBook + Mac mini smoke
   procedure lives in `docs/agent-maintenance/multinode-two-node-smoke.md`.
-- Worker heartbeat expiry (#876/#879): start a worker with provider and MCP
+- Runner heartbeat expiry (#876/#879): start a runner with provider and MCP
   capabilities, stop heartbeats, and assert new work is not routed to it after
   the expiry window.
-- Leader failover (#877): kill the leader while policy tick, GitHub sync, and
-  `dispatch_outbox` have pending work; assert exactly one replacement leader
+- Hub failover (#877): kill the hub while policy tick, GitHub sync, and
+  `dispatch_outbox` have pending work; assert exactly one replacement hub
   takes ownership and no duplicate merge/issue mutation occurs.
-- Duplicate outbox claim prevention (#878): run two workers draining
+- Duplicate outbox claim prevention (#878): run two runners draining
   `dispatch_outbox`; inject a crash after claim and before completion; assert the
   row is retried once, delivery remains idempotent, and retry counts stay in
   bounds.
 - Node-local MCP routing (#879): advertise different MCP capabilities on two
-  workers; dispatch an MCP-dependent turn; assert the selected worker has the
-  capability and the non-capable worker never receives the MCP call.
+  runners; dispatch an MCP-dependent turn; assert the selected runner has the
+  capability and the non-capable runner never receives the MCP call.
 - Resource lock contention (#880/#881): enqueue two exclusive Unreal editor/test
   phases for the same resource; assert one acquires the PG lock and the other
   waits, fails fast, or is rescheduled according to the phase plan.
@@ -695,15 +695,15 @@ redeploy leaves the old values live in the plist.
 - Update this page in the same PR that changes any owning module listed above.
 - When #876 through #884 land, replace "single-node" or "partial" coverage notes
   with the concrete module and test anchors that prove the invariant.
-- If a new worker, durable queue, provider, MCP integration, or exclusive test
-  resource is added, classify it as leader-only, PG-lease-backed, or worker-local
+- If a new runner, durable queue, provider, MCP integration, or exclusive test
+  resource is added, classify it as hub-only, PG-lease-backed, or runner-local
   before merging.
 
 ### Audited touches
 - 2026-07-30 — #5014 / PR #5020 destructive cancel commit: the inflight
   sidecar flock, watcher cancel `AtomicBool`, and registry identity CAS remain
-  **worker-local** authority. The primitive adds no PostgreSQL lease, distributed
-  epoch, leader check, remote-owner RPC, durable cancel intent, worker placement,
+  **runner-local** authority. The primitive adds no PostgreSQL lease, distributed
+  epoch, hub check, remote-owner RPC, durable cancel intent, runner placement,
   or cross-node fencing; another node can independently verify the same channel
   row. Gateway lease containment narrows that deployment condition but does not
   turn the host-local commit into cluster authority.
@@ -730,11 +730,11 @@ redeploy leaves the old values live in the plist.
   `/resume`, force-kill ownership, and idle-heartbeat reads converge on one durable
   row. Ambiguous exact/alias/canonical or legacy evidence fails closed with
   categorical diagnostics. Existing tmux names, processes, panes, FIFOs, gateway
-  leases, leader election, and worker placement remain unchanged; no cross-node
+  leases, hub election, and runner placement remain unchanged; no cross-node
   tmux adoption, rename, kill, or routing cutover is introduced.
 - 2026-07-25 — #4913 GO-C1 trusted session-forwarding prerequisite:
   `session_forwarding` treats per-node `cluster.nodes.<instance>.trusted_forward_origin`
-  as operator-owned authority, requires exact agreement with fresh worker capability
+  as operator-owned authority, requires exact agreement with fresh runner capability
   advertisements, validates and pins every DNS answer, requires HTTPS by default,
   disables proxies/redirects, and attaches forwarding credentials only after
   validation. Cleartext HTTP requires separate private-address and insecure-
@@ -745,51 +745,51 @@ redeploy leaves the old values live in the plist.
   resume-previous fence the expected
   owner header against the current PostgreSQL `sessions.instance_id` and local
   instance before any node-local read/mutation; draft #4916 must apply the same
-  shared path to resume-candidates. Classification: leader/gateway-originated HTTP
-  routing to worker-local session state using existing PostgreSQL owner authority;
-  no new leader election, lease, schema, or durable outbox. Rolling order is (1)
+  shared path to resume-candidates. Classification: hub/gateway-originated HTTP
+  routing to runner-local session state using existing PostgreSQL owner authority;
+  no new hub election, lease, schema, or durable outbox. Rolling order is (1)
   configure trusted origins on every node, including explicit private/Tailscale
-  opt-in only where needed, (2) upgrade workers until matching origins and required
-  capabilities are advertised, then (3) upgrade the gateway/leader. Missing or
+  opt-in only where needed, (2) upgrade runners until matching origins and required
+  capabilities are advertised, then (3) upgrade the gateway/hub. Missing or
   mismatched trust configuration is a typed 503 with no discovered-URL fallback.
 - 2026-07-24 — #4712 lifecycle de-giant rebase: `runtime_bootstrap.rs` changes only
   update the restart-marker characterization fixture to the current nonce/version
   encoding, while watcher lifecycle logic moves verbatim behind the existing facade.
-  Gateway ownership, lease ordering, worker placement, and cross-node authority are
+  Gateway ownership, lease ordering, runner placement, and cross-node authority are
   unchanged.
 - 2026-07-24 — #4533 transcript clear fence: `/clear` boundary writes and watcher
   transcript persistence serialize through the same channel-scoped PostgreSQL
   advisory transaction lock. The persisted boundary remains cluster-wide authority;
-  this adds no leader election, worker placement, lease, schema, or routing change.
+  this adds no hub election, runner placement, lease, schema, or routing change.
 - 2026-07-24 — #4623 confirmed fresh-delivery cutover: the session sink preserves
   transport-confirmed fresh outcomes through the process-local exact-sequence ring
   and watcher ACK instead of folding them into sink errors. Existing shared delivery
   leases and durable frontier authority remain unchanged; this adds no PostgreSQL
-  schema, leader election, worker placement, or cross-node adoption rule.
-- #4488 PR-F destructive E2E controls are worker-local and opt-in: exact-message deletion and one-shot send/delete failure injection resolve the provider runtime registered on the receiving dcserver; the route subtree remains unmounted unless `AGENTDESK_E2E_CONTROL=1`, and every target must be in the boot-bound `AGENTDESK_E2E_CHANNEL_IDS` allowlist. They add no PostgreSQL authority, leader election, lease, worker placement, or cross-node routing rule; the harness targets the node-local loopback control plane for the owning E2E cell.
+  schema, hub election, runner placement, or cross-node adoption rule.
+- #4488 PR-F destructive E2E controls are runner-local and opt-in: exact-message deletion and one-shot send/delete failure injection resolve the provider runtime registered on the receiving dcserver; the route subtree remains unmounted unless `AGENTDESK_E2E_CONTROL=1`, and every target must be in the boot-bound `AGENTDESK_E2E_CHANNEL_IDS` allowlist. They add no PostgreSQL authority, hub election, lease, runner placement, or cross-node routing rule; the harness targets the node-local loopback control plane for the owning E2E cell.
 - 2026-07-24 — #4508 edit-failure fallback authority: controller and legacy
-  watcher owners capture the worker-local transcript path/generation before the
+  watcher owners capture the runner-local transcript path/generation before the
   edit await, then re-read a locked, double-validated EOF/frontier snapshot while
   retaining the same process-local delivery lease. Committed reconciliation uses
   delivered-anchor-aware guarded placeholder cleanup. This adds no cross-node
-  adoption authority, leader election, PG lease, or routing change; rotated or
-  otherwise unverifiable worker-local sidecars remain fail-open for delivery.
+  adoption authority, hub election, PG lease, or routing change; rotated or
+  otherwise unverifiable runner-local sidecars remain fail-open for delivery.
 - 2026-07-24 — #4536 idle JSONL cursor/commit boundary: temporary active/grace
   suppression now holds uncommitted ordered ranges, and only generation/EOF-checked
   confirmed delivery advances the durable and in-memory frontiers. No inflight
   blind save was added; #4843 reanchor and #4847 shared lease contracts remain intact.
-- #4756 blocking filesystem isolation: routine script reload scans remain inside the existing worker-local routine runtime and per-request validation paths, while startup dashboard provisioning and session-resume discovery retain their existing node-local paths. Moving those synchronous directory walks to Tokio's blocking pool changes no leader election, PG lease, worker placement, durable ownership, or cross-node routing authority.
-- #4340 r3 finalizer-panel ownership fencing remains worker-local: watchdog clear now returns the row removed under the existing per-channel inflight flock, and durable terminal-card records bind message IDs to turn episode plus panel/save revisions. No PostgreSQL schema, lease, leader election, cross-node routing, or owner placement authority changes.
-- #4521 live-state taxonomy audit: [`../relay-live-state-taxonomy.md`](../relay-live-state-taxonomy.md) classifies PostgreSQL authority, host-local durable sidecars, in-memory projections, and transient relay work. Cross-node `instance_id + epoch` stamping/reconciliation stays P3/deferred under #876–#884 until #4414 owner-approved design decides which durable state remains authoritative; current node-local files are never cross-node adoption authority. #4847's terminal delivery lease, #4843's durable-frontier reanchor CAS, #4830's panel invalidation epoch, and #4852's confirmed-commit-only idle cursor remain worker-local; I10 is now documented as landed.
+- #4756 blocking filesystem isolation: routine script reload scans remain inside the existing runner-local routine runtime and per-request validation paths, while startup dashboard provisioning and session-resume discovery retain their existing node-local paths. Moving those synchronous directory walks to Tokio's blocking pool changes no hub election, PG lease, runner placement, durable ownership, or cross-node routing authority.
+- #4340 r3 finalizer-panel ownership fencing remains runner-local: watchdog clear now returns the row removed under the existing per-channel inflight flock, and durable terminal-card records bind message IDs to turn episode plus panel/save revisions. No PostgreSQL schema, lease, hub election, cross-node routing, or owner placement authority changes.
+- #4521 live-state taxonomy audit: [`../relay-live-state-taxonomy.md`](../relay-live-state-taxonomy.md) classifies PostgreSQL authority, host-local durable sidecars, in-memory projections, and transient relay work. Cross-node `instance_id + epoch` stamping/reconciliation stays P3/deferred under #876–#884 until #4414 owner-approved design decides which durable state remains authoritative; current node-local files are never cross-node adoption authority. #4847's terminal delivery lease, #4843's durable-frontier reanchor CAS, #4830's panel invalidation epoch, and #4852's confirmed-commit-only idle cursor remain runner-local; I10 is now documented as landed.
 - #4777 PR-1 channel owner-authority rollout scope: `owner_authority_channel_ids`
   is a live-read, raw top-level Discord channel allowlist used only to tag the
-  leader-owned intake planner's structured telemetry. It does not activate the
-  dormant owner-record authority, mutate PG ownership, alter worker placement,
+  hub-owned intake planner's structured telemetry. It does not activate the
+  dormant owner-record authority, mutate PG ownership, alter runner placement,
   or change Observe/Enforce admission behavior; later rollout PRs own those
   authority changes. The environment mode override cannot populate or bypass
   this YAML-only channel scope.
 - #4799 discrete machine-trigger markers: the watcher converts only footer-owned background terminal notifications into an idempotent lifecycle outbox marker keyed by channel plus semantic event identity; card-owned subagent notifications remain card-only, and monitor notices retain their existing offset-scoped aggregation. This adds no lease, owner, schema, or cross-node routing authority.
-- #4779 target preflight: added a pure fail-closed readiness report and transfer guard over worker-node capability evidence; owner mutation remains delegated to the generation-fenced handoff interface.
+- #4779 target preflight: added a pure fail-closed readiness report and transfer guard over runner-node capability evidence; owner mutation remains delegated to the generation-fenced handoff interface.
 
 - #4800 PostgreSQL pool-starvation fix: the existing `policy-tick` and
   `github-sync` session advisory locks retain lock IDs 7,801,001 and 7,801,002
@@ -797,49 +797,49 @@ redeploy leaves the old values live in the plist.
   PostgreSQL connection instead of pinning a node-local runtime-pool slot across
   nested database work or GitHub CLI network I/O. The runtime-pool acquire
   deadline rises from 3s to 10s as burst margin. Classification:
-  **leader-only/singleton behavior unchanged, worker-local pool capacity freed**;
-  this changes no leader election, lock key, shared-row authority, routing rule,
+  **hub-only/singleton behavior unchanged, runner-local pool capacity freed**;
+  this changes no hub election, lock key, shared-row authority, routing rule,
   or failover semantics.
-- #4781 text-only routed attachment contract: leader-side `intake_router_hook.rs` rejects gateway-local attachment paths before a foreign-owner, `/node`, or preferred-label outbox insert. Queued nonportable uploads are notice-and-drop rather than indefinitely requeued; this changes no leader election, worker lease, or durable owner authority.
-- #4785 Claude TUI readiness classification is worker-local to one session-bound
+- #4781 text-only routed attachment contract: hub-side `intake_router_hook.rs` rejects gateway-local attachment paths before a foreign-owner, `/node`, or preferred-label outbox insert. Queued nonportable uploads are notice-and-drop rather than indefinitely requeued; this changes no hub election, runner lease, or durable owner authority.
+- #4785 Claude TUI readiness classification is runner-local to one session-bound
   pane/transcript pair. Extracting foreground busy evidence and transcript-aware
-  timeout diagnostics changes no leader election, PG lease, cross-node routing,
+  timeout diagnostics changes no hub election, PG lease, cross-node routing,
   durable ownership, or provider-session placement behavior.
-- #4706 structural lint debt backfill: item-level Clippy annotations and their checked-in occurrence ratchet change no runtime ownership, leader election, PG lease, or multinode routing behavior.
-- #4515 worker-local recovery supervision: `src/server/worker_recovery.rs` owns
-  bounded restart handling for the worker-local dispatch-outbox and session-discovery
+- #4706 structural lint debt backfill: item-level Clippy annotations and their checked-in occurrence ratchet change no runtime ownership, hub election, PG lease, or multinode routing behavior.
+- #4515 runner-local recovery supervision: `src/server/runner_recovery.rs` owns
+  bounded restart handling for the runner-local dispatch-outbox and session-discovery
   tasks. Each node applies its own restart budget (at most 5 restarts within 10
   minutes, with 1s-to-60s capped exponential backoff) and leaves an exhausted task
-  stopped on that node. `src/server/worker_registry.rs` retains both specs as
-  `WorkerExecutionScope::WorkerLocal`; this changes no leader election, leader-only
-  worker classification, lease acquisition, or cross-node ownership authority.
+  stopped on that node. `src/server/runner_registry.rs` retains both specs as
+  `RunnerExecutionScope::RunnerLocal`; this changes no hub election, hub-only
+  runner classification, lease acquisition, or cross-node ownership authority.
 - #4568 explicit queue cancellation: `/cancel-queued` removes only the selected
   queued item's primary Discord message ID through the existing per-channel
   mailbox actor; `/queue` exposes those primary IDs for the same channel. This
-  is **worker-local** queue control: it changes neither the durable intake
+  is **runner-local** queue control: it changes neither the durable intake
   schema nor the migration 0093 preserve-on-cancel rollout boundary. The
   existing migration 0093 binary-floor contract above remains authoritative.
-- #4548 lane-1 owner-aware Observe parity — **Leader-only routing decision,
-  worker-local execution, existing PG-backed visibility (not the dormant
-  generation-fenced PG-lease authority)**: the gateway leader's
+- #4548 lane-1 owner-aware Observe parity — **Hub-only routing decision,
+  runner-local execution, existing PG-backed visibility (not the dormant
+  generation-fenced PG-lease authority)**: the gateway hub's
   `src/services/cluster/intake_router_hook.rs` now sends `Observe` through the
-  same live `sessions` owner classification, `worker_nodes` capability/liveness,
+  same live `sessions` owner classification, `cluster_nodes` capability/liveness,
   open `intake_outbox` route, attachment portability, `/node` override, and
   preferred-label plan used by `Enforce`. Observe returns a structured shadow
   outcome and `src/services/discord/router/intake_dispatch.rs` still admits the
-  turn locally, so provider/tmux execution remains worker-local and no outbox or
+  turn locally, so provider/tmux execution remains runner-local and no outbox or
   owner row is written. The reads use existing shared PostgreSQL state, but this
   slice does not activate `owner_record.rs`, acquire a PG advisory lease, stamp
-  an owner generation, or add a leader side effect beyond the already
-  leader-owned gateway admission decision.
+  an owner generation, or add a hub side effect beyond the already
+  hub-owned gateway admission decision.
 - #4527 standby restart contract: both gateway and confirmed-standby providers
-  register the same restart marker poller before starting their intake worker.
+  register the same restart marker poller before starting their intake runner.
   The marker closes a provider-local atomic admission gate, returns an owned
   pre-accept claim to `pending` without retry/error pollution, and waits for any
   accepted tick to finish execution and its terminal outbox transition before
   exposing `restart_pending` or consuming that provider's shutdown-barrier slot.
-  Indeterminate gateway-lease failures start neither worker nor poller.
-- #4550/#4604 intake preservation rolling-deploy contract: worker heartbeats
+  Indeterminate gateway-lease failures start neither runner nor poller.
+- #4550/#4604 intake preservation rolling-deploy contract: runner heartbeats
   advertise `preserve_on_cancel_v1`, and all three routing authorities
   (durable foreign session owner, explicit `/node`, and preferred labels) use the
   same request-aware capability check. Human-authored terminal-shaped text is
@@ -857,20 +857,20 @@ redeploy leaves the old values live in the plist.
 - #4248/#4329 (queue reaction/card UX): keeps ownership **node-local to the
   Discord gateway/runtime**. Queue acceptance and retry requeue states are
   rendered only by the existing persisted `turn_view_reconciler` identity;
-  removing queue-status cards introduces no worker, lease, durable queue, or
+  removing queue-status cards introduces no runner, lease, durable queue, or
   cross-node side effect.
-- #4263 (daily log-digest routine): adds a **LEADER-ONLY/SINGLETON** scheduled
-  monitoring routine. `server::worker_registry` already runs
-  `routine_runtime_loop` through `register_leader_tokio`, and the existing
+- #4263 (daily log-digest routine): adds a **HUB-ONLY/SINGLETON** scheduled
+  monitoring routine. `server::runner_registry` already runs
+  `routine_runtime_loop` through `register_hub_tokio`, and the existing
   PostgreSQL routine claim also locks the single attached routine row with
   `FOR UPDATE SKIP LOCKED` plus `in_flight_run_id`; no second scheduler or
   node-local timer is introduced. Operators attach exactly one daily row on the
-  cluster leader. The routine checkpoint suppresses a second KST-day dispatch,
-  while pending issue drafts are written on the active leader's runtime root.
-  On leader failover the normal stale-run recovery and routine lease semantics
+  cluster hub. The routine checkpoint suppresses a second KST-day dispatch,
+  while pending issue drafts are written on the active hub's runtime root.
+  On hub failover the normal stale-run recovery and routine lease semantics
   remain authoritative. GitHub issue reads happen in the agent turn; issue
   creation stays default-off and requires the literal human-confirmed gate.
-- #4262 (post-deploy functional smoke): adds a **WORKER-LOCAL deploy-tooling**
+- #4262 (post-deploy functional smoke): adds a **RUNNER-LOCAL deploy-tooling**
   stage after `DEPLOY_OK` in `scripts/deploy-release.sh`. Each deployed node
   probes its own loopback API on the configured `server.port`, local
   health/detail relay-wedge markers, and local `dcserver.stdout.log`. Wedge
@@ -892,51 +892,51 @@ redeploy leaves the old values live in the plist.
   a persistent round-robin cursor, instead of fanning out synchronous `gh` API
   calls every tick; each `gh` exec is bounded to 1500 ms; the engine's repeating
   "policy hook slow" WARN is rate-limited to every Nth occurrence.
-  Classification (as it stood before removal): **leader-only / singleton-tick** —
+  Classification (as it stood before removal): **hub-only / singleton-tick** —
   the merge-automation policy tick was a single control-plane owner, and its
   round-robin cursor live in `kv_meta` under the same ownership as the policy's
   existing `kv_meta` state (merge-request queue, allowed authors); no new PG
-  lease, cross-node routing rule, or leader-election authority is introduced, and
-  the WARN de-noise counter is per-process worker-local.
+  lease, cross-node routing rule, or hub-election authority is introduced, and
+  the WARN de-noise counter is per-process runner-local.
 
-- #4237 DAVE/E2EE voice-close observability: the existing worker-local
+- #4237 DAVE/E2EE voice-close observability: the existing runner-local
   `DriverDisconnect` handler now classifies Discord voice close codes 4016/4017,
   records a structured counter event, and routes a deduplicated operator alert
-  through the existing notify bot. Multinode class: **worker-local likely** —
+  through the existing notify bot. Multinode class: **runner-local likely** —
   the metric, alert dedup, Songbird connection, and rejoin supervisor remain
   pinned to the node/provider that owns the guild voice connection; no shared
-  authority, PG lease, or leader-only side effect changes.
+  authority, PG lease, or hub-only side effect changes.
 - #4249 PostgreSQL bootstrap timeout hardening runs migration/reseed on an eager
   startup pool with a 10s acquire deadline, then eagerly activates the separate
   runtime pool before the shared six-attempt retry/alert envelope can succeed.
   The runtime deadline was originally 3s and became 10s in #4800. Typed
   `sqlx::Error::PoolTimedOut` failures
   get timestamped, source-attributed bootstrap diagnostics.
-  Classification: **worker-local** — every node owns its own connection pool,
+  Classification: **runner-local** — every node owns its own connection pool,
   wait budget, retry loop, and stderr; this changes no shared row, schema,
-  leader-only side effect, cross-node routing rule, or PG lease/claim authority.
+  hub-only side effect, cross-node routing rule, or PG lease/claim authority.
 
 - #4247 S0 reaction status-only containment removes the guild and DM reaction
   gateway subscriptions plus the only destructive `ReactionRemove` intake
   route. This narrows connection-level event intake on every node; it does not
-  change gateway lease acquisition, singleton ownership, worker routing, or
+  change gateway lease acquisition, singleton ownership, runner routing, or
   node-local/shared-Postgres authority. Explicit authenticated `/stop`
   cancellation remains on its existing owner.
 
 - #4424 message_outbox source-contract recovery: the protected
   `GET /api/message-outbox/failed` inspection route is read-only on any control
   node, while `POST /api/message-outbox/failed/redrive` is classified as a
-  **leader-owned operator side effect** and the deployment runbook must target
-  the active leader. The mutation itself is shared-Postgres durable and
+  **hub-owned operator side effect** and the deployment runbook must target
+  the active hub. The mutation itself is shared-Postgres durable and
   identity-safe: migration 0081 records a unique
   `(message_outbox_id,idempotency_key)` audit claim, the service locks exact
   requested rows, revalidates the central Loopback source contract, suppresses
   active/sent semantic siblings and duplicate failed identities, and only then
   updates the same failed row to pending. Consequently an accidental retry or
   concurrent call on another node converges to `idempotent_replay`/no-op rather
-  than a second pending row or send. The normal message_outbox worker retains
-  its existing PG claim-owner fencing; no worker scope, gateway lease, target
-  authorization, or worker-local relay ownership changes. Operational live
+  than a second pending row or send. The normal message_outbox runner retains
+  its existing PG claim-owner fencing; no runner scope, gateway lease, target
+  authorization, or runner-local relay ownership changes. Operational live
   redrive remains outside the implementation PR and is performed by the
   orchestrator only after deploy and independent review.
 
@@ -944,10 +944,10 @@ redeploy leaves the old values live in the plist.
   `turn_bridge/mod.rs` moved verbatim to `retry_state.rs`, `stream_receiver.rs`,
   `activity_heartbeat.rs`, `tmux_runtime.rs`, `cancel_finalize_policy.rs`,
   `panel_lifecycle.rs`, and `thinking.rs`; their inline tests
-  moved with the owning behavior. Classification: worker-local — this is a
+  moved with the owning behavior. Classification: runner-local — this is a
   module-boundary-only refactor of the existing per-turn receiver, retry,
   heartbeat, panel, cancel, and transcript helpers. It adds no state field,
-  database/schema write, PG lease, leader-only effect, cross-node read, or
+  database/schema write, PG lease, hub-only effect, cross-node read, or
   singleton assumption; call sites and side-effect ordering are unchanged.
 - #4275 watcher/jsonl segment-boundary separator: `tmux_output_stream.rs`
   (WATCHER) `process_watcher_lines_for_turn` now guards the bare
@@ -963,23 +963,23 @@ redeploy leaves the old values live in the plist.
   events that previously glued into one run-on line. The `content_block_delta`
   intra-block streaming push (qwen `--include-partial-messages`) is deliberately
   left a bare `push_str` so a separator never fractures a single sentence.
-  Classification: worker-local — the change only reshapes the per-node watcher's
+  Classification: runner-local — the change only reshapes the per-node watcher's
   in-memory `full_response` assembly before relay; it adds no new inflight-row
-  field, delivery record, PG lease, leader gate, or cross-node routing state, and
+  field, delivery record, PG lease, hub gate, or cross-node routing state, and
   no DB/schema change.
 - #3805 P2 PR-D two-message rollover re-anchor: `turn_bridge/mod.rs` (SINK) and
   `tmux_watcher.rs` (WATCHER) each re-anchor the separate two-message status panel
   BELOW the new tail answer after a mid-turn answer rollover, gated on the
   default-OFF `two_message_panel_enabled` flag. All logic lives in the non-giant
   siblings `{turn_bridge,tmux_watcher}/two_message_panel.rs` (send the new panel,
-  durably pre-register the new panel in the worker-local orphan store, persist or
+  durably pre-register the new panel in the runner-local orphan store, persist or
   bind the new `status_message_id`, retire the stranded old panel, and bump the
   per-turn `status_panel_generation` epoch); the giants carry only thin wiring.
-  Classification: worker-local — the epoch bump is persisted through the SAME
+  Classification: runner-local — the epoch bump is persisted through the SAME
   per-`(provider, channel)` inflight sidecar flock the create already used (sink:
   `save_inflight_state` before old-panel delete; watcher: atomic
   `bind_status_panel` with expected old panel id + in-lock generation bump), which
-  is worker-local runtime state, not a PG lease / leader gate / cross-node routing
+  is runner-local runtime state, not a PG lease / hub gate / cross-node routing
   field. The watcher re-anchor gate now also requires the loaded inflight row to
   be watcher-panel-eligible, so Managed bridge-owned turns delegated to watcher
   relay cannot hijack the bridge-owned panel. The generation epoch and
@@ -987,18 +987,18 @@ redeploy leaves the old values live in the plist.
   PR-D adds no new field, delivery record, or schema change, and item4's
   fire-and-forget session banner (`session_banner.rs`) is untouched. Delete
   failures fall back to the existing durable status-panel orphan store (also
-  worker-local). OFF path is byte-identical.
+  runner-local). OFF path is byte-identical.
 - #4488 two-message restart recovery + E2E: the restart inflight scan delegates
   panel repair to `recovery_engine/two_message_panel.rs` before watcher/bridge
   reattachment. The helper treats Discord message existence and snowflake order
   only as repair evidence, then authorizes the replacement exclusively through
   the existing full `InflightTurnIdentity` CAS and in-lock generation bump. A
-  just-sent panel is pre-registered in the worker-local orphan store, a bind loser
+  just-sent panel is pre-registered in the runner-local orphan store, a bind loser
   deletes or queues only its own duplicate, and an old live panel is retired only
   after the same episode durably owns the replacement. The #4830 process-local
   cache invalidation epoch is intentionally not copied across restart or panel
   identities; the new panel starts uncached, while terminal reconcile remains
-  keyed to the rebound panel generation. No PG lease, leader gate, schema field,
+  keyed to the rebound panel generation. No PG lease, hub gate, schema field,
   or cross-node authority is added. The default-OFF flag remains unchanged.
 - #3038 (b) early TUI completion gate extraction: `turn_bridge/mod.rs` moved the
   #2293/#2780 early TUI quiescence gate (the eligibility filter + bounded
@@ -1006,11 +1006,11 @@ redeploy leaves the old values live in the plist.
   `bridge_tui_gate_outcome_early` + `bridge_early_gate_timed_out`) verbatim into
   the new `early_tui_completion.rs` sibling; context is threaded in by shared
   reference (`inflight_state`, `provider`) and `Copy` value, and the two outputs
-  are returned. Classification: worker-local — a pure behavior-preserving
+  are returned. Classification: runner-local — a pure behavior-preserving
   decompose: control flow, conditions, order, and side effects are byte-identical
   to the inline block, and it adds no new inflight-row field, delivery record, PG
-  lease, leader gate, or cross-node routing state (the gate only reads
-  worker-local tmux / inflight runtime state and is `#[cfg(unix)]`). No DB/schema
+  lease, hub gate, or cross-node routing state (the gate only reads
+  runner-local tmux / inflight runtime state and is `#[cfg(unix)]`). No DB/schema
   change.
 - #3813 Phase 2 status-panel low-pri + Bridge-spans (AC#1 tail):
   `turn_bridge/mod.rs` streaming loop now defers the v2 status-panel / footer edit
@@ -1020,13 +1020,13 @@ redeploy leaves the old values live in the plist.
   first; and it emits observation-only bridge-side latency spans
   (`turn_start`->first_output / ->first_relay, struct in the new
   `bridge_latency_spans.rs`) reusing the existing `turn_start` `Instant` anchor.
-  Classification: worker-local — the low-pri deferral only reorders local
+  Classification: runner-local — the low-pri deferral only reorders local
   edit-timing within the shared per-channel lane (no `discord_io` min_gap change),
   keeps `status_panel_dirty` set so the panel renders on the next interval
   (coalesced, never dropped), and the #3477 live-panel guard (`first_answer_text_pending`)
   means tool-only / watcher- or standby-owned relay turns are never suppressed.
   The spans are pure `Instant` deltas emitted once at loop exit — no new
-  inflight-row field, delivery record, PG lease, leader gate, or cross-node
+  inflight-row field, delivery record, PG lease, hub gate, or cross-node
   routing state, and no new await/lock on the hot path; watcher-owned relay
   latency is out of scope (`tmux_watcher.rs`). No DB/schema change.
 - #3813 Phase 1b first-output fast-lane status-edit gate: `turn_bridge/mod.rs`
@@ -1035,9 +1035,9 @@ redeploy leaves the old values live in the plist.
   (default 5s); a `first_answer_relayed` flag + the pure
   `bridge_streaming_edit_gate_open` predicate (`streaming_edit_text.rs`) open the
   gate once for the opening answer, then it reverts to the normal interval
-  throttle (at most +1 edit per turn). Classification: worker-local — this only
+  throttle (at most +1 edit per turn). Classification: runner-local — this only
   relaxes the local edit-timing throttle inside the per-node bridge turn loop; it
-  writes no new inflight-row field, delivery record, PG lease, leader gate, or
+  writes no new inflight-row field, delivery record, PG lease, hub gate, or
   cross-node routing state, and the `!done` guard, rollover, and finalize
   ownership counters are untouched. No DB/schema change.
 - #3906 voice intake feedback P1+P4: `process_completed_utterance` now plays the
@@ -1046,10 +1046,10 @@ redeploy leaves the old values live in the plist.
   in `try_handle_voice_transcript_announcement` was removed), while the turn-done
   branch in `progress_playback.rs` plays a new distinct descending done chime
   (`DONE_CHIME_FILE_NAME` + `ensure_done_chime_file` / `play_done_chime`).
-  Classification: worker-local. The chime is audio emitted into the per-node
-  songbird voice call the worker is already connected to; it is upstream of the
+  Classification: runner-local. The chime is audio emitted into the per-node
+  songbird voice call the runner is already connected to; it is upstream of the
   durable-reservation/announce/dedup machinery and touches no delivery record, PG
-  lease, leader gate, or cross-node routing. No DB/schema change.
+  lease, hub gate, or cross-node routing. No DB/schema change.
 - #3976 orphan-relay reclaim durable delivered guard — prevents prior-tail
   re-emit on /loop non-Managed turn start: the `SessionBoundRelay` TUI-direct
   confirmed-POST route advanced only the resettable in-memory
@@ -1063,10 +1063,10 @@ redeploy leaves the old values live in the plist.
   fired) via a single-flock identity-re-gated RMW
   (`mark_session_bound_relay_delivered_locked`), and excludes a marked row from
   `session_bound_relay_external_input_orphan_shape_at` (plus the symmetric
-  ownerless predicate). Classification: worker-local — a per-worker inflight-row
+  ownerless predicate). Classification: runner-local — a per-runner inflight-row
   marker. The inflight row is per-node sidecar state the owning sink/watcher
   reads/writes for its own turn; the new field is additive `#[serde(default)]`
-  (legacy rows deserialize as `false`), so it adds no leader gate, cross-node
+  (legacy rows deserialize as `false`), so it adds no hub gate, cross-node
   routing, or PG-lease assumption and is forward/backward compatible on disk.
   Independent of `AGENTDESK_DELIVERY_RECORD_AUTHORITY` / `_SHADOW` (it touches no
   delivery records) and of #3933.
@@ -1081,10 +1081,10 @@ redeploy leaves the old values live in the plist.
   (new additive `#[serde(default)] streaming_rollover_frozen_msg_ids` on
   `InflightTurnState`, union-merged via the streaming-progress patch and restored
   through the watcher seed), so a fallback in a later iteration / after a restart
-  still deletes every accumulated prefix. Classification: worker-local relay
+  still deletes every accumulated prefix. Classification: runner-local relay
   cleanup + node-local inflight state. The inflight row is per-node sidecar state
   the owning watcher reads/writes for its own turn; the new field is additive
-  `#[serde(default)]` (legacy rows deserialize as empty), so it adds no leader
+  `#[serde(default)]` (legacy rows deserialize as empty), so it adds no hub
   gate, cross-node routing, or PG-lease assumption and is forward/backward
   compatible on disk. Independent of the `AGENTDESK_DELIVERY_RECORD_AUTHORITY`
   flag (it touches no delivery records).
@@ -1095,30 +1095,30 @@ redeploy leaves the old values live in the plist.
   submodules — voice-announcement resolution, the `if !started` race-loss
   mailbox enqueue + queued-placeholder render + reaction lifecycle, and the
   per-turn watchdog spawn. Classification: UNCHANGED. Intake/turn-execution
-  stays worker-local — workers invoke the unchanged `execute_intake_turn_core`
-  facade after claiming a PG-lease-backed `intake_outbox` row, and the leader
+  stays runner-local — runners invoke the unchanged `execute_intake_turn_core`
+  facade after claiming a PG-lease-backed `intake_outbox` row, and the hub
   runs the same in-process `handle_text_message`; this is pure code movement
-  with no new leader gate, cross-node routing, or PG-lease assumption.
+  with no new hub gate, cross-node routing, or PG-lease assumption.
 
 - #3870 fail-closed control-plane bind: `server::run` now resolves the HTTP
   listener host through `routes::resolve_secure_bind_host`, which force-binds to
   loopback when `server.host` is non-loopback AND `server.auth_token` is unset
   (escape hatch: `server.allow_insecure_nonloopback_bind=true`). Classification:
-  control-plane, per-node startup — every node (leader or follower) runs this
-  guard at its own dcserver boot; it is NOT leader-gated and adds no cross-node
+  control-plane, per-node startup — every node (hub or follower) runs this
+  guard at its own dcserver boot; it is NOT hub-gated and adds no cross-node
   routing or PG-lease assumption. Multinode note: all live cross-node
-  coordination (heartbeat/leader-epoch/dispatch claims) is Postgres-based and
+  coordination (heartbeat/hub-epoch/dispatch claims) is Postgres-based and
   deploy is SSH-based, so force-loopback does not affect cluster comms. The only
   cross-node HTTP path (session-forwarding to a peer's `cluster.api_base_url`)
   is inbound-only on the receiver and already requires `auth_token`, which by
   design exempts that node from the force-loopback downgrade.
 
-- #3739 worker-local loop-owned terminal supervision: `worker_registry` now records
-  unexpected worker-local `LoopOwned` Tokio task return/panic as local runtime
-  status and tracing with `auto_restart=false`. Shutdown remains worker-local:
-  the registry first lets the inner worker observe runtime shutdown and run its
+- #3739 runner-local loop-owned terminal supervision: `runner_registry` now records
+  unexpected runner-local `LoopOwned` Tokio task return/panic as local runtime
+  status and tracing with `auto_restart=false`. Shutdown remains runner-local:
+  the registry first lets the inner runner observe runtime shutdown and run its
   own cleanup, only aborting after a bounded grace timeout. This does not move
-  the worker to leader-only ownership, add cross-node routing, or change PG lease
+  the runner to hub-only ownership, add cross-node routing, or change PG lease
   assumptions.
 
 - #3698/#3710 `/node` channel picker: Discord command registration now exposes a
@@ -1127,34 +1127,34 @@ redeploy leaves the old values live in the plist.
   the effective intake routing authority is enforce
   (`cluster.intake_routing.enabled=true` + `mode=enforce`, or emergency
   `ADK_INTAKE_ROUTING_MODE=enforce` override). Available choices are filtered
-  from `worker_nodes` nodes that advertise the active provider's intake-worker
-  capability. This adds no gateway ownership, leader-election, or lease
+  from `cluster_nodes` nodes that advertise the active provider's intake-runner
+  capability. This adds no gateway ownership, hub-election, or lease
   assumption; it only constrains the already-clustered intake target decision.
 
 - #3749 intake routing config authority: `cluster.intake_routing` is now the
   YAML source of truth for disabled/observe/enforce mode, with
-  `ADK_INTAKE_ROUTING_MODE` retained as an emergency override. The leader hook,
-  `/node`, worker spawn gate, and `/api/health.intake_routing` read the same
-  effective authority. Classification: PG-lease-backed worker-local execution;
-  no new gateway owner, no extra leader election surface.
+  `ADK_INTAKE_ROUTING_MODE` retained as an emergency override. The hub hook,
+  `/node`, runner spawn gate, and `/api/health.intake_routing` read the same
+  effective authority. Classification: PG-lease-backed runner-local execution;
+  no new gateway owner, no extra hub election surface.
 
 - #4611 owner-targeted cancel forwarding: REST cancel and Discord `/stop` resolve
   the canonical active `sessions.instance_id` owner and fail closed instead of
-  mutating leader-local state when ownership is remote or changes during cancel.
-  The #4913 GO-C1 prerequisite supersedes the original workers-first shorthand:
+  mutating hub-local state when ownership is remote or changes during cancel.
+  The #4913 GO-C1 prerequisite supersedes the original runners-first shorthand:
   first configure `cluster.nodes.<instance>.trusted_forward_origin` for every
-  potential owner, then upgrade workers until they advertise the exact configured
+  potential owner, then upgrade runners until they advertise the exact configured
   origin and `capabilities.agentdesk_api.cancel_forwarding_v1=true`, and upgrade
-  leaders last. Leaders do not forward cancel to older or mismatched workers.
+  hubs last. Hubs do not forward cancel to older or mismatched runners.
   Keep old and new nodes registered during rollout only after every potential
   owner advertises the fence. No durable cancel outbox or new lease is introduced.
 
-- #4350 session-owner intake affinity: leader-only routing resolves the existing
+- #4350 session-owner intake affinity: hub-only routing resolves the existing
   PG `sessions.instance_id` owner before `/node` or preferred labels, and every
   Discord/skill/queued producer shares one admission path. Stale or conflicting
   owners, distinct open routes, and foreign-owner node-local attachments fail
   safe without local execution; queued items are front-requeued before marker
-  teardown. Worker execution remains instance-local and is the one intentional
+  teardown. Runner execution remains instance-local and is the one intentional
   admission bypass after an outbox claim. No new lease or migration.
 
 - #5040 owner-authority admission fence correction: `owner_authority_channel_ids`
@@ -1164,12 +1164,12 @@ redeploy leaves the old values live in the plist.
   and the channel is explicitly unlisted; the row is atomically retired under
   the channel advisory lock before local execution. Unknown config and
   `claimed`/`accepted`/`spawned` routes remain fenced. Foreign-owner routing,
-  worker claim, lease, migration, and gateway ownership remain unchanged.
+  runner claim, lease, migration, and gateway ownership remain unchanged.
 
 - #3630 frontier mirror for cancel/stop + prompt_too_long terminal arms:
   turn_bridge now mirrors only Delivered+committed terminal-replace lease ranges
   into the durable delivery-record frontier keyed by `watcher_owner_channel_id`.
-  Classification: worker-local relay frontier; no leader election, PG lease, or
+  Classification: runner-local relay frontier; no hub election, PG lease, or
   cross-node gossip change.
 
 - #3573 `pause_reason` DB field + opt-in failure-pause auto-resume:
@@ -1178,13 +1178,13 @@ redeploy leaves the old values live in the plist.
   `'migration_invalid'` (migrated-launchd structural-validation failure). All
   routine scheduling logic (supervisor tick, store methods `close_run`,
   `pause_routine`, `list_failure_paused_routines`, `auto_resume_failure_paused_routine`)
-  runs on the single leader node that owns the PG pool — no cross-node state,
-  no gossip, no worker-local cache. The new `failure_pause_auto_resume_secs`
+  runs on the single hub node that owns the PG pool — no cross-node state,
+  no gossip, no runner-local cache. The new `failure_pause_auto_resume_secs`
   config knob (default 0 = disabled) gates the auto-resume scan. The existing
   `ResumeRequiresNextDueAt` guard is preserved: schedule-less routines with no
   `next_due_at` are skipped. `pause_reason = NULL` (pre-existing rows) and
   `'manual'`/`'migration_invalid'` pauses are never touched by auto-resume.
-  No leader election, gateway lease, startup order, worker ownership, or
+  No hub election, gateway lease, startup order, runner ownership, or
   singleton assumption outside the existing PG-lease-gated routine supervisor is
   touched.
 - #3610 (Phase B PR-1c) long-chunk terminal anchor recording: `turn_bridge/mod.rs`
@@ -1198,12 +1198,12 @@ redeploy leaves the old values live in the plist.
   `watcher_owner_channel_id` (the offset authority — UNCHANGED), and the recorded
   anchor PAIR is `(panel_channel_id = delivery channel_id, panel_msg_id = last chunk)`;
   the helper body + gating live in `outbound/delivery_record.rs`
-  (`record_long_chunk_terminal_delivery`). This is purely worker-local delivery
+  (`record_long_chunk_terminal_delivery`). This is purely runner-local delivery
   instrumentation behind the existing shadow flag (`AGENTDESK_DELIVERY_RECORD_SHADOW`,
   default OFF → no-op): the recorded panel fields have NO production reader (the sole
   durable-frontier reader consumes only `.range.1`), so the #3593/#3520 dedup, #3604
   window, and the `watcher_owner_channel_id` offset-authority key are all unaffected.
-  No leader election, gateway lease, PG ownership, startup order, worker ownership, or
+  No hub election, gateway lease, PG ownership, startup order, runner ownership, or
   singleton assumption is touched; the recovery-fallback re-post criterion remains
   deferred to a later #3610 PR.
 - #3593 synthetic-resume relay-duplicate guard: `tmux_watcher.rs` extends the
@@ -1211,14 +1211,14 @@ redeploy leaves the old values live in the plist.
   background-agent-completion synthetic resume that restores the placeholder and
   rewinds `response_sent_offset`) routes to the EXISTING non-destructive
   `SkipAlreadyCommitted` arm instead of re-sending the prior body. The dedup
-  reads the worker's OWN per-channel relay watermark (`effective_committed_offset`,
+  reads the runner's OWN per-channel relay watermark (`effective_committed_offset`,
   generation self-healed before the read) and preserves the restored placeholder —
-  it is a worker-local, in-memory/durable-record dedup, NOT a routing authority and
+  it is a runner-local, in-memory/durable-record dedup, NOT a routing authority and
   never read cross-node. The pure `range_already_committed` helper + tests live in
-  `outbound/delivery_record.rs`. No leader election, gateway lease, PG ownership,
-  startup order, worker ownership, or singleton assumption is touched.
+  `outbound/delivery_record.rs`. No hub election, gateway lease, PG ownership,
+  startup order, runner ownership, or singleton assumption is touched.
 - #3607 terminal-delete protection guard + durable delete observability
-  (Phase A): `turn_bridge/mod.rs` gained a worker-local cleanup guard that
+  (Phase A): `turn_bridge/mod.rs` gained a runner-local cleanup guard that
   preserves a committed terminal anchor (a finished turn's retired message
   recorded in the per-process `PlaceholderCleanupRegistry` tombstone, signal-c,
   fused with the live-inflight fast path, signal-a) from the orphan-spinner
@@ -1228,18 +1228,18 @@ redeploy leaves the old values live in the plist.
   sibling); only a dispatch call + guard remain inline. The guard reads the same
   per-process tombstone registry the watcher already owns and the turn's OWN
   inflight handle — it is NOT a routing authority, never read cross-node. No
-  leader election, gateway lease, PG ownership, startup order, worker ownership,
+  hub election, gateway lease, PG ownership, startup order, runner ownership,
   or singleton assumption is touched; the recovery-fallback criterion is
   deferred to #3610.
 - #3607 terminal-UI obligation durable sidecar + sweeper: the
-  TimedOut+committed terminal path writes a worker-local sidecar obligation and
+  TimedOut+committed terminal path writes a runner-local sidecar obligation and
   edits only the existing status card to "delivered / session-end confirming";
   `terminal_ui_obligation.rs` owns the durable sidecar and isolated sweeper that
   converges the same card to ✅ on pane idle or ⚠ on deadline. This is a
-  worker-local UI reconcile over per-channel runtime state, not a body-delivery
+  runner-local UI reconcile over per-channel runtime state, not a body-delivery
   authority: no assistant body repost, no response/confirmed offset movement,
-  no `delivery_record.rs` frontier reuse, and no new leader election, gateway
-  lease, PG ownership, startup order, worker ownership, or singleton assumption.
+  no `delivery_record.rs` frontier reuse, and no new hub election, gateway
+  lease, PG ownership, startup order, runner ownership, or singleton assumption.
 - #3560 single_message_panel default-ON + footer-mode migration guard: the
   `single_message_panel` flag is now default-ON (opt-out via
   `AGENTDESK_SINGLE_MESSAGE_PANEL=0|false`) and `turn_bridge/mod.rs` gained a
@@ -1247,11 +1247,11 @@ redeploy leaves the old values live in the plist.
   status panel under the old default-OFF runtime resumes under footer mode, the
   bridge now reconciles (edits to a migration notice) and clears its OWN
   `inflight_state.status_message_id` instead of orphaning that Discord message.
-  This is purely worker-local: it operates on the resuming turn's own per-turn
+  This is purely runner-local: it operates on the resuming turn's own per-turn
   inflight handle and its own gateway, with no node ownership, lease, or
-  singleton implication. Gateway lease, startup order, worker ownership, and
+  singleton implication. Gateway lease, startup order, runner ownership, and
   singleton assumptions are unchanged.
-- #3540 phantom-synthetic-inflight fix: two worker-local, in-memory-state-only
+- #3540 phantom-synthetic-inflight fix: two runner-local, in-memory-state-only
   touches with no multinode ownership/lease/singleton implications.
   (A) `tui_prompt_dedupe.rs` gained a process-global `relayed_entry_ids_by_tmux`
   ledger keyed on the Claude transcript `user` entry's stable `uuid`
@@ -1265,8 +1265,8 @@ redeploy leaves the old values live in the plist.
   `schedule_deferred_idle_queue_kickoff` once (after the pending record is
   deleted) so a queued follow-up dispatches through the unchanged
   `mailbox_try_start_turn_kinded` FSM — NO inflight is cleared/reset/deleted, so
-  the worst case is a normal merge with zero live-turn loss. The detached worker
-  remains per-`(provider, channel_id)` worker-local under the existing channel
+  the worst case is a normal merge with zero live-turn loss. The detached runner
+  remains per-`(provider, channel_id)` runner-local under the existing channel
   lock; queue ownership, lease semantics, and singleton assumptions are
   unchanged. (C) absorbed warm-followup strand fix in
   `turn_bridge/watcher_handoff.rs`: the #3277 proven-delivered guard
@@ -1276,17 +1276,17 @@ redeploy leaves the old values live in the plist.
   its full response past `turn_start_offset`. Both `turn_start_offset` and
   `tmux_last_offset` are seeded to the same per-turn `inflight_offset` (itself a
   `std::fs::metadata().len()` of the same `output_path`), so the new EOF read is
-  in the SAME single-file byte-space — purely a worker-local disk read on the
+  in the SAME single-file byte-space — purely a runner-local disk read on the
   bridge's own transcript path, with no node ownership, lease, or singleton
   implication. A rotated/truncated transcript shrinks the EOF and the guard
   conservatively fails open to the existing #3268 watcher handoff.
-- #3038 run_bot S5: the leader gateway runtime tail moved verbatim from
+- #3038 run_bot S5: the hub gateway runtime tail moved verbatim from
   `runtime_bootstrap.rs` into `runtime_bootstrap/gateway_runtime.rs`: restored
   generation/model/fast-mode logging, health registry registration,
   slash-command/framework/client construction, gateway lease keepalive spawn,
   SIGTERM handler spawn, and backend event-loop entry remain in the same order.
   The root `run_bot` body now delegates that tail after the lease succeeds; no
-  gateway ownership, worker routing, singleton, or lease semantics changed.
+  gateway ownership, runner routing, singleton, or lease semantics changed.
 - #3038 run_bot S4: `run_bot_build_shared_data` (and its side-effect-order
   doc comment) moved verbatim from `runtime_bootstrap.rs` into
   `runtime_bootstrap/shared_data.rs`, unblocked by the merged SharedData
@@ -1297,7 +1297,7 @@ redeploy leaves the old values live in the plist.
   side-effecting initializer order (`load_queue_exit_placeholder_clears` ↔
   `load_generation` ↔ `TurnFinalizer::spawn` ↔ `broadcast::channel`), and the
   standby-before-lease call order are
-  unchanged. Worker-local module move only: no multinode ownership,
+  unchanged. Runner-local module move only: no multinode ownership,
   singleton, or lease assumption changes.
 - #3038 SharedData S3: `runtime_bootstrap.rs` gained restart-lifecycle
   characterization tests that pin the deferred-restart marker quick-exit path
@@ -1315,13 +1315,13 @@ redeploy leaves the old values live in the plist.
   `shared.<field>` → `shared.restart.<field>` substitution with no
   statement, ordering, or lock-span changes. The process-global
   `global_active`/`global_finalizing`/`shutdown_remaining` counters remain
-  injected `Arc` handles (no flattening), so worker-local state grouping
+  injected `Arc` handles (no flattening), so runner-local state grouping
   only: no multinode ownership, singleton, or lease assumption changes.
 - #3038 SharedData S2: `runtime_bootstrap.rs` changed only inside
   `run_bot_build_shared_data` — the eight session-override fields are now
   initialized through the `SessionOverrideState` group literal wrapped at the
   first member's original position (member expressions byte-identical,
-  evaluation order preserved; `run_bot` body byte-identical). Worker-local
+  evaluation order preserved; `run_bot` body byte-identical). Runner-local
   state grouping only: no multinode ownership, singleton, or lease assumption
   changes.
 - #3038 run_bot S0/S1: `runtime_bootstrap.rs` gained characterization tests and
@@ -1330,32 +1330,32 @@ redeploy leaves the old values live in the plist.
   **behavior-preserving module split**: `run_bot` body, gateway lease acquisition,
   keepalive self-fence, shutdown ordering, and the recovery/spawn callsites remain
   in their original order. Multinode classification is unchanged: gateway
-  ownership remains leader-only under the existing lease, while thread/session GC
-  and queued-placeholder cleanup retain their previous worker-local/runtime-local
+  ownership remains hub-only under the existing lease, while thread/session GC
+  and queued-placeholder cleanup retain their previous runner-local/runtime-local
   assumptions.
 - #3038 run_bot S2/S3: setup/spawn/recovery/voice helpers moved into
   `framework_setup.rs`, `spawns.rs`, `recovery_flush.rs`, and `voice.rs`; gateway
-  lease, shutdown/backend, and intake-worker helpers moved into
+  lease, shutdown/backend, and intake-runner helpers moved into
   `gateway_lease.rs`, `shutdown.rs`, and `intake.rs`. This is a
   **behavior-preserving module split**: the `run_bot` call order, gateway
   acquisition before client startup, keepalive self-fence, SIGTERM
-  persist-before-I/O ordering, and standby intake-worker placement are unchanged.
+  persist-before-I/O ordering, and standby intake-runner placement are unchanged.
   S4 (`run_bot_build_shared_data`) remains gated on the SharedData slice.
 - #3274 residual cleanup: `turn_finalizer.rs` now invokes a small
   `turn_finalizer/cleanup.rs` helper when a terminal loser receives
   `AlreadyFinalized`, clearing only same-`user_msg_id` mailbox/inflight
-  active-state. This is **worker-local**: it runs in the same process that owns
+  active-state. This is **runner-local**: it runs in the same process that owns
   the channel mailbox, finalizer actor, and local inflight file, and it adds no
-  leader-only side effect, durable queue authority, or PG lease assumption.
+  hub-only side effect, durable queue authority, or PG lease assumption.
 - #3334 reaction lifecycle cleanup: abnormal finalizer backstops and restart
   catch-up now run idempotent same-message reaction cleanup through local Discord
-  HTTP helpers. This is **worker-local**: it touches only the recovered/finalized
-  Discord message id on the worker processing that channel and adds no shared
+  HTTP helpers. This is **runner-local**: it touches only the recovered/finalized
+  Discord message id on the runner processing that channel and adds no shared
   scheduling authority or cross-node lease dependency.
 - TUI hook registry upstream-port audit: `runtime_bootstrap.rs` bootstrap
   wiring now feeds the Claude TUI hook buffer/claim registry, but the registry
-  is **worker-local** in-memory state scoped to a provider session / tmux key.
-  It adds no leader-only side effect, durable queue, cross-node singleton, or
+  is **runner-local** in-memory state scoped to a provider session / tmux key.
+  It adds no hub-only side effect, durable queue, cross-node singleton, or
   PG lease; on restart it can only lose buffered hook events and falls back to
   the legacy readiness path.
 - #3038 S1 (SharedData `QueuedPlaceholderState` extraction): `runtime_bootstrap.rs`
@@ -1363,25 +1363,25 @@ redeploy leaves the old values live in the plist.
   queued-placeholder members wrapped into the new `queued:` group field;
   initialization expressions and their evaluation order byte-identical) and
   `run_bot_spawn_recovery_and_flush_restart_reports` (mechanical `.queued.`
-  field-path rewrite). Pure behavior-preserving extraction. **Worker-local**:
-  no leader-only side effect, no durable queue, no PG lease — multinode
+  field-path rewrite). Pure behavior-preserving extraction. **Runner-local**:
+  no hub-only side effect, no durable queue, no PG lease — multinode
   assumptions unchanged.
 - #3082 (queued-card / answer-flush barrier): `runtime_bootstrap.rs` changed
   only to initialize the new in-process `answer_flush_barrier` field on
-  `SharedData`. The barrier is **worker-local** (a per-process, per-channel
-  in-memory gate guarding queued-card ordering) — it owns no leader-only side
+  `SharedData`. The barrier is **runner-local** (a per-process, per-channel
+  in-memory gate guarding queued-card ordering) — it owns no hub-only side
   effect, no durable queue, and no PG lease, so it introduces no new multinode
   ownership/singleton/lease assumption.
 - #3038 (`run_bot` god-function decomposition): `runtime_bootstrap.rs` changed
   by a **pure, behavior-preserving extraction** of `run_bot`'s inline
-  leader-only background-spawn block into six `run_bot_spawn_*` free helpers
+  hub-only background-spawn block into six `run_bot_spawn_*` free helpers
   (deferred_restart_poller, skills_hot_reload, recovery_and_flush_restart_reports,
-  upload_cleanup, stale_session_gc, voice_auto_join). The leader/standby gating,
+  upload_cleanup, stale_session_gc, voice_auto_join). The hub/standby gating,
   the gateway-lease acquisition order, every `tokio::spawn` point, and all
   captured clones are **unchanged** — each helper recreates the same named clones
   internally and is invoked at the identical position in `run_bot`. No new
   multinode ownership, singleton, or lease assumption is introduced; the
-  leader-only vs worker-local classification of every spawned task is preserved.
+  hub-only vs runner-local classification of every spawned task is preserved.
 - #3038 (`execute_streaming_local_tui_tmux` god-function decomposition, follow-up
   slice to #3196): `claude.rs` changed by a **pure, behavior-preserving
   extraction** of the orchestrator's inline fresh-turn dispatch + completion gate
@@ -1415,7 +1415,7 @@ redeploy leaves the old values live in the plist.
   purely from the **process-local** in-memory inflight snapshots
   (`inflight_before_relay` / late-read `inflight_state`) and the per-session JSONL
   `current_offset` already owned by THIS watcher loop — it reads no cross-node
-  state, acquires no lease, and changes no leader/standby ownership. The watcher
+  state, acquires no lease, and changes no hub/standby ownership. The watcher
   loop remains **session-owner-local** (a watcher only processes a tmux session
   it owns); this change only narrows which in-process side-effects fire on a
   turn boundary and introduces no new multinode ownership/singleton/lease
@@ -1426,18 +1426,18 @@ redeploy leaves the old values live in the plist.
   and adding a reconciler pass that finalizes them ONLY after a liveness
   re-check (`watcher_backstop_turn_is_terminal`: never a `PausedLive`/paused/
   pane-busy turn; `Unknown` non-JSONL runtimes gated on pane-idle). The
-  `TurnFinalizer` actor is already **worker-local** (one actor per in-process
+  `TurnFinalizer` actor is already **runner-local** (one actor per in-process
   `SharedData`, owning its ledger and a `Weak<SharedData>`); the backstop reads
   only this process's ledger plus the local tmux pane/transcript via the
   existing `tmux_watchers` registry and `tui_turn_state`/`provider` probes. It
-  acquires no lease, touches no durable queue, and changes no leader/standby
+  acquires no lease, touches no durable queue, and changes no hub/standby
   ownership — finalize remains the same per-process exactly-once unit. No new
   multinode ownership/singleton/lease assumption is introduced. (codex HIGH
   follow-up: the reconcile cache `Weak<SharedData>` is now primed at the FIRST
   `register_start` — the `Start` message carries a `Weak` downgraded from the
   caller's `Arc<SharedData>` — instead of only at the first `Terminal`, so the
-  far-backstop is deterministic for a fresh worker-local actor whose first
-  watcher turn never submits its own terminal. Still worker-local `Weak`, no
+  far-backstop is deterministic for a fresh runner-local actor whose first
+  watcher turn never submits its own terminal. Still runner-local `Weak`, no
   cross-node reference.)
 - #3016 phase-5b1 (make `mailbox_finalize_owed` write-only by replacing its
   CONSUMERS, not removing it): two consumer rewrites, both behaviour-equivalent
@@ -1453,10 +1453,10 @@ redeploy leaves the old values live in the plist.
   current_generation)` instead of loading `mailbox_finalize_owed`; the two are
   equivalent because `owed` is set atomically with the
   `register_start(.., RelayOwnerKind::Watcher)` keyed by the same channel/
-  generation. Both consumers stay **worker-local**: the watcher reads only the
+  generation. Both consumers stay **runner-local**: the watcher reads only the
   local tmux pane/transcript, and `has_live_watcher_pending` is a read-only query
   of THIS process's actor-owned ledger (the `TurnFinalizer` is one actor per
-  in-process `SharedData`). No lease, no durable queue, no leader/standby
+  in-process `SharedData`). No lease, no durable queue, no hub/standby
   ownership change — finalize remains the same per-process exactly-once unit. No
   new multinode ownership/singleton/lease assumption. (The flag field/producers
   remain until phase-5b2.)
@@ -1477,7 +1477,7 @@ redeploy leaves the old values live in the plist.
   of `finish_restored_watcher_active_turn` (redundant under `normal_completion =
   true` at both production call sites). The stale-skip kickoff suppression the
   flag-derived term used to provide is already covered by the live-`has_active_turn`
-  gate, so the finalize path is identical. Nothing here is worker-non-local: the
+  gate, so the finalize path is identical. Nothing here is runner-non-local: the
   removed flag was a per-handle in-process atomic, and the surviving authority (the
   per-process actor-owned ledger) is unchanged. No new multinode
   ownership/singleton/lease assumption.
@@ -1494,32 +1494,32 @@ redeploy leaves the old values live in the plist.
   the managed root (`worktrees/<repo_name>/`) that the flat 1-depth scan missed,
   removing terminal dispatch/automation worktrees via the existing
   `cleanup_managed_worktree` guards (dirty/unmerged skip). **Multinode class:
-  LEADER-ONLY maintenance job with worker-local side effects.** It is one of the
-  `services::maintenance::jobs` registered on the production leader-only
-  `worker_registry::MaintenanceScheduler`, alongside `storage.target_sweep` and
+  HUB-ONLY maintenance job with runner-local side effects.** It is one of the
+  `services::maintenance::jobs` registered on the production hub-only
+  `runner_registry::MaintenanceScheduler`, alongside `storage.target_sweep` and
   maintenance jobs that own persistent PG-lease state
   (`voice.turn_link_gc` / `storage.cancel_tombstone_prune`). The sweep reads PG
   read-only (the active-dispatch + resumable-GUID keep-set), probes the
   **process-local** tmux server for live AgentDesk panes (fail-closed on query
-  failure), and deletes only directories on the local filesystem under the leader
+  failure), and deletes only directories on the local filesystem under the hub
   host's `~/.adk/release/worktrees`. It acquires no job-specific lease and owns no
-  durable queue; the worker registry's leader epoch supplies the singleton. The
-  keep/discard predicates derive solely from PG rows + the leader host's tmux +
+  durable queue; the runner registry's hub epoch supplies the singleton. The
+  keep/discard predicates derive solely from PG rows + the hub host's tmux +
   local disk. (Caveat for multinode: the keep-set is
   global PG state but the live-tmux owner check is host-local — a worktree owned by
-  a pane on a non-leader node is not protected by the leader's tmux probe. Today
-  each host provisions worktrees under its own root, so the leader sweep does not
+  a pane on a non-hub node is not protected by the hub's tmux probe. Today
+  each host provisions worktrees under its own root, so the hub sweep does not
   see another node's directories. If worktree roots ever become shared storage, the
   live-owner check would need to fan out cross-node.)
-  **Coverage consequence of the LEADER-ONLY class:** a non-leader host's
+  **Coverage consequence of the HUB-ONLY class:** a non-hub host's
   `~/.adk/release/worktrees` is never orphan-swept at all — the periodic backstop
-  runs only where the leader epoch is held (`register_leader_tokio`), and no other
-  live path substitutes for it. The only reclaimer that still runs off-leader is
+  runs only where the hub epoch is held (`register_hub_tokio`), and no other
+  live path substitutes for it. The only reclaimer that still runs off-hub is
   the inline per-card `kanban::terminal_cleanup` (`cleanup_managed_worktree` on a
   terminal kanban transition), which removes the worktree paths a dispatch
   recorded but is not a backstop for the leaks that path misses. This is a
   documentation correction rather than a regression: the pre-#5463 "each node
-  sweeps its OWN worktree root" wording described the dynamic (non-leader)
+  sweeps its OWN worktree root" wording described the dynamic (non-hub)
   scheduler, which had zero registered jobs and zero callers, so per-node
   coverage never actually ran.
 - #3037 (backflow hotfile re-point): `tmux_watcher.rs` changed by a **pure import
@@ -1530,7 +1530,7 @@ redeploy leaves the old values live in the plist.
   same symbol). The resolved function, the per-node in-memory `MonitoringStore`,
   and every call argument are **byte-identical**; the store remains
   **process-local** (one in-memory `Arc<Mutex<MonitoringStore>>` per node, no PG
-  lease, no durable queue, no leader-only side effect). No behavior, ownership,
+  lease, no durable queue, no hub-only side effect). No behavior, ownership,
   singleton, or lease assumption changes — this is a layering/import fix only.
 - #3037 (thread_reuse backflow relocation): the Postgres/Discord-API thread-map
   helpers (`get_thread_for_channel_pg`, `get_mapped_thread_for_channel_pg`,
@@ -1558,9 +1558,9 @@ redeploy leaves the old values live in the plist.
   **in-process** single-authority finalizer ledger (`turn_finalizer` actor) with
   the watcher-owned `register_start` that the in-memory ledger lost on restart, so
   the watcher's gate-timeout arms its backstop instead of finalizing-as-orphan.
-  The finalizer ledger is **worker-local** (a per-process in-memory map owned by
+  The finalizer ledger is **runner-local** (a per-process in-memory map owned by
   the watcher/recovery on the SAME node that holds the live tmux pane) — it owns
-  no leader-only side effect, no durable queue, and no PG lease — so re-seeding it
+  no hub-only side effect, no durable queue, and no PG lease — so re-seeding it
   introduces no new multinode ownership/singleton/lease assumption. The register
   is idempotent vs. a later bridge handoff and only ever seeds a full-identity
   Watcher entry (id-0 guarded); the normal non-restart path is unaffected.
@@ -1570,7 +1570,7 @@ redeploy leaves the old values live in the plist.
   `forward_idle_stream_into_bridge`) instead of pre-collecting the whole response
   and posting one batched `[Text{full}, Done]` at turn end. The transcript
   reader, the bridge `(tx, rx)`, the intake placeholder, and `spawn_turn_bridge`
-  are all **worker-local** — they run on the SAME node that holds the live tmux
+  are all **runner-local** — they run on the SAME node that holds the live tmux
   pane, exactly as the prior collect-then-send path did; the change only moves
   WHEN frames reach the in-process bridge (live vs. batched), not WHO owns the
   relay. The single-card / single-`spawn_turn_bridge` per-turn invariant and the
@@ -1578,15 +1578,15 @@ redeploy leaves the old values live in the plist.
   `committed_relay_offset` clamp (read-side dedupe) and the runtime-binding
   offset advance on success (write-side ledger) are unchanged — no new multinode
   ownership, singleton, or lease assumption is introduced. Classification:
-  **worker-local relay path**.
+  **runner-local relay path**.
 - #3263 (Codex context-window fallback): `provider.rs` changed by adding a
   **pure** max-of-cache fallback to Codex context-window resolution
   (`codex_context_window_from_cache`: exact slug → max-of-cache on slug drift →
   documented `CODEX_FALLBACK_CONTEXT_WINDOW` last-resort), documenting each
   provider's hardcoded `default_context_window` intent, and a unit-test module.
-  The resolver is a **worker-local** read of the local CLI cache
+  The resolver is a **runner-local** read of the local CLI cache
   (`~/.codex/models_cache.json`) on the node that owns the session — it owns no
-  global state, no durable queue, and no lease, and touches no PG-lease/leader
+  global state, no durable queue, and no lease, and touches no PG-lease/hub
   path. No new multinode ownership, singleton, or lease assumption is introduced.
 - #3296 (aborted-anchor reaction reconcile): the synthetic turn-start ABORT path
   (`tui_prompt_relay.rs` / `tui_direct_pending_start.rs`) now records a durable
@@ -1598,16 +1598,16 @@ redeploy leaves the old values live in the plist.
   `runtime/discord_tui_direct_commit_tombstone/` root (`CommitTombstone`):
   written only by the same node's watcher chokepoint BEFORE its inflight-row
   clear, read only by that node's ABORT path / sweeper 대조, GC'd by the same
-  sweeper — the same worker-local surfaces. **Worker-local**: both stores live
+  sweeper — the same runner-local surfaces. **Runner-local**: both stores live
   on the SAME node's filesystem as the pending-start store they mirror, are
-  written and drained only by that node's own relay worker / watcher loop /
+  written and drained only by that node's own relay runner / watcher loop /
   sweeper task, and the reaction ops resolve the process-local
   `serenity_http_or_token_fallback()` bot identity — no PG lease, no cross-node
-  reads, no leader-only side effect. No new multinode ownership/singleton/lease
+  reads, no hub-only side effect. No new multinode ownership/singleton/lease
   assumption is introduced.
 - #3350 (synthetic-anchor hourglass bound for inline claims): the INLINE
   synthetic claim (`tui_prompt_relay.rs`) now records the same #3303
-  `DeferredClaim` marker as the deferred worker (shared helper generalized in
+  `DeferredClaim` marker as the deferred runner (shared helper generalized in
   `tui_direct_pending_start.rs`), and `turn_finalizer.rs::do_finalize` calls a
   new `turn_finalizer/cleanup.rs` hook that idempotently ENSURES the marker
   (`tui_direct_abort_marker/deferred_claim.rs::ensure_marker_for_own_synthetic_turn`)
@@ -1616,7 +1616,7 @@ redeploy leaves the old values live in the plist.
   `runtime/discord_tui_direct_abort_marker/` store from the same node's own
   relay observer / finalizer actor; reconcile/delivery stays with the existing
   #3303 drain/sweep owners unchanged (zero new reaction call sites).
-  **Worker-local**: no PG lease, no cross-node reads, no leader-only side
+  **Runner-local**: no PG lease, no cross-node reads, no hub-only side
   effect. No new multinode ownership, singleton, or lease assumption is
   introduced.
 - #3038 S5 (SharedData cluster G — `RuntimeHttpCache`): pure field relocation;
@@ -1625,7 +1625,7 @@ redeploy leaves the old values live in the plist.
   `discord/mod.rs` into `shared_state.rs::RuntimeHttpCache`, with call sites
   (including `runtime_bootstrap*` init and 2 single-token sites in the frozen
   `turn_bridge/mod.rs`) rerouted `shared.cached_*` → `shared.http.cached_*`.
-  The leader-vs-standby semantics of the accessor (gateway ctx preferred,
+  The hub-vs-standby semantics of the accessor (gateway ctx preferred,
   token-built Http fallback on standby nodes) are byte-identical and stay
   process-local. No new multinode ownership, singleton, or lease assumption
   is introduced.
@@ -1634,12 +1634,12 @@ redeploy leaves the old values live in the plist.
   never be unlinked: unlinking an open inode L1 lets a new canonical-path inode
   L2 admit another writer and splits advisory-lock mutual exclusion. Stale JSON
   data-row GC and abandoned rebind-origin cleanup remain; permanent zero-byte
-  directory entries per used provider/channel are the intentional worker-local
-  tradeoff. This changes no durable queue, lease, leader/standby ownership, or
+  directory entries per used provider/channel are the intentional runner-local
+  tradeoff. This changes no durable queue, lease, hub/standby ownership, or
   cross-node routing authority.
 - Active-session audit: `active_session_audit` adds read-only health diagnostics
   plus optional local repair-path metadata for stale running-session rows. It
-  does not move Discord gateway startup, worker ownership, durable queue claims,
+  does not move Discord gateway startup, runner ownership, durable queue claims,
   or PG lease boundaries; each reported repair action still targets the existing
   node-local/runtime owner. No new multinode ownership, singleton, or lease
   assumption is introduced.
@@ -1647,8 +1647,8 @@ redeploy leaves the old values live in the plist.
   `opencode.rs` now marks a warm server as retiring before the exclusive
   hard-kill fallback and rejects new leases on retiring servers; pre-SSE
   `/session` and `/prompt_async` REST calls use bounded request timeouts.
-  This remains a worker-local provider process pool on the node that owns the
-  OpenCode turn. It adds no durable queue, cross-node read, leader-only side
+  This remains a runner-local provider process pool on the node that owns the
+  OpenCode turn. It adds no durable queue, cross-node read, hub-only side
   effect, or PG lease assumption, so multinode ownership semantics are
   unchanged.
 - #3558 (watcher offset TOCTOU root fix): the two watcher write paths that ran an
@@ -1662,9 +1662,9 @@ redeploy leaves the old values live in the plist.
   re-check the caller's identity/session guards against the freshly reloaded row,
   patch only watcher-owned fields, and persist via `persist_under_lock` (never
   re-entering `save_inflight_state`, so the non-reentrant flock cannot
-  self-deadlock). This is **worker-local**: it operates entirely on the same
+  self-deadlock). This is **runner-local**: it operates entirely on the same
   per-channel inflight sidecar file the watcher already owns, under the same
-  advisory lock. No lease, durable queue, leader/standby ownership, or singleton
+  advisory lock. No lease, durable queue, hub/standby ownership, or singleton
   assumption changes — the only behavioural change is that the streaming path now
   PRESERVES the non-owned `last_offset` from the in-lock reload (instead of
   clobbering it backward) and the commit path `max`-serializes its watermark
@@ -1672,8 +1672,8 @@ redeploy leaves the old values live in the plist.
   `refresh_inflight_last_offset_*` advance.
 - Producer liveness in `health/stall_liveness.rs` defers cleanup and paging
   regardless of total turn age. Missing or stale evidence still follows the
-  existing recovery decision. The state and evidence remain worker-local; lease,
-  durable queue, gateway startup, and leader ownership are unchanged.
+  existing recovery decision. The state and evidence remain runner-local; lease,
+  durable queue, gateway startup, and hub ownership are unchanged.
 - #3646 (relay-owner observability — OBSERVATION-ONLY): splits the relay flight
   recorder's collapsed `relay_owner_kind` into two distinct signals so the #3607
   None-ledger vs Watcher-finalize ambiguity is PG-resolvable, and adds three
@@ -1681,55 +1681,55 @@ redeploy leaves the old values live in the plist.
   `inflight_clear` + a NON-FATAL invariant signal). The watcher side
   (`tmux_watcher.rs`) emits `inflight_relay_owner` from the node-local pre-relay
   inflight snapshot; the finalizer side (`turn_finalizer.rs`) emits
-  `finalizer_ledger_owner` reading the **worker-local** `turn_finalizer` actor
+  `finalizer_ledger_owner` reading the **runner-local** `turn_finalizer` actor
   ledger entry's `relay_owner` — the same per-process in-memory map already
   documented above (re-seeded by #3293's `reseed_watcher_owned_finalizer_ledger`).
   The two signals JOIN on `discord:<channel>:<user_msg_id>`. All payload/derivation
   logic lives in the non-hot `relay_owner_observability.rs`. NO relay/cleanup
   behaviour, branch, ordering, or condition changes; the emits only gate the EMIT
   (never the cleanup) and the invariant is an error-event + `debug_assert!` (no
-  operational panic). **Worker-local**: both owner reads are node-local (inflight
+  operational panic). **Runner-local**: both owner reads are node-local (inflight
   file + in-process ledger on the node that holds the live pane); the events flow
   through the existing `emit_inflight_lifecycle_event` PG/jsonl sink. No lease,
-  durable queue, leader/standby ownership, or singleton assumption is introduced.
+  durable queue, hub/standby ownership, or singleton assumption is introduced.
 - #3909 voice TTS cache/temp disk-exhaustion fix — two classifications:
-  - **Worker-local** (leak E): `tts/edge.rs` `EdgeTtsTempGuard` is a `Drop` guard
+  - **Runner-local** (leak E): `tts/edge.rs` `EdgeTtsTempGuard` is a `Drop` guard
     that unlinks the partially-written `agentdesk-edge-tts-*.mp3` when the synth
     future is dropped mid-`.await` (barge-in abort) or any error returns. It runs
     in-process on whichever node performed the synthesis, deleting only that node's
     own temp file. No cross-node state, lease, or ownership; every node cleans up
     after its own aborted synthesis.
-  - **Leader-only** (leak A): `server::maintenance::ProgressTtsCacheSweepJob`
+  - **Hub-only** (leak A): `server::maintenance::ProgressTtsCacheSweepJob`
     (logic in `services::maintenance::jobs::voice_cache_sweep`) bounds the progress
     TTS cache dir (TTL + capacity LRU) and mops up orphaned edge-tts temp mp3s. It
     is a `MaintenanceJob` on the static registry, run through the existing
-    `worker_registry::MaintenanceScheduler` whose `WorkerExecutionScope` is
-    `LeaderOnly` — mirroring `voice.turn_link_gc`. Gated leader-only so N cluster
+    `runner_registry::MaintenanceScheduler` whose `RunnerExecutionScope` is
+    `HubOnly` — mirroring `voice.turn_link_gc`. Gated hub-only so N cluster
     nodes do not each spin a redundant sweeper. The sweep dirs are resolved from
     the loaded runtime `VoiceConfig` (`Config::from_voice_config`, tilde-expanded)
     — the same source of truth the TTS write path uses — so operator overrides of
     `voice.tts.progress_cache_dir` / `voice.audio.temp_dir` are swept, not the
-    defaults. Pool-less, no new lease, durable queue, leader-election surface, or
+    defaults. Pool-less, no new lease, durable queue, hub-election surface, or
     singleton assumption.
 - #3914 voice P3 cleanup bundle (observability / leak / validation) — **all
-  Worker-local**: every state surface touched is process-global on the node that
+  Runner-local**: every state surface touched is process-global on the node that
   holds the live voice session, with no cross-node coordination introduced.
   - `src/voice/receiver.rs`: the songbird `ClientDisconnect` handler prunes the
     leaver's SSRC→user entries from the in-process `ssrc_users` map. The map is
     pinned to the node running that voice connection (songbird driver is
-    node-local), so disconnect cleanup is purely worker-local.
+    node-local), so disconnect cleanup is purely runner-local.
   - `src/voice/metrics.rs`: the new STT outcome counters and `voice_stt_outcome`
     structured events are process-local telemetry (same class as the existing
     `voice_latency_turn` registry), flowing through the node-local observability
-    event sink. No leader/standby ownership.
+    event sink. No hub/standby ownership.
   - `src/voice/cancel_tombstone.rs`: the re-fire guard remains an explicitly
     process-local `OnceLock<RwLock<HashMap>>` (documented in its module header) —
     the poison-recovery + read-path prune changes do not alter that boundary; a
     dcserver restart between the two cancel attempts is still covered by the
     background turn's own cancel-on-restart recovery.
-  - `src/voice/tts/edge.rs` keeps the edge-tts subprocess timeout a worker-local
+  - `src/voice/tts/edge.rs` keeps the edge-tts subprocess timeout a runner-local
     constant; making it configurable + adding TTS synth/cache hit-miss metrics is
-    explicitly deferred (informational sub-item) and would also be worker-local.
+    explicitly deferred (informational sub-item) and would also be runner-local.
 - #4002 (recap duplicate root fix — SystemContinuation Path-X convergence): the
   compact-resume suppress branch (`tui_prompt_relay.rs`) used to post its neutral
   note and fall through INFLIGHT-LESS, so the observer spawned an un-arbitrated
@@ -1749,30 +1749,30 @@ redeploy leaves the old values live in the plist.
   additive `#[serde(default)] relay_ownership_only` flag on the node-local inflight
   row (`inflight/model.rs`; legacy rows deserialize as `false`), set at the
   SystemContinuation synthetic birth site (`claim_tui_direct_synthetic_turn`, and
-  re-derived from the durable prompt text on the deferred worker path), and gates
+  re-derived from the durable prompt text on the deferred runner path), and gates
   Path B on `terminal_readiness::watcher_completion_lifecycle_applies` so a
-  relay-ownership-only row is skipped. **Worker-local**: the passive inflight, the
+  relay-ownership-only row is skipped. **Runner-local**: the passive inflight, the
   in-memory external-input relay lease, and the durable pending-start / claim-marker
   stores are all the SAME per-node surfaces the active-turn synthetic path already
   uses; the fix only ROUTES the compact-resume observation onto them and suppresses
   its per-node completion bookkeeping. It introduces no new PG lease, cross-node
-  read, leader-only side effect, or singleton assumption — the cross-relayer
+  read, hub-only side effect, or singleton assumption — the cross-relayer
   single-owner invariant it enforces, and the completion Path B it gates, both
   already lived on the per-node inflight row. The only persisted change is the
   additive node-local inflight-row field (no PG schema change; relay-ownership
   adoption / bridge-tail stand-down / response finalize are all unaffected).
-- #4018 compact-resume stale mailbox follow-up - **Worker-local relay lifecycle,
+- #4018 compact-resume stale mailbox follow-up - **Runner-local relay lifecycle,
   no PG lease/schema**: the passive synthetic completion guard is confined to
   `tmux_watcher/completion_gate.rs` and `turn_bridge/early_tui_completion.rs`,
   finalizer identity-release diagnostics stay in `turn_finalizer/finalize.rs`,
   stale-owner reclaim stays in `tui_prompt_relay/synthetic_start.rs` plus
   `synthetic_start/stale_reclaim.rs`, and frame-decision logging stays in
   `tui_prompt_relay/claude_idle_bridge.rs`. All touched state is the existing
-  per-node mailbox/inflight/relay-owner surface; no leader election, PG lease,
+  per-node mailbox/inflight/relay-owner surface; no hub election, PG lease,
   PG schema, cross-node read, or singleton assumption is introduced. The
   watchdog observe_only/force-clean behavior remains a follow-up audit item.
 - #4370 restart-resume stale mailbox (generalises #4018 to the restart path) -
-  **Worker-local relay lifecycle, no PG lease/schema**: #4018 keyed its stale
+  **Runner-local relay lifecycle, no PG lease/schema**: #4018 keyed its stale
   reclaim on the synthetic relay owner, but a dcserver restart re-adopts the REAL
   user turn (`recovery_engine/runtime.rs::reregister_active_turn_from_inflight`,
   mailbox owner == `request_owner_user_id`), so the synthetic-owner-only reclaim
@@ -1798,7 +1798,7 @@ redeploy leaves the old values live in the plist.
   touched state is the same per-node mailbox / inflight / relay-owner surface #4018
   used plus the new in-memory ledger; the marker is DELIBERATELY DISTINCT from
   `relay_ownership_only` so the re-adopted turn's own `✅`/footer + analytics/transcript
-  still fire. No leader election, PG lease, PG schema, cross-node read, or singleton
+  still fire. No hub election, PG lease, PG schema, cross-node read, or singleton
   assumption is introduced. The core-4 serial hotfiles (`turn_bridge/mod.rs`,
   `tmux_watcher.rs`, `session_relay_sink.rs`, `turn_finalizer.rs`) are untouched, as
   in #4018.
@@ -1809,7 +1809,7 @@ redeploy leaves the old values live in the plist.
   `task_notification_response_delivery` table is 1:N from that semantic event and
   uniquely keys each restart-stable `response_turn_key`; it stores the exact
   referenced card id, owner token/lease, and `claimed → sent → delivered` state.
-  Multiple workers therefore converge through PG CAS. An ambiguous card create retries the same
+  Multiple runners therefore converge through PG CAS. An ambiguous card create retries the same
   `enforce_nonce=true` nonce within Discord's bounded nonce-replay window; the
   PG row/message id, rather than the nonce window, remains the durable card
   authority. Every response POST chunk separately derives a bounded Discord
@@ -1828,26 +1828,26 @@ redeploy leaves the old values live in the plist.
   the shared card is confirmed. The watcher queries the exact event key or
   restart-stable response-turn key in PG and fails closed for missing/error/card-
   pending state. `sent` is a no-POST tombstone even after lease expiry, so a
-  final delivered-CAS failure is observable without allowing another worker to
+  final delivered-CAS failure is observable without allowing another runner to
   duplicate the Discord POST; `delivered` completes the response fence.
   An unrelated event in the same session cannot release or suppress that turn.
   The in-memory card store is used only when PG is absent (tests/non-release
-  fallback), never as multi-worker authority. This adds no leader-only singleton
+  fallback), never as multi-runner authority. This adds no hub-only singleton
   assumption.
-- #3805 P2 PR-A (two-message model scaffolding — worker-local UI flag): adds the
+- #3805 P2 PR-A (two-message model scaffolding — runner-local UI flag): adds the
   additive `two_message_panel_enabled` flag to `PlaceholderConfig` and threads it
   through the per-node UI plumbing (`runtime_bootstrap.rs` RunBotContext /
   UiFeatureFlags → `runtime_bootstrap/shared_data.rs` → `shared_state.rs`
   PlaceholderState) plus an additive `status_panel_generation` field on the
   node-local inflight row (`inflight/model.rs`; `#[serde(default)]`, legacy rows
-  deserialize as 0). **Worker-local**: the flag is a per-node UI feature toggle
+  deserialize as 0). **Runner-local**: the flag is a per-node UI feature toggle
   (default OFF, restart-required — the `placeholder` config section is already
   restart-scoped) and the generation counter lives on the same per-node inflight
   row the bridge/watcher already own. No behavior reads either yet (pure additive
   no-op scaffolding for the later two-message PRs); introduces no new PG lease,
-  cross-node read, leader-only side effect, singleton assumption, or PG schema
+  cross-node read, hub-only side effect, singleton assumption, or PG schema
   change.
-- #3805 P2 PR-B (two-message SINK creation order — worker-local, first reader of
+- #3805 P2 PR-B (two-message SINK creation order — runner-local, first reader of
   the PR-A flag): when `two_message_panel_enabled` is ON the bridge sink creates
   the `status_panel_v2` status panel as a NEW message BELOW the answer
   (answer-first layout) instead of the legacy panel-above swap. All logic lives
@@ -1855,16 +1855,16 @@ redeploy leaves the old values live in the plist.
   `single_message_footer.rs` carry only thin call-site wiring plus a per-turn
   `status_panel_generation` epoch (already the node-local inflight row's field
   from PR-A) threaded from the pinned inflight snapshot into the create + the
-  terminal completion edit. **Worker-local**: this is pure per-node msg-id / HTTP
+  terminal completion edit. **Runner-local**: this is pure per-node msg-id / HTTP
   bookkeeping on the bridge/watcher-owned inflight row and Discord messages — the
   panel handle (`status_message_id`), the answer anchor (`current_msg_id`), and
   the epoch counter all already lived on the node-local row. It never tears down
   the per-channel `StatusPanelState`, so item4's `session_banner` exactly-once
   claim (`session_banner_emitted_key`) is untouched. Gated on the default-OFF
   flag so the OFF path is byte-identical; introduces no new PG lease, cross-node
-  read, leader-only side effect, singleton assumption, or PG schema change. The
+  read, hub-only side effect, singleton assumption, or PG schema change. The
   watcher-path parity for this ordering is a later PR (PR-C, `tmux_watcher.rs`).
-- #3805 P2 PR-C (two-message WATCHER creation-order parity — worker-local): mirrors
+- #3805 P2 PR-C (two-message WATCHER creation-order parity — runner-local): mirrors
   PR-B on the fully-independent tmux WATCHER relay path. When
   `two_message_panel_enabled` is ON the watcher defers its `status_panel_v2` panel
   creation until the answer placeholder exists so the panel lands BELOW the answer
@@ -1879,33 +1879,33 @@ redeploy leaves the old values live in the plist.
   panel-completion tail moved verbatim out of the 700-capped
   `single_message_footer.rs`); `tmux_watcher.rs` carries only thin call-site wiring
   plus a per-turn epoch local seeded from the node-local inflight snapshot.
-  **Worker-local**: this is per-node msg-id / HTTP bookkeeping on the
+  **Runner-local**: this is per-node msg-id / HTTP bookkeeping on the
   watcher-owned inflight sidecar row (the `status_message_id` panel handle and the
   `status_panel_generation` epoch already lived on the node-local row; the
   generation write is under the same per-turn inflight sidecar flock as the panel
   bind) and per-node Discord messages. It never tears down the per-channel
   `StatusPanelState`, so item4's `session_banner` exactly-once claim is untouched.
   Gated on the default-OFF flag so the OFF path is byte-identical; introduces no
-  new PG lease, cross-node read, leader-only side effect, singleton assumption, or
+  new PG lease, cross-node read, hub-only side effect, singleton assumption, or
   PG schema change.
 - #4309 codex memento contract via prompt injection + version allowlist —
-  **Worker-local**: the provider-aware guidance is assembled per turn on the node
+  **Runner-local**: the provider-aware guidance is assembled per turn on the node
   that owns the provider session, and the CLI allowlist is a node-local startup
   compatibility check. No cross-node authority, lease, singleton, or routing
   behavior is introduced.
 - #4305 fresh-session channel recent-pairs context injection — **Shared durable
-  boundary, worker-local assembly**: `/clear` and routine-agent identity changes
+  boundary, runner-local assembly**: `/clear` and routine-agent identity changes
   upsert a monotonic, database-server-timestamped row in
-  `channel_session_clear_boundaries`; any worker may perform that idempotent
+  `channel_session_clear_boundaries`; any runner may perform that idempotent
   write. Per-turn prompt assembly joins the shared boundary while reading
-  `session_transcripts`, so restart or worker reassignment cannot cross a clear.
-  This adds no leader lease, singleton, or routing decision.
+  `session_transcripts`, so restart or runner reassignment cannot cross a clear.
+  This adds no hub lease, singleton, or routing decision.
 - #4551 fresh routine context severance and verified start evidence — **Existing
-  leader-owned routine state, worker-local provider launch**: the routine
+  hub-owned routine state, runner-local provider launch**: the routine
   executor records turn-matched start evidence in the shared `routine_runs` row,
   and terminal close serializes on that same row so neither interleaving loses
   the verified flag. Fresh provider continuity is cleared only after the shared
-  transcript boundary succeeds. No new worker, queue, lease, singleton, routing
+  transcript boundary succeeds. No new runner, queue, lease, singleton, routing
   decision, or node-local authority is introduced.
 - #4538 PR-A durable intake placement-owner (dormant schema + owner-CAS
   primitives) — **PG-lease-backed shared authority, dormant**: migration 0094
@@ -1919,7 +1919,7 @@ redeploy leaves the old values live in the plist.
   serialize per channel on a deterministic `pg_advisory_xact_lock` key and fence
   every authoritative write on `(owner_instance_id, generation)`. This is a
   **generation-fenced PG-lease** authority in the taxonomy above
-  (`pg_lease_backed_claim`), not leader-only or worker-local. PR-A ships it
+  (`pg_lease_backed_claim`), not hub-only or runner-local. PR-A ships it
   DORMANT: no production caller resolves ownership or routes intake through it
   (reader flip + admission wiring are PR-C / #4548), and the schema-activation
   CHECK (`intake_outbox_open_requires_owner`) and open-route unique re-alignment
@@ -1939,27 +1939,27 @@ redeploy leaves the old values live in the plist.
   `OwnerIdentity::advisory_key()` transaction lock. A channel-global
   `authority_epoch` orders episode resets while same-episode frontier transitions
   must follow the coupled baseline/open-generation rule. Non-owner and stale
-  writers fail closed. S3a ships dormant: no relay producer or outbox worker uses
-  these APIs until S3b adds the final worker delivery fence, so no circuit alert
+  writers fail closed. S3a ships dormant: no relay producer or outbox runner uses
+  these APIs until S3b adds the final runner delivery fence, so no circuit alert
   is exposed to an unfenced external send. Classification:
-  **generation-fenced PG-lease authority**; no leader-only singleton is added.
+  **generation-fenced PG-lease authority**; no hub-only singleton is added.
 
 - #4527 (safe-restart standby drain + standby health visibility): `runtime_bootstrap.rs`
   now registers a **confirmed-standby** node's provider `SharedData` into the
   `HealthRegistry` even when the gateway runtime never starts (lease held
   elsewhere), and `runtime_bootstrap/gateway_lease.rs` splits the lease outcome
   into `Proceed` / `Standby` (confirmed `Ok(None)`) / `Failed`. This is
-  **worker-local** health visibility (not leader-only or PG-lease): it exposes
-  the standby intake worker's own `global_active` / provider `active_turns` /
+  **runner-local** health visibility (not hub-only or PG-lease): it exposes
+  the standby intake runner's own `global_active` / provider `active_turns` /
   mailbox / relay state — previously only populated inside the gateway runtime —
   so the safe-restart wrapper cannot mistake a live standby turn for an idle
   node. A new provider-health `runtime_state_complete=true` flag lets the wrapper
   reject legacy/partial health as idle evidence. Lease-acquire *errors* are
-  classified `Failed` (never `Standby`), so a restart never skips leader
+  classified `Failed` (never `Standby`), so a restart never skips hub
   drain-ack on an ambiguous lease result: every incomplete/failed/missing signal
   falls back to the existing drain path (fail-closed).
 - #4658 scheduled-message immutable context snapshots: **PG-lease-safe /
-  worker-local execution, no new leader or lease authority**. Snapshot capture
+  runner-local execution, no new hub or lease authority**. Snapshot capture
   (`services::scheduled_messages::context_snapshot::capture_snapshot_tx`) and
   validation (`validate_snapshot_pg`) store and read the fully-rendered context
   inline in `scheduled_message_context_snapshots` (PostgreSQL), never provider
@@ -1972,7 +1972,7 @@ redeploy leaves the old values live in the plist.
   (`scheduled:{definition_id}`) is derived deterministically from PG-persisted
   definition state, so any node computes the identical, channel-independent key
   — the reserved turn never mutates the channel's live `sessions.session_key`
-  row. No node-local timer, leader singleton, or advisory lease is introduced.
+  row. No node-local timer, hub singleton, or advisory lease is introduced.
 - #5071 S-R2c preparatory safety gate — **no runtime authority yet**: the gate
   pins both intake-outbox `done` symbols. While
   `src/services/discord/runtime_bootstrap/intake_delivery_reconciler.rs` is

@@ -303,7 +303,7 @@ pub(crate) async fn reconcile_boot_db_pg(
     // Touch next_attempt_at so oldest_pending_age reflects "re-queued at boot",
     // not the original created_at. Without this, rows that were stuck in
     // 'processing' across a restart show up as multi-minute-aged pending rows
-    // and the promote health gate fails even though the outbox worker picks
+    // and the promote health gate fails even though the outbox runner picks
     // them up on the next tick.
     let stale_processing_outbox_reset = sqlx::query(
         "UPDATE dispatch_outbox
