@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "1d94524f892184f15b7dfcf8c9de6437b938b46d",
+  "measured_at_sha": "dffa41394b5451047d39e1aa5654b6d7a0a217b3",
   "records": [
     {
       "root": "migrations/postgres",
@@ -1548,7 +1548,7 @@
       "api": "agentdesk.db.query",
       "symbol": "query",
       "classification": "UNRESOLVED",
-      "fingerprint": "sha256:75d120ac557d482e70780513119a772b621f2a071fe90faf22a19169982e871c"
+      "fingerprint": "sha256:243d3659dc09bc907cd1eca93cc0a2b9b293e00e1ae9f88cdfef248759c9ca0b"
     },
     {
       "root": "policies",
