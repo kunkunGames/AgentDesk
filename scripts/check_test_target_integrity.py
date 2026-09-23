@@ -92,7 +92,14 @@ LIB_INVENTORY_STATIC_ONLY_BY_PLATFORM = {
         "cli::init::launchd_plist_tests::clamp_launchd_nofile_soft_limit_never_exceeds_host_hard_limit",
         "cli::init::launchd_plist_tests::generate_launchd_plist_release_sets_clamped_soft_number_of_files_limit",
         "cli::init::launchd_plist_tests::generate_launchd_plist_uses_requested_fresh_home_and_root_only",
+        "runtime_layout::windows_links::tests::windows_junction_paths_are_literal_and_removal_preserves_target",
+        "runtime_layout::windows_links::tests::windows_optional_file_alias_never_copies_or_hardlinks_content",
+        "services::dispatched_sessions::output::tests::windows_missing_process_is_unavailable_instead_of_empty_tmux_success",
         "services::platform::binary_resolver::tests::codex_fallback_dirs_include_app_bundle_resources_on_macos",
+        "services::platform::network::tests::api_listener_is_not_inheritable_by_provider_processes",
+        "services::platform::shell::hostname_tests::windows_native_hostname_matches_computer_name",
+        "services::platform::windows_job::tests::forced_runtime_exit_terminates_grandchildren_and_releases_ports",
+        "services::platform::windows_job::tests::runtime_job_descendant_fixture",
     }),
 }
 LIB_INVENTORY_KNOWN_CARGO_ONLY = frozenset({
