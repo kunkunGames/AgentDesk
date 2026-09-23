@@ -1,6 +1,6 @@
 use super::{GpuResources, command::run as command};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(test, target_os = "macos"))]
 mod macos;
 #[cfg(not(target_os = "macos"))]
 mod other;
