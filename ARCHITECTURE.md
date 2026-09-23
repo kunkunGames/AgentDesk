@@ -572,6 +572,18 @@ src/
 │   │   ├── intake_runner/
 │   │   │   ├── dispatch_stamp_tests.rs
 │   │   │   └── drain_tests.rs
+│   │   ├── machine_resources/
+│   │   │   ├── gpu/
+│   │   │   │   ├── macos.rs
+│   │   │   │   └── other.rs
+│   │   │   ├── store/
+│   │   │   │   └── tests.rs
+│   │   │   ├── command.rs
+│   │   │   ├── gpu.rs
+│   │   │   ├── network.rs
+│   │   │   ├── sampler.rs
+│   │   │   ├── store.rs
+│   │   │   └── tests.rs
 │   │   ├── readiness/
 │   │   │   └── tests.rs
 │   │   ├── stream_relay/
@@ -593,6 +605,7 @@ src/
 │   │   ├── intake_routing_telemetry.rs
 │   │   ├── intake_runner.rs
 │   │   ├── intake_runner_capabilities.rs
+│   │   ├── machine_resources.rs
 │   │   ├── mod.rs
 │   │   ├── node_registry.rs
 │   │   ├── readiness.rs
