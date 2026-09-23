@@ -485,7 +485,7 @@ export function useSettingsMetaCatalog({
         id: group.id,
         title: tr(group.nameKo, group.nameEn),
         detail: tr(group.descKo, group.descEn),
-        count: String(groupCounts[group.id] ?? 0),
+        count: group.id === "machine" ? "" : String(groupCounts[group.id] ?? 0),
       })),
     [groupCounts, tr],
   );

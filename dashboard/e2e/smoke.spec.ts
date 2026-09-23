@@ -2726,6 +2726,74 @@ test.describe("Dashboard smoke tests", () => {
     await expect(page.getByTestId("pipeline-refresh-indicator")).toBeHidden({ timeout: 3000 });
   });
 
+  test("settings: machines show Hub and Runner details and honest connection states", async ({ page }, testInfo) => {
+    const pageErrors: string[] = [];
+    page.on("pageerror", error => pageErrors.push(error.message));
+    await page.route(/\/api\/settings\/runtime-config$/, route => route.fulfill({ json: { current: {}, defaults: {} } }));
+    await page.route(/\/api\/settings$/, route => route.fulfill({ json: {
+      language: testInfo.project.name === "desktop" ? "en" : "ko", theme: "dark",
+    } }));
+    let fail = false;
+    let enabled = true;
+    let offline = false;
+    await page.route(/\/api\/cluster\/nodes$/, route => {
+      if (fail) return route.fulfill({ status: 503, json: { error: "fixture unavailable" } });
+      const now = Date.now();
+      return route.fulfill({ json: {
+        cluster: { enabled, local_instance_id: "hub-example", lease_ttl_secs: 30, heartbeat_interval_secs: 5 },
+        nodes: ["hub-example", "runner-example"].map((id, index) => ({
+          instance_id: id, hostname: index ? "Build runner" : "Control hub",
+          status: index && offline ? "offline" : "online", role: index ? "runner" : "hub",
+          effective_role: index ? "worker" : "leader", process_id: 100 + index,
+          last_heartbeat_at: new Date(now).toISOString(), started_at: new Date(now - 60_000).toISOString(),
+          api_base_url: `https://${id}.example.invalid`, labels: [index ? "build" : "control"],
+          execution_active: 1, execution_occupied: 1, active_session_count: 1, active_dispatch_count: 0,
+          capabilities: { execution_capacity: { version: 1, slots: 2 }, execution_readiness: {
+            os: index ? "windows" : "linux", arch: "x86_64", runtime_profile: index ? "runner" : "full",
+            observed_at_ms: now, expires_at_ms: now + 60_000, backends: ["process"],
+          } },
+          execution_readiness: { providers: { codex: { eligible: true, reasons: [] } } },
+          forwarding_diagnostics: { advertised: true, configured: true, trust_validated: true,
+            reachability_verified: true, expires_at_ms: now + 30_000 },
+        })),
+      } });
+    });
+    await page.goto("/settings?settingsPanel=machine");
+    const panel = page.getByTestId("settings-machine-panel");
+    await expect(panel).toBeVisible();
+    await expect(page.locator("#settings-tab-machine")).toHaveAttribute("aria-selected", "true");
+    const order = await page.getByRole("tablist", { name: /설정 패널|Settings panels/ }).getByRole("tab").evaluateAll(tabs => tabs.map(tab => tab.id));
+    expect(order[order.indexOf("settings-tab-general") + 1]).toBe("settings-tab-machine");
+    const runner = page.getByTestId("machine-node-runner-example");
+    await expect(runner.getByText("Runner", { exact: true }).first()).toBeVisible();
+    await expect(runner.getByText("Windows / x86_64", { exact: true })).toBeVisible();
+    await expect(runner.getByText(/연결 확인됨|Connection verified/, { exact: true })).toBeVisible();
+    await expect(runner.getByText(/신규 실행 가능|Ready for new work/, { exact: true })).toBeVisible();
+    await expectNoHorizontalOverflow(page);
+    await page.screenshot({ path: testInfo.outputPath("machine-settings.png"), fullPage: true });
+    await page.locator("#settings-tab-general").click();
+    await expect(panel).toHaveCount(0);
+    await page.goBack();
+    await expect(panel).toBeVisible();
+    await page.reload();
+    await expect(panel).toBeVisible();
+    fail = true;
+    await panel.getByRole("button", { name: /상태 새로고침|Refresh status/ }).click();
+    await expect(panel.getByRole("alert")).toContainText(/마지막 조회|last snapshot/);
+    await expect(runner.getByText(/연결 확인됨|Connection verified/, { exact: true })).toHaveCount(0);
+    await expect(runner.getByText(/신규 실행 가능|Ready for new work/, { exact: true })).toHaveCount(0);
+    fail = false;
+    offline = true;
+    await panel.getByRole("button", { name: /상태 새로고침|Refresh status/ }).click();
+    await expect(runner.getByText(/오프라인|Offline/, { exact: true })).toBeVisible();
+    enabled = false;
+    await panel.getByRole("button", { name: /상태 새로고침|Refresh status/ }).click();
+    await expect(panel.getByText(/단독 운영 중|runs standalone/)).toBeVisible();
+    await expect(panel.locator("article")).toHaveCount(0);
+    await expectNoHorizontalOverflow(page);
+    expect(pageErrors).toEqual([]);
+  });
+
   test("all app shell routes are directly reachable", async ({ page }) => {
     for (const route of ROUTES) {
       await page.goto(route.path);

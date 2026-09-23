@@ -5,6 +5,9 @@ const readinessReport = z.object({ eligible: z.boolean(), reasons: z.array(z.str
 const nodeSchema = z.object({
   instance_id: z.string(), status: z.string().nullish(), effective_role: z.string().nullish(),
   hostname: z.string().nullish(),
+  role: z.string().nullish(), process_id: z.number().int().nullish(),
+  labels: z.array(z.string()).nullish(), api_base_url: z.string().nullish(),
+  last_heartbeat_at: z.string().nullish(), started_at: z.string().nullish(),
   active_session_count: z.number().nullish(), active_dispatch_count: z.number().nullish(),
   execution_active: z.number().nullish(), execution_occupied: z.number().nullish(),
   capabilities: z.object({
@@ -22,8 +25,14 @@ const nodeSchema = z.object({
   }).nullish(),
 });
 const nodesSchema = z.object({
-  cluster: z.object({ enabled: z.boolean(), local_instance_id: z.string().nullish() }),
+  cluster: z.object({
+    enabled: z.boolean(), local_instance_id: z.string().nullish(),
+    configured_role: z.string().nullish(),
+    lease_ttl_secs: z.number().positive().nullish(),
+    heartbeat_interval_secs: z.number().positive().nullish(),
+  }),
   nodes: z.array(nodeSchema),
+  session_owner_error: z.object({ code: z.string(), message: z.string() }).nullish(),
 });
 const sessionSchema = z.object({
   id: z.union([z.number(), z.string()]), session_key: z.string(),
@@ -34,6 +43,7 @@ const outputSchema = z.object({
   unavailable_reason: z.string().nullish(), output_format: z.string(), captured_at_ms: z.number(),
 });
 export type ClusterNode = z.infer<typeof nodeSchema>;
+export type ClusterNodesResponse = z.infer<typeof nodesSchema>;
 export type NodeSession = z.infer<typeof sessionSchema>;
 export const getClusterNodes = (signal?: AbortSignal) => request("/api/cluster/nodes", {
   signal, cache: "no-store", suppressErrorToast: true, maxRetries: 0,
