@@ -15,6 +15,7 @@
 - [ ] **PR size:** I ran `scripts/pr_cap_check.sh` on this PR head (20 files / +800 additions, deletion credit 0; semantics: `docs/pr-cap-check.md`).
 - [ ] **Docs-only verification:** If this is a docs-only change, I have explicitly stated 'docs-only' in the PR body and listed the source files or commands used to verify the documentation.
 - [ ] **False verification guard:** I have not falsely claimed verification (e.g. PostgreSQL, Discord, tmux, CI) that I could not execute, and I have listed unavailable checks under skipped checks.
+- [ ] **Partial check status:** I have not claimed this PR is merge-ready from a partial check status. I have explicitly called out any pending or UNKNOWN mergeability in the PR body.
 
 ## Dashboard / UI checklist
 - [ ] **시안에 없는 기존 기능을 임의로 삭제하지 않았다.** Reference 시안(redesign reference)에서 빠진 위젯·필터·탭이라도 기존 dashboard에 있던 기능은 사용자 명시 제거 요청 없이 삭제하지 않는다. 시안의 톤·간격·타이포에 맞춰 확장하거나 별도 sub-issue로 분리한다. (관련 결정: #1254 audit, 2026-04-15 결정 기록)
