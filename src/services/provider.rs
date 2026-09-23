@@ -1726,6 +1726,34 @@ mod cancel_token_tests {
     use super::{CancelSource, CancelToken, cancel_requested, register_child_pid};
     use std::sync::{Arc, Barrier};
     use std::thread;
+    #[test]
+    fn recovers_from_a_poisoned_lock() {
+        let token = CancelToken::new();
+        let token = Arc::new(token);
+
+        let t = token.clone();
+        let _ = thread::spawn(move || {
+            let _guard = t.cancel_source.lock().unwrap();
+            panic!("Poisoning cancel_source lock");
+        }).join();
+
+        let t = token.clone();
+        let _ = thread::spawn(move || {
+            let _guard = t.cancel_source_kind.lock().unwrap();
+            panic!("Poisoning cancel_source_kind lock");
+        }).join();
+
+        assert!(token.cancel_source.is_poisoned());
+        assert!(token.cancel_source_kind.is_poisoned());
+
+        // This should not panic, and should successfully update the poisoned locks
+        token.set_cancel_source("watchdog_timeout");
+
+        assert_eq!(token.cancel_source().as_deref(), Some("watchdog_timeout"));
+        assert_eq!(token.cancel_source_kind(), Some(CancelSource::WatchdogTimeout));
+    }
+
+
 
     #[test]
     fn cancel_token_helpers_register_source_and_state() {
