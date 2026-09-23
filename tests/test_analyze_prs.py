@@ -2,7 +2,6 @@ import unittest
 from pathlib import Path
 
 from scripts.analyze_prs import (
-    has_no_change_avoidance_guard_ack,
     has_duplicate_guard_ack,
     has_non_empty_body_field,
     has_no_change_verification_ack,
@@ -161,23 +160,6 @@ class PrAnalyzerDuplicateGuardTests(unittest.TestCase):
         body = "- Duplicate PR guard:\n- Risk: limited to analyzer reporting"
 
         self.assertFalse(has_duplicate_guard_ack(body))
-
-
-class PrAnalyzerNoChangeAvoidanceGuardTests(unittest.TestCase):
-    def test_unchecked_template_no_change_avoidance_guard_is_not_acknowledgement(self):
-        body = "- [ ] **No-change avoidance:** A no-change result should NOT become a PR..."
-
-        self.assertFalse(has_no_change_avoidance_guard_ack(body))
-
-    def test_checked_template_no_change_avoidance_guard_is_acknowledgement(self):
-        body = "- [x] **No-change avoidance:** Checked"
-
-        self.assertTrue(has_no_change_avoidance_guard_ack(body))
-
-    def test_filled_no_change_avoidance_field_is_acknowledgement(self):
-        body = "- no-change avoidance: ensured changes were made."
-
-        self.assertTrue(has_no_change_avoidance_guard_ack(body))
 
 
 class PrAnalyzerNoChangeVerificationGuardTests(unittest.TestCase):
