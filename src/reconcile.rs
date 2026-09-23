@@ -935,17 +935,19 @@ async fn fetch_delivery_kv_guard_batch_pg(
 ) -> Result<Vec<DeliveryKvGuardRow>> {
     sqlx::query_as::<_, DeliveryKvGuardRow>(
         "WITH kv_guards AS (
-            SELECT SUBSTRING(key FROM LENGTH('dispatch_reserving:') + 1) AS dispatch_id,
-                   'reserving' AS guard_kind
-              FROM kv_meta
-             WHERE key LIKE 'dispatch\\_reserving:%' ESCAPE '\\'
-               AND key > 'dispatch_reserving:' || $1
+            (SELECT SUBSTRING(key FROM LENGTH('dispatch_reserving:') + 1) AS dispatch_id,
+                    'reserving' AS guard_kind
+               FROM kv_meta
+              WHERE key LIKE 'dispatch\\_reserving:%' ESCAPE '\\'
+                AND key > 'dispatch_reserving:' || $1
+              ORDER BY key LIMIT $2)
             UNION ALL
-            SELECT SUBSTRING(key FROM LENGTH('dispatch_notified:') + 1) AS dispatch_id,
-                   'notified' AS guard_kind
-              FROM kv_meta
-             WHERE key LIKE 'dispatch\\_notified:%' ESCAPE '\\'
-               AND key > 'dispatch_notified:' || $1
+            (SELECT SUBSTRING(key FROM LENGTH('dispatch_notified:') + 1) AS dispatch_id,
+                    'notified' AS guard_kind
+               FROM kv_meta
+              WHERE key LIKE 'dispatch\\_notified:%' ESCAPE '\\'
+                AND key > 'dispatch_notified:' || $1
+              ORDER BY key LIMIT $2)
         ),
         grouped AS (
             SELECT dispatch_id,
