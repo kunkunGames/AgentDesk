@@ -645,8 +645,10 @@ src/
 │   │   ├── abandon_request_store/
 │   │   │   └── probe_contract_tests.rs
 │   │   ├── catch_up/
+│   │   │   ├── api.rs
 │   │   │   ├── classification.rs
 │   │   │   ├── classification_order_tests.rs
+│   │   │   ├── frontier_sweep_tests.rs
 │   │   │   ├── phase2.rs
 │   │   │   ├── settled_ledger_consult.rs
 │   │   │   └── too_old_notice.rs
@@ -1156,7 +1158,8 @@ src/
 │   │   │   ├── supervisor_relay/
 │   │   │   │   └── supervisor_frame_source.rs
 │   │   │   ├── terminal_commit_epilogue/
-│   │   │   │   └── continuation_marker_tests.rs
+│   │   │   │   ├── continuation_marker_tests.rs
+│   │   │   │   └── synthetic_mailbox_release_tests.rs
 │   │   │   ├── turn_identity/
 │   │   │   │   └── soft_terminal_authority.rs
 │   │   │   ├── turn_stream_collector/
