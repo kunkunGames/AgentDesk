@@ -411,7 +411,6 @@ src/
 │   │   ├── registry.rs
 │   │   └── status.rs
 │   ├── web_surface/
-│   │   ├── hub_redirect.rs
 │   │   ├── runner.html
 │   │   └── tests.rs
 │   ├── cluster.rs

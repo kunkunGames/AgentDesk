@@ -40,14 +40,14 @@ cluster:
 적용된다. 유효한 관리자 토큰도 실행 전용 모드에서 빠진 route를 활성화하지 못한다.
 TUI provider hook/relay는 provider self-exec를 위해 필요한 경우 유지한다.
 
-브라우저에서 실행 전용 장비의 `/` 또는 `/settings`를 열면 온라인 Hub의 주소로
-307 임시 리다이렉트한다. 경로와 쿼리를 보존하며 응답은 `Cache-Control: no-store`다.
-Hub의 registry 주소가 `cluster.nodes.<Hub instance_id>.trusted_forward_origin`과
-일치해야 한다. 자체 노드, 루프백 주소, 미설정 주소, 다중 Hub는 이동 대상으로 쓰지 않는다.
-DB 조회는 2초로 제한하며 Hub를 확인하지 못하면 내장 안내 HTML과 503을 반환한다.
-Runner의 dashboard 자산과 관리 API는 계속 비활성 상태다. 없는 경로는 404로 응답한다.
-Windows Runner의 `http://localhost:8791/`에서 이동해도 인증 정보는 전달하지 않는다.
-Hub의 LAN 주소에서는 기존 Hub 로그인/토큰 인증이 적용된다.
+브라우저에서 실행 전용 장비의 `/` 또는 `/settings`를 열면 Hub 대시보드로 접속하라는
+안내 화면을 제공한다. 이 화면은 바이너리에 포함되며 dashboard 자산을 복사하거나
+관리 API를 활성화하지 않는다. 없는 경로는 인증 실패 대신 404로 응답한다.
+Windows Runner에서 `http://127.0.0.1:8791`을 열어도 다른 장비의 Hub에 접속하지 않는다.
+브라우저의 대시보드 주소나 바로가기는 Hub의 실제 웹 주소를 직접 사용한다.
+Runner에서 Hub 자동 조회, 프록시 또는 리다이렉트를 수행하지 않는다.
+Hub의 LAN 주소로 접속할 때는 서버 토큰이 필요하며, Hub 장비에서 직접 localhost로
+접속한 브라우저에는 기존 루프백 인증 규칙이 적용된다.
 
 `/api/health`는 `runtime_profile`, `modules`, `dashboard_required`를 제공한다.
 실행 전용 모드의 dashboard는 `false`, `dashboard_required`도 `false`다. 상세 health의

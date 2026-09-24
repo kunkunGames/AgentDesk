@@ -48,7 +48,6 @@ cli::client::health_compare_tests::classify_machine_label_prefers_explicit_label
 cli::client::health_compare_tests::cluster_lease_ttl_secs_handles_missing_and_zero_values
 cli::client::health_compare_tests::diff_marker_only_fires_on_real_mismatch
 cli::client::health_compare_tests::human_age_seconds_buckets_match_expected_units
-cli::client::health_compare_tests::machine_role_display_uses_effective_role_and_accepts_legacy_names
 cli::client::health_compare_tests::machine_role_display_uses_effective_role_and_canonical_names
 cli::client::health_compare_tests::render_machine_compare_table_synthesises_offline_columns
 cli::client::health_compare_tests::validate_status_payload_rejects_missing_arrays
@@ -542,15 +541,6 @@ db::intake_outbox_status::tests::operator_retry_classifies_every_status
 db::intake_outbox_status::tests::status_strings_round_trip
 db::intake_outbox_status::tests::unknown_status_preserves_rejected_spelling
 db::postgres::hub_runner_names_tests::hub_runner_migration_preserves_references_and_capacity_enforcement_pg
-db::postgres::test_db_reclaim::tests::pg_reclaim_drops_old_database_created_but_never_marked
-db::postgres::test_db_reclaim::tests::pg_reclaim_drops_orphaned_fixture_database
-db::postgres::test_db_reclaim::tests::pg_reclaim_dry_run
-db::postgres::test_db_reclaim::tests::pg_reclaim_finds_database_killed_before_marker
-db::postgres::test_db_reclaim::tests::pg_reclaim_fresh_process_child
-db::postgres::test_db_reclaim::tests::pg_reclaim_never_targets_unmarked_databases
-db::postgres::test_db_reclaim::tests::pg_reclaim_runs_on_first_fixture_of_fresh_process
-db::postgres::test_db_reclaim::tests::pg_reclaim_skips_database_with_active_session
-db::postgres::test_db_reclaim::tests::pg_reclaim_skips_database_younger_than_min_age
 db::postgres::tests::agent_roster_sync_gated_to_hub_or_single_node
 db::postgres::tests::background_backpressure_disabled_when_reserve_zero
 db::postgres::tests::background_backpressure_saturating_boundaries
@@ -583,6 +573,8 @@ db::postgres::tests::postgres_startup_reseed_migrates_legacy_openclaw_agent_ids
 db::postgres::tests::postgres_startup_reseed_preserves_configured_legacy_openclaw_agent_id
 db::postgres::tests::postgres_summary_uses_config_fields_when_enabled
 db::postgres::tests::postgres_test_sqlx_timeout_wrapper_fails_fast
+db::postgres::tests::postgres_worker_first_boot_requires_leader_without_seeding_shared_config
+db::postgres::tests::postgres_worker_reseed_preserves_all_leader_configuration_and_overrides
 db::postgres::tests::require_pg_guard_leaves_success_untouched_when_ci_lane_requires_postgres
 db::postgres::tests::require_pg_guard_panics_for_all_entrypoints_on_unreachable_database
 db::postgres::tests::require_pg_guard_preserves_errors_when_ci_lane_does_not_require_postgres
@@ -1257,7 +1249,6 @@ server::runner_recovery::tests::restarts_after_unexpected_return
 server::runner_recovery::tests::shutdown_waits_for_inner_cleanup
 server::runner_recovery::tests::simultaneous_return_and_shutdown_is_expected_without_budget_use
 server::runner_recovery::tests::stable_run_resets_backoff
-server::runner_recovery::windows_contract::tests::first_fatal_exit_persists_ledger_and_exits
 server::runner_registry::hub_takeover_tests::policy_tick_thread_captures_the_process_health_registry
 server::runner_registry::hub_takeover_tests::runner_profile_starts_local_runners_without_spawning_hub_waiters
 server::runner_registry::hub_takeover_tests::supervisor_respawns_runner_after_lease_takeover
@@ -1275,9 +1266,8 @@ server::test_phase_runs::tests::default_idempotency_key_is_phase_and_head_sha
 server::test_phase_runs::tests::status_validation_allows_only_phase_run_states
 server::test_phase_runs::tests::terminal_statuses_close_phase_runs
 server::web_surface::tests::full_profile_keeps_public_spa_entry_and_protected_api
-server::web_surface::tests::runner_browser_entry_reports_unavailable_hub_without_token_or_dashboard_assets
+server::web_surface::tests::runner_browser_entry_explains_profile_without_token_or_dashboard_assets
 server::web_surface::tests::runner_entry_keeps_execution_routes_protected_and_absent_routes_not_found
-server::web_surface::tests::runner_redirect_preserves_navigation_and_requires_one_trusted_online_hub
 server::ws::ws_auth_gate_tests::configured_token_accepts_only_the_exact_token
 server::ws::ws_auth_gate_tests::configured_token_rejects_wrong_missing_and_prefix_tokens
 server::ws::ws_auth_gate_tests::unset_or_empty_configured_token_leaves_the_route_open
@@ -2804,6 +2794,7 @@ services::discord::health::provider_probe::tests::stalled_reconcile_keeps_the_in
 services::discord::health::provider_probe::tests::standby_live_and_finalizing_evidence_remains_visible_for_fail_closed_restart
 services::discord::health::provider_probe::tests::standby_role_only_ignores_gateway_disconnect_and_masks_no_other_axis
 services::discord::health::provider_probe::tests::unfinished_reconcile_is_promoted_to_stalled_after_the_threshold
+services::discord::health::provider_probe::tests::worker_profile_health_does_not_require_gateway_or_hide_recovery_failure
 services::discord::health::reachability::composite::composite_tests::a_carried_over_incarnation_publishes_what_a_fully_covered_turn_publishes
 services::discord::health::reachability::composite::composite_tests::a_ledger_inside_its_ttl_is_not_expired
 services::discord::health::reachability::composite::composite_tests::a_live_executor_blocks_expiry_of_a_stale_ledger
