@@ -75,6 +75,8 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/cluster/intake_router_hook/execution_requirement_tests.rs",
         "src/services/cluster/intake_runner/dispatch_stamp_tests.rs",
         "src/services/cluster/intake_runner/drain_tests.rs",
+        "src/services/cluster/machine_resources/store/tests.rs",
+        "src/services/cluster/machine_resources/tests.rs",
         "src/services/cluster/readiness/tests.rs",
         "src/services/cluster/stream_relay/tests/shutdown_tests.rs",
         "src/services/discord/abandon_request_store/probe_contract_tests.rs",

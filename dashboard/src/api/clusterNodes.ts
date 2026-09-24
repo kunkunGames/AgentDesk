@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { request } from "./httpClient";
+import { machineResourcesSchema } from "./machineResources";
 
 const readinessReport = z.object({ eligible: z.boolean(), reasons: z.array(z.string()) });
 const nodeSchema = z.object({
@@ -11,10 +12,15 @@ const nodeSchema = z.object({
   active_session_count: z.number().nullish(), active_dispatch_count: z.number().nullish(),
   execution_active: z.number().nullish(), execution_occupied: z.number().nullish(),
   capabilities: z.object({
+    machine_resources: machineResourcesSchema.nullish().catch(null),
     execution_capacity: z.object({ version: z.literal(1), slots: z.number().int().positive() }).nullish(),
     execution_readiness: z.object({
       os: z.string(), arch: z.string(), runtime_profile: z.string(),
       observed_at_ms: z.number(), expires_at_ms: z.number(), backends: z.array(z.string()),
+      providers: z.record(z.string(), z.object({
+        cli_installed: z.boolean().optional(), cli_usable: z.boolean(),
+        version: z.string().nullish(), failure: z.string().nullish(),
+      })).optional(),
     }).nullish(),
   }).passthrough(),
   execution_readiness: z.object({ providers: z.record(z.string(), readinessReport) }).nullish(),

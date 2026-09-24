@@ -1,20 +1,16 @@
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
-import { getClusterNodes } from "../../api/clusterNodes";
+import { useMachineNodes } from "./useMachineNodes";
 import { StatusBadge } from "../common/StatusBadge";
 import { SettingsMachineCard, machineTimestamp } from "./SettingsMachineCard";
 import {
-  MACHINE_CLOCK_INTERVAL_MS, MACHINE_REFRESH_INTERVAL_MS, MACHINE_SNAPSHOT_MAX_AGE_MS,
+  MACHINE_CLOCK_INTERVAL_MS, MACHINE_SNAPSHOT_MAX_AGE_MS,
   machineOnline, machineRole,
 } from "./SettingsMachineModel";
 import type { SettingsTr } from "./SettingsPanelTypes";
 
 export function SettingsMachinePanel({ tr }: { tr: SettingsTr }) {
-  const nodes = useQuery({
-    queryKey: ["cluster-nodes"], queryFn: ({ signal }) => getClusterNodes(signal),
-    refetchInterval: MACHINE_REFRESH_INTERVAL_MS, retry: false,
-  });
+  const nodes = useMachineNodes();
   const [now, setNow] = useState(Date.now);
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), MACHINE_CLOCK_INTERVAL_MS);
@@ -39,12 +35,6 @@ export function SettingsMachinePanel({ tr }: { tr: SettingsTr }) {
         <RefreshCw size={14} aria-hidden className={nodes.isFetching ? "animate-spin" : undefined} />
         {nodes.isFetching ? tr("확인 중…", "Checking…") : tr("상태 새로고침", "Refresh status")}
       </button>
-    </div>
-    <div className="grid gap-3 sm:grid-cols-2">
-      <div className="rounded-xl border border-th-border p-4"><h3 className="text-sm font-semibold">Hub</h3>
-        <p className="mt-1 text-xs leading-5 text-th-text-muted">{tr("클러스터를 조율하고 작업을 배정합니다. 준비 상태에 따라 직접 실행도 할 수 있습니다.", "Coordinates the cluster and assigns work. It can also execute work when ready.")}</p></div>
-      <div className="rounded-xl border border-th-border p-4"><h3 className="text-sm font-semibold">Runner</h3>
-        <p className="mt-1 text-xs leading-5 text-th-text-muted">{tr("배정된 작업을 자신의 실행 환경에서 수행하고 상태를 보고합니다.", "Runs assigned work in its own environment and reports its status.")}</p></div>
     </div>
     {nodes.isPending && <p role="status">{tr("머신 정보를 불러오는 중…", "Loading machine details…")}</p>}
     {nodes.isError && <p role="alert" className="rounded-xl border border-amber-400/30 bg-amber-400/10 p-3 text-sm">{nodes.data

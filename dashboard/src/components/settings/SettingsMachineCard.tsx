@@ -3,6 +3,8 @@ import { Monitor, Server } from "lucide-react";
 import type { ClusterNode } from "../../api/clusterNodes";
 import { nodePlatformLabel, nodeRoleLabel, runtimeModeLabel } from "../../lib/nodeLabels";
 import { StatusBadge } from "../common/StatusBadge";
+import { SettingsMachineResources } from "./SettingsMachineResources";
+import { useMachineResourceHistory } from "./useMachineResourceHistory";
 import {
   machineApiOrigin, machineConnection, machineOnline, machineReadinessReason, machineRole,
 } from "./SettingsMachineModel";
@@ -32,6 +34,7 @@ type Props = {
 };
 
 export function SettingsMachineCard({ node, localId, leaseTtlSeconds, stale, sessionCountsUnavailable, now, tr }: Props) {
+  const history = useMachineResourceHistory(node.instance_id);
   const role = machineRole(node.effective_role);
   const connection = machineConnection(node, localId, stale, now, leaseTtlSeconds, tr);
   const online = !stale && machineOnline(node, now, leaseTtlSeconds);
@@ -41,7 +44,8 @@ export function SettingsMachineCard({ node, localId, leaseTtlSeconds, stale, ses
   const occupied = node.execution_occupied;
   const capacityKnown = slots != null && occupied != null;
   const capacityAvailable = capacityKnown && occupied < slots;
-  const reports = Object.entries(node.execution_readiness?.providers ?? {});
+  const installedProviders = Object.entries(probe?.providers ?? {}).filter(([, evidence]) =>
+    evidence.cli_installed ?? evidence.cli_usable);
   const origin = machineApiOrigin(node.api_base_url);
   const unknown = tr("미확인", "Unknown");
   const DeviceIcon = role === "Hub" ? Server : Monitor;
@@ -64,11 +68,16 @@ export function SettingsMachineCard({ node, localId, leaseTtlSeconds, stale, ses
       <StatusBadge tone={connection.tone}>{connection.label}</StatusBadge>
     </div>
     <p className="mt-3 text-xs leading-5 text-th-text-muted">{connection.detail}</p>
-    <dl className="mt-4 grid min-w-0 grid-cols-1 gap-x-5 gap-y-4 sm:grid-cols-2">
+    <p className="mt-1 text-xs text-th-text-muted">{probe ? `${nodePlatformLabel(probe.os, tr)} / ${probe.arch}` : unknown} · {runtimeModeLabel(probe?.runtime_profile, tr)}</p>
+    <SettingsMachineResources resources={node.capabilities.machine_resources} history={history.data ?? []} stale={stale || !online} now={now} tr={tr} />
+    {history.isError && <p className="mt-2 text-xs text-th-text-muted">{tr(
+      "저장된 이력을 불러오지 못했습니다. 다음 갱신 때 다시 시도합니다.",
+      "Saved history is unavailable. It will be retried on the next refresh.",
+    )}</p>}
+    <details className="mt-4 rounded-xl border border-th-border p-3">
+      <summary className="cursor-pointer text-xs font-medium">{tr("장치 및 연결 상세", "Device and connection details")}</summary>
+    <dl className="mt-3 grid min-w-0 grid-cols-1 gap-x-5 gap-y-3 sm:grid-cols-2">
       <Detail label={tr("장치 ID", "Device ID")}>{node.instance_id}</Detail>
-      <Detail label={tr("설정된 역할", "Configured role")}>{machineRole(node.role) || nodeRoleLabel(node.role, tr)}</Detail>
-      <Detail label={tr("운영 체제 / 아키텍처", "Operating system / architecture")}>{probe ? `${nodePlatformLabel(probe.os, tr)} / ${probe.arch}` : unknown}</Detail>
-      <Detail label={tr("런타임 모드", "Runtime mode")}>{runtimeModeLabel(probe?.runtime_profile, tr)}</Detail>
       <Detail label={tr("등록된 API 주소", "Advertised API address")}>{origin || tr("등록 안 됨", "Not advertised")}</Detail>
       <Detail label={tr("프로세스 ID", "Process ID")}>{node.process_id ?? unknown}</Detail>
       <Detail label={tr("마지막 heartbeat", "Last heartbeat")}>{machineTimestamp(node.last_heartbeat_at, tr)}</Detail>
@@ -76,10 +85,7 @@ export function SettingsMachineCard({ node, localId, leaseTtlSeconds, stale, ses
       <Detail label={tr("실행 backend", "Execution backends")}>{probe?.backends.join(", ") || unknown}</Detail>
       <Detail label={tr("장치 라벨", "Device labels")}>{node.labels?.join(", ") || tr("없음", "None")}</Detail>
     </dl>
-    <p className="mt-3 text-xs leading-5 text-th-text-muted">{tr(
-      "등록 주소는 장치가 알린 값입니다. 연결 확인은 서버의 신뢰 설정과 인증 검사 결과를 따릅니다.",
-      "The address is advertised by the device. Connection verification uses the server's trust settings and authentication checks.",
-    )}</p>
+    </details>
     <div className="mt-4 border-t border-th-border pt-4">
       <h4 className="text-sm font-semibold">{tr("실행 준비 상태", "Execution readiness")}</h4>
       <dl className="mt-3 grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
@@ -90,23 +96,29 @@ export function SettingsMachineCard({ node, localId, leaseTtlSeconds, stale, ses
       </dl>
       <p className="mt-3 text-xs text-th-text-muted">{tr("실행 검사 시각", "Execution probe time")}: {machineTimestamp(probe?.observed_at_ms, tr)}</p>
       <div className="mt-3 space-y-2">
-        {reports.length === 0 && <p className="text-sm text-th-text-muted">{tr("프로바이더 준비 상태가 아직 보고되지 않았습니다.", "Provider readiness has not been reported yet.")}</p>}
-        {reports.map(([provider, report]) => {
-          const ready = report.eligible && probeCurrent && capacityAvailable;
+        <h5 className="text-xs font-medium">{tr("설치된 프로바이더 CLI", "Installed provider CLIs")} <span className="text-th-text-muted">{installedProviders.length}</span></h5>
+        {installedProviders.length === 0 && <p className="text-sm text-th-text-muted">{probe?.providers
+          ? tr("설치가 확인된 프로바이더 CLI가 없습니다.", "No installed provider CLIs were detected.")
+          : tr("CLI 설치 정보를 기다리는 중입니다.", "Waiting for CLI installation information.")}</p>}
+        {installedProviders.map(([provider, evidence]) => {
+          const report = node.execution_readiness?.providers[provider];
+          const ready = evidence.cli_usable && report?.eligible && probeCurrent && capacityAvailable;
           const label = !probeCurrent ? tr("검사 갱신 필요", "Probe refresh needed")
+            : !evidence.cli_usable ? tr("CLI 확인 필요", "CLI needs attention")
+            : !report ? tr("실행 미설정", "Execution not configured")
             : !report.eligible ? tr("실행 보류", "Not ready")
             : !capacityKnown ? tr("용량 미확인", "Capacity unknown")
             : !capacityAvailable ? tr("용량 대기", "Waiting for capacity")
             : tr("신규 실행 가능", "Ready for new work");
           return <div key={provider} className="flex flex-wrap items-center gap-2 text-xs">
             <strong>{provider}</strong><StatusBadge tone={ready ? "healthy" : "warning"}>{label}</StatusBadge>
-            <span className="text-th-text-muted">{report.reasons.map(reason => machineReadinessReason(reason, tr)).join(" · ")}</span>
+            <span className="text-th-text-muted">{report?.reasons.map(reason => machineReadinessReason(reason, tr)).join(" · ")}</span>
           </div>;
         })}
       </div>
       <p className="mt-3 text-xs leading-5 text-th-text-muted">{tr(
-        "실행 준비 상태는 로컬 CLI·인증 설정 검사 결과입니다. 외부 계정의 인증 유효성이나 잔여 할당량을 보장하지 않습니다.",
-        "Readiness checks local CLI and credential configuration. It does not verify remote account authentication or remaining quota.",
+        "실행 준비 상태는 로컬 CLI·인증 설정 검사 결과입니다.",
+        "Readiness checks local CLI and credential configuration.",
       )}</p>
     </div>
   </article>;

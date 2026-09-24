@@ -1,7 +1,11 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import type { ClusterNode } from "../../api/clusterNodes";
 import { SettingsMachineCard } from "./SettingsMachineCard";
+
+vi.mock("./useMachineResourceHistory", () => ({
+  useMachineResourceHistory: () => ({ data: [] }),
+}));
 
 const now = Date.parse("2026-09-23T00:00:30Z");
 const node: ClusterNode = {
@@ -9,7 +13,8 @@ const node: ClusterNode = {
   active_session_count: 0, execution_active: 1, execution_occupied: 1,
   capabilities: {
     execution_capacity: { version: 1, slots: 2 },
-    execution_readiness: { os: "linux", arch: "aarch64", runtime_profile: "runner", observed_at_ms: now, expires_at_ms: now + 60_000, backends: ["process"] },
+    execution_readiness: { os: "linux", arch: "aarch64", runtime_profile: "runner", observed_at_ms: now, expires_at_ms: now + 60_000, backends: ["process"],
+      providers: { codex: { cli_installed: true, cli_usable: true }, antigravity: { cli_installed: false, cli_usable: false } } },
   },
   execution_readiness: { providers: { codex: { eligible: true, reasons: [] } } },
 };
@@ -23,6 +28,19 @@ it("shows platform, canonical role and capacity from the selected device", () =>
   expect(html).not.toContain(">worker<");
   expect(html).toContain("Linux / aarch64");
   expect(html).toContain("Ready for new work");
+});
+
+it("shows installed CLIs even without credentials and hides uninstalled providers and removed copy", () => {
+  const html = render({ ...node, execution_readiness: { providers: {
+    codex: { eligible: false, reasons: ["provider_credentials_missing"] },
+    antigravity: { eligible: false, reasons: ["provider_cli_unavailable"] },
+  } } });
+  expect(html).toContain("codex");
+  expect(html).toContain("Local credentials missing");
+  expect(html).not.toContain("antigravity");
+  expect(html).not.toContain("Configured role");
+  expect(html).not.toContain("The address is advertised");
+  expect(html).not.toContain("remaining quota");
 });
 
 it("never offers healthy execution readiness on offline, expired, stale, or full nodes", () => {
