@@ -90,7 +90,7 @@ fn runner_response(target: Option<&str>) -> Response {
         Some(target) => Redirect::temporary(target).into_response(),
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Html(include_str!("web_surface/runner.html")),
+            Html(include_str!("../../assets/runner-entry.html")),
         )
             .into_response(),
     };
