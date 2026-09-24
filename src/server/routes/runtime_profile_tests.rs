@@ -50,7 +50,6 @@ async fn runner_profile_routes_preserve_execution_auth_and_remove_admin_methods(
             ("GET", "/sessions/example/tmux-output"),
             ("POST", "/sessions/example/force-kill"),
             ("POST", "/turns/123/cancel"),
-            ("POST", "/hook/reset-status"),
             ("GET", "/channels/123/watcher-state"),
         ] {
             assert_eq!(
@@ -65,6 +64,9 @@ async fn runner_profile_routes_preserve_execution_auth_and_remove_admin_methods(
         }
         // A valid administrator credential cannot mount disabled runner routes.
         for (method, path) in [
+            ("POST", "/hook/reset-status"),
+            ("POST", "/hook/skill-usage"),
+            ("DELETE", "/hook/session/example"),
             ("PUT", "/settings"),
             ("PATCH", "/settings/config"),
             ("POST", "/agents"),
