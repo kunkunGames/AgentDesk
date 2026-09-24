@@ -1282,7 +1282,7 @@ mod windows_contract {
             );
             let persisted = load_fatal_ledger(&path);
             assert_eq!(persisted.len(), 1);
-            assert_eq!(persisted[0].worker, "dispatch_outbox");
+            assert_eq!(persisted[0].runner, "dispatch_outbox");
         }
     }
 }
