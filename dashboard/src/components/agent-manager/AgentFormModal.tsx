@@ -317,12 +317,18 @@ export default function AgentFormModal({
             <div className="grid grid-cols-[72px_minmax(0,1fr)] gap-2 md:grid-cols-[72px_minmax(0,1fr)_minmax(0,1fr)]">
               <div>
                 <label htmlFor="agent-emoji" className="block text-xs mb-1.5 font-medium" style={{ color: "var(--th-text-secondary)" }}>
-                  {tr("아이콘", "Icon")}
+                  {tr("이모지", "Emoji")}
                 </label>
                 <EmojiPicker
                   id="agent-emoji"
                   value={formValues.avatar_emoji}
                   onChange={(emoji) => setValue("avatar_emoji", emoji, { shouldDirty: true, shouldValidate: true })}
+                  aria-label={
+                    formValues.avatar_emoji
+                      ? tr(`선택된 이모지: ${formValues.avatar_emoji}, 이모지 변경`, `Selected emoji: ${formValues.avatar_emoji}, change emoji`)
+                      : tr("이모지 선택기 열기", "Open emoji picker")
+                  }
+                  dialogLabel={tr("이모지 선택", "Choose an emoji")}
                 />
               </div>
               <div>
