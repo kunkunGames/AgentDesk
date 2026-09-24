@@ -153,16 +153,7 @@ pub(in crate::services::discord) async fn build_health_report(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(none)".to_string());
     let release_label = |value: &str| value.rsplit('/').next().unwrap_or(value).to_string();
-    let home_prefix = dirs::home_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let compact_path = |value: String| {
-        if value.starts_with(&home_prefix) {
-            value.replacen(&home_prefix, "~", 1)
-        } else {
-            value
-        }
-    };
+    let compact_path = |value: String| crate::utils::format::compact_path(&value);
     let inflight_states = load_inflight_states(&provider);
     let inflight_count = inflight_states.len();
     let channel_inflight = inflight_states
@@ -293,16 +284,7 @@ pub(in crate::services::discord) async fn build_status_report(
     let active_owner = channel_snapshot.active_request_owner;
     let queued_count = pending_queue_len(&channel_snapshot.intervention_queue);
 
-    let home_prefix = dirs::home_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let compact_path = |value: String| {
-        if value.starts_with(&home_prefix) {
-            value.replacen(&home_prefix, "~", 1)
-        } else {
-            value
-        }
-    };
+    let compact_path = |value: String| crate::utils::format::compact_path(&value);
     let session_id_text = session_id.unwrap_or_else(|| "(none)".to_string());
     let session_id_short = shorten_session_identifier(&session_id_text);
     let tmux_session_name =

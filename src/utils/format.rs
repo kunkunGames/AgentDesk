@@ -119,3 +119,17 @@ pub fn expand_tilde_path(path: &str) -> std::path::PathBuf {
     }
     std::path::PathBuf::from(path)
 }
+
+/// Replaces the home directory prefix with '~' for display purposes.
+/// If the path does not start with the home directory, it is returned unchanged.
+pub fn compact_path(value: &str) -> String {
+    let home_prefix = dirs::home_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+
+    if !home_prefix.is_empty() && value.starts_with(&home_prefix) {
+        value.replacen(&home_prefix, "~", 1)
+    } else {
+        value.to_string()
+    }
+}
