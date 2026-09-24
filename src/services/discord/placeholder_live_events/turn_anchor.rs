@@ -17,6 +17,8 @@ use poise::serenity_prelude::{Channel, ChannelId, Http};
 use super::status_panel::StatusPanelState;
 use crate::services::discord::is_synthetic_headless_message_id_raw;
 
+const CHANNEL_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Builds the `턴 트리거:` original-request deeplink, or `None` when no real
 /// Discord user message backs the turn (headless / synthetic / voice / id-0) or
 /// the request's channel could not be resolved.

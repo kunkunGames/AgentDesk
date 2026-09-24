@@ -208,11 +208,11 @@ impl ProviderKind {
     pub(crate) fn resolve_runtime_path(&self) -> Option<String> {
         registry::resolve_kind_runtime_path(self)
     }
-
     pub fn probe_runtime(&self) -> Option<ProviderRuntimeProbe> {
         let entry = self.registry_entry()?;
         let capabilities = entry.capabilities;
-        let binary_probe = crate::services::platform::probe_provider_binary_version(self.as_str());
+        let binary_probe =
+            crate::services::platform::probe_provider_binary_version(capabilities.binary_name);
         let credentials =
             crate::services::provider_auth::detect_provider_credentials(entry.id, &entry.auth);
         Some(ProviderRuntimeProbe {

@@ -34,7 +34,16 @@ from pathlib import Path
 # Mechanical ``tests.rs`` / ``*_tests.rs`` basename exclusions.
 PINNED_BASENAME_TEST_FILES = frozenset(
     {
+        "src/services/cluster/attachment_transfer/storage_tests.rs",
+        "src/services/cluster/intake_router_hook/attachment_tests.rs",
+        "src/services/cluster/execution_capacity/tests.rs",
+        "src/services/cluster/machine_resources/tests.rs",
         "src/db/auto_queue/tests.rs",
+        "src/services/cluster/intake_router_hook/edge_case_tests.rs",
+        "src/services/cluster/intake_router_hook/agent_execution_node_tests.rs",
+        "src/services/cluster/intake_router_hook/capacity_tests.rs",
+        "src/services/discord/queue_io/transport/tests.rs",
+        "src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rest_delivery_tests.rs",
         "src/db/automation_candidates/verdict_tests.rs",
         "src/db/calendar_sync/postgres_tests.rs",
         "src/db/campaigns/tests.rs",
@@ -49,6 +58,7 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/github/triage/warning_tests.rs",
         "src/server/dashboard_auth/tests.rs",
         "src/server/database_fixture_invariant_tests.rs",
+        "src/server/dashboard_auth/tests.rs",
         "src/server/routes/auto_queue_lifecycle_pg_tests.rs",
         "src/server/routes/dispatched_sessions_tests.rs",
         "src/server/routes/runtime_profile_tests.rs",
@@ -189,6 +199,7 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/provider/provider_conformance_invariant_tests.rs",
         "src/services/provider_auth_profile/fallback/tests.rs",
         "src/services/provider_output_guard_tests.rs",
+        "src/services/session_forwarding/probe/tests.rs",
         "src/services/scheduled_messages/postgres_tests.rs",
         "src/services/session_forwarding/probe/tests.rs",
         "src/services/tui_prompt_dedupe/tests.rs",
@@ -199,10 +210,12 @@ PINNED_BASENAME_TEST_FILES = frozenset(
 # Production-looking basenames classified as test-only by the shared resolver.
 PINNED_RESOLVER_TEST_ONLY_FILES = frozenset(
     {
+        "src/services/kakao/test_support.rs",
         "src/config/test_env.rs",
         "src/config/test_env/teardown_probe.rs",
         "src/db/auto_queue/test_support.rs",
         "src/db/fixture_target.rs",
+        "src/db/postgres/test_db_reclaim.rs",
         "src/dispatch/test_support.rs",
         "src/github/test_support.rs",
         "src/high_risk_recovery.rs",
@@ -216,8 +229,10 @@ PINNED_RESOLVER_TEST_ONLY_FILES = frozenset(
         "src/services/discord/relay_recovery/tests/circuit_breaker_apply.rs",
         "src/services/discord/session_relay_sink/tests/stream_frame_fixtures.rs",
         "src/services/discord/tui_prompt_relay/local_model_queue_wake_e2e.rs",
+        "src/services/discord/tui_prompt_relay/relay_e2e/catch_up_pagination_e2e.rs",
         "src/services/discord/tui_prompt_relay/relay_e2e/discord_mock.rs",
         "src/services/discord/tui_prompt_relay/relay_e2e/mod.rs",
+        "src/services/discord/tui_prompt_relay/relay_e2e/stale_resume_retry_e2e.rs",
         "src/services/discord/tui_prompt_relay/tests/scenario_census_e2e.rs",
         "src/services/observability/events/test_capture.rs",
         "src/services/observability/test_support.rs",

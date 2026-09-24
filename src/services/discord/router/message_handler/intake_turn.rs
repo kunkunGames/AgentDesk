@@ -1658,7 +1658,6 @@ pub(super) async fn handle_text_message(
     // General recall stays model-owned; session anchors use the native instruction layer.
     let memory_settings = settings::memory_settings_for_binding(role_binding.as_ref());
     // Prepend pending file uploads
-    let mut context_chunks = Vec::new();
     let memory_injection_plan =
         build_memory_injection_plan(&provider, session_id.is_some(), dispatch_profile);
     let channel_recent_context = load_channel_recent_context(
@@ -1679,28 +1678,21 @@ pub(super) async fn handle_text_message(
         shared.pg_pool.as_ref(),
     )
     .await?;
-    if !materialized_uploads.records.is_empty() {
-        context_chunks.push(materialized_uploads.records.join("\n"));
+    let context_prompt = TurnContext {
+        provider: &provider,
+        session_id: session_id.as_deref(),
+        uploads: &materialized_uploads.records,
+        trigger: None,
+        reply: reply_context.as_deref(),
+        recent: channel_recent_context.as_ref(),
+        knowledge: memory_injection_plan
+            .shared_knowledge_for_context
+            .as_deref(),
+        author_name: request_owner_name,
+        author_id: request_owner,
+        user_input: sanitized_input,
     }
-    if let Some(ref reply_ctx) = reply_context {
-        context_chunks.push(reply_ctx.clone());
-    }
-    if let Some(ref recent_context) = channel_recent_context {
-        recent_context.append_rendered_context_to(&mut context_chunks);
-    }
-    if let Some(ref knowledge) = memory_injection_plan.shared_knowledge_for_context {
-        context_chunks.push(knowledge.to_string());
-    }
-    context_chunks.push(wrap_user_prompt_with_author(
-        request_owner_name,
-        request_owner,
-        sanitized_input,
-    ));
-    let context_prompt = crate::services::provider::compact_resumed_provider_turn_prompt(
-        &provider,
-        session_id.as_deref(),
-        context_chunks.join("\n\n"),
-    );
+    .build();
     // Build Discord context info
     let discord_context = {
         let data = shared.core.lock().await;
@@ -2393,12 +2385,6 @@ pub(super) async fn handle_text_message(
             provider_execution_context,
             || {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let system_prompt_for_turn =
-                        crate::services::provider::system_prompt_for_provider_turn(
-                            &provider_for_blocking,
-                            session_id_clone.as_deref(),
-                            &system_prompt_owned,
-                        );
                     super::provider_dispatch::execute(
                         super::provider_dispatch::StreamingTurn {
                             pool: execution_pool.as_ref(),
@@ -2406,7 +2392,7 @@ pub(super) async fn handle_text_message(
                             prompt: &context_prompt,
                             session_id: session_id_clone.as_deref(),
                             working_dir: &current_path_clone,
-                            system_prompt: system_prompt_for_turn,
+                            system_prompt: Some(&system_prompt_owned),
                             allowed_tools: &allowed_tools,
                             cancel: cancel_token_clone,
                             remote_profile: remote_profile.as_ref(),

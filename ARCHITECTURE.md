@@ -24,10 +24,14 @@ src/
 │   ├── args/
 │   │   └── parsing.rs
 │   ├── client/
-│   │   └── runtime_config.rs
+│   │   ├── runtime_config.rs
+│   │   └── transport.rs
+│   ├── dcserver/
+│   │   └── startup.rs
 │   ├── doctor/
 │   │   ├── orchestrator/
 │   │   │   ├── config_dir_checks.rs
+│   │   │   ├── health_snapshot.rs
 │   │   │   ├── provider_credentials.rs
 │   │   │   └── relay_notifications.rs
 │   │   ├── contract.rs
@@ -75,6 +79,7 @@ src/
 │   ├── agent_channels.rs
 │   ├── cluster_role.rs
 │   ├── runtime_profile.rs
+│   ├── runtime_settings.rs
 │   └── test_env.rs
 ├── db/
 │   ├── auto_queue/
@@ -133,7 +138,8 @@ src/
 │   │   │   └── migration_compat_tests.rs
 │   │   ├── hub_runner_names_tests.rs
 │   │   ├── migration_compat.rs
-│   │   └── shared_config.rs
+│   │   ├── shared_config.rs
+│   │   └── test_db_reclaim.rs
 │   ├── prompt_manifests/
 │   │   ├── builder.rs
 │   │   ├── mod.rs
@@ -314,7 +320,8 @@ src/
 │   │   │   ├── reviews.rs
 │   │   │   └── runtime.rs
 │   │   ├── health_api/
-│   │   │   └── public_projection.rs
+│   │   │   ├── public_projection.rs
+│   │   │   └── runtime_profile.rs
 │   │   ├── review_verdict/
 │   │   │   ├── decision_route.rs
 │   │   │   ├── mod.rs
@@ -1010,6 +1017,7 @@ src/
 │   │   │   │   ├── provider_isolation.rs
 │   │   │   │   ├── session_strategy_lifecycle_tests.rs
 │   │   │   │   ├── tui_followup.rs
+│   │   │   │   ├── turn_context.rs
 │   │   │   │   ├── turn_lifecycle.rs
 │   │   │   │   ├── typing_indicator.rs
 │   │   │   │   ├── voice_announcement_route.rs
@@ -1227,8 +1235,10 @@ src/
 │   │   │   ├── rehydration/
 │   │   │   │   └── idempotency_tests.rs
 │   │   │   ├── relay_e2e/
+│   │   │   │   ├── catch_up_pagination_e2e.rs
 │   │   │   │   ├── discord_mock.rs
-│   │   │   │   └── mod.rs
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── stale_resume_retry_e2e.rs
 │   │   │   ├── synthetic_start/
 │   │   │   │   ├── bridge_handoff.rs
 │   │   │   │   ├── claim.rs
@@ -1478,6 +1488,7 @@ src/
 │   │   ├── internal_api.rs
 │   │   ├── jsonl_watcher.rs
 │   │   ├── mailbox_finish.rs
+│   │   ├── mailbox_probe.rs
 │   │   ├── mcp_credential_watcher.rs
 │   │   ├── meeting_artifact_store.rs
 │   │   ├── meeting_orchestrator.rs
@@ -1678,6 +1689,7 @@ src/
 │   ├── platform/
 │   │   ├── binary_resolver/
 │   │   │   ├── grok.rs
+│   │   │   ├── resolution.rs
 │   │   │   └── windows_codex.rs
 │   │   ├── tmux/
 │   │   │   └── availability.rs
@@ -1817,7 +1829,9 @@ src/
 │   │   ├── episode_identity.rs
 │   │   ├── front_requeue.rs
 │   │   ├── inbound_order.rs
+│   │   ├── intervention.rs
 │   │   ├── lease_release.rs
+│   │   ├── mailbox_unreachable_tests.rs
 │   │   ├── overflow.rs
 │   │   ├── pending_queue_persistence.rs
 │   │   ├── queue_cancellation.rs

@@ -40,14 +40,17 @@ impl WriterClaim {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-        let mut file = options
-            .open(directory.join(format!("{}.receipt", key.to_ascii_lowercase())))
+        let receipt = directory.join(format!("{}.receipt", key.to_ascii_lowercase()));
+        let file = options
+            .open(&receipt)
             .map_err(|error| format!("memento writer receipt open: {error}"))?;
         file.try_lock().map_err(|error| {
             format!("memento remember is in flight or its receipt cannot be locked: {error}")
         })?;
+        // Own the lock at once so every early return below unlocks via Drop.
+        let mut claim = Self { file };
         let mut state = Vec::new();
-        (&mut file)
+        (&mut claim.file)
             .take(2)
             .read_to_end(&mut state)
             .map_err(|error| format!("memento writer receipt read: {error}"))?;
@@ -62,18 +65,17 @@ impl WriterClaim {
             }
         }
 
-        let mut claim = Self { file };
         claim.write_state(PENDING)?;
         // Persist the directory entry before the request is allowed to leave.
         // Also persist creation of the receipt directory itself on first use.
         #[cfg(unix)]
         {
-            sync_directory(directory)?;
-            if let Some(parent) = directory
+            sync_parent_directory(&receipt)?;
+            if directory
                 .parent()
-                .filter(|path| !path.as_os_str().is_empty())
+                .is_some_and(|path| !path.as_os_str().is_empty())
             {
-                sync_directory(parent)?;
+                sync_parent_directory(directory)?;
             }
         }
         Ok(Some(claim))
@@ -103,10 +105,18 @@ impl WriterClaim {
     }
 }
 
+impl Drop for WriterClaim {
+    /// A child spawned while the claim was open shares its lock until it execs,
+    /// so closing alone can leave the lock held; unlocking releases it for every holder.
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+/// Flushes the directory holding `entry` through `fsync_parent_dir`.
 #[cfg(unix)]
-fn sync_directory(directory: &Path) -> Result<(), String> {
-    File::open(directory)
-        .and_then(|file| file.sync_all())
+fn sync_parent_directory(entry: &Path) -> Result<(), String> {
+    crate::services::discord::runtime_store::fsync_parent_dir(entry)
         .map_err(|error| format!("memento writer receipt directory persist: {error}"))
 }
 
@@ -213,7 +223,7 @@ pub(crate) fn invalidate_writer_receipts(
     }
     result?;
     #[cfg(unix)]
-    sync_directory(directory)?;
+    sync_parent_directory(&generation_path(directory, endpoint))?;
     Ok(())
 }
 
@@ -305,6 +315,79 @@ mod tests {
         assert!(error.contains("in flight"));
         claim.complete().unwrap();
         assert!(WriterClaim::acquire(dir.path(), &key).unwrap().is_none());
+    }
+
+    #[test]
+    fn duplicate_handles_do_not_extend_a_finished_claim_lock() {
+        for outcome in ["confirmed", "not_sent", "ambiguous"] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = fingerprint(fact());
+            let claim = WriterClaim::acquire(dir.path(), &key).unwrap().unwrap();
+            // Like a descriptor inherited by a concurrent process spawn, this
+            // handle shares the locked file description but does not own the claim.
+            let retained_handle = claim.file.try_clone().unwrap();
+            assert!(WriterClaim::acquire(dir.path(), &key).is_err());
+            match outcome {
+                "confirmed" => claim.complete().unwrap(),
+                "not_sent" => claim.release_before_send().unwrap(),
+                _ => drop(claim),
+            }
+            let reopened = WriterClaim::acquire(dir.path(), &key);
+            match outcome {
+                "confirmed" => assert!(reopened.unwrap().is_none()),
+                "not_sent" => assert!(reopened.unwrap().is_some()),
+                _ => assert!(reopened.unwrap_err().contains("unresolved prior write")),
+            }
+            drop(retained_handle);
+        }
+    }
+
+    #[test]
+    fn finished_claim_is_released_while_other_threads_spawn_children() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct StopOnDrop(Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
+        let spawning = stop.0.clone();
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "exit"])
+        } else {
+            ("true", &[])
+        };
+        let spawner = std::thread::spawn(move || {
+            while !spawning.load(Ordering::Relaxed) {
+                let _ = std::process::Command::new(program).args(args).status();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..300 {
+            let key = fingerprint(json!({"content": round}));
+            let claim = WriterClaim::acquire(dir.path(), &key).unwrap().unwrap();
+            if round % 2 == 0 {
+                claim.complete().unwrap();
+                // A confirmed lookup must also release, or the next lookup sees "in flight".
+                for lookup in 0..4 {
+                    let reopened = WriterClaim::acquire(dir.path(), &key);
+                    assert!(
+                        matches!(reopened, Ok(None)),
+                        "round {round} lookup {lookup}: {reopened:?}"
+                    );
+                }
+            } else {
+                claim.release_before_send().unwrap();
+                let retried = WriterClaim::acquire(dir.path(), &key);
+                assert!(matches!(retried, Ok(Some(_))), "round {round}: {retried:?}");
+            }
+        }
+        drop(stop);
+        spawner.join().unwrap();
     }
 
     #[test]

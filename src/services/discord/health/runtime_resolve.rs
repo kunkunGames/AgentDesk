@@ -12,6 +12,8 @@ use crate::services::discord::SharedData;
 use crate::services::discord::bot_role::UtilityBotRole;
 use crate::services::provider::ProviderKind;
 
+const CHANNEL_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Resolve the bot HTTP client by alias.
 /// Utility aliases are parsed into a stable role before provider lookup.
 pub async fn resolve_bot_http(

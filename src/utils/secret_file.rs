@@ -5,6 +5,9 @@ use std::path::Path;
 pub(crate) mod private_directory;
 
 #[cfg(unix)]
+pub(crate) mod private_directory;
+
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 #[cfg(unix)]

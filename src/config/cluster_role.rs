@@ -19,6 +19,10 @@ impl ClusterRole {
             Self::Auto => "auto",
         }
     }
+
+    pub fn registry_value(self) -> &'static str {
+        self.as_str()
+    }
 }
 
 impl FromStr for ClusterRole {
@@ -26,8 +30,8 @@ impl FromStr for ClusterRole {
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "hub" => Ok(Self::Hub),
-            "runner" => Ok(Self::Runner),
+            "hub" | "leader" => Ok(Self::Hub),
+            "runner" | "worker" => Ok(Self::Runner),
             "auto" => Ok(Self::Auto),
             _ => Err("cluster.role must be hub, runner, or auto"),
         }

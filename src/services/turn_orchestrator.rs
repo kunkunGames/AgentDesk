@@ -17,7 +17,10 @@ mod dispatch_reservation;
 mod episode_identity;
 mod front_requeue;
 mod inbound_order;
+mod intervention;
 mod lease_release;
+#[cfg(test)]
+mod mailbox_unreachable_tests;
 mod overflow;
 mod pending_queue_persistence;
 mod queue_cancellation;
@@ -46,6 +49,7 @@ use front_requeue::requeue_intervention_front;
 use inbound_order::INBOUND_ORDER_FAIL_OPEN_AFTER;
 pub(crate) use inbound_order::TurnAdmissionOrder;
 use inbound_order::{claim_yields, pause_inbound_stall_for_turn};
+pub(crate) use intervention::{Intervention, InterventionMode, SourceMessageTextSegment};
 use lease_release::release_active_turn_anchor;
 pub(crate) use overflow::SoftInterventionProbe;
 use overflow::drain_head_overflow;
@@ -78,114 +82,6 @@ use turn_finished_signal::{
 
 pub(crate) const MAX_INTERVENTIONS_PER_CHANNEL: usize = 30;
 pub(crate) const INTERVENTION_DEDUP_WINDOW: Duration = Duration::from_secs(10);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InterventionMode {
-    Soft,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SourceMessageTextSegment {
-    pub(crate) message_id: MessageId,
-    pub(crate) text: String,
-}
-
-impl SourceMessageTextSegment {
-    pub(crate) fn new(message_id: MessageId, text: impl Into<String>) -> Self {
-        Self {
-            message_id,
-            text: text.into(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct Intervention {
-    pub(crate) author_id: UserId,
-    pub(crate) author_is_bot: bool,
-    pub(crate) message_id: MessageId,
-    pub(crate) queued_generation: u64,
-    pub(crate) source_message_ids: Vec<MessageId>,
-    pub(crate) source_message_queued_generations: Vec<SourceMessageQueuedGeneration>,
-    pub(crate) source_text_segments: Vec<SourceMessageTextSegment>,
-    pub(crate) text: String,
-    pub(crate) mode: InterventionMode,
-    pub(crate) created_at: Instant,
-    pub(crate) reply_context: Option<String>,
-    pub(crate) has_reply_boundary: bool,
-    pub(crate) merge_consecutive: bool,
-    pub(crate) pending_uploads:
-        crate::services::cluster::attachment_transfer::uploads::PendingUploads,
-    /// #2266: when a voice-transcript announcement loses the
-    /// `mailbox_try_start_turn` race and is enqueued for later dispatch, the
-    /// per-process `voice::announce_meta` store entry is consumed by the
-    /// original `handle_text_message` call before the race-loss branch runs.
-    /// Embedding the full announcement here keeps the queued payload
-    /// self-contained so the dispatch path (which reinserts the entry into
-    /// the store before re-entering `handle_text_message`) can reconstruct
-    /// the voice-transcript framing instead of falling back to plain text.
-    /// `None` for non-voice paths.
-    pub(crate) voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
-}
-
-impl Intervention {
-    pub(crate) fn preserve_on_cancel(&self) -> bool {
-        self.source_message_queued_generations
-            .iter()
-            .any(|source| source.preserve_on_cancel)
-    }
-
-    pub(crate) fn source_message_queued_generations(&self) -> Vec<SourceMessageQueuedGeneration> {
-        let source_message_ids = if self.source_message_ids.is_empty() {
-            vec![self.message_id]
-        } else {
-            self.source_message_ids.clone()
-        };
-        if self.source_message_queued_generations.is_empty() {
-            return source_message_ids
-                .into_iter()
-                .map(|message_id| {
-                    SourceMessageQueuedGeneration::new(message_id, self.queued_generation)
-                })
-                .collect();
-        }
-        let mut owners = self.source_message_queued_generations.clone();
-        for message_id in source_message_ids {
-            if !owners.iter().any(|owner| owner.message_id == message_id) {
-                owners.push(SourceMessageQueuedGeneration::new(
-                    message_id,
-                    self.queued_generation,
-                ));
-            }
-        }
-        owners
-    }
-
-    pub(crate) fn source_text_segments(&self) -> Vec<SourceMessageTextSegment> {
-        let source_message_ids = if self.source_message_ids.is_empty() {
-            vec![self.message_id]
-        } else {
-            self.source_message_ids.clone()
-        };
-        if self.source_text_segments.is_empty() {
-            return split_text_segments_for_sources(&source_message_ids, &self.text);
-        }
-
-        let mut segments = Vec::new();
-        for message_id in source_message_ids {
-            if let Some(segment) = self
-                .source_text_segments
-                .iter()
-                .find(|segment| segment.message_id == message_id)
-            {
-                segments.push(segment.clone());
-            } else {
-                segments.push(SourceMessageTextSegment::new(message_id, String::new()));
-            }
-        }
-        segments
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueueExitKind {
@@ -234,38 +130,6 @@ fn intervention_age_since(last: &Intervention, current: &Intervention) -> Durati
         .created_at
         .checked_duration_since(last.created_at)
         .unwrap_or_default()
-}
-
-fn split_text_segments_for_sources(
-    source_message_ids: &[MessageId],
-    text: &str,
-) -> Vec<SourceMessageTextSegment> {
-    if source_message_ids.is_empty() {
-        return Vec::new();
-    }
-    if source_message_ids.len() == 1 {
-        return vec![SourceMessageTextSegment::new(source_message_ids[0], text)];
-    }
-
-    if text.matches('\n').count() + 1 != source_message_ids.len() {
-        return source_message_ids
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, message_id)| {
-                SourceMessageTextSegment::new(message_id, if index == 0 { text } else { "" })
-            })
-            .collect();
-    }
-
-    let mut pieces = text.splitn(source_message_ids.len(), '\n');
-    source_message_ids
-        .iter()
-        .copied()
-        .map(|message_id| {
-            SourceMessageTextSegment::new(message_id, pieces.next().unwrap_or_default())
-        })
-        .collect()
 }
 
 fn join_source_text_segments(segments: &[SourceMessageTextSegment]) -> String {
@@ -693,6 +557,11 @@ pub(crate) struct RequeueInterventionResult {
     pub(crate) persistence_error: Option<String>,
 }
 
+/// The mailbox actor is gone (its task ended), so whatever it would have
+/// answered — including "no active turn" — was never observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MailboxUnreachable;
+
 static GLOBAL_CHANNEL_MAILBOXES: LazyLock<dashmap::DashMap<ChannelId, ChannelMailboxHandle>> =
     LazyLock::new(dashmap::DashMap::new);
 
@@ -705,30 +574,29 @@ impl ChannelMailboxHandle {
     async fn request<T>(
         &self,
         build: impl FnOnce(oneshot::Sender<T>) -> ChannelMailboxMsg,
-        fallback: T,
-    ) -> T {
+    ) -> Result<T, MailboxUnreachable> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.sender.send(build(reply_tx)).is_err() {
-            return fallback;
-        }
-        reply_rx.await.unwrap_or(fallback)
+        self.sender
+            .send(build(reply_tx))
+            .map_err(|_| MailboxUnreachable)?;
+        reply_rx.await.map_err(|_| MailboxUnreachable)
     }
 
     pub(crate) async fn snapshot(&self) -> ChannelMailboxSnapshot {
-        self.request(
-            |reply| ChannelMailboxMsg::Snapshot { reply },
-            ChannelMailboxSnapshot::default(),
-        )
-        .await
+        self.request(|reply| ChannelMailboxMsg::Snapshot { reply })
+            .await
+            .unwrap_or_default()
     }
 
-    pub(crate) async fn has_active_turn(&self) -> bool {
-        self.request(|reply| ChannelMailboxMsg::HasActiveTurn { reply }, false)
+    pub(crate) async fn has_active_turn(&self) -> Result<bool, MailboxUnreachable> {
+        self.request(|reply| ChannelMailboxMsg::HasActiveTurn { reply })
             .await
     }
 
-    pub(crate) async fn cancel_token(&self) -> Option<Arc<CancelToken>> {
-        self.request(|reply| ChannelMailboxMsg::CancelToken { reply }, None)
+    pub(crate) async fn cancel_token(
+        &self,
+    ) -> Result<Option<Arc<CancelToken>>, MailboxUnreachable> {
+        self.request(|reply| ChannelMailboxMsg::CancelToken { reply })
             .await
     }
 
@@ -753,14 +621,12 @@ impl ChannelMailboxHandle {
         &self,
         reason: String,
     ) -> CancelActiveTurnResult {
-        self.request(
-            |reply| ChannelMailboxMsg::CancelActiveTurnWithReason { reason, reply },
-            CancelActiveTurnResult {
+        self.request(|reply| ChannelMailboxMsg::CancelActiveTurnWithReason { reason, reply })
+            .await
+            .unwrap_or(CancelActiveTurnResult {
                 token: None,
                 already_stopping: false,
-            },
-        )
-        .await
+            })
     }
 
     // Unguarded `if_current` cancel; production uses the
@@ -770,17 +636,15 @@ impl ChannelMailboxHandle {
         &self,
         expected_token: Arc<CancelToken>,
     ) -> CancelActiveTurnResult {
-        self.request(
-            |reply| ChannelMailboxMsg::CancelActiveTurnIfCurrent {
-                expected_token,
-                reply,
-            },
-            CancelActiveTurnResult {
-                token: None,
-                already_stopping: false,
-            },
-        )
+        self.request(|reply| ChannelMailboxMsg::CancelActiveTurnIfCurrent {
+            expected_token,
+            reply,
+        })
         .await
+        .unwrap_or(CancelActiveTurnResult {
+            token: None,
+            already_stopping: false,
+        })
     }
 
     /// #2374 — see [`Self::cancel_active_turn_with_reason`]. This variant
@@ -797,12 +661,12 @@ impl ChannelMailboxHandle {
                 reason,
                 reply,
             },
-            CancelActiveTurnResult {
-                token: None,
-                already_stopping: false,
-            },
         )
         .await
+        .unwrap_or(CancelActiveTurnResult {
+            token: None,
+            already_stopping: false,
+        })
     }
 
     /// #2374 Codex round-1 fix (HIGH-1) — actor-owned guarded cancel
@@ -829,12 +693,12 @@ impl ChannelMailboxHandle {
                 reason,
                 reply,
             },
-            CancelActiveTurnResult {
-                token: None,
-                already_stopping: false,
-            },
         )
         .await
+        .unwrap_or(CancelActiveTurnResult {
+            token: None,
+            already_stopping: false,
+        })
     }
 
     /// #3167 — atomically cancel the active turn IFF it is a *background* turn
@@ -851,11 +715,9 @@ impl ChannelMailboxHandle {
     /// that starts after the background turn finalizes is never aborted by a
     /// stale supersede.
     pub(crate) async fn cancel_active_background_turn_if_current(&self) -> bool {
-        self.request(
-            |reply| ChannelMailboxMsg::CancelActiveBackgroundTurnIfCurrent { reply },
-            false,
-        )
-        .await
+        self.request(|reply| ChannelMailboxMsg::CancelActiveBackgroundTurnIfCurrent { reply })
+            .await
+            .unwrap_or(false)
     }
 
     #[allow(dead_code)]
@@ -950,19 +812,17 @@ impl ChannelMailboxHandle {
         admission_order: TurnAdmissionOrder,
         persistence: Option<QueuePersistenceContext>,
     ) -> TryStartTurnResult {
-        self.request(
-            |reply| ChannelMailboxMsg::TryStartTurn {
-                cancel_token,
-                request_owner,
-                user_message_id,
-                turn_kind,
-                admission_order,
-                persistence,
-                reply,
-            },
-            TryStartTurnResult::default(),
-        )
+        self.request(|reply| ChannelMailboxMsg::TryStartTurn {
+            cancel_token,
+            request_owner,
+            user_message_id,
+            turn_kind,
+            admission_order,
+            persistence,
+            reply,
+        })
         .await
+        .unwrap_or_default()
     }
 
     // Default-kind wrapper for the dormant restore path and tests.
@@ -993,16 +853,13 @@ impl ChannelMailboxHandle {
         turn_kind: ActiveTurnKind,
     ) {
         let _ = self
-            .request(
-                |reply| ChannelMailboxMsg::RestoreActiveTurn {
-                    cancel_token,
-                    request_owner,
-                    user_message_id,
-                    turn_kind,
-                    reply,
-                },
-                (),
-            )
+            .request(|reply| ChannelMailboxMsg::RestoreActiveTurn {
+                cancel_token,
+                request_owner,
+                user_message_id,
+                turn_kind,
+                reply,
+            })
             .await;
     }
 
@@ -1010,19 +867,17 @@ impl ChannelMailboxHandle {
     /// this accessor is retained for tests.
     #[allow(dead_code)]
     pub(crate) async fn active_turn_kind(&self) -> Option<ActiveTurnKind> {
-        self.request(|reply| ChannelMailboxMsg::ActiveTurnKind { reply }, None)
+        self.request(|reply| ChannelMailboxMsg::ActiveTurnKind { reply })
             .await
+            .unwrap_or(None)
     }
 
     /// #3167 — true only when a *real* (non-background) active turn holds the
     /// slot. Distinct from [`Self::has_active_turn`], which reports any active
     /// turn (background included) and whose semantics 30+ callers rely on.
-    pub(crate) async fn has_blocking_active_turn(&self) -> bool {
-        self.request(
-            |reply| ChannelMailboxMsg::HasBlockingActiveTurn { reply },
-            false,
-        )
-        .await
+    pub(crate) async fn has_blocking_active_turn(&self) -> Result<bool, MailboxUnreachable> {
+        self.request(|reply| ChannelMailboxMsg::HasBlockingActiveTurn { reply })
+            .await
     }
 
     pub(crate) async fn recovery_kickoff(
@@ -1034,24 +889,22 @@ impl ChannelMailboxHandle {
         // `active_user_message_id` to bind. `MessageId::new(0)` would panic.
         user_message_id: Option<MessageId>,
     ) -> RecoveryKickoffResult {
-        self.request(
-            |reply| ChannelMailboxMsg::RecoveryKickoff {
-                cancel_token,
-                request_owner,
-                user_message_id,
-                reply,
-            },
-            RecoveryKickoffResult {
-                activated_turn: false,
-                refused_closed: false,
-            },
-        )
+        self.request(|reply| ChannelMailboxMsg::RecoveryKickoff {
+            cancel_token,
+            request_owner,
+            user_message_id,
+            reply,
+        })
         .await
+        .unwrap_or(RecoveryKickoffResult {
+            activated_turn: false,
+            refused_closed: false,
+        })
     }
 
     pub(crate) async fn clear_recovery_marker(&self) {
         let _ = self
-            .request(|reply| ChannelMailboxMsg::ClearRecoveryMarker { reply }, ())
+            .request(|reply| ChannelMailboxMsg::ClearRecoveryMarker { reply })
             .await;
     }
 
@@ -1060,36 +913,32 @@ impl ChannelMailboxHandle {
         intervention: Intervention,
         persistence: QueuePersistenceContext,
     ) -> EnqueueInterventionResult {
-        self.request(
-            |reply| ChannelMailboxMsg::Enqueue {
-                intervention,
-                persistence,
-                reply,
-            },
-            EnqueueInterventionResult {
-                enqueued: false,
-                merged: false,
-                refusal_reason: Some(EnqueueRefusalReason::ActorUnreachable),
-                queue_exit_events: Vec::new(),
-                persistence_error: None,
-            },
-        )
+        self.request(|reply| ChannelMailboxMsg::Enqueue {
+            intervention,
+            persistence,
+            reply,
+        })
         .await
+        .unwrap_or(EnqueueInterventionResult {
+            enqueued: false,
+            merged: false,
+            refusal_reason: Some(EnqueueRefusalReason::ActorUnreachable),
+            queue_exit_events: Vec::new(),
+            persistence_error: None,
+        })
     }
 
     pub(crate) async fn has_pending_soft_queue(
         &self,
         persistence: QueuePersistenceContext,
     ) -> HasPendingSoftQueueResult {
-        self.request(
-            |reply| ChannelMailboxMsg::HasPendingSoftQueue { persistence, reply },
-            HasPendingSoftQueueResult {
+        self.request(|reply| ChannelMailboxMsg::HasPendingSoftQueue { persistence, reply })
+            .await
+            .unwrap_or(HasPendingSoftQueueResult {
                 has_pending: false,
                 queue_exit_events: Vec::new(),
                 persistence_error: None,
-            },
-        )
-        .await
+            })
     }
 
     pub(crate) async fn take_next_soft(
@@ -1104,22 +953,20 @@ impl ChannelMailboxHandle {
         persistence: QueuePersistenceContext,
         primary_message_id: Option<MessageId>,
     ) -> TakeNextSoftResult {
-        self.request(
-            |reply| ChannelMailboxMsg::TakeNextSoft {
-                persistence,
-                primary_message_id,
-                reply,
-            },
-            TakeNextSoftResult {
-                intervention: None,
-                dispatch_lease: None,
-                has_more: false,
-                queue_len_after: 0,
-                queue_exit_events: Vec::new(),
-                persistence_error: None,
-            },
-        )
+        self.request(|reply| ChannelMailboxMsg::TakeNextSoft {
+            persistence,
+            primary_message_id,
+            reply,
+        })
         .await
+        .unwrap_or(TakeNextSoftResult {
+            intervention: None,
+            dispatch_lease: None,
+            has_more: false,
+            queue_len_after: 0,
+            queue_exit_events: Vec::new(),
+            persistence_error: None,
+        })
     }
 
     pub(crate) async fn requeue_front(
@@ -1147,21 +994,19 @@ impl ChannelMailboxHandle {
         persistence: QueuePersistenceContext,
         dispatch_lease: Option<Arc<DispatchLease>>,
     ) -> RequeueInterventionResult {
-        self.request(
-            |reply| ChannelMailboxMsg::RequeueFront {
-                intervention,
-                persistence,
-                dispatch_lease,
-                reply,
-            },
-            RequeueInterventionResult {
-                enqueued: false,
-                refusal_reason: None,
-                queue_exit_events: Vec::new(),
-                persistence_error: None,
-            },
-        )
+        self.request(|reply| ChannelMailboxMsg::RequeueFront {
+            intervention,
+            persistence,
+            dispatch_lease,
+            reply,
+        })
         .await
+        .unwrap_or(RequeueInterventionResult {
+            enqueued: false,
+            refusal_reason: Some(EnqueueRefusalReason::ActorUnreachable),
+            queue_exit_events: Vec::new(),
+            persistence_error: None,
+        })
     }
 
     pub(crate) async fn cancel_queued_primary_message(
@@ -1169,76 +1014,66 @@ impl ChannelMailboxHandle {
         message_id: MessageId,
         persistence: QueuePersistenceContext,
     ) -> CancelQueuedMessageResult {
-        self.request(
-            |reply| ChannelMailboxMsg::CancelQueuedPrimaryMessage {
-                message_id,
-                persistence,
-                reply,
-            },
-            CancelQueuedMessageResult {
-                removed: None,
-                queue_exit_events: Vec::new(),
-                persistence_error: None,
-            },
-        )
+        self.request(|reply| ChannelMailboxMsg::CancelQueuedPrimaryMessage {
+            message_id,
+            persistence,
+            reply,
+        })
         .await
+        .unwrap_or(CancelQueuedMessageResult {
+            removed: None,
+            queue_exit_events: Vec::new(),
+            persistence_error: None,
+        })
     }
 
     pub(crate) async fn finish_turn(
         &self,
         persistence: QueuePersistenceContext,
     ) -> FinishTurnResult {
-        self.request(
-            |reply| ChannelMailboxMsg::FinishTurn { persistence, reply },
-            FinishTurnResult {
+        self.request(|reply| ChannelMailboxMsg::FinishTurn { persistence, reply })
+            .await
+            .unwrap_or(FinishTurnResult {
                 removed_token: None,
                 has_pending: false,
                 mailbox_online: false,
                 queue_exit_events: Vec::new(),
                 persistence_error: None,
-            },
-        )
-        .await
+            })
     }
 
     pub(crate) async fn hard_stop(&self) -> FinishTurnResult {
-        self.request(
-            |reply| ChannelMailboxMsg::HardStop { reply },
-            FinishTurnResult {
+        self.request(|reply| ChannelMailboxMsg::HardStop { reply })
+            .await
+            .unwrap_or(FinishTurnResult {
                 removed_token: None,
                 has_pending: false,
                 mailbox_online: false,
                 queue_exit_events: Vec::new(),
                 persistence_error: None,
-            },
-        )
-        .await
+            })
     }
 
     pub(crate) async fn finish_cancelled_turn(&self) -> FinishTurnResult {
-        self.request(
-            |reply| ChannelMailboxMsg::FinishCancelledTurn { reply },
-            FinishTurnResult {
+        self.request(|reply| ChannelMailboxMsg::FinishCancelledTurn { reply })
+            .await
+            .unwrap_or(FinishTurnResult {
                 removed_token: None,
                 has_pending: false,
                 mailbox_online: false,
                 queue_exit_events: Vec::new(),
                 persistence_error: None,
-            },
-        )
-        .await
+            })
     }
 
     pub(crate) async fn clear(&self, persistence: QueuePersistenceContext) -> ClearChannelResult {
-        self.request(
-            |reply| ChannelMailboxMsg::Clear { persistence, reply },
-            ClearChannelResult {
+        self.request(|reply| ChannelMailboxMsg::Clear { persistence, reply })
+            .await
+            .unwrap_or(ClearChannelResult {
                 removed_token: None,
                 queue_exit_events: Vec::new(),
                 persistence_error: None,
-            },
-        )
-        .await
+            })
     }
 
     /// #2706: queue-only purge. Drains the intervention queue without
@@ -1255,15 +1090,13 @@ impl ChannelMailboxHandle {
         persistence: QueuePersistenceContext,
         clear_cancelled_active_anchor: bool,
     ) -> PurgeQueueResult {
-        self.request(
-            |reply| ChannelMailboxMsg::PurgeQueue {
-                persistence,
-                clear_cancelled_active_anchor,
-                reply,
-            },
-            PurgeQueueResult::default(),
-        )
+        self.request(|reply| ChannelMailboxMsg::PurgeQueue {
+            persistence,
+            clear_cancelled_active_anchor,
+            reply,
+        })
         .await
+        .unwrap_or_default()
     }
 
     // #3864: test-only queue seeding; production uses the race-safe merge.
@@ -1274,14 +1107,11 @@ impl ChannelMailboxHandle {
         persistence: QueuePersistenceContext,
     ) {
         let _ = self
-            .request(
-                |reply| ChannelMailboxMsg::ReplaceQueue {
-                    queue,
-                    persistence,
-                    reply,
-                },
-                (),
-            )
+            .request(|reply| ChannelMailboxMsg::ReplaceQueue {
+                queue,
+                persistence,
+                reply,
+            })
             .await;
     }
 
@@ -1289,11 +1119,9 @@ impl ChannelMailboxHandle {
         &self,
         persistence: QueuePersistenceContext,
     ) -> HydratePendingQueueResult {
-        self.request(
-            |reply| ChannelMailboxMsg::HydratePendingQueueFromDisk { persistence, reply },
-            HydratePendingQueueResult::default(),
-        )
-        .await
+        self.request(|reply| ChannelMailboxMsg::HydratePendingQueueFromDisk { persistence, reply })
+            .await
+            .unwrap_or_default()
     }
 
     /// #3864: actor-serialized dedup/merge/persist of restored queue items.
@@ -1302,15 +1130,13 @@ impl ChannelMailboxHandle {
         items: Vec<Intervention>,
         persistence: QueuePersistenceContext,
     ) -> HydratePendingQueueResult {
-        self.request(
-            |reply| ChannelMailboxMsg::MergeRestoredQueueItems {
-                items,
-                persistence,
-                reply,
-            },
-            HydratePendingQueueResult::default(),
-        )
+        self.request(|reply| ChannelMailboxMsg::MergeRestoredQueueItems {
+            items,
+            persistence,
+            reply,
+        })
         .await
+        .unwrap_or_default()
     }
 
     pub(crate) async fn merge_restored_dispatch_marker(
@@ -1319,39 +1145,32 @@ impl ChannelMailboxHandle {
         restored_override: Option<ChannelId>,
         persistence: QueuePersistenceContext,
     ) -> HydratePendingQueueResult {
-        self.request(
-            |reply| ChannelMailboxMsg::MergeRestoredDispatchMarker {
-                marker,
-                restored_override,
-                persistence,
-                reply,
-            },
-            HydratePendingQueueResult::default(),
-        )
+        self.request(|reply| ChannelMailboxMsg::MergeRestoredDispatchMarker {
+            marker,
+            restored_override,
+            persistence,
+            reply,
+        })
         .await
+        .unwrap_or_default()
     }
 
     pub(crate) async fn restart_drain(
         &self,
         persistence: QueuePersistenceContext,
     ) -> RestartDrainResult {
-        self.request(
-            |reply| ChannelMailboxMsg::RestartDrain { persistence, reply },
-            RestartDrainResult {
+        self.request(|reply| ChannelMailboxMsg::RestartDrain { persistence, reply })
+            .await
+            .unwrap_or(RestartDrainResult {
                 queued_count: 0,
                 persistence_error: None,
-            },
-        )
-        .await
+            })
     }
 
     #[cfg(test)]
     pub(crate) async fn age_active_turn_for_test(&self, age: Duration) {
         let _ = self
-            .request(
-                |reply| ChannelMailboxMsg::AgeActiveTurnForTest { age, reply },
-                (),
-            )
+            .request(|reply| ChannelMailboxMsg::AgeActiveTurnForTest { age, reply })
             .await;
     }
 
@@ -1361,20 +1180,14 @@ impl ChannelMailboxHandle {
     #[cfg(test)]
     pub(crate) async fn age_inbound_waits_for_test(&self, age: Duration) {
         let _ = self
-            .request(
-                |reply| ChannelMailboxMsg::AgeInboundWaitsForTest { age, reply },
-                (),
-            )
+            .request(|reply| ChannelMailboxMsg::AgeInboundWaitsForTest { age, reply })
             .await;
     }
 
     #[cfg(test)]
     pub(crate) async fn age_valve_cleared_dispatch_for_test(&self, age: Duration) {
         let _ = self
-            .request(
-                |reply| ChannelMailboxMsg::AgeValveClearedDispatchForTest { age, reply },
-                (),
-            )
+            .request(|reply| ChannelMailboxMsg::AgeValveClearedDispatchForTest { age, reply })
             .await;
     }
 }
@@ -4583,11 +4396,11 @@ mod active_turn_kind_tests {
         );
 
         assert!(
-            handle.has_active_turn().await,
+            handle.has_active_turn().await.unwrap(),
             "a background turn still holds the slot for `has_active_turn`"
         );
         assert!(
-            !handle.has_blocking_active_turn().await,
+            !handle.has_blocking_active_turn().await.unwrap(),
             "#3167: a background turn must NOT block a queued user intervention"
         );
         assert_eq!(
@@ -4611,9 +4424,9 @@ mod active_turn_kind_tests {
                 .await
         );
 
-        assert!(handle.has_active_turn().await);
+        assert!(handle.has_active_turn().await.unwrap());
         assert!(
-            handle.has_blocking_active_turn().await,
+            handle.has_blocking_active_turn().await.unwrap(),
             "a real user/agent turn must block the dequeue"
         );
         assert_eq!(
@@ -4644,7 +4457,7 @@ mod active_turn_kind_tests {
 
         let _ = handle.hard_stop().await;
 
-        assert!(!handle.has_active_turn().await);
+        assert!(!handle.has_active_turn().await.unwrap());
         assert_eq!(
             handle.active_turn_kind().await,
             None,
@@ -4683,9 +4496,9 @@ mod active_turn_kind_tests {
             )
             .await;
 
-        assert!(handle.has_active_turn().await);
+        assert!(handle.has_active_turn().await.unwrap());
         assert!(
-            !handle.has_blocking_active_turn().await,
+            !handle.has_blocking_active_turn().await.unwrap(),
             "#3167: restore must preserve the background classification"
         );
         assert_eq!(
@@ -4769,7 +4582,7 @@ mod active_turn_kind_tests {
             "the real turn's token must remain un-cancelled — this is the TOCTOU fix"
         );
         assert!(
-            user.has_active_turn().await,
+            user.has_active_turn().await.unwrap(),
             "the real turn must still hold the slot"
         );
 
@@ -4836,7 +4649,7 @@ mod active_turn_kind_tests {
             "a Background turn must NOT acquire the slot ahead of a queued backlog"
         );
         assert!(
-            !backlog.has_active_turn().await,
+            !backlog.has_active_turn().await.unwrap(),
             "the slot must stay free so the kickoff can drain the queued user"
         );
 
@@ -4855,7 +4668,7 @@ mod active_turn_kind_tests {
             .await,
             "a real user/agent turn must still start even with a queued backlog"
         );
-        assert!(user.has_active_turn().await);
+        assert!(user.has_active_turn().await.unwrap());
         // `EnvGuard` removes `AGENTDESK_ROOT_DIR` on drop.
     }
 
@@ -4948,7 +4761,7 @@ mod active_turn_kind_tests {
             "Background must yield during the dequeue→claim window (reservation held, queue empty)"
         );
         assert!(
-            !handle.has_active_turn().await,
+            !handle.has_active_turn().await.unwrap(),
             "the slot must stay free so the dequeued user can claim it"
         );
 
@@ -5027,7 +4840,7 @@ mod active_turn_kind_tests {
                     .await,
                 "refusal {attempt}/{PENDING_USER_DISPATCH_MAX_YIELDS} must still yield"
             );
-            assert!(!handle.has_active_turn().await);
+            assert!(!handle.has_active_turn().await.unwrap());
         }
 
         // The Nth refusal force-cleared the (stuck) reservation. The NEXT
@@ -5043,7 +4856,7 @@ mod active_turn_kind_tests {
                 .await,
             "after N reservation-only refusals the safety valve clears the reservation"
         );
-        assert!(handle.has_active_turn().await);
+        assert!(handle.has_active_turn().await.unwrap());
     }
 
     // #3167 BLOCKER-2 — a failed dispatch requeues the reserved head; that
@@ -5087,7 +4900,7 @@ mod active_turn_kind_tests {
                 .await,
             "Background still yields — now because the queue is non-empty, not the reservation"
         );
-        assert!(!handle.has_active_turn().await);
+        assert!(!handle.has_active_turn().await.unwrap());
     }
 
     // #3903 — a genuine user message queued behind a `/loop`/system-injection
@@ -5158,11 +4971,11 @@ mod active_turn_kind_tests {
                 // drain (the #3903 bug); the NEW guard
                 // (`!has_blocking_active_turn`) is TRUE and schedules it.
                 assert!(
-                    handle.has_active_turn().await,
+                    handle.has_active_turn().await.unwrap(),
                     "the Background injection holds the slot for has_active_turn — old guard skipped the drain"
                 );
                 assert!(
-                    !handle.has_blocking_active_turn().await,
+                    !handle.has_blocking_active_turn().await.unwrap(),
                     "#3903: a Background injection is non-blocking, so the new guard schedules the rescue drain"
                 );
 
@@ -5178,7 +4991,7 @@ mod active_turn_kind_tests {
                     finish.has_pending,
                     "the queued user message is still pending after the injection finalizes"
                 );
-                assert!(!handle.has_active_turn().await, "the slot is now free");
+                assert!(!handle.has_active_turn().await.unwrap(), "the slot is now free");
 
                 // Invariant 2 — exactly-once delivery. The drain dequeues the
                 // queued user message and the dispatched user turn claims the
@@ -7263,7 +7076,7 @@ mod purge_queue_tests {
         assert!(snapshot.intervention_queue.is_empty());
 
         // Active turn (its token and ownership) must survive the queue purge.
-        let surviving = handle.cancel_token().await;
+        let surviving = handle.cancel_token().await.unwrap();
         assert!(surviving.is_some());
         assert!(Arc::ptr_eq(&surviving.unwrap(), &active_token));
     }
@@ -7318,7 +7131,7 @@ mod purge_queue_tests {
             "force purge must release a cancelled active-turn anchor (#3029 D)"
         );
         assert!(
-            handle.cancel_token().await.is_none(),
+            handle.cancel_token().await.unwrap().is_none(),
             "cancelled active anchor must be cleared after force purge"
         );
     }
@@ -7349,7 +7162,7 @@ mod purge_queue_tests {
             !purge.cleared_active_anchor,
             "uncancelled fresh turn must keep its anchor (#2706 no-collateral-cancel)"
         );
-        let surviving = handle.cancel_token().await;
+        let surviving = handle.cancel_token().await.unwrap();
         assert!(surviving.is_some());
         assert!(Arc::ptr_eq(&surviving.unwrap(), &fresh_token));
     }

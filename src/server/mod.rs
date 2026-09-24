@@ -33,11 +33,11 @@ use axum::Router;
 use axum::routing::get;
 use serde::Serialize;
 use sqlx::{PgPool, Row};
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::db::postgres::AdvisoryLockLease;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config::Config;
 use crate::engine::PolicyEngine;

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, State, WebSocketUpgrade};
+use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::{Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -21,6 +21,9 @@ pub(in crate::services::discord::tui_prompt_relay) const CHANNEL_ID: u64 = 940_4
 pub(super) const USER_ID: u64 = 940_487_400_000_002;
 pub(super) const BOT_ID: u64 = 940_487_400_000_003;
 const FIRST_RESPONSE_MESSAGE_ID: u64 = 940_487_400_000_021;
+
+/// Minted message id to `(reply_to, latest content)`.
+type MintedMessages = std::collections::BTreeMap<u64, (Option<u64>, String)>;
 
 /// Counters and gates over the mock's message endpoint. A `"..."` body is the
 /// relay's placeholder post, which the harness uses as its dispatch witness;
@@ -37,9 +40,12 @@ pub(super) struct DiscordMockState {
     pub(super) first_placeholder_arrived: Arc<Notify>,
     pub(super) release_first_placeholder: Arc<Notify>,
     pub(super) unhandled: Arc<Mutex<Vec<String>>>,
-    /// Channel history `catch_up` phase 2 reads, newest first. Empty until a
-    /// scenario seeds it, which is the "nothing to catch up" answer.
+    /// Channel history `GET /messages` pages over. Empty until a scenario
+    /// seeds it, which is the "nothing to catch up" answer.
     pub(super) history: Arc<Mutex<Vec<Value>>>,
+    pub(super) history_queries: Arc<Mutex<Vec<HistoryQuery>>>,
+    /// Every message the mock minted, in id order, as `(reply_to, latest content)`.
+    pub(super) messages: Arc<Mutex<MintedMessages>>,
     next_response_id: Arc<AtomicU64>,
 }
 
@@ -52,9 +58,21 @@ impl DiscordMockState {
             release_first_placeholder: Arc::new(Notify::new()),
             unhandled: Arc::new(Mutex::new(Vec::new())),
             history: Arc::new(Mutex::new(Vec::new())),
+            history_queries: Arc::new(Mutex::new(Vec::new())),
+            messages: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             next_response_id: Arc::new(AtomicU64::new(FIRST_RESPONSE_MESSAGE_ID)),
         }
     }
+}
+
+/// A `GET /messages` query. Serenity sends at most one cursor; `around` does
+/// not deserialize, so a query the mock cannot page reaches the 404 fallback.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::services::discord::tui_prompt_relay) struct HistoryQuery {
+    pub(in crate::services::discord::tui_prompt_relay) limit: Option<usize>,
+    pub(in crate::services::discord::tui_prompt_relay) before: Option<u64>,
+    pub(in crate::services::discord::tui_prompt_relay) after: Option<u64>,
 }
 
 fn discord_user_json(id: u64, name: &str, bot: bool) -> Value {
@@ -142,6 +160,89 @@ pub(super) fn history_message_json(id: u64, content: &str, bot: bool) -> Value {
     message
 }
 
+fn history_message_id(message: &Value) -> u64 {
+    message["id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("history message id")
+}
+
+/// Discord's page shape: the `limit` messages nearest the cursor (the newest
+/// without one), always newest first. `None` for both cursors or a `limit`
+/// outside Discord's documented 1..=100, whose real answer is unmeasured.
+fn history_page(history: &[Value], query: &HistoryQuery) -> Option<Vec<Value>> {
+    let limit = query.limit.unwrap_or(50);
+    if (query.before.is_some() && query.after.is_some()) || !(1..=100).contains(&limit) {
+        return None;
+    }
+    let mut page: Vec<Value> = history
+        .iter()
+        .filter(|message| {
+            let id = history_message_id(message);
+            query.before.is_none_or(|before| id < before)
+                && query.after.is_none_or(|after| id > after)
+        })
+        .cloned()
+        .collect();
+    page.sort_by_key(|message| std::cmp::Reverse(history_message_id(message)));
+    let keep = page.len().min(limit);
+    // `after` pages forward from the cursor, so it keeps the oldest end.
+    if query.after.is_some() {
+        page.drain(..page.len() - keep);
+    } else {
+        page.truncate(keep);
+    }
+    Some(page)
+}
+
+/// Pins the page contract `catch_up` and `recovery_text` read: which ids, and
+/// newest first, since both index into the page assuming that order.
+#[test]
+fn history_page_returns_the_ids_nearest_the_cursor_newest_first() {
+    // Seeded out of order so the page order comes from the mock, not the seed.
+    let history: Vec<Value> = [3, 1, 4, 10, 5, 9, 2, 6, 8, 7]
+        .into_iter()
+        .map(|id| history_message_json(id, "m", true))
+        .collect();
+    let page = |limit, before, after| {
+        history_page(
+            &history,
+            &HistoryQuery {
+                limit,
+                before,
+                after,
+            },
+        )
+        .map(|page| page.iter().map(history_message_id).collect::<Vec<u64>>())
+    };
+    let cases: [(Option<usize>, Option<u64>, Option<u64>, Option<Vec<u64>>); 12] = [
+        (Some(3), None, None, Some(vec![10, 9, 8])),
+        (None, None, None, Some(vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1])),
+        (Some(2), Some(5), None, Some(vec![4, 3])),
+        (Some(5), Some(3), None, Some(vec![2, 1])),
+        (Some(5), Some(1), None, Some(vec![])),
+        (Some(2), None, Some(5), Some(vec![7, 6])),
+        (Some(5), None, Some(8), Some(vec![10, 9])),
+        (Some(5), None, Some(10), Some(vec![])),
+        (
+            Some(100),
+            None,
+            None,
+            Some(vec![10, 9, 8, 7, 6, 5, 4, 3, 2, 1]),
+        ),
+        (Some(2), Some(9), Some(3), None),
+        (Some(0), None, None, None),
+        (Some(101), None, None, None),
+    ];
+    for (limit, before, after, expected) in cases {
+        assert_eq!(
+            page(limit, before, after),
+            expected,
+            "limit={limit:?} before={before:?} after={after:?}"
+        );
+    }
+}
+
 async fn get_channel(Path(_channel_id): Path<u64>) -> Json<Value> {
     Json(private_channel_json())
 }
@@ -184,14 +285,33 @@ async fn discord_rest(State(state): State<DiscordMockState>, request: Request<Bo
             state.local_note_posts.fetch_add(1, Ordering::SeqCst);
         }
         let id = state.next_response_id.fetch_add(1, Ordering::SeqCst);
+        let reply_to = payload
+            .pointer("/message_reference/message_id")
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse().ok());
+        let message = (reply_to, content.clone());
+        state
+            .messages
+            .lock()
+            .expect("mock messages")
+            .insert(id, message);
         return (StatusCode::OK, Json(discord_message_json(id, &content))).into_response();
     }
 
-    // `catch_up` phase 2 reads this before it can reach its dedup branch; an
-    // unseeded channel answers "nothing to catch up" rather than an error.
+    // `catch_up` reads this before it can reach its dedup branch; an unseeded
+    // channel answers "nothing to catch up" rather than an error.
     if method == Method::GET && path == format!("/api/v10/channels/{CHANNEL_ID}/messages") {
-        let history = state.history.lock().expect("mock history").clone();
-        return Json(Value::Array(history)).into_response();
+        if let Ok(Query(query)) = Query::<HistoryQuery>::try_from_uri(request.uri()) {
+            state
+                .history_queries
+                .lock()
+                .expect("history queries")
+                .push(query.clone());
+            let history = state.history.lock().expect("mock history");
+            if let Some(page) = history_page(&history, &query) {
+                return Json(Value::Array(page)).into_response();
+            }
+        }
     }
     if method == Method::PATCH
         && path.starts_with(&format!("/api/v10/channels/{CHANNEL_ID}/messages/"))
@@ -206,6 +326,14 @@ async fn discord_rest(State(state): State<DiscordMockState>, request: Request<Bo
             .unwrap_or_default();
         let id = path.rsplit('/').next().and_then(|tail| tail.parse().ok());
         let id = id.unwrap_or(FIRST_RESPONSE_MESSAGE_ID);
+        let edited = content.to_string();
+        state
+            .messages
+            .lock()
+            .expect("mock messages")
+            .entry(id)
+            .or_default()
+            .1 = edited;
         return Json(discord_message_json(id, content)).into_response();
     }
     if method == Method::POST && path == format!("/api/v10/channels/{CHANNEL_ID}/typing") {

@@ -29,6 +29,7 @@ mod merged_placeholders;
 mod outbound_messages;
 #[cfg(test)]
 use self::outbound_messages::await_answer_flush_if_queued_notice;
+use self::outbound_messages::outbound_delivery_error;
 pub(super) use self::outbound_messages::{
     ClassifiedOutboundEditError, ClassifiedOutboundPostError, edit_intake_placeholder,
     edit_outbound_message, edit_outbound_message_classified, send_intake_placeholder,
@@ -256,53 +257,6 @@ impl DiscordGateway {
             provider,
             live_turn,
         }
-    }
-}
-
-fn outbound_delivery_error(result: DeliveryResult) -> Result<Option<MessageId>, String> {
-    match result {
-        DeliveryResult::Sent { messages, .. } => first_raw_message_id(&messages)
-            .map(|message_id| parse_message_id(&message_id))
-            .transpose(),
-        DeliveryResult::Fallback {
-            messages,
-            fallback_used,
-            ..
-        } => {
-            let message_id = first_raw_message_id(&messages).unwrap_or_default();
-            tracing::info!(
-                delivery_status = "fallback",
-                fallback_kind = ?fallback_used,
-                message_id,
-                "[discord] outbound delivery used fallback"
-            );
-            parse_message_id(&message_id).map(Some)
-        }
-        DeliveryResult::Duplicate {
-            existing_messages, ..
-        } => {
-            let message_id = first_raw_message_id(&existing_messages);
-            tracing::info!(
-                delivery_status = "duplicate",
-                ?message_id,
-                "[discord] outbound delivery deduplicated"
-            );
-            match message_id {
-                Some(message_id) => parse_message_id(&message_id).map(Some),
-                None => Ok(None),
-            }
-        }
-        DeliveryResult::Skip { reason } => {
-            tracing::info!(
-                delivery_status = "skip",
-                reason,
-                "[discord] outbound delivery skipped"
-            );
-            Ok(None)
-        }
-        DeliveryResult::TransientFailure { reason }
-        | DeliveryResult::ConfirmedMissing { reason }
-        | DeliveryResult::PermanentFailure { reason } => Err(reason),
     }
 }
 

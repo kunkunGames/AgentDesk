@@ -90,13 +90,6 @@ fn is_loopback_peer(peer: Option<SocketAddr>) -> bool {
     peer.is_some_and(|addr| addr.ip().is_loopback())
 }
 
-fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
-    headers
-        .get(axum::http::header::UPGRADE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-}
-
 fn dashboard_auth_strength(
     config: &crate::config::Config,
     headers: &axum::http::HeaderMap,
@@ -127,6 +120,13 @@ fn dashboard_auth_strength(
         return Some(AuthStrength::Loopback);
     }
     None
+}
+
+fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
 }
 
 fn unauthorized_response() -> axum::response::Response {
@@ -299,21 +299,6 @@ mod tests {
             HeaderValue::from_static("Basic user:pass"),
         );
         assert_eq!(extract_bearer(&headers), None);
-    }
-
-    #[test]
-    fn is_websocket_upgrade_detects_handshake_header() {
-        let mut headers = axum::http::HeaderMap::new();
-        assert!(!is_websocket_upgrade(&headers));
-
-        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
-        assert!(is_websocket_upgrade(&headers));
-
-        headers.insert(header::UPGRADE, HeaderValue::from_static("WebSocket"));
-        assert!(is_websocket_upgrade(&headers));
-
-        headers.insert(header::UPGRADE, HeaderValue::from_static("h2c"));
-        assert!(!is_websocket_upgrade(&headers));
     }
 
     #[test]

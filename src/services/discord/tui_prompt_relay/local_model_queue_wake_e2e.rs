@@ -370,7 +370,7 @@ async fn local_model_observation_wakes_idle_durable_queue_through_production_run
     // dispatch racing the wake, not the deferred runner's later kickoff.
     assert!(
         !harness
-            .wait_for_placeholder_posts(3, Duration::from_millis(100))
+            .wait_for_placeholder_posts(3, Duration::from_secs(3))
             .await,
         "coalesced two-half wake must not dispatch B twice"
     );

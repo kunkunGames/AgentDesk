@@ -11,21 +11,21 @@
 
 | Path | Prod | Decision | Owner | Deadline | Decompose Issue | Keep Reason |
 | --- | ---: | --- | --- | --- | --- | --- |
-| `src/cli/client.rs` | 2476 | shrink | server-runtime | 2027-01-31 | #4710 |  |
-| `src/cli/dcserver.rs` | 1484 | shrink | server-runtime | 2027-01-31 | #4710 |  |
+| `src/cli/client.rs` | 2418 | shrink | server-runtime | 2027-01-31 | #4710 |  |
+| `src/cli/dcserver.rs` | 1426 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/cli/direct.rs` | 1838 | shrink | server-runtime | 2027-01-31 | #4710 |  |
-| `src/cli/doctor/orchestrator.rs` | 4227 | shrink | server-runtime | 2027-01-31 | #4710 |  |
+| `src/cli/doctor/orchestrator.rs` | 4182 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/cli/init.rs` | 1439 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/cli/migrate/apply.rs` | 3238 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/cli/migrate/plan.rs` | 1513 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/cli/migrate/source.rs` | 1612 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/cli/provider_cli/mod.rs` | 1039 | shrink | server-runtime | 2027-01-31 | #4710 |  |
-| `src/config.rs` | 3220 | shrink | server-runtime | 2027-01-31 | #4710 |  |
+| `src/config.rs` | 2948 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/db/auto_queue/entries.rs` | 1692 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
 | `src/db/auto_queue/phase_gates.rs` | 1556 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
 | `src/db/dispatched_sessions.rs` | 2149 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
 | `src/db/dispatches/mod.rs` | 1029 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
-| `src/db/postgres.rs` | 1774 | shrink | server-runtime | 2027-01-31 | #4710 |  |
+| `src/db/postgres.rs` | 1768 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/dispatch/dispatch_context.rs` | 2816 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
 | `src/dispatch/dispatch_create.rs` | 1337 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
 | `src/dispatch/dispatch_status.rs` | 1573 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
@@ -41,7 +41,7 @@
 | `src/server/routes/agents_crud.rs` | 1044 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/server/routes/agents_setup.rs` | 1357 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/server/routes/escalation.rs` | 1361 | shrink | server-runtime | 2027-01-31 | #4710 |  |
-| `src/server/routes/health_api.rs` | 1853 | shrink | server-runtime | 2027-01-31 | #4710 |  |
+| `src/server/routes/health_api.rs` | 1814 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/server/routes/kanban.rs` | 2420 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/server/routes/meetings.rs` | 1245 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/server/routes/resume.rs` | 1227 | shrink | server-runtime | 2027-01-31 | #4710 |  |
@@ -54,17 +54,17 @@
 | `src/services/codex.rs` | 2780 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/services/codex_tmux_wrapper.rs` | 1115 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/services/codex_tui/input.rs` | 1914 | shrink | server-runtime | 2027-01-31 | #4710 |  |
-| `src/services/codex_tui/rollout_tail.rs` | 1501 | shrink | discord-relay | 2026-10-31 | #4712 |  |
+| `src/services/codex_tui/rollout_tail.rs` | 1480 | shrink | discord-relay | 2026-10-31 | #4712 |  |
 | `src/services/discord/catch_up.rs` | 1805 | shrink | discord-relay | 2026-10-31 | #4712 |  |
 | `src/services/discord/commands/text_commands.rs` | 1454 | shrink | discord-relay | 2027-01-31 | #4712 |  |
-| `src/services/discord/health/recovery.rs` | 2599 | shrink | discord-relay | 2026-10-31 | #4712 |  |
-| `src/services/discord/health/snapshot.rs` | 1207 | shrink | discord-relay | 2027-02-28 | #5447 |  |
-| `src/services/discord/mod.rs` | 2228 | shrink | discord-relay | 2027-01-31 | #4712 |  |
+| `src/services/discord/health/recovery.rs` | 2585 | shrink | discord-relay | 2026-10-31 | #4712 |  |
+| `src/services/discord/health/snapshot.rs` | 1205 | shrink | discord-relay | 2027-02-28 | #5447 |  |
+| `src/services/discord/mod.rs` | 2224 | shrink | discord-relay | 2027-01-31 | #4712 |  |
 | `src/services/discord/outbound/delivery_record.rs` | 2581 | shrink | discord-relay | 2026-10-31 | #4712 |  |
 | `src/services/discord/recovery_engine/restore_inflight.rs` | 2294 | shrink | discord-relay | 2026-10-31 | #4712 |  |
 | `src/services/discord/router/intake_gate.rs` | 1680 | shrink | discord-relay | 2026-10-31 | #4712 |  |
-| `src/services/discord/router/message_handler/headless_turn.rs` | 1131 | shrink | discord-relay | 2027-01-31 | #4712 |  |
-| `src/services/discord/router/message_handler/intake_turn.rs` | 2402 | shrink | discord-relay | 2026-10-31 | #4712 |  |
+| `src/services/discord/router/message_handler/headless_turn.rs` | 1114 | shrink | discord-relay | 2027-01-31 | #4712 |  |
+| `src/services/discord/router/message_handler/intake_turn.rs` | 2388 | shrink | discord-relay | 2026-10-31 | #4712 |  |
 | `src/services/discord/session_relay_sink.rs` | 1463 | shrink | discord-relay | 2026-10-31 | #4712 |  |
 | `src/services/discord/standby_relay.rs` | 1012 | keep | discord-relay |  |  | Completion draining, terminal response selection, and identity-guarded delivery share one durable cursor contract; preserve the cohesive verified relay boundary until a scoped split is planned. |
 | `src/services/discord/tmux.rs` | 1469 | shrink | discord-relay | 2026-10-31 | #4712 |  |
@@ -88,7 +88,7 @@
 | `src/services/routines/store.rs` | 3570 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
 | `src/services/settings.rs` | 1080 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/services/tmux_common.rs` | 2083 | shrink | discord-relay | 2026-10-31 | #4712 |  |
-| `src/services/turn_orchestrator.rs` | 3057 | shrink | server-runtime | 2027-01-31 | #4710 |  |
+| `src/services/turn_orchestrator.rs` | 2868 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 
 ## Grandfathered
 

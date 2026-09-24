@@ -12,7 +12,9 @@
 //! CI pins these to `env -u AGENTDESK_ROOT_DIR ... -- --test-threads=1`; a new
 //! scenario module inherits that only once it is named in the same invocation.
 
+mod catch_up_pagination_e2e;
 mod discord_mock;
+mod stale_resume_retry_e2e;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,7 +37,7 @@ use crate::services::tui_prompt_dedupe as dedupe;
 use crate::services::turn_orchestrator as orchestrator;
 
 pub(super) use discord_mock::CHANNEL_ID;
-use discord_mock::{USER_ID, history_message_json, user_message};
+use discord_mock::{HistoryQuery, USER_ID, history_message_json, user_message};
 
 /// Dedupe and lease tables key on the provider's wire name, not [`ProviderKind`].
 pub(super) const PROVIDER_KEY: &str = "claude";
@@ -84,6 +86,37 @@ fn watcher_handle(tmux_session_name: &str, output_path: &std::path::Path) -> Tmu
     }
 }
 
+/// What the `claude` stand-in answers.
+#[derive(Clone, Copy)]
+pub(super) enum ProviderStub {
+    /// Every turn succeeds at once on the bound session.
+    Success,
+    /// A `--resume` launch is rejected as a stale session, as a real CLI rejects the
+    /// synthetic id; a fresh launch succeeds.
+    StaleResumeThenSuccess,
+}
+
+fn write_provider_stub(root: &std::path::Path, stub: ProviderStub) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("claude-stub");
+    let stale = match stub {
+        ProviderStub::Success => "",
+        ProviderStub::StaleResumeThenSuccess => {
+            "case \"$*\" in *--resume*) echo '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true}'\n\
+             echo 'No conversation found with session ID' >&2; exit 1;; esac\n"
+        }
+    };
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '0.0.0 (stub)'; exit 0; fi\ncat >/dev/null\n{stale}\
+         echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{SESSION_UUID}\"}}'\n\
+         echo '{{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\"session_id\":\"{SESSION_UUID}\"}}'\n"
+    );
+    std::fs::write(&path, script).expect("write provider stub");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod provider stub");
+    path
+}
+
 /// An isolated AgentDesk root, a mock Discord transport, a real
 /// `serenity::Context` over it, and a channel already bound to a session.
 ///
@@ -99,6 +132,8 @@ pub(super) struct RelayE2eHarness {
     _server: AbortOnDrop<()>,
     _dedupe_guard: std::sync::MutexGuard<'static, ()>,
     _intake_guard: crate::config::TestEnvVarGuard,
+    _provider_guard: crate::config::TestEnvVarGuard,
+    _config_guard: crate::config::TestEnvVarGuard,
     _root_guard: crate::config::TestEnvVarGuard,
     _env_lock: std::sync::MutexGuard<'static, ()>,
     root: tempfile::TempDir,
@@ -106,6 +141,10 @@ pub(super) struct RelayE2eHarness {
 
 impl RelayE2eHarness {
     pub(super) async fn start() -> Self {
+        Self::start_with_provider(ProviderStub::Success).await
+    }
+
+    pub(super) async fn start_with_provider(stub: ProviderStub) -> Self {
         let env_lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -117,6 +156,16 @@ impl RelayE2eHarness {
         let intake_guard = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
             "ADK_INTAKE_ROUTING_MODE",
             std::path::Path::new("disabled"),
+        );
+        // Dispatched turns must not reach a host `claude` or host config: a real
+        // CLI rejects the synthetic resume id and triggers a stale-resume re-dispatch.
+        let provider_guard = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_CLAUDE_PATH",
+            &write_provider_stub(root.path(), stub),
+        );
+        let config_guard = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_CONFIG",
+            &root.path().join("config").join("agentdesk.yaml"),
         );
         let dedupe_guard = dedupe::TEST_LOCK
             .lock()
@@ -159,6 +208,8 @@ impl RelayE2eHarness {
             _server: AbortOnDrop(Some(server)),
             _dedupe_guard: dedupe_guard,
             _intake_guard: intake_guard,
+            _provider_guard: provider_guard,
+            _config_guard: config_guard,
             _root_guard: root_guard,
             _env_lock: env_lock,
             root,
@@ -269,21 +320,57 @@ impl RelayE2eHarness {
         self.mock.local_note_posts.load(Ordering::SeqCst)
     }
 
+    /// Every message the mock minted, oldest first, as `(reply_to, latest content)`.
+    pub(super) fn messages(&self) -> Vec<(Option<u64>, String)> {
+        let messages = self.mock.messages.lock().expect("mock messages");
+        messages.values().cloned().collect()
+    }
+
     /// Requests the mock could not answer. A non-empty list means production
     /// took a failure path the scenario never asserted on.
     pub(super) fn unhandled_requests(&self) -> Vec<String> {
         self.mock.unhandled.lock().expect("unhandled log").clone()
     }
 
-    /// Seeds the history `catch_up` phase 2 reads, newest first, as
+    /// Seeds the history `catch_up` reads, in any order, as
     /// `(message_id, content, is_bot)`.
-    // Consumed by the queue-reclaim scenario, which lands in a later lane.
-    #[allow(dead_code)]
     pub(super) fn seed_channel_history(&self, entries: &[(u64, &str, bool)]) {
         *self.mock.history.lock().expect("mock history") = entries
             .iter()
             .map(|(id, content, bot)| history_message_json(*id, content, *bot))
             .collect();
+    }
+
+    /// Every `GET /messages` query the mock answered, in arrival order.
+    pub(super) fn history_queries(&self) -> Vec<HistoryQuery> {
+        self.mock
+            .history_queries
+            .lock()
+            .expect("history queries")
+            .clone()
+    }
+
+    /// Registers the channel in the role map with no checkpoint, which is what
+    /// makes `catch_up` scan it in `Recent` mode.
+    pub(super) fn register_channel_in_role_map(&self) {
+        let path = crate::runtime_layout::role_map_path(self.root.path());
+        std::fs::create_dir_all(path.parent().expect("role map dir")).expect("role map dir");
+        let role_map = serde_json::json!({
+            "byChannelId": {
+                CHANNEL_ID.to_string(): {"roleId": "adk-cc", "promptFile": "prompt.md", "provider": PROVIDER_KEY}
+            }
+        });
+        std::fs::write(path, role_map.to_string()).expect("write role map");
+    }
+
+    /// One production catch-up sweep, both phases, over the mock transport.
+    pub(super) async fn run_catch_up(&self) {
+        crate::services::discord::catch_up::catch_up_missed_messages(
+            &self.ctx.http,
+            &self.shared,
+            &self.data.provider,
+        )
+        .await;
     }
 
     /// Level-triggered: safe to call after the POST has already landed.
