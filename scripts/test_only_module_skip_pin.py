@@ -203,9 +203,11 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/services/provider_output_guard_tests.rs",
         "src/services/session_forwarding/probe/tests.rs",
         "src/services/scheduled_messages/postgres_tests.rs",
-        "src/services/session_forwarding/probe/tests.rs",
         "src/services/tui_prompt_dedupe/tests.rs",
         "src/services/turn_lifecycle/native_session_tests.rs",
+        "src/services/turn_orchestrator/mailbox_unreachable_tests.rs",
+        "src/services/turn_orchestrator/recovery_kickoff_tests.rs",
+        "src/services/discord/queue_io/turn_admission_tests.rs",
     }
 )
 

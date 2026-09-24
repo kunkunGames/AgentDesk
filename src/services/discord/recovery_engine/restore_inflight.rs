@@ -2099,7 +2099,7 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
         )
         .await;
 
-        if !kickoff.activated_turn {
+        if !kickoff.activated_turn() {
             continue;
         }
         // Consume outgoing planned-restart authority (identity-guarded readoption)
@@ -2335,6 +2335,7 @@ mod tests {
             .without_time()
             .with_writer(CapturingWriter(buffer.clone()))
             .finish();
+        crate::logging::test_capture::pin_callsite_interest();
         tracing::subscriber::with_default(subscriber, run);
         String::from_utf8(buffer.lock().expect("captured logs").clone())
             .expect("captured logs are utf8")
