@@ -7,7 +7,7 @@
 
 | Method | Path | Handler | Handler Source | Route Decl |
 | --- | --- | --- | --- | --- |
-| `GET` | `/` | `runner_entry` | `src/server/web_surface.rs:53` | `src/server/web_surface.rs:50` |
+| `GET` | `/` | `runner_entry` | `src/server/web_surface.rs:61` | `src/server/web_surface.rs:58` |
 | `GET` | `/api/achievements` | `analytics::achievements` | `src/server/routes/analytics.rs:431` | `src/server/routes/domains/analytics.rs:18` |
 | `GET` | `/api/activity-heatmap` | `analytics::activity_heatmap` | `src/server/routes/analytics.rs:446` | `src/server/routes/domains/analytics.rs:19` |
 | `GET` | `/api/agents` | `agents_crud::list_agents` | `src/server/routes/agents_crud.rs:388` | `src/server/routes/domains/agents.rs:16` |
@@ -336,5 +336,5 @@
 | `GET` | `/api/v1/tokens` | `tokens` | `src/server/routes/v1.rs:205` | `src/server/routes/v1.rs:122` |
 | `GET` | `/api/voice/config` | `voice_config::get_voice_config` | `src/server/routes/voice_config.rs:110` | `src/server/routes/domains/admin.rs:82` |
 | `PUT` | `/api/voice/config` | `voice_config::put_voice_config` | `src/server/routes/voice_config.rs:120` | `src/server/routes/domains/admin.rs:82` |
-| `GET` | `/settings` | `runner_entry` | `src/server/web_surface.rs:53` | `src/server/web_surface.rs:51` |
-| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:27` | `src/server/web_surface.rs:20` |
+| `GET` | `/settings` | `runner_entry` | `src/server/web_surface.rs:61` | `src/server/web_surface.rs:59` |
+| `GET` | `/ws` | `ws::ws_handler` | `src/server/ws.rs:27` | `src/server/web_surface.rs:28` |
