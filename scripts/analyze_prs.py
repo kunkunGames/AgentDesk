@@ -112,6 +112,16 @@ def has_no_change_verification_ack(body):
         ],
     )
 
+def has_infrastructure_ci_failure_guard_ack(body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*infrastructure ci failure guard:\*\*", body):
+        return True
+    return has_non_empty_body_field(
+        body,
+        [
+            "infrastructure ci failure guard",
+        ]
+    )
+
 def has_stale_branch_cleanup_ack(body):
     if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*stale branch cleanup:\*\*", body):
         return True
@@ -325,6 +335,8 @@ def main():
             print("  [!] MISSING SCRATCH FILE CLEANUP CHECK: PR body lacks a completed scratch file cleanup acknowledgement.")
         if not has_pr_size_ack(body):
             print("  [!] MISSING PR SIZE CHECK: PR body lacks a completed PR size acknowledgement.")
+        if not has_infrastructure_ci_failure_guard_ack(body):
+            print("  [!] MISSING INFRASTRUCTURE CI FAILURE GUARD: PR body lacks a completed infrastructure CI failure guard acknowledgement.")
         if not has_false_verification_guard_ack(body):
             print("  [!] MISSING FALSE VERIFICATION GUARD: PR body lacks a completed false verification guard acknowledgement.")
         if not has_partial_check_status_ack(body):
