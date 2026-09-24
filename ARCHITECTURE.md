@@ -403,7 +403,9 @@ src/
 │   ├── runner_registry/
 │   │   ├── registry.rs
 │   │   └── status.rs
-│   ├── worker_registry/
+│   ├── web_surface/
+│   │   ├── runner.html
+│   │   └── tests.rs
 │   ├── cluster.rs
 │   ├── cluster_session_routing.rs
 │   ├── cron_catalog.rs
@@ -426,6 +428,7 @@ src/
 │   ├── state.rs
 │   ├── task_dispatch_claims.rs
 │   ├── test_phase_runs.rs
+│   ├── web_surface.rs
 │   └── ws.rs
 ├── services/
 │   ├── agent_quality/
@@ -572,7 +575,18 @@ src/
 │   │   ├── intake_runner/
 │   │   │   ├── dispatch_stamp_tests.rs
 │   │   │   └── drain_tests.rs
-│   │   ├── intake_worker/
+│   │   ├── machine_resources/
+│   │   │   ├── gpu/
+│   │   │   │   ├── macos.rs
+│   │   │   │   └── other.rs
+│   │   │   ├── store/
+│   │   │   │   └── tests.rs
+│   │   │   ├── command.rs
+│   │   │   ├── gpu.rs
+│   │   │   ├── network.rs
+│   │   │   ├── sampler.rs
+│   │   │   ├── store.rs
+│   │   │   └── tests.rs
 │   │   ├── readiness/
 │   │   │   └── tests.rs
 │   │   ├── stream_relay/
@@ -594,6 +608,7 @@ src/
 │   │   ├── intake_routing_telemetry.rs
 │   │   ├── intake_runner.rs
 │   │   ├── intake_runner_capabilities.rs
+│   │   ├── machine_resources.rs
 │   │   ├── mod.rs
 │   │   ├── node_registry.rs
 │   │   ├── readiness.rs

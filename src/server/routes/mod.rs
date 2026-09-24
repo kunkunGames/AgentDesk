@@ -746,7 +746,10 @@ pub(super) fn public_api_domain(router: ApiRouter) -> ApiRouter {
 
 pub(super) fn protected_api_domain(router: ApiRouter, state: AppState) -> ApiRouter {
     router
-        .layer(axum::middleware::from_fn_with_state(
+        // Authenticate registered endpoints, not the router's 404 fallback.
+        // Otherwise merging a protected domain also protects unrelated paths,
+        // including the web entry point of a dashboard-less Runner.
+        .route_layer(axum::middleware::from_fn_with_state(
             state,
             auth::auth_middleware,
         ))

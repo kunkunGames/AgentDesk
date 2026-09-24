@@ -40,6 +40,13 @@ cluster:
 적용된다. 유효한 관리자 토큰도 실행 전용 모드에서 빠진 route를 활성화하지 못한다.
 TUI provider hook/relay는 provider self-exec를 위해 필요한 경우 유지한다.
 
+브라우저에서 실행 전용 장비의 `/` 또는 `/settings`를 열면 Hub 대시보드로 접속하라는
+안내 화면을 제공한다. 이 화면은 바이너리에 포함되며 dashboard 자산을 복사하거나
+관리 API를 활성화하지 않는다. 없는 경로는 인증 실패 대신 404로 응답한다.
+Windows Runner에서 `http://127.0.0.1:8791`을 열어도 다른 장비의 Hub에 접속하지 않는다.
+Hub의 LAN 주소로 접속할 때는 서버 토큰이 필요하며, Hub 장비에서 직접 localhost로
+접속한 브라우저에는 기존 루프백 인증 규칙이 적용된다.
+
 `/api/health`는 `runtime_profile`, `modules`, `dashboard_required`를 제공한다.
 실행 전용 모드의 dashboard는 `false`, `dashboard_required`도 `false`다. 상세 health의
 provider `runtime_role`은 `runner`이며 gateway 접속이 없다는 이유로 standby나
