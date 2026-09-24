@@ -24,16 +24,14 @@ mod runner_registry;
 mod startup_preflight;
 pub(crate) mod task_dispatch_claims;
 pub(crate) mod test_phase_runs;
+mod web_surface;
 pub mod ws;
 
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
-use axum::Router;
-use axum::routing::get;
 use serde::Serialize;
 use sqlx::{PgPool, Row};
-use tower_http::services::{ServeDir, ServeFile};
 
 use crate::db::postgres::AdvisoryLockLease;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -389,9 +387,6 @@ pub(crate) async fn run(
 
     let broadcast_tx = ws::new_broadcast();
     let batch_buffer = runner_registry.start_after_websocket_broadcast(broadcast_tx.clone())?;
-    let dashboard_service = ServeDir::new(&dashboard_dir)
-        .append_index_html_on_directories(true)
-        .fallback(ServeFile::new(dashboard_dir.join("index.html")));
     let control_plane_auth_state = routes::AppState {
         pg_pool: pg_pool.clone(),
         engine: engine.clone(),
@@ -402,46 +397,11 @@ pub(crate) async fn run(
         cluster_instance_id: Some(cluster_instance_id.clone()),
     };
 
-    let dashboard_access = dashboard_auth::DashboardAccess::new(&config);
-    let mut app = Router::new();
-    if modules.dashboard {
-        app = app.route(
-            "/ws",
-            get(ws::ws_handler).with_state((broadcast_tx.clone(), dashboard_access.clone())),
-        );
-    }
-    app = app.nest(
-        "/api",
-        routes::api_router_with_dashboard_access(
-            control_plane_auth_state.clone(),
-            dashboard_access,
-        ),
+    let app = web_surface::router(
+        control_plane_auth_state,
+        &dashboard_dir,
+        _claude_tui_hook_endpoint.is_some(),
     );
-    if _claude_tui_hook_endpoint.is_some() {
-        app = app.merge(
-            crate::services::claude_tui::hook_server::hook_receiver_router().layer(
-                axum::middleware::from_fn_with_state(
-                    control_plane_auth_state.clone(),
-                    routes::auth::auth_middleware,
-                ),
-            ),
-        );
-    }
-    // `tui_relay` exposes the `claude_tui_send` / `claude_tui_wait` MCP
-    // primitives (see audit issue #2652). It is always mounted because the
-    // event-driven wait path is useful even when the hook receiver
-    // endpoint has not been published yet (e.g. early-boot Codex calls).
-    app = app.merge(crate::services::claude_tui::tui_relay::router().layer(
-        axum::middleware::from_fn_with_state(
-            control_plane_auth_state,
-            routes::auth::auth_middleware,
-        ),
-    ));
-    let app = if modules.dashboard {
-        app.fallback_service(dashboard_service)
-    } else {
-        app
-    };
 
     // #3870 — fail closed on the dangerous combination of a non-loopback bind
     // host with no `server.auth_token`. The control-plane auth middleware is

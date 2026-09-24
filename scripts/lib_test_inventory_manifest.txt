@@ -1265,6 +1265,9 @@ server::task_dispatch_claims::task_dispatch_claims_pg_tests::claim_waits_when_pe
 server::test_phase_runs::tests::default_idempotency_key_is_phase_and_head_sha
 server::test_phase_runs::tests::status_validation_allows_only_phase_run_states
 server::test_phase_runs::tests::terminal_statuses_close_phase_runs
+server::web_surface::tests::full_profile_keeps_public_spa_entry_and_protected_api
+server::web_surface::tests::runner_browser_entry_explains_profile_without_token_or_dashboard_assets
+server::web_surface::tests::runner_entry_keeps_execution_routes_protected_and_absent_routes_not_found
 server::ws::ws_auth_gate_tests::configured_token_accepts_only_the_exact_token
 server::ws::ws_auth_gate_tests::configured_token_rejects_wrong_missing_and_prefix_tokens
 server::ws::ws_auth_gate_tests::unset_or_empty_configured_token_leaves_the_route_open

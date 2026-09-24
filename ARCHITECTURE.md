@@ -410,6 +410,9 @@ src/
 │   ├── runner_registry/
 │   │   ├── registry.rs
 │   │   └── status.rs
+│   ├── web_surface/
+│   │   ├── runner.html
+│   │   └── tests.rs
 │   ├── cluster.rs
 │   ├── cluster_session_routing.rs
 │   ├── cron_catalog.rs
@@ -432,6 +435,7 @@ src/
 │   ├── state.rs
 │   ├── task_dispatch_claims.rs
 │   ├── test_phase_runs.rs
+│   ├── web_surface.rs
 │   └── ws.rs
 ├── services/
 │   ├── agent_quality/
