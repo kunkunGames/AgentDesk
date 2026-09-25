@@ -204,6 +204,11 @@ class GiantFileProgressTest(unittest.TestCase):
         self.reject(lambda b, c, f: c["modules"].update(
             {SURVIVOR: 1201}), "new or growing giant")
 
+    def test_file_test_declaration_gets_no_production_movement_credit(self):
+        source = ('#[cfg(test)]\n#[path = "fixture.rs"]\nmod fixture;\n'
+                  '#[cfg(any(test, unix))]\nmod platform;\nfn production() {}\n')
+        self.assertEqual(PROGRESS.production_line_numbers(source, 3), {4, 5, 6})
+
     def test_same_path_child_and_movement_are_required(self):
         self.reject(lambda b, c, f: c["modules"].pop(ROOT_FILE), "same-path progress")
         self.reject(lambda b, c, f: c["modules"].update(

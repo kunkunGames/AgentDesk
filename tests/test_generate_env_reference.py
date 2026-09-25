@@ -10,6 +10,22 @@ import generate_env_reference as gen  # noqa: E402
 
 
 class BlankTestModulesTests(unittest.TestCase):
+    def test_file_test_module_preserves_following_production_and_line_numbers(self) -> None:
+        source = (
+            '#[cfg(test)]\n#[path = "env_tests.rs"]\npub(crate) mod env_tests;\n'
+            '#[cfg(not(test))]\nmod production;\n'
+            'fn after() { let _ = std::env::var("AGENTDESK_AFTER"); }\n'
+        )
+        blanked = gen.blank_test_modules(source)
+        self.assertEqual(blanked, '\n\n\n' + source.split('mod env_tests;\n', 1)[1])
+        self.assertEqual(blanked.count('\n'), source.count('\n'))
+
+    def test_file_module_cfg_must_require_test(self) -> None:
+        for predicate in ['not(test)', 'any(test, unix)', 'feature = "test"']:
+            source = f'#[cfg({predicate})]\nmod production;\n'
+            with self.subTest(predicate=predicate):
+                self.assertEqual(gen.blank_test_modules(source), source)
+
     def test_cfg_test_module_is_blanked_but_line_numbers_survive(self) -> None:
         source = textwrap.dedent(
             """\

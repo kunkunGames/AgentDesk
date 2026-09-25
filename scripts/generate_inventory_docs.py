@@ -53,8 +53,8 @@ GIANT_FILE_ISSUE_RATCHET_WRITER = (
 # `any(test, …)` (compiles when the other option is set) — are rejected.
 
 # `#[cfg(...)]` attribute immediately before a (optionally attributed, optionally
-# `pub`) `mod <name> {` declaration. The cfg body is captured for structural
-# evaluation; the `mod` open brace anchors the test-module body.
+# `pub`) `mod <name>` declaration. The cfg body is captured for structural
+# evaluation; the delimiter distinguishes inline bodies from file modules.
 # The predicate stays inside a single attribute (`[^]]`), and only further
 # attributes or whitespace may sit between the cfg and the `mod` keyword — so an
 # inline `#[cfg(test)]` guarding a function does not spuriously bind to a later
@@ -62,7 +62,7 @@ GIANT_FILE_ISSUE_RATCHET_WRITER = (
 _CFG_MOD_RE = re.compile(
     r"#\[cfg\((?P<predicate>[^]]*?)\)\]"
     r"\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?"
-    r"mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{",
+    r"mod\s+[A-Za-z_][A-Za-z0-9_]*\s*(?P<delimiter>[{;])",
 )
 
 
@@ -230,7 +230,7 @@ def line_count(text: str) -> int:
 
 
 def test_line_count(text: str) -> int:
-    """Count lines that live inside ``#[cfg(test)] mod`` blocks.
+    """Count test-only module declarations and their inline bodies.
 
     Whole ``*_tests.rs`` files are already excluded from the production set by
     :func:`is_test_file`; this splits the remaining files so the giant-file
@@ -242,18 +242,20 @@ def test_line_count(text: str) -> int:
 
 
 def test_line_numbers(text: str) -> set[int]:
-    """Line numbers covered by ``#[cfg(test)] mod`` blocks (1-based)."""
+    """Lines covered by test-only module declarations and bodies (1-based)."""
 
     total = line_count(text)
     test_lines: set[int] = set()
     for match in _CFG_MOD_RE.finditer(text):
         if not cfg_requires_test(match.group("predicate")):
             continue
-        brace = text.rindex("{", match.start(), match.end())
-        try:
-            _body, end = scan_balanced(text, brace, "{", "}")
-        except ParseError:
-            continue
+        end = match.end()
+        if match.group("delimiter") == "{":
+            brace = match.end() - 1
+            try:
+                _body, end = scan_balanced(text, brace, "{", "}")
+            except ParseError:
+                continue
         start_line = offset_to_line(text, match.start())
         end_line = offset_to_line(text, end)
         for line in range(start_line, end_line + 1):
