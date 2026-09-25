@@ -953,8 +953,9 @@ class GiantFileLedgerIntegrationTest(unittest.TestCase):
 
     def run_main(self, before, after, now, *, candidate="merge", base="base",
                  head="head", origin="base", checkout=None, parents=None,
-                 head_repository="itismyfield/AgentDesk"):
-        env = {"GFP_EVENT_NAME": "pull_request", "GFP_REPOSITORY": "itismyfield/AgentDesk",
+                 head_repository="itismyfield/AgentDesk", repository="itismyfield/AgentDesk",
+                 event="pull_request"):
+        env = {"GFP_EVENT_NAME": event, "GFP_REPOSITORY": repository,
                "GFP_HEAD_REPOSITORY": head_repository, "GFP_CANDIDATE_SHA": candidate,
                "GFP_BASE_SHA": base, "GFP_HEAD_SHA": head}
         lineage = [candidate, base, head] if parents is None else parents
@@ -1006,6 +1007,23 @@ class GiantFileLedgerIntegrationTest(unittest.TestCase):
 
     def repair_pair(self):
         return self.files(), self.files(deadline=NEW, history=marker())
+
+    def test_canonical_fork_push_and_pr_retain_event_validation(self):
+        before, after = self.repair_pair()
+        for event in ("push", "pull_request"):
+            with self.subTest(event=event):
+                rc, evidence, calls = self.run_main(before, after, NOW, event=event,
+                    repository="kunkunGames/AgentDesk", head_repository="kunkunGames/AgentDesk")
+                self.assertEqual(rc, 0, evidence)
+                self.assertEqual(calls, int(event == "pull_request"))
+                self.assertEqual(evidence["repository"], "kunkunGames/AgentDesk")
+                rc, evidence, calls = self.run_main(before, after, NOW, event=event,
+                    repository="untrusted/AgentDesk")
+                self.assertEqual((rc, calls), (2, 0), evidence)
+        for overrides in ({"head_repository": ""}, {"parents": ["merge", "base", "spoof"]}):
+            rc, evidence, calls = self.run_main(before, after, NOW,
+                repository="kunkunGames/AgentDesk", **overrides)
+            self.assertEqual((rc, calls), (2, 0), evidence)
 
     def test_unrelated_main_advance_does_not_invalidate_the_same_candidate(self):
         """An identical, legitimate candidate must not fail merely because main moved.

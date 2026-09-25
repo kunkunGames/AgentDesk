@@ -14,6 +14,7 @@ from pathlib import Path
 import generate_inventory_docs as inventory
 from ratchet_admission import parse_cap_table
 ROOT = Path(__file__).resolve().parent.parent
+CANONICAL_REPOSITORIES = frozenset({"itismyfield/AgentDesk", "kunkunGames/AgentDesk"})
 EVIDENCE = ROOT / "target/giant-file-progress/evidence.json"
 REGISTRY = "scripts/giant_file_registry.toml"
 EVALUATOR = "scripts/giant_file_progress.py"
@@ -600,9 +601,9 @@ def main() -> int:
             # to equal the base repository adds no provenance guarantee, but it
             # rejects legitimate PRs from a trusted fork before the same
             # fail-closed object checks can run.
-            if repository != "itismyfield/AgentDesk" or not env.get("GFP_HEAD_REPOSITORY"):
+            if repository not in CANONICAL_REPOSITORIES or not env.get("GFP_HEAD_REPOSITORY"):
                 raise RuntimeError(
-                    "progress requires a pull request targeting itismyfield/AgentDesk "
+                    "progress requires a pull request targeting a canonical repository "
                     "with a resolved head repository"
                 )
             event_base_sha = oid(env.get("GFP_BASE_SHA", ""))
@@ -671,7 +672,7 @@ def main() -> int:
                     "pr_strict_progress": "retirement or 200-line partial progress",
                     "pr_ledger_repair": "bounded deadline and monotone ledger repair; production unchanged",
                 }[selector]
-            elif event == "push" and repository == "itismyfield/AgentDesk":
+            elif event == "push" and repository in CANONICAL_REPOSITORIES:
                 selector = "main_no_regression_record"
                 payload.update(main_record(candidate))
                 reason = "main records current giant-file debt"
