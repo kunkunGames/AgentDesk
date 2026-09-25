@@ -1,4 +1,5 @@
 scripts/** text eol=lf
+tests/*.sh text eol=lf
 .githooks/** text eol=lf
 .github/workflows/*.yml text eol=lf
 # SQL inventory hashes migration bytes; keep checkouts identical across platforms.
