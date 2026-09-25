@@ -219,8 +219,6 @@ class PrCapCheckTest(unittest.TestCase):
             "test_normalize.rs",
             "scratch.txt",
             "scratchpad.md",
-            "open_prs.json",
-            "prs.json",
             "test.sql",
             "scratch-check.sql",
             "verify.sh",

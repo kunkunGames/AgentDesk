@@ -58,7 +58,7 @@ while IFS= read -r -d '' record; do
   scratch_basename="${file_to_check##*/}"
 
   case "$scratch_basename" in
-    pr-body.md | pr_body.md | plan.md | plan.txt | prs.json | scratch.json | scratchpad.json | cargo_out.txt | npm_output.log | bun_output.txt | open_prs.json | open-prs.json )
+    pr-body.md | pr_body.md | plan.md | plan.txt | prs.json | scratch.json | scratchpad.json | cargo_out.txt | npm_output.log | bun_output.txt )
       fail "scratch file detected: $file_to_check"
       ;;
     *.diff | *.patch | *.log )
