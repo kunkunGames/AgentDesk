@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 import zipfile
 
 
@@ -17,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import package_release as packaging
 import verify_release_artifacts as verification
+import verify_runner_wrappers as wrappers
 
 
 class ReleasePackagingTests(unittest.TestCase):
@@ -154,6 +156,50 @@ class ReleasePackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside"):
             packaging.copy_file(outside, self.output / "leak", self.root)
         self.assertFalse(self.output.exists())
+
+
+class NativeWrapperSmokeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="wrapper test ")
+        self.addCleanup(self.temp.cleanup)
+        self.binary = Path(self.temp.name) / "agentdesk.exe"
+        self.binary.touch()
+
+    def test_checks_each_native_pipe_entrypoint_in_an_isolated_directory(self):
+        observed = []
+
+        def run(command, **kwargs):
+            root = kwargs["cwd"]
+            self.assertEqual(command[0], str(self.binary.resolve()))
+            self.assertEqual(command[command.index("--input-mode") + 1], "pipe")
+            self.assertFalse(Path(command[command.index("--prompt-file") + 1]).exists())
+            self.assertEqual(kwargs["env"]["AGENTDESK_ROOT_DIR"], str(root))
+            self.assertEqual(kwargs["env"]["AGENTDESK_CONFIG"], str(root / "missing-config.yaml"))
+            self.assertEqual(kwargs["timeout"], 15)
+            self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+            observed.append(command[1])
+            return subprocess.CompletedProcess(command, 1, b"", b"Error reading prompt file: missing")
+
+        with mock.patch.object(wrappers.subprocess, "run", side_effect=run):
+            wrappers.verify(self.binary)
+        self.assertEqual(observed, ["tmux-wrapper", "codex-tmux-wrapper", "qwen-tmux-wrapper"])
+
+    def test_rejects_unrelated_failure_or_unexpected_success(self):
+        for code, stderr in [(1, b"unknown command"), (2, b"Error reading prompt file: missing"),
+                             (0, b"Error reading prompt file: missing")]:
+            with self.subTest(code=code, stderr=stderr):
+                result = subprocess.CompletedProcess([], code, b"", stderr)
+                with mock.patch.object(wrappers.subprocess, "run", return_value=result) as run:
+                    with self.assertRaisesRegex(RuntimeError, "did not reach its pipe entrypoint"):
+                        wrappers.verify(self.binary)
+                    self.assertEqual(run.call_count, 1)
+
+    def test_timeout_and_missing_binary_fail_closed(self):
+        with mock.patch.object(wrappers.subprocess, "run", side_effect=subprocess.TimeoutExpired("wrapper", 15)):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                wrappers.verify(self.binary)
+        with self.assertRaises(FileNotFoundError):
+            wrappers.verify(self.binary.with_name("absent"))
 
 
 if __name__ == "__main__":

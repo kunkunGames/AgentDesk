@@ -148,6 +148,7 @@ jobs:
           binary="target/$RELEASE_TARGET/release-fast/agentdesk"
           if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
           "$binary" --version
+          python scripts/verify_runner_wrappers.py --binary "$binary"
           python scripts/verify_release_artifacts.py dist --commit "$GITHUB_SHA" --version "$RELEASE_VERSION" --target "$RELEASE_TARGET" --profile release-fast
       - uses: actions/upload-artifact@v4
         with:
