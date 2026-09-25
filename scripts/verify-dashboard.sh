@@ -16,6 +16,7 @@ echo "==> Dashboard security audit (high+)"
 # advisory that has no available fix, set DASHBOARD_AUDIT_WAIVER to a short
 # documented reason (it is echoed into the CI log for an audit trail). The
 # waiver downgrades the failure to a warning; it does not silence the report.
+# A successful audit must clear an old waiver before another finding appears.
 audit_status=0
 npm audit --audit-level=high || audit_status=$?
 if [ "$audit_status" -ne 0 ]; then
@@ -27,6 +28,10 @@ if [ "$audit_status" -ne 0 ]; then
     echo "       DASHBOARD_AUDIT_WAIVER='<reason>' ./scripts/verify-dashboard.sh" >&2
     exit "$audit_status"
   fi
+elif [ -n "${DASHBOARD_AUDIT_WAIVER:-}" ]; then
+  echo "Error: DASHBOARD_AUDIT_WAIVER is set, but npm audit found no high/critical advisories." >&2
+  echo "       Remove the stale waiver so it cannot waive a future unrelated finding." >&2
+  exit 1
 fi
 
 echo "==> Dashboard build"
