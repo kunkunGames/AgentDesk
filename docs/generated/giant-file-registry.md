@@ -55,7 +55,7 @@
 | `src/services/codex_tmux_wrapper.rs` | 1115 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/services/codex_tui/input.rs` | 1914 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/services/codex_tui/rollout_tail.rs` | 1480 | shrink | discord-relay | 2026-10-31 | #4712 |  |
-| `src/services/discord/catch_up.rs` | 1701 | shrink | discord-relay | 2026-10-31 | #4712 |  |
+| `src/services/discord/catch_up.rs` | 1805 | shrink | discord-relay | 2026-10-31 | #4712 |  |
 | `src/services/discord/commands/text_commands.rs` | 1454 | shrink | discord-relay | 2027-01-31 | #4712 |  |
 | `src/services/discord/health/recovery.rs` | 2585 | shrink | discord-relay | 2026-10-31 | #4712 |  |
 | `src/services/discord/health/snapshot.rs` | 1205 | shrink | discord-relay | 2027-02-28 | #5447 |  |
@@ -88,7 +88,7 @@
 | `src/services/routines/store.rs` | 3570 | shrink | automation-pipeline | 2027-01-31 | #4711 |  |
 | `src/services/settings.rs` | 1080 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 | `src/services/tmux_common.rs` | 2083 | shrink | discord-relay | 2026-10-31 | #4712 |  |
-| `src/services/turn_orchestrator.rs` | 2861 | shrink | server-runtime | 2027-01-31 | #4710 |  |
+| `src/services/turn_orchestrator.rs` | 2868 | shrink | server-runtime | 2027-01-31 | #4710 |  |
 
 ## Grandfathered
 
