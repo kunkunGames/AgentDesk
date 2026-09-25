@@ -139,6 +139,18 @@ class InventoryTrackingContractTest(unittest.TestCase):
 
 
 class ProdTestSplitTest(unittest.TestCase):
+    def test_file_test_module_counts_only_its_declaration(self) -> None:
+        source = ('#[cfg(all(test, unix))]\n#[path = "fixture.rs"]\n'
+                  'pub(crate) mod fixture;\nfn production() {}\n')
+        self.assertEqual(GEN.test_line_numbers(source), {1, 2, 3})
+        self.assertEqual(GEN.split_prod_test_lines(source), (1, 3))
+
+    def test_file_modules_available_without_test_remain_production(self) -> None:
+        for predicate in ['not(test)', 'any(test, unix)', 'feature = "test"']:
+            with self.subTest(predicate=predicate):
+                source = f'#[cfg({predicate})]\nmod production;\n'
+                self.assertEqual(GEN.test_line_numbers(source), set())
+
     def test_cfg_test_mod_block_counts_as_test(self) -> None:
         text = _src(
             """
