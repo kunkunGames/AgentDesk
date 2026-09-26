@@ -27,3 +27,10 @@ Every PR must include:
 ## Review Process
 - Ensure generated-inventory refresh PRs contain an explicit duplicate-PR guard in the body.
 - Changes must be concrete enough for agents or humans to follow.
+
+## Agent Execution Plan Guidelines
+- **Groundedness Rule:** Only use tools, test names, and targets that are explicitly confirmed to exist in the trace. Do not guess test commands; verify them via bash first (e.g., using `grep`) or use standard test commands without specific targets.
+- **Completeness Rule:** Execution plans must explicitly include comprehensive final test runs (e.g., `cargo check --all-targets`, `npm run test:policies`, `./scripts/verify-dashboard.sh`, `python3 scripts/generate_inventory_docs.py`) as defined for the specific agent role, rather than relying solely on `git diff`.
+- **Pre-commit Step:** The pre-commit step description must use the exact mandatory phrasing: 'Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.'
+- **Specificity Rule:** The step to submit a PR or no-change report must explicitly draft the full text for the description parameter, including all mandatory sections (What changed, Why, WorkFingerprint, duplicate/overlap check, verification commands and results, skipped checks, risk, and rollback notes).
+- **Verification Fallback:** If a required verification check (e.g., `cargo check`) cannot run due to environment limitations or timeouts, explicitly skip it, state the exact reason, and document the residual risk in the PR body.
