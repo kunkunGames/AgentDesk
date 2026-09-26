@@ -376,11 +376,10 @@ pub(crate) async fn pending_run_cleanup_task_count_pg(pool: &PgPool) -> Result<i
 /// but unclaimable). Reporting the second case as `completed` would make the
 /// replay statistics lie.
 async fn run_cleanup_task_exists_pg(pool: &PgPool, id: i64) -> Result<bool, String> {
-    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM auto_queue_run_cleanup_tasks WHERE id = $1")
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM auto_queue_run_cleanup_tasks WHERE id = $1)")
         .bind(id)
         .fetch_one(pool)
         .await
-        .map(|count| count > 0)
         .map_err(|error| format!("probe auto-queue run cleanup task {id}: {error}"))
 }
 
