@@ -116,7 +116,7 @@ pub async fn validate_token(body: ValidateTokenBody) -> (StatusCode, Json<serde_
     let client = reqwest::Client::new();
     let resp = client
         .get("https://discord.com/api/v10/users/@me")
-        .header("Authorization", format!("Bot {}", body.token))
+        .header("Authorization", format!("Bot {}", body.token.trim()))
         .send()
         .await;
 
@@ -193,7 +193,7 @@ async fn load_channels(
     // Fetch guilds
     let guilds: Vec<serde_json::Value> = match client
         .get("https://discord.com/api/v10/users/@me/guilds")
-        .header("Authorization", format!("Bot {}", token))
+        .header("Authorization", format!("Bot {}", token.trim()))
         .send()
         .await
     {
@@ -216,7 +216,7 @@ async fn load_channels(
             .get(format!(
                 "https://discord.com/api/v10/guilds/{guild_id}/channels"
             ))
-            .header("Authorization", format!("Bot {}", token))
+            .header("Authorization", format!("Bot {}", token.trim()))
             .send()
             .await
         {
