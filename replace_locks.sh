@@ -1,0 +1,3 @@
+sed -i 's/\.lock().unwrap_or_else(|e| e.into_inner())/\.lock().unwrap_or_else(|e| {\n            tracing::warn!("Recovered poisoned lock for CancelToken state");\n            e.into_inner()\n        })/g' src/services/provider.rs
+sed -i 's/\.unwrap_or_else(|error| error.into_inner())/\.unwrap_or_else(|e| {\n            tracing::warn!("Recovered poisoned lock for CancelToken state");\n            e.into_inner()\n        })/g' src/services/provider.rs
+sed -i 's/\.unwrap_or_else(|e| e.into_inner())/\.unwrap_or_else(|e| {\n            tracing::warn!("Recovered poisoned lock for CancelToken state");\n            e.into_inner()\n        })/g' src/services/provider.rs
