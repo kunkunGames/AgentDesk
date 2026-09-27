@@ -4,8 +4,8 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, claude_accounts_api, discord, github, github_dashboard, hooks, kakao_calendar,
-    meetings, pr_summary, protected_api_domain, provider_auth_profiles,
+    ApiRouter, AppState, claude_accounts_api, discord, github, github_dashboard, hooks,
+    kakao_calendar, meetings, pr_summary, protected_api_domain, provider_auth_profiles,
 };
 
 // Category: integrations
@@ -19,7 +19,6 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 "/hook/session/{sessionKey}",
                 delete(hooks::disconnect_session),
             )
-
             .route("/kakao/calendar/accounts", get(kakao_calendar::accounts))
             .route(
                 "/kakao/calendar/accounts/{accountId}/check",
