@@ -1,0 +1,1 @@
+// Ah, the test does not mock useI18n, so it gets the actual `useI18n` which defaults to Korean? Or wait, in testing env, `useI18n` is not mocked so maybe it's just falling back to the default `ko`? Wait, `tr` is `(ko, en) => ko` in the default unmocked state maybe, or `i18n` context is empty.

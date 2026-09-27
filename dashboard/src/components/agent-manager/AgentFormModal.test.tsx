@@ -43,7 +43,7 @@ it.each([null, 20, 30, 39, 40])("keeps button and keyboard portrait selection in
   const afterKey = Math.min(40, (initial ?? 0) + 1);
   expect(picker.getAttribute("aria-valuenow")).toBe(String(afterKey));
   await act(async () => {
-    container.querySelector<HTMLButtonElement>('button[aria-label="Next Sprite"]')!.click();
+    container.querySelector<HTMLButtonElement>('button[aria-label="Next Avatar"]')!.click();
   });
   expect(picker.getAttribute("aria-valuenow")).toBe(String(Math.min(40, afterKey + 1)));
 });
