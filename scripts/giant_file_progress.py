@@ -19,7 +19,8 @@ EVIDENCE = ROOT / "target/giant-file-progress/evidence.json"
 REGISTRY = "scripts/giant_file_registry.toml"
 EVALUATOR = "scripts/giant_file_progress.py"
 METADATA = "scripts/giant_file_issue_metadata.json"
-GENERATED_DOCS = frozenset({"ARCHITECTURE.md", "docs/generated/route-inventory.md",
+GENERATED_DOCS = frozenset({"ARCHITECTURE.md", "docs/generated/module-inventory.md",
+                            "docs/generated/route-inventory.md",
                             "docs/generated/worker-inventory.md"})
 GUARD_REPIN_ALLOWED = frozenset({
     "scripts/check_delivery_journal_raw_writer.py",
