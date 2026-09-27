@@ -7,7 +7,10 @@ import EmojiPickerLibraryPanel from "./EmojiPickerLibraryPanel";
 
 vi.mock("../../i18n", () => ({
   useI18n: () => ({
-    t: (ko: string, en: string) => en || ko,
+    t: (input: { en?: string; ko?: string } | string, enFallback?: string) => {
+      if (typeof input === "string") return enFallback || input;
+      return input.en || input.ko || "";
+    },
   }),
 }));
 
