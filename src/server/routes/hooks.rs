@@ -134,3 +134,18 @@ async fn disconnect_session_pg(pool: &PgPool, session_key: &str) -> Result<bool,
         .await
         .map(|result| result.rows_affected() > 0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_skill_usage_body_deserialization() {
+        let json_data = r#"{"skill_id": "test_skill", "agent_id": "agent_123"}"#;
+        let parsed: SkillUsageBody = serde_json::from_str(json_data).unwrap();
+        assert_eq!(parsed.skill_id, "test_skill");
+        assert_eq!(parsed.agent_id.as_deref(), Some("agent_123"));
+        assert!(parsed.role_id.is_none());
+        assert!(parsed.session_key.is_none());
+    }
+}
