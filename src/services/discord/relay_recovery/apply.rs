@@ -128,7 +128,7 @@ pub(super) async fn apply_relay_recovery_decision(
                 // #5071 relay-tail S2: `Some(0)`, never `None`. An unmeasured
                 // tail must not open the destructive branch — see
                 // `unread_tail_is_proven_drained`.
-                && reattach_idle_clear_tail_admits(provider, decision, tmux_session)
+                && unread_tail_is_proven_drained(decision.evidence.unread_bytes)
                 // This branch intentionally does not route through
                 // `destructive_cancel_gate`: the snapshot readiness check is
                 // the turn-scope proof that the provider prompt has returned

@@ -54,47 +54,23 @@ pub(in crate::services::discord) async fn mailbox_try_start_turn_unless_released
     request_owner: UserId,
     user_message_id: MessageId,
 ) -> TryStartTurnResult {
-    let episode_nonce = cancel_token.turn_nonce().map(str::to_owned);
-    mailbox_try_start_turn_adopting(
-        shared,
-        channel_id,
-        cancel_token,
-        request_owner,
-        user_message_id,
-        ActiveTurnKind::UserOrAgent,
-        episode_nonce,
-    )
-    .await
-}
-
-/// Row -> lease re-adoption: the claim's own step refuses the ROW's episode unless it
-/// started after the last exact release, and records the installed token as started.
-pub(in crate::services::discord) async fn mailbox_try_start_turn_adopting(
-    shared: &SharedData,
-    channel_id: ChannelId,
-    cancel_token: Arc<CancelToken>,
-    request_owner: UserId,
-    user_message_id: MessageId,
-    kind: ActiveTurnKind,
-    episode_nonce: Option<String>,
-) -> TryStartTurnResult {
     mailbox_try_start_turn_ordered(
         shared,
         channel_id,
         cancel_token,
         request_owner,
         user_message_id,
-        AdmissionClaim::Adopt(kind, episode_nonce),
+        AdmissionClaim::UnlessReleased,
     )
     .await
 }
 
 /// The mailbox claim an admitted turn issues.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum AdmissionClaim {
     Kinded(ActiveTurnKind, TurnAdmissionOrder),
-    /// An immediate claim the actor's recovery fence may refuse for the named episode.
-    Adopt(ActiveTurnKind, Option<String>),
+    /// An immediate user claim the actor's recovery fence may refuse.
+    UnlessReleased,
 }
 
 async fn mailbox_try_start_turn_ordered(
@@ -137,14 +113,12 @@ async fn mailbox_try_start_turn_ordered(
                 )
                 .await
         }
-        AdmissionClaim::Adopt(kind, ref episode_nonce) => {
+        AdmissionClaim::UnlessReleased => {
             mailbox
-                .try_start_turn_adopting(
+                .try_start_turn_unless_released(
                     cancel_token,
                     request_owner,
                     user_message_id,
-                    kind,
-                    episode_nonce.clone(),
                     persistence,
                 )
                 .await

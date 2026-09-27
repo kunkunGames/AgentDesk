@@ -43,7 +43,7 @@ pub(crate) fn kill_proven_idle_provider_session(
     })
 }
 
-pub(crate) fn provider_session_is_proven_idle_under_authority(
+fn provider_session_is_proven_idle_under_authority(
     authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
 ) -> Result<(), &'static str> {
     let tmux_session_name = authority.session();

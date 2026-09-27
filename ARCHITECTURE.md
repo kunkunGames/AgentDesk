@@ -27,19 +27,10 @@ src/
 │   ├── dcserver/
 │   │   └── startup.rs
 │   ├── doctor/
-│   │   ├── health/
-│   │   │   └── measurement.rs
-│   │   ├── mailbox/
-│   │   │   └── observation.rs
 │   │   ├── orchestrator/
 │   │   │   ├── config_dir_checks.rs
 │   │   │   ├── health_snapshot.rs
-│   │   │   ├── observation_checks.rs
-│   │   │   ├── observation_tests.rs
-│   │   │   ├── provider_credentials.rs
-│   │   │   ├── repair_response.rs
-│   │   │   ├── report_display.rs
-│   │   │   └── stale_mailbox_repair.rs
+│   │   │   └── provider_credentials.rs
 │   │   ├── contract.rs
 │   │   ├── health.rs
 │   │   ├── mailbox.rs
@@ -324,9 +315,7 @@ src/
 │   │   │   └── runtime.rs
 │   │   ├── health_api/
 │   │   │   ├── public_projection.rs
-│   │   │   ├── runtime_profile.rs
-│   │   │   ├── session_repair.rs
-│   │   │   └── unread_tail_attribution_tests.rs
+│   │   │   └── runtime_profile.rs
 │   │   ├── review_verdict/
 │   │   │   ├── decision_route.rs
 │   │   │   ├── mod.rs
@@ -638,8 +627,6 @@ src/
 │   ├── codex_tmux_wrapper/
 │   │   └── input.rs
 │   ├── codex_tui/
-│   │   ├── input/
-│   │   │   └── composer_lock.rs
 │   │   ├── rollout_tail/
 │   │   │   └── parser.rs
 │   │   ├── session/
@@ -782,7 +769,6 @@ src/
 │   │   │   │   ├── abandon.rs
 │   │   │   │   ├── identity.rs
 │   │   │   │   ├── mod.rs
-│   │   │   │   ├── operator_disposition.rs
 │   │   │   │   └── reconcile_gate.rs
 │   │   │   ├── model/
 │   │   │   │   ├── identity.rs
@@ -970,8 +956,7 @@ src/
 │   │   │   ├── tests/
 │   │   │   │   ├── circuit_breaker_apply.rs
 │   │   │   │   ├── incarnation_follow_up.rs
-│   │   │   │   ├── orphan_token_finish.rs
-│   │   │   │   └── unread_tail_seed.rs
+│   │   │   │   └── orphan_token_finish.rs
 │   │   │   ├── apply.rs
 │   │   │   ├── decision.rs
 │   │   │   ├── destructive_warrant.rs
@@ -1202,7 +1187,6 @@ src/
 │   │   │   ├── no_result_exits.rs
 │   │   │   ├── orphan_status_panel_cleanup.rs
 │   │   │   ├── orphan_terminal_frame.rs
-│   │   │   ├── owed_range_baseline_tests.rs
 │   │   │   ├── panel_decisions.rs
 │   │   │   ├── panel_decisions_tests.rs
 │   │   │   ├── placeholder_reclaim.rs
@@ -1217,8 +1201,6 @@ src/
 │   │   │   ├── single_message_footer.rs
 │   │   │   ├── single_message_footer_tests.rs
 │   │   │   ├── stall_exit.rs
-│   │   │   ├── streaming_baseline_tests.rs
-│   │   │   ├── streaming_harness_tests.rs
 │   │   │   ├── streaming_session_banner.rs
 │   │   │   ├── streaming_status_tick.rs
 │   │   │   ├── supervisor_relay.rs
@@ -1272,7 +1254,6 @@ src/
 │   │   │   │   ├── claim.rs
 │   │   │   │   └── stale_reclaim.rs
 │   │   │   ├── tests/
-│   │   │   │   ├── fenced_admission_tests.rs
 │   │   │   │   ├── scenario_census_e2e.rs
 │   │   │   │   ├── synthetic_bridge_handoff_pg_tests.rs
 │   │   │   │   └── synthetic_terminal_ordering_tests.rs
@@ -1656,8 +1637,6 @@ src/
 │   │   ├── repo_resolver.rs
 │   │   ├── runner.rs
 │   │   └── worktree_resolver.rs
-│   ├── health_diagnostics/
-│   │   └── session_state.rs
 │   ├── kakao/
 │   │   ├── account.rs
 │   │   ├── calendar.rs

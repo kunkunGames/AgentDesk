@@ -66,7 +66,7 @@ async fn claim_tui_direct_synthetic_turn_prepared(
         register_deferred_start: _,
     } = identity;
 
-    let (cancel_token, pg_pin, class) = match bridge_handoff::prepare_admission(
+    let (cancel_token, pg_pin) = match bridge_handoff::prepare_admission(
         shared,
         provider,
         channel_id,
@@ -90,13 +90,13 @@ async fn claim_tui_direct_synthetic_turn_prepared(
     // #3167 — the self-paced TUI loop / TUI-direct turn is a low-priority
     // background turn; mark it `Background` so a queued external USER
     // intervention is not starved behind the continuously-cycling loop.
-    let mut started = bridge_handoff::admit_kinded(
+    let mut started = super::super::mailbox_try_start_turn_kinded(
         shared,
         channel_id,
         cancel_token.clone(),
         serenity::UserId::new(TUI_DIRECT_SYNTHETIC_OWNER_USER_ID),
         anchor_message_id,
-        &class,
+        crate::services::turn_orchestrator::ActiveTurnKind::Background,
     )
     .await;
     let mut mailbox_activation_occurred = started;
@@ -114,13 +114,13 @@ async fn claim_tui_direct_synthetic_turn_prepared(
                 )
                 .await
             {
-                started = bridge_handoff::admit_kinded(
+                started = super::super::mailbox_try_start_turn_kinded(
                     shared,
                     channel_id,
                     cancel_token.clone(),
                     serenity::UserId::new(TUI_DIRECT_SYNTHETIC_OWNER_USER_ID),
                     anchor_message_id,
-                    &class,
+                    crate::services::turn_orchestrator::ActiveTurnKind::Background,
                 )
                 .await;
                 if started {
@@ -150,13 +150,13 @@ async fn claim_tui_direct_synthetic_turn_prepared(
                 )
                 .await
             {
-                started = bridge_handoff::admit_kinded(
+                started = super::super::mailbox_try_start_turn_kinded(
                     shared,
                     channel_id,
                     cancel_token.clone(),
                     serenity::UserId::new(TUI_DIRECT_SYNTHETIC_OWNER_USER_ID),
                     anchor_message_id,
-                    &class,
+                    crate::services::turn_orchestrator::ActiveTurnKind::Background,
                 )
                 .await;
                 if started {
@@ -264,7 +264,7 @@ async fn claim_tui_direct_synthetic_turn_prepared(
         && bridge_handoff::refresh_actor_matches(
             &existing,
             Some(&admitted_actor),
-            (mailbox_activation_occurred, &class),
+            mailbox_activation_occurred,
         )
     {
         return bridge_handoff::refresh_existing(

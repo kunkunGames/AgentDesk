@@ -97,13 +97,6 @@ pub(in crate::services::discord) fn inflight_state_path(
 
 pub(crate) struct InflightStateFileLock {
     file: fs::File,
-    state_path: PathBuf,
-}
-
-impl InflightStateFileLock {
-    pub(in crate::services::discord::inflight) fn state_path(&self) -> &Path {
-        &self.state_path
-    }
 }
 
 impl Drop for InflightStateFileLock {
@@ -150,10 +143,7 @@ pub(crate) fn lock_inflight_state_path(path: &Path) -> Result<InflightStateFileL
         .open(&lock_path)
         .map_err(|e| e.to_string())?;
     file.lock().map_err(|e| e.to_string())?;
-    Ok(InflightStateFileLock {
-        file,
-        state_path: path.to_path_buf(),
-    })
+    Ok(InflightStateFileLock { file })
 }
 
 // #3835: shared lock-held persist tail + save-side validation gate, consumed
