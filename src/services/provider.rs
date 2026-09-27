@@ -758,10 +758,7 @@ impl CancelToken {
     }
 
     pub fn mark_completion_cleanup(&self) {
-        let _publication = self
-            .cancellation_publication
-            .lock()
-            .unwrap_or_else(|e| {
+        let _publication = self.cancellation_publication.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
         });
@@ -776,8 +773,7 @@ impl CancelToken {
         *self.child_pid.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
-        }) =
-            Some(CapturedProcess::capture(pid));
+        }) = Some(CapturedProcess::capture(pid));
     }
 
     pub(crate) fn child_pid_value(&self) -> Option<u32> {
@@ -803,10 +799,7 @@ impl CancelToken {
     }
 
     pub(crate) fn clear_child_pid_if_matches(&self, pid: u32) {
-        let mut child = self
-            .child_pid
-            .lock()
-            .unwrap_or_else(|e| {
+        let mut child = self.child_pid.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
         });
@@ -862,10 +855,7 @@ impl CancelToken {
         let classified = CancelSource::classify(&label);
         // All source writers take kind before label. Cleanup is provisional and
         // may never replace an already recorded cancellation cause.
-        let mut kind = self
-            .cancel_source_kind
-            .lock()
-            .unwrap_or_else(|e| {
+        let mut kind = self.cancel_source_kind.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
         });
@@ -882,10 +872,7 @@ impl CancelToken {
     }
 
     pub(crate) fn set_cancel_source_if_absent(&self, source: impl Into<String>) {
-        let _publication = self
-            .cancellation_publication
-            .lock()
-            .unwrap_or_else(|e| {
+        let _publication = self.cancellation_publication.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
         });
@@ -898,10 +885,7 @@ impl CancelToken {
         // Keep kind and label transactional. Specific kinds retain #3908's
         // first-wins behavior, except that cleanup's Other classification is
         // deliberately provisional and upgrades to a later specific source.
-        let mut kind = self
-            .cancel_source_kind
-            .lock()
-            .unwrap_or_else(|e| {
+        let mut kind = self.cancel_source_kind.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
         });
@@ -918,10 +902,7 @@ impl CancelToken {
     }
 
     pub fn set_cancel_source(&self, source: impl Into<String>) {
-        let _publication = self
-            .cancellation_publication
-            .lock()
-            .unwrap_or_else(|e| {
+        let _publication = self.cancellation_publication.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
         });
@@ -932,10 +913,7 @@ impl CancelToken {
     /// free-form label (used for tracing / dispatch reason) to the canonical
     /// string for the variant when no label was previously recorded.
     pub fn set_cancel_source_kind(&self, kind: CancelSource) {
-        let _publication = self
-            .cancellation_publication
-            .lock()
-            .unwrap_or_else(|e| {
+        let _publication = self.cancellation_publication.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
         });
@@ -943,10 +921,7 @@ impl CancelToken {
     }
 
     pub(crate) fn publish_cancel(&self, source: impl Into<String>) {
-        let _publication = self
-            .cancellation_publication
-            .lock()
-            .unwrap_or_else(|e| {
+        let _publication = self.cancellation_publication.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
         });
@@ -955,10 +930,7 @@ impl CancelToken {
     }
 
     pub(crate) fn publish_cancel_if_source_absent(&self, source: impl Into<String>) {
-        let _publication = self
-            .cancellation_publication
-            .lock()
-            .unwrap_or_else(|e| {
+        let _publication = self.cancellation_publication.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
         });
@@ -973,10 +945,7 @@ impl CancelToken {
     ) {
         // Hold both locks across the pair update so cleanup cannot leave a
         // canonical kind paired with a cleanup-only label.
-        let mut current_kind = self
-            .cancel_source_kind
-            .lock()
-            .unwrap_or_else(|e| {
+        let mut current_kind = self.cancel_source_kind.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
         });
@@ -1006,9 +975,9 @@ impl CancelToken {
         self.cancel_source
             .lock()
             .unwrap_or_else(|e| {
-            tracing::warn!("Recovered poisoned lock for CancelToken state");
-            e.into_inner()
-        })
+                tracing::warn!("Recovered poisoned lock for CancelToken state");
+                e.into_inner()
+            })
             .clone()
     }
 
@@ -1017,10 +986,7 @@ impl CancelToken {
     /// [`CancelToken::set_cancel_source`] nor
     /// [`CancelToken::set_cancel_source_kind`] has been called yet.
     pub fn cancel_source_kind(&self) -> Option<CancelSource> {
-        *self
-            .cancel_source_kind
-            .lock()
-            .unwrap_or_else(|e| {
+        *self.cancel_source_kind.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for CancelToken state");
             e.into_inner()
         })
