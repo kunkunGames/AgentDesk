@@ -25,6 +25,9 @@ impl ProviderFixture {
         let progress = match provider {
             "codex" => r#"{"type":"thread.started","thread_id":"fixture"}"#,
             "gemini" => r#"{"type":"message","role":"assistant","content":"working"}"#,
+            "qwen" => {
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#
+            }
             _ => r#"{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}"#,
         };
         let terminal = match provider {

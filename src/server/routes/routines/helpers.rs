@@ -12,7 +12,7 @@ use crate::utils::api::clamp_api_limit;
 use super::super::AppState;
 use super::PARALLEL_SAFE_MIGRATED_LAUNCHD_SCRIPT_REF;
 
-pub(super) fn ensure_routine_runtime_runnable(
+pub(crate) fn ensure_routine_runtime_runnable(
     config: &crate::config::RoutinesConfig,
 ) -> AppResult<()> {
     if !config.enabled {

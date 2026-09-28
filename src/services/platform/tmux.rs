@@ -497,16 +497,18 @@ fn paste_buffer_raw_args<'a>(buffer_name: &'a str, target: &'a str, delete: bool
 /// Return the PID of the active pane process for a tmux session.
 #[cfg(unix)]
 pub fn pane_pid(session_name: &str) -> Option<u32> {
-    let output = tmux_command()
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            &exact_target(session_name),
-            "#{pane_pid}",
-        ])
-        .output()
-        .ok()?;
+    if is_blank_session_name(session_name) {
+        return None;
+    }
+    let mut command = tmux_command();
+    command.args([
+        "display-message",
+        "-p",
+        "-t",
+        &exact_target(session_name),
+        "#{pane_pid}",
+    ]);
+    let output = wait_for_tmux_output(command, Duration::from_secs(2), "tmux pane PID").ok()?;
     if !output.status.success() {
         return None;
     }

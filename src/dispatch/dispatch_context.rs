@@ -316,6 +316,10 @@ pub(super) fn dispatch_context_worktree_target(
         return Ok(None);
     };
     if !std::path::Path::new(path).is_dir() {
+        anyhow::ensure!(
+            context.get("managed_campaign") != Some(&json!(true)),
+            "managed campaign workspace is missing; fallback is forbidden"
+        );
         tracing::warn!(
             "[dispatch] Ignoring explicit worktree_path '{}' because the path does not exist or is not a directory; falling back to canonical worktree resolution",
             path

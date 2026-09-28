@@ -21,6 +21,10 @@ fn campaign_router() -> ApiRouter {
             get(campaigns::get).put(campaigns::replace),
         )
         .route("/campaigns/{id}/history", get(campaigns::history))
+        .route(
+            "/campaigns/{id}/operations",
+            get(campaigns::operations).post(campaigns::adopt_operation),
+        )
         .layer(DefaultBodyLimit::max(campaigns::LEDGER_BODY_LIMIT_BYTES))
         .layer(map_response(campaigns::body_limit_envelope))
 }
@@ -29,6 +33,18 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
     protected_api_domain(
         Router::new()
             .merge(campaign_router())
+            .route(
+                "/managed-checks/{id}",
+                get(super::super::managed_checks::inspect),
+            )
+            .route(
+                "/managed-checks/{id}/enroll",
+                post(super::super::managed_checks::enroll),
+            )
+            .route(
+                "/managed-checks/{id}/approve",
+                post(super::super::managed_checks::approve),
+            )
             .route(
                 "/offices",
                 get(offices::list_offices).post(offices::create_office),

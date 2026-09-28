@@ -1,6 +1,54 @@
 use super::*;
 use serde_json::json;
 
+#[test]
+fn execution_limits_validate_bounds_and_reject_nodes_without_the_contract() {
+    let limits = json!({"max_elapsed_secs":60,"max_tool_calls":2});
+    let requirements = ExecutionRequirements::parse(json!({"execution_limits":limits})).unwrap();
+    assert!(!requirements.is_empty());
+    let node = ready_node("worker", "linux");
+    let now = chrono::Utc::now().timestamp_millis();
+    assert!(
+        requirements
+            .explain(&node, now)
+            .contains(&"managed_execution_protocol_missing".into())
+    );
+    let mut supported = node.clone();
+    supported["capabilities"]["execution_capacity"] = json!({
+        "version":1,"slots":2,"managed_providers":{"opencode":1}
+    });
+    assert!(
+        requirements
+            .provider_reasons(&supported, "opencode")
+            .is_empty()
+    );
+    for provider in ["codex", "grok", "qwen", "unknown"] {
+        assert!(
+            !requirements
+                .provider_reasons(&supported, provider)
+                .is_empty()
+        );
+        assert!(
+            !super::super::capability_routing::explain_capability_match(
+                &supported,
+                &json!({"providers":[provider],"execution":{"execution_limits":limits}})
+            )
+            .eligible
+        );
+    }
+    assert!(!requirements.provider_reasons(&node, "opencode").is_empty());
+    for limits in [
+        json!({"max_elapsed_secs":0,"max_tool_calls":2}),
+        json!({"max_elapsed_secs":604801,"max_tool_calls":2}),
+        json!({"max_elapsed_secs":60,"max_tool_calls":0}),
+        json!({"max_elapsed_secs":60,"max_tool_calls":10001}),
+        json!({"max_elapsed_secs":60}),
+        json!({"max_elapsed_secs":60,"max_tool_calls":2,"reset_on_retry":true}),
+    ] {
+        assert!(ExecutionRequirements::parse(json!({"execution_limits":limits})).is_err());
+    }
+}
+
 pub(crate) fn ready_node(id: &str, os: &str) -> Value {
     let now = chrono::Utc::now().timestamp_millis();
     json!({"instance_id":id,"status":"online","labels":[],"capabilities":{

@@ -6,6 +6,9 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod campaign;
+pub use campaign::AdoptCampaignOperation;
+
 use crate::api_caller_observability::{
     IdentityConsumptionFields, RequestPrincipal, emit_identity_consumption,
     identity_consumption_fields,
@@ -825,6 +828,7 @@ impl RoutineStore {
                    created_at, updated_at
             FROM routines
             WHERE status = 'paused'
+              AND campaign_id IS NULL
               AND updated_at < $1
             ORDER BY updated_at ASC
             LIMIT 500
@@ -854,6 +858,7 @@ impl RoutineStore {
                    created_at, updated_at
             FROM routines
             WHERE status = 'paused'
+              AND campaign_id IS NULL
               AND pause_reason = $1
               AND updated_at < $2
               -- Skip schedule-less rows with no next_due_at: they can never be
@@ -902,6 +907,7 @@ impl RoutineStore {
             FROM routines
             WHERE id = $1
               AND status = 'paused'
+              AND campaign_id IS NULL
               AND pause_reason = $2
               AND updated_at < $3
             FOR UPDATE
@@ -937,6 +943,7 @@ impl RoutineStore {
                 updated_at = NOW()
             WHERE id = $1
               AND status = 'paused'
+              AND campaign_id IS NULL
               AND pause_reason = $2
               AND updated_at < $3
             "#,

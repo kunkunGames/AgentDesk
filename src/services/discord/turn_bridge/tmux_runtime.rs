@@ -442,10 +442,18 @@ pub(in crate::services::discord) fn bind_cancel_token_tmux_runtime(
     tmux_session_name: &str,
     reason: &str,
 ) -> Option<u32> {
-    if matches!(provider, ProviderKind::Claude) {
-        token.bind_claude_tmux_session(tmux_session_name);
+    if matches!(provider, ProviderKind::Claude | ProviderKind::Qwen) {
+        token.bind_owned_tmux_session(provider.clone(), tmux_session_name);
     } else {
         token.bind_unmanaged_session_name(tmux_session_name);
+    }
+
+    // Recovery must retain the same wrapper ownership as a fresh Qwen launch.
+    // A CLI PID alone omits the parent wrapper and its other tool descendants.
+    if matches!(provider, ProviderKind::Qwen)
+        && let Some(pid) = crate::services::platform::tmux::pane_pid(tmux_session_name)
+    {
+        token.store_child_pid_if_empty(pid);
     }
 
     let tracked_child_pid = token.child_pid_value();
@@ -470,6 +478,9 @@ pub(in crate::services::discord) fn bind_cancel_token_tmux_runtime(
     provider_pid
 }
 
+#[cfg(all(test, unix))]
+mod qwen_generation_tests;
+
 /// Standard turn-stop sequence: send the provider abort key (e.g. C-c) FIRST,
 /// give the CLI ~750ms to settle / send SIGINT fallback, and THEN flip the
 /// cooperative cancel flag + SIGKILL the wrapper PID.
@@ -484,6 +495,11 @@ pub(in crate::services::discord) fn bind_cancel_token_tmux_runtime(
 /// In that case the wrong order leaves the provider running and the user
 /// sees stop "fail".
 ///
+/// Qwen session destruction is different: its CLI runs in a separate process
+/// group, so interrupting the wrapper first can destroy the ancestry needed to
+/// stop that CLI and its tools. A tracked Qwen wrapper is cleaned behind the
+/// token's generation fence before any pane interrupt.
+///
 /// All user-initiated stop paths (⏳ reaction removal, `/stop`, `!stop`,
 /// `/clear`, watchdog timeouts) MUST call this helper instead of pairing
 /// the two primitives by hand.
@@ -493,6 +509,12 @@ pub(in crate::services::discord) async fn stop_active_turn(
     cleanup_policy: TmuxCleanupPolicy,
     reason: &str,
 ) -> bool {
+    if matches!(provider, ProviderKind::Qwen)
+        && cleanup_policy.should_cleanup_tmux()
+        && token.child_pid_value().is_some()
+    {
+        return cancel_active_token(token, cleanup_policy, reason);
+    }
     let interrupt_outcome = interrupt_provider_cli_turn(provider, token, reason).await;
     let termination_recorded = cancel_active_token(token, cleanup_policy, reason);
     hard_stop_unresponsive_provider_cli_turn(

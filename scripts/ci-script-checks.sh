@@ -151,6 +151,9 @@ banner "PG audit guard"
 banner "Writer namespace Windows exact-target runner fixtures (#5670)"
 "$PYTHON" -m unittest tests.test_writer_namespace_windows_targets
 
+banner "24x7 activation evidence counterexamples"
+"$PYTHON" -m unittest tests.test_activation_24x7_gate
+
 banner "Postgres migration checksum guard"
 "$PYTHON" scripts/check_postgres_migration_checksums.py
 

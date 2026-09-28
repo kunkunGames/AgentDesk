@@ -43,6 +43,8 @@ pub(super) fn execute(
         turn.pool,
         turn.provider.as_str(),
         turn.channel_id,
+        turn.working_dir,
+        turn.remote_profile.is_some(),
         Arc::clone(&turn.cancel),
     )?;
     let turn = StreamingTurn {
@@ -175,6 +177,69 @@ fn stream_json_request(turn: &StreamingTurn<'_>) -> Result<ProviderTurnRequest, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_discord_dispatch_uses_native_dialect_and_preserves_model_policy_and_attempt() {
+        let provider = ProviderKind::Grok;
+        let cancel = Arc::new(CancelToken::new());
+        let tools = vec!["Read".to_string()];
+        let session = "18b99824-ef4a-4363-8094-1b5dbf878dfc";
+        let mut turn = StreamingTurn {
+            pool: None,
+            provider: &provider,
+            prompt: "inspect the candidate",
+            session_id: Some(session),
+            working_dir: "workspace",
+            system_prompt: Some("reviewer"),
+            allowed_tools: &tools,
+            cancel: Arc::clone(&cancel),
+            remote_profile: None,
+            tmux_session_name: None,
+            channel_id: 42,
+            model: Some("operator-selected-model"),
+            native_fast_mode: None,
+            codex_goals: None,
+            compact_percent: None,
+            compact_lower_bound_tokens: 0,
+            compact_token_limit: None,
+            cache_ttl_minutes: None,
+            dispatch_type: None,
+            force_fresh: false,
+        };
+        assert!(matches!(
+            provider.legacy_streaming_dispatch_kind(),
+            LegacyDispatchKind::StreamJsonCli(crate::services::provider::StreamJsonDialectId::Grok)
+        ));
+        let request = stream_json_request(&turn).unwrap();
+        assert_eq!(request.provider, provider);
+        assert_eq!(request.model.as_deref(), Some("operator-selected-model"));
+        assert_eq!(request.session.as_ref().map(|s| s.as_str()), Some(session));
+        assert_eq!(request.system_prompt.as_deref(), Some("reviewer"));
+        assert_eq!(
+            request.tool_policy,
+            ConfiguredToolPolicy::from_legacy_allowed_tools(&tools)
+        );
+        assert!(Arc::ptr_eq(request.cancel.as_ref().unwrap(), &cancel));
+        // Exercise the selected native dialect's request boundary, not a
+        // substitute OpenCode HTTP request or a prompt-only tool declaration.
+        let argv = crate::services::stream_json_cli::dialects::grok::build_argv(&request).unwrap();
+        assert!(
+            argv.windows(2)
+                .any(|args| args == ["--model", "operator-selected-model"])
+        );
+        assert!(argv.windows(2).any(|args| args == ["--resume", session]));
+        assert!(argv.iter().any(|arg| arg == "streaming-messages-json"));
+        turn.force_fresh = true;
+        let fresh = stream_json_request(&turn).unwrap();
+        assert!(
+            fresh.session.is_none(),
+            "Grok must honor the caller's fresh-session request"
+        );
+        assert!(Arc::ptr_eq(fresh.cancel.as_ref().unwrap(), &cancel));
+        let fresh_argv =
+            crate::services::stream_json_cli::dialects::grok::build_argv(&fresh).unwrap();
+        assert!(!fresh_argv.iter().any(|arg| arg == "--resume"));
+    }
 
     #[test]
     fn agy_discord_dispatch_preserves_turn_identity_policy_and_cancellation() {

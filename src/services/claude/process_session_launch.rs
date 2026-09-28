@@ -163,11 +163,7 @@ pub(crate) fn execute_streaming_local_process(
             });
         },
         |_| {
-            let _ = sender.send(StreamMessage::Done {
-                result: "⚠ 프로세스가 종료되었습니다. 새 메시지를 보내면 새 세션이 시작됩니다."
-                    .to_string(),
-                session_id: None,
-            });
+            let _ = sender.send(StreamMessage::session_ended("Claude"));
             remove_process_session(session_name);
         },
     );

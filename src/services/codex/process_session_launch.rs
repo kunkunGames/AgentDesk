@@ -74,10 +74,7 @@ pub(super) fn execute_streaming_local_process_codex(
                 });
             },
             |_| {
-                let _ = sender.send(StreamMessage::Done {
-                    result: "⚠ 세션이 종료되었습니다.".to_string(),
-                    session_id: None,
-                });
+                let _ = sender.send(StreamMessage::session_ended("Codex"));
                 remove_process_session(session_name);
             },
         );
@@ -163,10 +160,7 @@ pub(super) fn execute_streaming_local_process_codex(
             });
         },
         |_| {
-            let _ = sender.send(StreamMessage::Done {
-                result: "⚠ 프로세스가 종료되었습니다.".to_string(),
-                session_id: None,
-            });
+            let _ = sender.send(StreamMessage::session_ended("Codex"));
             remove_process_session(session_name);
         },
     );

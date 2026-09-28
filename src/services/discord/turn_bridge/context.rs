@@ -61,7 +61,7 @@ pub(in crate::services::discord) struct TurnBridgeContext {
 mod tests {
     #[test]
     fn intake_completion_waiter_discards_typed_payload_and_only_maps_recv_error() {
-        let source = include_str!("../router/message_handler/intake_turn.rs");
+        let source = include_str!("../router/message_handler/intake_turn.rs").replace("\r\n", "\n");
         let start = source
             .find("    if let Some(rx) = completion_rx {")
             .expect("intake completion wait remains present");

@@ -507,6 +507,7 @@ pub(super) async fn run_completion_postlude(
         && (!routine_attempt_owns_turn
             || !should_suppress_headless_delivery_for_cancel(Some(&cancel_token)))
     {
+        transcript_events.push(SessionTranscriptEvent::turn_outcome(turn_outcome));
         let channel_id_text = channel_id.get().to_string();
         if let Err(e) = crate::db::session_transcripts::persist_turn_db_with_clear_fence(
             shared_owned.pg_pool.as_ref(),

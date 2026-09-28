@@ -12,6 +12,8 @@ const UNKNOWN_PROVIDER_ERROR_PREFIXES: &[&str] = &[
     "error: unknown antigravity error",
 ];
 
+pub(crate) const PROVIDER_FAILURE_GUIDANCE: &str = "provider가 응답을 완료하지 못했어요.\n같은 요청을 다시 시도해 주세요. 문제가 반복되면 `!clear`로 세션을 초기화한 뒤 다시 보내 주세요.";
+
 pub(crate) fn is_strong_provider_error_transcript(message: &str) -> bool {
     let trimmed = message.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -56,6 +58,18 @@ fn has_explicit_suffix_boundary(message: &str, prefix: &str) -> bool {
 /// work, so recognize it without matching ordinary prose that merely mentions
 /// an error or a rate limit.
 fn is_provider_error_presentation(lower: &str) -> bool {
+    // This exact envelope is emitted by our transport error presenter. Its
+    // details may describe any provider failure, including new error types.
+    if lower
+        .strip_prefix("⚠️ ")
+        .and_then(|body| body.strip_prefix(PROVIDER_FAILURE_GUIDANCE))
+        .map(str::trim)
+        .is_some_and(|detail| {
+            detail.starts_with("||**상세**\n```text\nerror: ") && detail.ends_with("\n```||")
+        })
+    {
+        return true;
+    }
     let framed = lower.contains("||") && lower.contains("```") && lower.contains("provider");
     if !framed {
         return false;

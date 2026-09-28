@@ -62,12 +62,17 @@ impl CancelToken {
     /// The registry is monotonic per session: delayed recovery/rebind callers may
     /// refresh their token-local tmux name, but cannot replace a newer turn.
     pub(crate) fn bind_claude_tmux_session(&self, tmux_session_name: &str) {
+        self.bind_owned_tmux_session(ProviderKind::Claude, tmux_session_name);
+    }
+
+    /// Bind a provider wrapper to this turn's existing generation fence.
+    pub(crate) fn bind_owned_tmux_session(&self, provider: ProviderKind, tmux_session_name: &str) {
         let tmux_session_name = tmux_session_name.trim();
         if tmux_session_name.is_empty() {
             return;
         }
         let Some(binding) = authority::publish(
-            ProviderKind::Claude,
+            provider,
             tmux_session_name,
             self.claude_interrupt_generation,
         ) else {
@@ -114,10 +119,18 @@ impl CancelToken {
         if tmux_session_name.is_empty() {
             return;
         }
-        *self
+        let mut binding = self
             .tmux_binding
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(
+            .unwrap_or_else(|error| error.into_inner());
+        // A compatibility/recovery caller must not discard ownership already
+        // published for this exact session, including an older stale generation.
+        if matches!(binding.as_ref(), Some(authority::TmuxBinding::Published { key, .. })
+            if key.name() == tmux_session_name)
+        {
+            return;
+        }
+        *binding = Some(
             super::cancel_token_cleanup::authority::TmuxBinding::NameOnly {
                 name: tmux_session_name.to_string(),
             },

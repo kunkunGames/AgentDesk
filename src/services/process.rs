@@ -1,3 +1,5 @@
+#[cfg(unix)]
+mod descendant_tree;
 pub(crate) mod stream_child;
 
 use std::process::{Command, Output};
@@ -542,6 +544,38 @@ pub(crate) fn kill_pid_tree_if_identity_matches(pid: u32, _identity: ProcessIden
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn kill_pid_tree_with_identity(pid: u32, identity: ProcessIdentity) -> bool {
+    if pid <= 1 || pid == std::process::id() {
+        return false;
+    }
+    // A waiting parent must not advance to its next command when we terminate
+    // its tool. Freeze verified owners before descendant-first cleanup; the
+    // SIGKILL escalation below also terminates stopped processes. Never resume
+    // a cancelled build helper between killing its compiler and its next push.
+    if identity.has_baseline() && identity.matches(pid) {
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+    }
+    // A native tool may start its own process group. Snapshot those descendants
+    // while the owned wrapper is still alive, before killing its parent chain.
+    let descendants = descendant_tree::capture(pid, identity);
+    for &(child_pid, child_identity) in &descendants {
+        if child_identity.matches(child_pid) {
+            unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGSTOP) };
+        }
+    }
+    for (child_pid, child_identity) in descendants.into_iter().rev() {
+        if child_identity.matches(child_pid) {
+            kill_process_group_with_identity(child_pid, child_identity);
+        }
+    }
+    if identity.has_baseline() && !identity.matches(pid) {
+        return false;
+    }
+    kill_process_group_with_identity(pid, identity)
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn kill_process_group_with_identity(pid: u32, identity: ProcessIdentity) -> bool {
     unsafe {
         let ret = libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
         let mut signalled = ret == 0;

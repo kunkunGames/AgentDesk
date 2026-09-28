@@ -106,6 +106,32 @@ class ReleasePackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "build profile"):
             verification.verify_archive(archive, head, "1.2.3", allow_dirty=True, profile="release")
 
+    def test_native_archive_remains_executable_on_non_posix_packaging_host(self):
+        # Simulate a host where chmod cannot encode execute bits, then inspect
+        # actual archive metadata consumed by tar extraction on the target host.
+        with mock.patch.object(Path, "chmod"):
+            archive = packaging.package(self.root, self.binary("darwin"),
+                                        "aarch64-apple-darwin", self.output)
+        with tarfile.open(archive) as bundle:
+            self.assertEqual(bundle.getmember("agentdesk-darwin-aarch64/agentdesk").mode, 0o755)
+            self.assertEqual(bundle.getmember("agentdesk-darwin-aarch64/scripts/queue-stability-batch.sh").mode, 0o755)
+            self.assertEqual(bundle.getmember("agentdesk-darwin-aarch64/policies/default-pipeline.yaml").mode, 0o644)
+
+    def test_publish_rejects_native_binary_without_execute_permission(self):
+        archive = packaging.package(self.root, self.binary("darwin"),
+                                    "aarch64-apple-darwin", self.output)
+        altered = archive.with_name("altered.tar.gz")
+        with tarfile.open(archive) as source, tarfile.open(altered, "w:gz") as target:
+            for member in source:
+                if member.name.endswith("/agentdesk"):
+                    member.mode = 0o644
+                target.addfile(member, source.extractfile(member) if member.isfile() else None)
+        altered.replace(archive)
+        archive.with_name(archive.name + ".sha256").write_text(f"{packaging.sha256(archive)}  {archive.name}\n")
+        with self.assertRaisesRegex(ValueError, "executable permissions"):
+            verification.verify_archive(archive, packaging.git(self.root, "rev-parse", "HEAD").strip(),
+                                        "1.2.3", allow_dirty=True)
+
     def test_dashboard_exclusion_is_explicit_and_missing_dashboard_fails(self):
         binary = self.binary("windows")
         archive = packaging.package(self.root, binary, "x86_64-pc-windows-msvc", self.output, False)

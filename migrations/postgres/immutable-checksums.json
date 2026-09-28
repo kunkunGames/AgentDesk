@@ -665,6 +665,26 @@
       "path": "migrations/postgres/0130_machine_resource_samples.sql",
       "sha256": "65a8926e026238fbabe1de241119208ff5448705b26f8c0a2308a85fa513a387",
       "version": 130
+    },
+    {
+      "path": "migrations/postgres/0131_managed_execution_lifetime.sql",
+      "sha256": "225c906e3cc19cb304f4afe4ab8841d36aa91898a7538e0085fc3f4968f10dcc",
+      "version": 131
+    },
+    {
+      "path": "migrations/postgres/0132_managed_check_completion.sql",
+      "sha256": "535c177b61f5feb6bccfd1720c36844331fe258ce22e6097e435d2462b54afe1",
+      "version": 132
+    },
+    {
+      "path": "migrations/postgres/0133_campaign_execution_guards.sql",
+      "sha256": "bac9054e4fc846cb10ee509d9956436329aaa09896985afb0d4c5db27486128a",
+      "version": 133
+    },
+    {
+      "path": "migrations/postgres/0134_campaign_operations.sql",
+      "sha256": "c3d075258cd20ec60012cde59b1169ba6cca86e91ef1a2365680039706cd1846",
+      "version": 134
     }
   ],
   "version": 1

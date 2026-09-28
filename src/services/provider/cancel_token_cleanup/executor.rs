@@ -68,7 +68,7 @@ impl CancelToken {
                     token_generation,
                     registry_generation,
                     cancel_source = request.cancel_source,
-                    "skip cancellation cleanup for stale Claude generation"
+                    "skip cancellation cleanup for stale provider generation"
                 );
                 CleanupOutcome {
                     authorization: KillAuthorizationState::Stale,

@@ -1,3 +1,4 @@
+mod campaign_execution;
 pub(crate) mod cluster;
 pub(crate) mod cluster_session_routing;
 pub(crate) mod cron_catalog;
@@ -550,6 +551,10 @@ async fn policy_tick_loop(
         };
 
         // ── 30s tier: every tick ── (#134: fire by name for dynamic hook binding)
+        if let Some(pool) = pg_pool.as_deref().or_else(|| engine.pg_pool()) {
+            test_phase_runs::checks::kick(pool.clone(), engine.clone());
+            campaign_execution::kick(pool.clone(), engine.clone());
+        }
         fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick30s", "30s").await;
 
         // ── 1min tier: every 2nd tick (60s) ──
@@ -3005,6 +3010,16 @@ async fn routine_runtime_loop(
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "routine agent turn polling failed"),
+        }
+        if let Err(error) = crate::services::routines::runtime::run_campaign_tick(
+            &store,
+            &script_loader,
+            &agent_executor,
+            &discord_logger,
+        )
+        .await
+        {
+            tracing::warn!(%error, "Campaign native operation tick held");
         }
         match run_due_tick(
             &store,

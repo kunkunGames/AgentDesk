@@ -81,6 +81,7 @@ pub(super) struct RuntimeHandoffLoopContext<'a> {
     pub(super) provider: &'a ProviderKind,
     pub(super) channel_id: ChannelId,
     pub(super) done: bool,
+    pub(super) persisted_inflight_baseline: &'a InflightTurnState,
     pub(super) adk_session_name: &'a Option<String>,
 }
 
@@ -158,7 +159,9 @@ pub(super) async fn handle_runtime_handoff_loop_message(
             terminal_control_ready_observed = true;
             let state_dirty_before_handoff = state_dirty;
             let mut tmux_ready_guarded_save_outcome;
-            let tmux_ready_baseline = inflight_state.clone();
+            // Done may first reveal a provider session ID. Compare the handoff
+            // against the last persisted state, not that dirty local update.
+            let tmux_ready_baseline = ctx.persisted_inflight_baseline.clone();
             let tmux_ready_expected =
                 crate::services::discord::inflight::InflightTurnIdentity::from_state(
                     &tmux_ready_baseline,
@@ -702,7 +705,7 @@ pub(super) async fn handle_runtime_handoff_loop_message(
                     session_name,
                     last_offset,
                 } => {
-                    let persisted_baseline = inflight_state.clone();
+                    let persisted_baseline = ctx.persisted_inflight_baseline.clone();
                     let expected_identity =
                         crate::services::discord::inflight::InflightTurnIdentity::from_state(
                             &persisted_baseline,
@@ -785,7 +788,7 @@ pub(super) async fn handle_runtime_handoff_loop_message(
             // Do NOT set tmux_handed_off: ProcessBackend has no watcher,
             // so the handoff cleanup path would delete the placeholder
             // with no one to send the final response.
-            let persisted_baseline = inflight_state.clone();
+            let persisted_baseline = ctx.persisted_inflight_baseline.clone();
             let expected_identity =
                 crate::services::discord::inflight::InflightTurnIdentity::from_state(
                     &persisted_baseline,

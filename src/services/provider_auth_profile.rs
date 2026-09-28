@@ -383,7 +383,7 @@ pub fn resolve(
     )
 }
 
-fn resolve_at(
+pub(crate) fn resolve_at(
     managed_root: &Path,
     provider: ProviderKind,
     channel_auth_profile: Option<&str>,

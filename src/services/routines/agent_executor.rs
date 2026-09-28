@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 
+#[cfg(test)]
+mod completion_pg_tests;
 mod reliability;
 use reliability::{current_attempt_started_at, provider_error_from_completion};
 use serde_json::{Map, Value, json};
@@ -34,6 +36,7 @@ pub struct RoutineAgentExecutor {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct AgentTranscriptCompletionRow {
     assistant_message: String,
+    events_json: String,
     duration_ms: Option<i64>,
     created_at: DateTime<Utc>,
 }
@@ -2099,7 +2102,10 @@ fn assistant_message_is_no_reply(message: &str) -> bool {
 fn terminal_completion_from_quality_event(
     terminal: AgentQualityCompletionRow,
 ) -> Option<AgentTurnCompletion> {
-    if !is_no_deliverable_quality_event(&terminal.event_type, terminal.outcome.as_deref()) {
+    if !is_no_deliverable_quality_event(&terminal.event_type, terminal.outcome.as_deref())
+        && !(terminal.event_type == "turn_error"
+            && reliability::is_terminal_failure(terminal.outcome.as_deref()))
+    {
         return None;
     }
     Some(AgentTurnCompletion {

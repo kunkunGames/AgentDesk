@@ -474,7 +474,9 @@ pub(crate) async fn sweep_failed_pre_accept_once(
     let target = targets
         .iter()
         .find(|node| {
-            requirements.intake_reasons(node).is_empty()
+            requirements
+                .intake_reasons(node, &source.provider)
+                .is_empty()
                 && (source.attachment_refs.as_array().is_some_and(Vec::is_empty)
                     || crate::services::cluster::attachment_transfer::supports(node))
                 && crate::services::cluster::readiness::evaluate_declared(
@@ -2124,43 +2126,40 @@ mod postgres_tests {
         .execute(&mut *capability_update)
         .await
         .expect("remove claude capability without committing"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+        let capability_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *capability_update)
+            .await
+            .expect("identify capability update transaction"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
 
         let sweep_pool = pool.clone();
         let sweep = tokio::spawn(async move {
             sweep_failed_pre_accept_once(&sweep_pool, "leader-1", 5, 60, None).await
         });
 
-        // A NOWAIT probe makes the interleaving deterministic: do not release the
-        // worker update until the sweep owns the source row and is at its re-check.
-        let mut source_locked = false;
+        // Observe the sweep waiting on the capability update without locking
+        // its source row. A FOR UPDATE NOWAIT probe can itself win that row and
+        // make the production SKIP LOCKED query select the later family instead.
+        let mut sweep_waiting = false;
         for _ in 0..200 {
-            let mut probe = pool.begin().await.expect("begin source-lock probe"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
-            let result = sqlx::query_scalar::<_, i64>(
-                "SELECT id FROM intake_outbox WHERE id=$1 FOR UPDATE NOWAIT",
+            sweep_waiting = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))",
             )
-            .bind(rotated_id)
-            .fetch_one(&mut *probe)
-            .await;
-            match result {
-                Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("55P03") => {
-                    source_locked = true;
-                    probe.rollback().await.expect("rollback blocked probe"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
-                    break;
-                }
-                Ok(_) => {
-                    probe.rollback().await.expect("release probe lock"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                Err(error) => panic!("unexpected source-lock probe error: {error}"), // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+            .bind(capability_pid)
+            .fetch_one(&pool)
+            .await
+            .expect("observe capability re-check wait"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+            if sweep_waiting || sweep.is_finished() {
+                break;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        if !source_locked {
+        if !sweep_waiting {
             capability_update
                 .rollback()
                 .await
                 .expect("release worker after failed probe"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
             let sweep_result = sweep.await.expect("join sweep after failed probe"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
-            panic!("sweep never locked source; result={sweep_result:?}"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
+            panic!("sweep never waited on the capability re-check; result={sweep_result:?}"); // agentdesk-audit: allow-unwrap — test assertion in #[cfg(test)] postgres module
         }
 
         capability_update

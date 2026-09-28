@@ -605,6 +605,7 @@ pub(super) async fn run_stream_loop(
                                     provider: &provider,
                                     channel_id,
                                     done,
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     adk_session_name: &adk_session_name,
                                 },
                                 RuntimeHandoffLoopState {
@@ -644,6 +645,7 @@ pub(super) async fn run_stream_loop(
                                     provider: &provider,
                                     channel_id,
                                     done,
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     adk_session_name: &adk_session_name,
                                 },
                                 RuntimeHandoffLoopState {
@@ -691,6 +693,7 @@ pub(super) async fn run_stream_loop(
                                     provider: &provider,
                                     channel_id,
                                     done,
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     adk_session_name: &adk_session_name,
                                 },
                                 RuntimeHandoffLoopState {
@@ -729,6 +732,7 @@ pub(super) async fn run_stream_loop(
                                     provider: &provider,
                                     channel_id,
                                     done,
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     adk_session_name: &adk_session_name,
                                 },
                                 RuntimeHandoffLoopState {

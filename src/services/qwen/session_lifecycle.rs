@@ -1,6 +1,9 @@
 //! Local Qwen process/tmux lifecycle and fresh-session recreation.
 use super::*;
 
+#[cfg(all(test, unix))]
+mod tests;
+
 #[cfg(unix)]
 pub(super) fn execute_streaming_local_tmux(
     prompt: &str,
@@ -146,13 +149,17 @@ pub(super) fn execute_streaming_local_tmux(
             exec_path.replace('\'', "'\\''")
         ));
     }
-    if let Ok(root_dir) = std::env::var("AGENTDESK_ROOT_DIR") {
-        let trimmed = root_dir.trim();
-        if !trimmed.is_empty() {
-            env_lines.push_str(&format!(
-                "export AGENTDESK_ROOT_DIR='{}'\n",
-                trimmed.replace('\'', "'\\''")
-            ));
+    // tmux may predate the service profile. Carry the selected native settings
+    // into its wrapper so per-turn tool narrowing preserves execution limits.
+    for key in ["AGENTDESK_ROOT_DIR", QWEN_CODE_SYSTEM_SETTINGS_ENV] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                env_lines.push_str(&format!(
+                    "export {key}='{}'\n",
+                    trimmed.replace('\'', "'\\''")
+                ));
+            }
         }
     }
     if let Some(channel_id) = report_channel_id {
@@ -217,6 +224,12 @@ pub(super) fn execute_streaming_local_tmux(
         tmux_session_name,
         prompt,
     );
+    if let Some(ref token) = cancel_token {
+        token.bind_owned_tmux_session(ProviderKind::Qwen, tmux_session_name);
+        if cancel_requested(Some(token)) {
+            return Err(QWEN_CANCELLED_MESSAGE.to_string());
+        }
+    }
     let tmux_result = crate::services::platform::tmux::create_session(
         tmux_session_name,
         Some(working_dir),
@@ -238,6 +251,14 @@ pub(super) fn execute_streaming_local_tmux(
         return Err(format!("tmux error: {}", stderr));
     }
 
+    // Capture the owned wrapper before any later setup can fail or block.
+    if let Some(ref token) = cancel_token {
+        if let Err(error) = bind_qwen_wrapper_pid(token, tmux_session_name) {
+            token.publish_cancel_if_source_absent("qwen_wrapper_identity_unavailable");
+            token.cancel_with_tmux_cleanup();
+            return Err(error);
+        }
+    }
     crate::services::tmux_common::write_tmux_session_auth_profile(
         tmux_session_name,
         &auth_overlay.profile_id,
@@ -246,10 +267,6 @@ pub(super) fn execute_streaming_local_tmux(
 
     // #3087: stamp the provider spawn markers before reading the session output.
     super::stamp_qwen_spawn_markers(tmux_session_name);
-
-    if let Some(ref token) = cancel_token {
-        token.bind_unmanaged_session_name(tmux_session_name);
-    }
 
     let read_result = match qwen_read_output_file_until_result(
         &output_path,
@@ -291,14 +308,22 @@ pub(super) fn execute_streaming_local_tmux(
                 tmux_session_name,
                 prompt,
             );
-            let _ = sender.send(StreamMessage::Done {
-                result: "⚠ 세션이 종료되었습니다. 새 메시지를 보내면 새 세션이 시작됩니다."
-                    .to_string(),
-                session_id: None,
-            });
+            let _ = sender.send(StreamMessage::session_ended("Qwen"));
         }
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(super) fn bind_qwen_wrapper_pid(token: &CancelToken, session: &str) -> Result<(), String> {
+    let pid = crate::services::platform::tmux::pane_pid(session)
+        .ok_or_else(|| format!("cannot capture Qwen wrapper PID for {session}"))?;
+    register_child_pid(Some(token), pid);
+    if cancel_requested(Some(token)) {
+        token.cancel_with_tmux_cleanup();
+        return Err(QWEN_CANCELLED_MESSAGE.to_string());
+    }
     Ok(())
 }
 pub(super) fn execute_streaming_local_process(
@@ -371,10 +396,7 @@ pub(super) fn execute_streaming_local_process(
                 });
             }
             ReadOutputResult::SessionDied { .. } => {
-                let _ = sender.send(StreamMessage::Done {
-                    result: "⚠ 세션이 종료되었습니다.".to_string(),
-                    session_id: None,
-                });
+                let _ = sender.send(StreamMessage::session_ended("Qwen"));
                 remove_process_session(session_name);
             }
         }
@@ -462,10 +484,7 @@ pub(super) fn execute_streaming_local_process(
             });
         }
         ReadOutputResult::SessionDied { .. } => {
-            let _ = sender.send(StreamMessage::Done {
-                result: "⚠ 프로세스가 종료되었습니다.".to_string(),
-                session_id: None,
-            });
+            let _ = sender.send(StreamMessage::session_ended("Qwen"));
             remove_process_session(session_name);
         }
     }

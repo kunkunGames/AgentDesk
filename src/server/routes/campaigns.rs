@@ -53,6 +53,41 @@ pub struct ListQuery {
     pub offset: Option<u32>,
 }
 
+fn operations_store(state: &AppState) -> AppResult<crate::services::routines::RoutineStore> {
+    Ok(
+        crate::services::routines::RoutineStore::new_with_timezone_and_checkpoint_limit(
+            std::sync::Arc::new(pool(state)?.clone()),
+            state.config.routines.default_timezone.clone(),
+            state.config.routines.max_checkpoint_bytes,
+        ),
+    )
+}
+
+pub async fn operations(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    campaigns::get(pool(&state)?, &id).await.map_err(error)?;
+    operations_store(&state)?
+        .campaign_operations(&id)
+        .await
+        .map(Json)
+        .map_err(|e| AppError::internal(format!("Campaign operations: {e}")))
+}
+
+pub async fn adopt_operation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<crate::services::routines::store::AdoptCampaignOperation>,
+) -> AppResult<Json<Value>> {
+    super::routines::ensure_routine_runtime_runnable(&state.config.routines)?;
+    operations_store(&state)?
+        .adopt_campaign_operation(&id, body)
+        .await
+        .map(Json)
+        .map_err(|e| AppError::conflict(format!("Campaign adoption held: {e}")))
+}
+
 fn pool(state: &AppState) -> AppResult<&sqlx::PgPool> {
     state.pg_pool_ref().ok_or_else(|| {
         AppError::new(

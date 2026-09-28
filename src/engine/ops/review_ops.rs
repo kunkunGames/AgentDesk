@@ -23,6 +23,26 @@ pub(super) fn register_review_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) 
     )?;
 
     let pg_entry = pg_pool.clone();
+    let pg_disposition = pg_pool.clone();
+    review_obj.set(
+        "__dispositionRaw",
+        Function::new(ctx.clone(), move |card_id: String| -> String {
+            let Some(pool) = pg_disposition.as_ref() else {
+                return json!({"error":"postgres backend is required for review.disposition"})
+                    .to_string();
+            };
+            match crate::utils::async_bridge::block_on_pg_result(
+                pool,
+                move |pool| async move {
+                    crate::server::test_phase_runs::checks::disposition(&pool, &card_id).await
+                },
+                |error| error,
+            ) {
+                Ok(disposition) => json!({"disposition":disposition}).to_string(),
+                Err(error) => json!({"error":error}).to_string(),
+            }
+        })?,
+    )?;
     review_obj.set(
         "__entryContextRaw",
         Function::new(ctx.clone(), move |card_id: String| -> String {
@@ -72,6 +92,11 @@ pub(super) fn register_review_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) 
     ctx.eval::<(), _>(
         r#"
         (function() {
+            agentdesk.review.disposition = function(cardId) {
+                var result = JSON.parse(agentdesk.review.__dispositionRaw(cardId || ""));
+                if (result.error) throw new Error(result.error);
+                return result.disposition;
+            };
             agentdesk.review.getVerdict = function(cardId) {
                 var result = JSON.parse(agentdesk.review.__getVerdictRaw(cardId || ""));
                 if (result.error) throw new Error(result.error);

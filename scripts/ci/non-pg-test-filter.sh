@@ -54,6 +54,7 @@ NON_PG_SKIP_ARGS=(
   --skip github::sync::terminal_open_alert_tests
   --skip high_risk_recovery
   --skip reconcile::dispatch_delivery_reconcile_tests
+  --skip server::campaign_execution::native_tests
   --skip server::issue_specs::issue_specs_pg_tests
   --skip server::message_outbox_retry_tests
   --skip server::multinode_regression::multinode_regression_pg_tests
@@ -70,6 +71,9 @@ NON_PG_SKIP_ARGS=(
   --skip server::routes::scheduled_messages::postgres_tests
   --skip server::routes::stats::memento_feedback_stats_pg_tests
   --skip server::task_dispatch_claims::task_dispatch_claims_pg_tests
+  --skip server::test_phase_runs::checks::native_tests
+  --skip server::test_phase_runs::checks::pg_tests
+  --skip server::test_phase_runs::lifecycle_pg_tests
   --skip services::agent_quality::regression_alerts::explicit_decode_fallback_tests
   --skip services::agent_recovery::durable::postgres_tests
   --skip services::auto_queue::cancel_run::pg_tests
@@ -87,6 +91,7 @@ NON_PG_SKIP_ARGS=(
   --skip services::auto_queue::tests
   --skip services::automation_candidate_materializer::iteration_result_tests
   --skip services::cluster::attachment_transfer::storage_tests
+  --skip services::cluster::execution_capacity::managed_tests
   --skip services::cluster::execution_capacity::tests
   --skip services::cluster::intake_preflight::tests
   --skip services::cluster::intake_router_hook::agent_execution_node_tests
@@ -139,8 +144,11 @@ NON_PG_SKIP_ARGS=(
   --skip services::observability::queries::alert_authority_tests
   --skip services::observability::recovery_audit::tests::recovery_audit_pg_tests
   --skip services::observability::turn_lifecycle::tests::turn_lifecycle_pg_tests
+  --skip services::opencode::managed_native_tests
   --skip services::pipeline_override::pipeline_override_pg_tests
   --skip services::pipeline_routes::tests
+  --skip services::routines::agent_executor::completion_pg_tests
+  --skip services::routines::store::campaign::tests
   --skip services::scheduled_messages::context_snapshot::postgres_tests
   --skip services::scheduled_messages::postgres_tests
   --skip services::session_forwarding::tests
@@ -259,6 +267,9 @@ NON_PG_FILTER_REPLAY=(
   server::routes::message_outbox::tests::redrive_contract_defaults_to_dry_run_and_denies_mass_field
   server::routes::scheduled_messages::postgres_tests::scheduled_message_bot_defaults_to_non_triggering_notify
   server::routes::scheduled_messages::postgres_tests::scheduled_push_rejects_agent_only_fields_but_allows_explicit_clears
+  server::test_phase_runs::checks::native_tests::candidate_rejects_literal_backslash_and_aliasing_filenames
+  server::test_phase_runs::checks::native_tests::deadline_reaps_a_checker_even_after_it_prints_a_passing_report
+  server::test_phase_runs::checks::native_tests::kernel_denies_candidate_mutation_network_children_and_forged_background_report
   services::agent_quality::regression_alerts::explicit_decode_fallback_tests::fails_closed_on_column_decode_error
   services::agent_quality::regression_alerts::explicit_decode_fallback_tests::fails_closed_on_other_errors
   services::agent_quality::regression_alerts::explicit_decode_fallback_tests::metric_thresholds_preserve_retired_authority_policy
@@ -277,6 +288,7 @@ NON_PG_FILTER_REPLAY=(
   services::auto_queue::tests::thread_link_view_only_builds_url_for_discord_snowflakes
   services::cluster::attachment_transfer::storage_tests::attachment_upload_reference_preserves_legacy_json_and_enforces_size_limits
   services::cluster::execution_capacity::tests::execution_capacity_ranking_uses_ratio_fairness_and_preserves_legacy_selector
+  services::cluster::execution_capacity::tests::resource_admission_preserves_remote_and_unresolved_legacy_workspaces
   services::cluster::intake_preflight::tests::claude_and_codex_emit_structured_pass_and_fail_evidence
   services::cluster::intake_preflight::tests::each_required_failure_is_independently_fail_closed
   services::cluster::intake_preflight::tests::missing_or_malformed_snapshot_fails_closed

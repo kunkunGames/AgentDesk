@@ -295,6 +295,18 @@ pub enum StreamMessage {
 }
 
 impl StreamMessage {
+    /// A dead transport without a terminal response is never successful work.
+    /// Keep every process/tmux adapter on the same typed failure path so the
+    /// bridge and routine ledger cannot accept a session notice as a result.
+    pub(crate) fn session_ended(provider: &str) -> Self {
+        Self::Error {
+            message: format!("{provider} session ended before producing a terminal response"),
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: None,
+        }
+    }
+
     pub(crate) fn redacted_thinking() -> Self {
         Self::Thinking { summary: None }
     }

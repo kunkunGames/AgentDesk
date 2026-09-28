@@ -11,6 +11,11 @@ pub(super) fn send_followup_to_tmux(
 ) -> Result<FollowupResult, String> {
     let start_offset = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
 
+    if let Some(ref token) = cancel_token {
+        token.bind_owned_tmux_session(ProviderKind::Qwen, tmux_session_name);
+        super::session_lifecycle::bind_qwen_wrapper_pid(token, tmux_session_name)?;
+    }
+
     let write_result = std::fs::OpenOptions::new()
         .write(true)
         .open(input_fifo_path)
@@ -40,10 +45,6 @@ pub(super) fn send_followup_to_tmux(
         tmux_session_name,
         prompt,
     );
-
-    if let Some(ref token) = cancel_token {
-        token.bind_unmanaged_session_name(tmux_session_name);
-    }
 
     let read_result = match qwen_read_output_file_until_result_tracked(
         output_path,

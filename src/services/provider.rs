@@ -250,14 +250,19 @@ impl ProviderKind {
     }
 
     pub(crate) fn legacy_streaming_dispatch_kind(&self) -> LegacyDispatchKind {
-        match self {
-            Self::Claude => LegacyDispatchKind::Claude,
-            Self::Codex => LegacyDispatchKind::Codex,
-            Self::Gemini => LegacyDispatchKind::Gemini,
-            Self::OpenCode | Self::Grok => LegacyDispatchKind::OpenCode,
-            Self::Qwen => LegacyDispatchKind::Qwen,
-            Self::Antigravity => LegacyDispatchKind::StreamJsonCli(StreamJsonDialectId::Agy),
-            Self::Unsupported(name) => LegacyDispatchKind::Unsupported(name.clone()),
+        // Human intake and headless execution use the same registry as one-shot
+        // dispatch. Grok previously took a detour through the OpenCode facade,
+        // which delegated to Grok again but lost the caller's fresh-session flag.
+        match self.execution_adapter() {
+            Some(ProviderExecutionAdapter::Claude) => LegacyDispatchKind::Claude,
+            Some(ProviderExecutionAdapter::Codex) => LegacyDispatchKind::Codex,
+            Some(ProviderExecutionAdapter::Gemini) => LegacyDispatchKind::Gemini,
+            Some(ProviderExecutionAdapter::OpenCode) => LegacyDispatchKind::OpenCode,
+            Some(ProviderExecutionAdapter::Qwen) => LegacyDispatchKind::Qwen,
+            Some(ProviderExecutionAdapter::StreamJsonCli(dialect)) => {
+                LegacyDispatchKind::StreamJsonCli(dialect)
+            }
+            None => LegacyDispatchKind::Unsupported(self.as_str().to_string()),
         }
     }
 
@@ -685,6 +690,11 @@ impl CancelSource {
 /// Cooperative cancellation token shared by provider runtimes and Discord orchestration.
 pub struct CancelToken {
     pub cancelled: AtomicBool,
+    /// Bound once by the existing execution lease owner before provider entry.
+    /// A new native session on the same attempt cannot reset these limits.
+    pub(crate) managed_execution: std::sync::OnceLock<
+        std::sync::Arc<crate::services::cluster::execution_capacity::ManagedAttempt>,
+    >,
     child_pid: Mutex<Option<CapturedProcess>>,
     cancel_source: Mutex<Option<String>>,
     cancel_source_kind: Mutex<Option<CancelSource>>,
@@ -735,6 +745,7 @@ impl CancelToken {
 
         Self {
             cancelled: AtomicBool::new(false),
+            managed_execution: std::sync::OnceLock::new(),
             child_pid: Mutex::new(None),
             cancel_source: Mutex::new(None),
             cancel_source_kind: Mutex::new(None),
@@ -971,7 +982,18 @@ impl CancelToken {
 }
 
 pub fn cancel_requested(token: Option<&CancelToken>) -> bool {
-    token.is_some_and(|token| token.cancelled.load(Ordering::Relaxed))
+    token.is_some_and(|token| {
+        if !token.cancelled.load(Ordering::Acquire)
+            && !token.is_completion_cleanup()
+            && token
+                .managed_execution
+                .get()
+                .is_some_and(|attempt| attempt.is_expired())
+        {
+            token.publish_cancel_if_source_absent("managed_attempt_watchdog_timeout");
+        }
+        token.cancelled.load(Ordering::Acquire)
+    })
 }
 
 pub fn register_child_pid(token: Option<&CancelToken>, child_pid: u32) {
@@ -1926,6 +1948,17 @@ mod poll_output_file_tests {
         .unwrap();
 
         assert_eq!(result, ReadOutputResult::SessionDied { offset: 12 });
+        // A real transport disappearing before its first result must reach
+        // the bridge as a failure, never as a successful session notice.
+        let terminal = super::fold_read_output_result(
+            result,
+            |_| panic!("dead transport cannot be ready"),
+            |_| crate::services::agent_protocol::StreamMessage::session_ended("Qwen"),
+        );
+        assert!(matches!(
+            terminal,
+            crate::services::agent_protocol::StreamMessage::Error { .. }
+        ));
     }
 
     #[test]

@@ -673,6 +673,13 @@ async fn create_dispatch_core_internal(
     };
     let mut context_with_session_strategy =
         dispatch_context_with_session_strategy(dispatch_type, context);
+    crate::services::managed_checks::bind_campaign_dispatch(
+        pg_pool,
+        kanban_card_id,
+        to_agent_id,
+        &mut context_with_session_strategy,
+    )
+    .await?;
     let sandbox_preflight_without_external_side_effects =
         sandbox_preflight_card_disables_external_side_effects(pg_pool, kanban_card_id).await;
     let target_repo = resolve_card_target_repo_ref(

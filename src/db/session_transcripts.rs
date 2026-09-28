@@ -61,6 +61,33 @@ pub struct SessionTranscriptEvent {
     pub is_error: bool,
 }
 
+impl SessionTranscriptEvent {
+    /// Persist the bridge's final decision atomically with its transcript.
+    /// The asynchronous analytics queue is not completion authority.
+    pub(crate) fn turn_outcome(outcome: &str) -> Self {
+        Self {
+            kind: SessionTranscriptEventKind::Result,
+            tool_name: None,
+            summary: Some("agentdesk.turn_outcome.v1".into()),
+            content: String::new(),
+            status: Some(outcome.into()),
+            is_error: false,
+        }
+    }
+
+    pub(crate) fn recorded_turn_outcome(events: &[Self]) -> Option<&str> {
+        events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.kind == SessionTranscriptEventKind::Result
+                    && event.summary.as_deref() == Some("agentdesk.turn_outcome.v1")
+                    && event.tool_name.is_none()
+            })
+            .and_then(|event| event.status.as_deref())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PersistSessionTranscript<'a> {
     pub turn_id: &'a str,

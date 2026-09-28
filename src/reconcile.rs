@@ -1424,6 +1424,7 @@ async fn missing_review_dispatch_candidates_pg(
         "SELECT c.id, c.status, c.repo_id, c.assigned_agent_id
          FROM kanban_cards c
          WHERE c.status NOT IN ('done', 'backlog', 'ready')
+           AND agentdesk_check_disposition(c) IN ('unmanaged','run_local_review')
            AND NOT EXISTS (
                SELECT 1 FROM task_dispatches td
                WHERE td.kanban_card_id = c.id

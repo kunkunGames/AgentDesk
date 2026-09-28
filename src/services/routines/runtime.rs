@@ -110,6 +110,35 @@ pub async fn run_due_tick(
     Ok(outcomes)
 }
 
+/// Recurring Campaigns own admission. Reuse the native script/CLI lifecycle,
+/// including its durable runs, typed completion, timeout and crash recovery.
+pub async fn run_campaign_tick(
+    store: &RoutineStore,
+    loader: &RoutineScriptLoader,
+    agent_executor: &RoutineAgentExecutor,
+    discord_logger: &RoutineDiscordLogger,
+) -> Result<()> {
+    store.reconcile_campaign_operations().await?;
+    let Some(run) = store.claim_campaign_operation().await? else {
+        return Ok(());
+    };
+    discord_logger.log_run_started(store, &run).await;
+    if let Some(outcome) = execute_claimed_script_run(
+        store,
+        loader,
+        Some(agent_executor),
+        Some(discord_logger),
+        run,
+        true,
+    )
+    .await?
+    {
+        discord_logger.log_run_outcome(store, &outcome).await;
+    }
+    store.reconcile_campaign_operations().await?;
+    Ok(())
+}
+
 fn validate_claimed_migrated_launchd_run(
     loader: &RoutineScriptLoader,
     claimed: &ClaimedRoutineRun,

@@ -9,6 +9,9 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 
 use crate::services::tmux_wrapper::{InputMode, render_for_terminal};
 
+#[cfg(all(test, unix))]
+mod retry_tests;
+
 const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
 
 #[derive(Debug, Default)]
@@ -401,7 +404,10 @@ fn run_turn_once(
                 let _ = finish_reader(&stderr_handle);
                 return Err(TurnFailure {
                     message,
-                    retryable: true,
+                    retryable: crate::services::qwen::can_retry_session(
+                        state.meaningful_progress_seen,
+                        saw_result,
+                    ),
                 });
             }
             Ok(TurnReadEvent::Eof) | Err(RecvTimeoutError::Disconnected) => break,
@@ -415,7 +421,10 @@ fn run_turn_once(
                         let _ = finish_reader(&stderr_handle);
                         return Err(TurnFailure {
                             message,
-                            retryable: true,
+                            retryable: crate::services::qwen::can_retry_session(
+                                state.meaningful_progress_seen,
+                                saw_result,
+                            ),
                         });
                     }
                 }
@@ -435,7 +444,10 @@ fn run_turn_once(
         let message = derive_wrapper_error_message(&stderr, status.code());
         return Err(TurnFailure {
             message,
-            retryable: true,
+            retryable: crate::services::qwen::can_retry_session(
+                state.meaningful_progress_seen,
+                saw_result,
+            ),
         });
     }
 
@@ -447,7 +459,10 @@ fn run_turn_once(
         };
         return Err(TurnFailure {
             message,
-            retryable: true,
+            retryable: crate::services::qwen::can_retry_session(
+                state.meaningful_progress_seen,
+                saw_result,
+            ),
         });
     }
 

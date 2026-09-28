@@ -27,6 +27,8 @@ pub struct StreamLineState {
     /// terminal result event.
     pub saw_per_message_usage: bool,
     pub final_result: Option<String>,
+    /// A failed terminal result ends a warm wrapper turn without a success frame.
+    pub terminal_error: bool,
     pub stdout_error: Option<(String, String)>,
     pub tool_use_names: HashMap<String, String>,
     pub task_starts: HashMap<String, TaskStartInfo>,
@@ -39,6 +41,10 @@ pub struct StreamLineState {
 impl StreamLineState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn has_terminal_result(&self) -> bool {
+        self.final_result.is_some() || self.terminal_error
     }
 }
 
@@ -184,7 +190,14 @@ pub fn process_stream_line(
         }
         StreamMessage::Error { message, .. } => {
             state.stdout_error = Some((message.clone(), line.to_string()));
-            return true;
+            if msg_type == "result" {
+                // A persistent wrapper remains alive after a terminal failure.
+                // Deliver it now; waiting for process death can synthesize a
+                // false success at idle or hold the routine until its timeout.
+                state.terminal_error = true;
+            } else {
+                return true;
+            }
         }
         _ => {}
     }

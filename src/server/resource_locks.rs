@@ -51,6 +51,18 @@ pub async fn acquire_resource_lock(
     pool: &PgPool,
     request: &ResourceLockRequest,
 ) -> Result<ResourceLockAcquireOutcome, String> {
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(|error| format!("acquire resource lock connection: {error}"))?;
+    acquire_resource_lock_on(&mut connection, request).await
+}
+
+/// Reuse the same lock primitive inside a caller-owned transaction.
+pub(crate) async fn acquire_resource_lock_on(
+    connection: &mut sqlx::PgConnection,
+    request: &ResourceLockRequest,
+) -> Result<ResourceLockAcquireOutcome, String> {
     validate_request(request)?;
     let ttl_secs = normalized_ttl_secs(request.ttl_secs);
     let metadata = request.metadata.clone().unwrap_or_else(|| json!({}));
@@ -83,7 +95,7 @@ pub async fn acquire_resource_lock(
     .bind(request.holder_job_id.trim())
     .bind(metadata)
     .bind(ttl_secs)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await
     .map_err(|error| format!("acquire resource lock {}: {error}", request.lock_key))?;
 
@@ -98,7 +110,7 @@ pub async fn acquire_resource_lock(
     Ok(ResourceLockAcquireOutcome {
         acquired: false,
         lock: None,
-        current: get_resource_lock(pool, request.lock_key.trim()).await?,
+        current: get_resource_lock_on(&mut *connection, request.lock_key.trim()).await?,
     })
 }
 
@@ -192,6 +204,13 @@ pub async fn get_resource_lock(
     pool: &PgPool,
     lock_key: &str,
 ) -> Result<Option<ResourceLock>, String> {
+    get_resource_lock_on(pool, lock_key).await
+}
+
+pub(crate) async fn get_resource_lock_on<'a>(
+    executor: impl sqlx::Executor<'a, Database = sqlx::Postgres>,
+    lock_key: &str,
+) -> Result<Option<ResourceLock>, String> {
     let row = sqlx::query(
         "SELECT lock_key, holder_instance_id, holder_job_id, metadata,
                 expires_at, heartbeat_at, created_at, updated_at
@@ -199,7 +218,7 @@ pub async fn get_resource_lock(
           WHERE lock_key = $1",
     )
     .bind(lock_key)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
     .map_err(|error| format!("get resource lock {lock_key}: {error}"))?;
     row.map(lock_from_row).transpose()

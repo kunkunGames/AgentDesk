@@ -1842,7 +1842,7 @@ fn execute_streaming_local_tui_tmux(
     wire_cancel_token_to_tmux_session(cancel_token.as_ref(), tmux_session_name);
 
     // #2172 cancel boundary: keep a clone of the cancel token so that
-    // post-tail emission (RuntimeReady / SessionDied Done) and the
+    // post-tail emission (RuntimeReady / SessionDied Error) and the
     // tail-error tmux-cleanup branch can BOTH consult `cancel_requested`
     // without re-acquiring it. The tail call itself moves its clone into
     // the rollout-tail thread; this clone stays in the launch frame.
@@ -1970,7 +1970,7 @@ fn resolve_codex_tui_tail_result(
 }
 
 /// Post-tail StreamMessage emission for the Codex Direct TUI launch: handles
-/// the cancel-suppression guards, the SessionDied failure `Done`, the idle
+/// the cancel-suppression guards, the SessionDied failure `Error`, the idle
 /// relay binding, and the gated RuntimeReady handoff (with its readiness /
 /// session-death / timeout outcomes). Always returns `Ok(())`; early returns
 /// stand in for the orchestrator's post-cancel suppression paths.
@@ -1987,7 +1987,7 @@ pub(crate) fn emit_codex_tui_post_tail_handoff(
     let read_result = tail_result.read_result.clone();
     // #2172 cancel boundary: relay suppression is enforced at every
     // Direct TUI StreamMessage producer, not just rollout_tail. The
-    // post-tail SessionDied Done and the RuntimeReady handoff frame
+    // post-tail SessionDied Error and the RuntimeReady handoff frame
     // must also drop on the floor when the user has cancelled — a
     // cancelled turn must not deliver any further frame to the bridge.
     // ReadOutputResult::Cancelled is handled explicitly: it never
@@ -2018,10 +2018,7 @@ pub(crate) fn emit_codex_tui_post_tail_handoff(
             "codex tui session ended before producing a response",
             Some(offset),
         );
-        let _ = sender.send(StreamMessage::Done {
-            result: "⚠ Codex TUI session ended before producing a response.".to_string(),
-            session_id: None,
-        });
+        let _ = sender.send(StreamMessage::session_ended("Codex TUI"));
     } else {
         // The Discord turn bridge only needs RuntimeReady when the TUI is
         // actually ready for another routed turn. The idle SSH-direct relay is
@@ -2045,14 +2042,13 @@ pub(crate) fn emit_codex_tui_post_tail_handoff(
         // the time we get here, so the bridge has started its
         // `terminal_control_drain_until` window (250ms) before it
         // finalises the inflight. The readiness wait MUST fit inside
-        // that window or our `RuntimeReady` / failure `Done` will be
+        // that window or our `RuntimeReady` handoff will be
         // dropped after the bridge has already cleared inflight state.
         // We use `PromptReadinessKind::PostTurnHandoff` (200ms budget)
         // and split outcomes:
         //   - Ready → emit RuntimeReady (handoff preserved).
-        //   - Session dead → emit failure Done; tmux death is
-        //     observable synchronously so the verdict reaches the
-        //     bridge inside the drain window.
+        //   - Session dead → keep the completed response but do not
+        //     publish a reusable handoff.
         //   - Composer not yet redrawn within the probe budget → emit
         //     RuntimeReady anyway with a tracing warning. The
         //     assistant response has already shipped via the tail
@@ -2091,8 +2087,8 @@ pub(crate) fn emit_codex_tui_post_tail_handoff(
             Err(error) if crate::services::codex_tui::input::is_session_dead_error(&error) => {
                 // Session death is detected synchronously by the tmux
                 // pane-alive check, so this verdict reaches the bridge
-                // inside its drain window. Skip RuntimeReady and surface
-                // a failure Done.
+                // inside its drain window. Skip RuntimeReady while preserving
+                // the already completed response.
                 tracing::warn!(
                     tmux_session = tmux_session_name,
                     error = %error,
@@ -2105,10 +2101,8 @@ pub(crate) fn emit_codex_tui_post_tail_handoff(
                     "codex tui session ended before becoming input-ready",
                     Some(tail_result.final_offset),
                 );
-                let _ = sender.send(StreamMessage::Done {
-                    result: "⚠ Codex TUI session ended before becoming input-ready.".to_string(),
-                    session_id: tail_result.session_id.clone(),
-                });
+                // The tail already delivered a genuine terminal response.
+                // Preserve that outcome; only the reusable handoff is lost.
             }
             Err(error) => {
                 // #2399 HIGH 2: composer did not redraw within the 200ms
@@ -2404,11 +2398,7 @@ fn execute_streaming_local_tmux(
                 "codex tmux session ended before turn completion",
                 Some(offset),
             );
-            let _ = sender.send(StreamMessage::Done {
-                result: "⚠ 세션이 종료되었습니다. 새 메시지를 보내면 새 세션이 시작됩니다."
-                    .to_string(),
-                session_id: None,
-            });
+            let _ = sender.send(StreamMessage::session_ended("Codex"));
         }
     }
 

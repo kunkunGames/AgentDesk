@@ -274,10 +274,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn accepted_stream_runs_past_virtual_day_until_real_eof() {
-        struct Codec(usize);
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Codec(usize, Arc<AtomicBool>);
         impl StreamJsonCodec for Codec {
             fn push_stdout_line(&mut self, _: &str) -> Result<Vec<StreamMessage>, String> {
                 self.0 += 1;
+                self.1.store(true, Ordering::Release);
                 Ok(vec![])
             }
             fn finish(&mut self, code: Option<i32>, _: &str) -> Result<Vec<StreamMessage>, String> {
@@ -290,6 +295,7 @@ mod tests {
             }
         }
         let dir = tempfile::tempdir().unwrap();
+        let accepted = Arc::new(AtomicBool::new(false));
         let prepared = PreparedCommand {
             executable: "/bin/sh".into(),
             resolution: BinaryResolution {
@@ -306,20 +312,27 @@ mod tests {
             current_dir: dir.path().into(),
             env: vec![],
             unset_env: vec![],
-            codec: Box::new(Codec(0)),
+            codec: Box::new(Codec(0, accepted.clone())),
         };
         let (tx, _rx) = mpsc::channel();
         let start = Instant::now();
-        let mut ticks = 0;
+        let mut advanced_after_acceptance = false;
         let result = run_prepared_with_clock(prepared, tx, Duration::ZERO, None, || {
-            ticks += 1;
-            start + Duration::from_secs(if ticks > 2 { 24 * 3600 } else { 0 })
+            // Poll counts depend on reader-thread scheduling. Advance only
+            // after the codec has received actual protocol progress; otherwise
+            // a slow spawn incorrectly exercises the startup-timeout path.
+            if accepted.load(Ordering::Acquire) {
+                advanced_after_acceptance = true;
+                start + Duration::from_secs(24 * 3600)
+            } else {
+                Instant::now()
+            }
         });
         assert!(
             result.is_ok(),
             "accepted provider was terminated: {result:?}"
         );
-        assert!(ticks >= 4);
+        assert!(advanced_after_acceptance);
     }
 
     use super::*;

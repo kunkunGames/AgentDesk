@@ -2,6 +2,32 @@ use super::*;
 use crate::db::auto_queue::test_support::TestPostgresDb;
 use crate::db::intake_outbox::{InsertPendingPayload, insert_pending};
 
+#[test]
+fn resource_admission_preserves_remote_and_unresolved_legacy_workspaces() {
+    let workspace = tempfile::tempdir().unwrap();
+    let local = workspace.path().to_str().unwrap();
+    let missing = workspace.path().join("not-created");
+    let missing = missing.to_str().unwrap();
+    let canonical = std::fs::canonicalize(local)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        admission::resource(local, false, true).unwrap(),
+        Some(canonical)
+    );
+    // An identical local path must not be mistaken for the remote resource.
+    assert!(admission::resource(local, true, false).unwrap().is_none());
+    assert!(admission::resource(missing, true, false).unwrap().is_none());
+    assert!(
+        admission::resource(missing, false, false)
+            .unwrap()
+            .is_none()
+    );
+    assert!(admission::resource(local, true, true).is_err());
+    assert!(admission::resource(missing, false, true).is_err());
+}
+
 fn payload(node: &str, channel: &str) -> InsertPendingPayload {
     InsertPendingPayload {
         execution_requirements: json!({}),
@@ -141,6 +167,7 @@ async fn execution_capacity_atomic_reservations_execution_and_fenced_expiry_pg()
                 "guard".into(),
                 cancel,
                 semaphore.try_acquire_owned().unwrap(),
+                None,
             )
         }
     })
@@ -177,6 +204,7 @@ async fn execution_capacity_atomic_reservations_execution_and_fenced_expiry_pg()
                 "guard".into(),
                 Arc::new(CancelToken::new()),
                 semaphore.try_acquire_owned().unwrap(),
+                None,
             )
             .unwrap();
             drop(guard);
@@ -220,4 +248,87 @@ fn execution_capacity_ranking_uses_ratio_fairness_and_preserves_legacy_selector(
         tied[0]["instance_id"], "z",
         "never assigned wins a utilization tie"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn execution_lease_survives_pool_timeout_but_cancels_on_lost_ownership_pg() {
+    let fixture = TestPostgresDb::create().await;
+    let pool = fixture.connect_and_migrate_with_max_connections(1).await;
+    sqlx::query("INSERT INTO worker_nodes(instance_id,last_heartbeat_at,capabilities) VALUES('renewal-node',NOW(),$1)")
+        .bind(json!({"execution_capacity":{"version":1,"slots":1}}))
+        .execute(&pool).await.unwrap();
+    let cancel = Arc::new(CancelToken::new());
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let worker_pool = pool.clone();
+    let worker_cancel = cancel.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let guard = acquire_guard(
+            worker_pool,
+            "renewal-node".into(),
+            "qwen".into(),
+            "pool-pressure".into(),
+            worker_cancel,
+            permit,
+            None,
+        )
+        .unwrap();
+        ready_tx.send(()).unwrap();
+        // Dropping the sender on an assertion failure also releases the guard.
+        let _ = stop_rx.recv();
+        drop(guard);
+    });
+    ready_rx.await.unwrap();
+    let original: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT expires_at FROM node_execution_leases WHERE instance_id='renewal-node'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let held_connection = pool.acquire().await.unwrap();
+    // Renewal starts at 10 s; holding the only connection beyond its 5 s I/O
+    // timeout reproduces transient pool pressure without expiring the 30 s lease.
+    tokio::time::sleep(LEASE_RENEW_INTERVAL + LEASE_IO_TIMEOUT + Duration::from_secs(2)).await;
+    assert!(
+        !cancel.cancelled.load(std::sync::atomic::Ordering::Acquire),
+        "one transport timeout must not cancel a still-valid lease"
+    );
+    drop(held_connection);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let renewed: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+                "SELECT expires_at FROM node_execution_leases WHERE instance_id='renewal-node'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if renewed > original {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("lease must renew after the connection becomes available");
+    assert!(!cancel.cancelled.load(std::sync::atomic::Ordering::Acquire));
+    sqlx::query("DELETE FROM node_execution_leases WHERE instance_id='renewal-node'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    tokio::time::timeout(LEASE_RENEW_INTERVAL + Duration::from_secs(5), async {
+        while !cancel.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("definitive ownership loss must still cancel immediately on renewal");
+    assert_eq!(
+        cancel.cancel_source().as_deref(),
+        Some("execution_lease_lost")
+    );
+    drop(stop_tx);
+    worker.await.unwrap();
+    pool.close().await;
+    fixture.drop().await;
 }

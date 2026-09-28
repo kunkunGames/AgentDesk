@@ -244,6 +244,9 @@ function createAgentdeskMock(options) {
       }
     },
     review: {
+      disposition(cardId) {
+        return (options.reviewDispositions || {})[cardId] || "unmanaged";
+      },
       entryContext(cardId) {
         if (typeof settings.reviewEntryContext === "function") {
           return settings.reviewEntryContext(cardId, state);
