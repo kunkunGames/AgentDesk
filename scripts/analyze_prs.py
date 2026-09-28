@@ -156,6 +156,16 @@ def has_docs_only_verification_ack(body):
         ],
     )
 
+def has_verification_constraints_ack(body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*verification constraints:\*\*", body):
+        return True
+    return has_non_empty_body_field(
+        body,
+        [
+            "verification constraints",
+        ],
+    )
+
 def has_overlap_reference(body):
     pr_ref = re.compile(r"(?i)(?:#[0-9]+|github\.com/[^/\s]+/[^/\s]+/pull/[0-9]+)")
     overlap_context = re.compile(r"(?i)\b(?:overlaps?|overlapping|duplicates?|supersed(?:e|ed|es|ing)?|replaces?|same scope)\b")
@@ -306,6 +316,8 @@ def main():
         if "docs-only" in normalized_body or "docs only" in normalized_body:
             if not has_docs_only_verification_ack(body):
                 print("  [!] MISSING DOCS-ONLY VERIFICATION CHECK: PR body claims docs-only but lacks a completed docs-only verification acknowledgement.")
+        if not has_verification_constraints_ack(body):
+            print("  [!] MISSING VERIFICATION CONSTRAINTS CHECK: PR body lacks a completed verification constraints acknowledgement.")
         if not has_non_empty_body_field(body, ["verification commands and results", "verification"]):
             print("  [!] MISSING VERIFICATION: PR body lacks the required 'verification' commands and results.")
         if not has_non_empty_body_field(
