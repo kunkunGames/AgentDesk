@@ -417,6 +417,8 @@ src/
 │   │   ├── termination_events.rs
 │   │   ├── turn_lease.rs
 │   │   ├── v1.rs
+│   │   ├── voice_audio.rs
+│   │   ├── voice_conductor.rs
 │   │   └── voice_config.rs
 │   ├── web_surface/
 │   │   └── tests.rs
@@ -663,10 +665,12 @@ src/
 │   │   ├── catch_up/
 │   │   │   ├── absorbed_active_tests.rs
 │   │   │   ├── api.rs
+│   │   │   ├── claim_cas_tests.rs
 │   │   │   ├── classification.rs
 │   │   │   ├── classification_order_tests.rs
 │   │   │   ├── frontier_evidence.rs
 │   │   │   ├── frontier_sweep_tests.rs
+│   │   │   ├── merged_alias_tests.rs
 │   │   │   ├── phase2.rs
 │   │   │   ├── retry_state.rs
 │   │   │   ├── settled_frontier.rs
@@ -733,6 +737,8 @@ src/
 │   │   │   ├── reachability/
 │   │   │   │   ├── composite.rs
 │   │   │   │   ├── composite_tests.rs
+│   │   │   │   ├── coverage.rs
+│   │   │   │   ├── coverage_tests.rs
 │   │   │   │   ├── discovery.rs
 │   │   │   │   ├── divergence.rs
 │   │   │   │   ├── external_verdict.rs
@@ -796,10 +802,14 @@ src/
 │   │   │   │   ├── identity.rs
 │   │   │   │   ├── serde_adapters.rs
 │   │   │   │   └── turn_kinds.rs
+│   │   │   ├── rebind_reap/
+│   │   │   │   └── tests.rs
 │   │   │   ├── removal/
 │   │   │   │   ├── boot_custody.rs
 │   │   │   │   ├── boot_custody_tests.rs
-│   │   │   │   └── boot_reaper.rs
+│   │   │   │   ├── boot_reaper.rs
+│   │   │   │   ├── custody_notice.rs
+│   │   │   │   └── custody_notice_tests.rs
 │   │   │   ├── save_store/
 │   │   │   │   ├── identity_gate/
 │   │   │   │   │   ├── runtime_stamp/
@@ -942,6 +952,7 @@ src/
 │   │   ├── queue_io/
 │   │   │   ├── transport/
 │   │   │   │   └── tests.rs
+│   │   │   ├── ledger_settlement_tests.rs
 │   │   │   ├── transport.rs
 │   │   │   ├── turn_admission.rs
 │   │   │   └── turn_admission_tests.rs
@@ -1180,6 +1191,8 @@ src/
 │   │   │   ├── monitor_auto_turn_inflight_tests.rs
 │   │   │   └── task_notification_kind_restart_roundtrip_tests.rs
 │   │   ├── tmux_output_stream/
+│   │   │   ├── tests/
+│   │   │   │   └── compact_summary_tests.rs
 │   │   │   ├── native_codex.rs
 │   │   │   └── provider_output_guard_tests.rs
 │   │   ├── tmux_placeholder_suppression/
@@ -1196,6 +1209,8 @@ src/
 │   │   │   │   ├── backstop_tests.rs
 │   │   │   │   └── idle_gate.rs
 │   │   │   ├── loop_poll_prologue/
+│   │   │   │   ├── post_terminal_disposal_tests/
+│   │   │   │   │   └── compact_summary_tests.rs
 │   │   │   │   ├── post_terminal_disposal_tests.rs
 │   │   │   │   └── watcher_resume.rs
 │   │   │   ├── streaming_status_tick/
@@ -1282,6 +1297,9 @@ src/
 │   │   │   ├── tombstone.rs
 │   │   │   └── warning_tests.rs
 │   │   ├── tui_direct_pending_start/
+│   │   │   ├── tests/
+│   │   │   │   └── retire_tests.rs
+│   │   │   ├── restore_gate.rs
 │   │   │   ├── state.rs
 │   │   │   ├── tests.rs
 │   │   │   └── watcher_cancel.rs
@@ -1298,7 +1316,9 @@ src/
 │   │   │   │   ├── claim.rs
 │   │   │   │   └── stale_reclaim.rs
 │   │   │   ├── tests/
+│   │   │   │   ├── compact_summary_tests.rs
 │   │   │   │   ├── fenced_admission_tests.rs
+│   │   │   │   ├── retired_pending_start_claim_tests.rs
 │   │   │   │   ├── scenario_census_e2e.rs
 │   │   │   │   ├── synthetic_bridge_handoff_pg_tests.rs
 │   │   │   │   └── synthetic_terminal_ordering_tests.rs
@@ -1651,6 +1671,8 @@ src/
 │   │   ├── voice_routing.rs
 │   │   ├── voice_sensitivity.rs
 │   │   └── zombie_foreground_release.rs
+│   ├── discord_custody/
+│   │   └── tests.rs
 │   ├── dispatch_gate/
 │   │   ├── auth_profiles/
 │   │   │   └── selection_tests.rs
@@ -1904,6 +1926,7 @@ src/
 │   │   ├── registry_purge/
 │   │   │   └── closed_gate_tests.rs
 │   │   ├── active_source_dedup.rs
+│   │   ├── claim_observation.rs
 │   │   ├── clear_channel.rs
 │   │   ├── closed_verdict.rs
 │   │   ├── dispatch_cleanup.rs
@@ -1918,6 +1941,7 @@ src/
 │   │   ├── overflow.rs
 │   │   ├── pending_queue_persistence.rs
 │   │   ├── queue_cancellation.rs
+│   │   ├── queue_enqueue.rs
 │   │   ├── recovery_kickoff.rs
 │   │   ├── recovery_kickoff_tests.rs
 │   │   ├── registry_purge.rs
@@ -1947,6 +1971,7 @@ src/
 │   ├── codex_tmux_wrapper.rs
 │   ├── cswap.rs
 │   ├── discord_config_audit.rs
+│   ├── discord_custody.rs
 │   ├── discord_dm_reply_store.rs
 │   ├── disk_monitor.rs
 │   ├── dispatch_gate.rs
@@ -2026,6 +2051,7 @@ src/
 │   ├── turn_cancel_queue_guard.rs
 │   ├── turn_lifecycle.rs
 │   ├── turn_orchestrator.rs
+│   ├── voice_conductor.rs
 │   └── writer_protocol.rs
 ├── supervisor/
 │   └── mod.rs
@@ -2064,6 +2090,7 @@ src/
 │   ├── flight.rs
 │   ├── metrics.rs
 │   ├── mod.rs
+│   ├── openai_compat.rs
 │   ├── progress.rs
 │   ├── prompt.rs
 │   ├── receiver.rs
