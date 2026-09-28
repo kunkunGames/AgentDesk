@@ -123,6 +123,17 @@ def has_stale_branch_cleanup_ack(body):
         ],
     )
 
+def has_pr_size_ack(body):
+    if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*pr size:\*\*", body):
+        return True
+    return has_non_empty_body_field(
+        body,
+        [
+            "pr size",
+            "pr-size",
+        ],
+    )
+
 def has_scratch_file_cleanup_ack(body):
     if re.search(r"(?im)^[ \t]*[-*][ \t]*\[[xX]\][ \t]*\*\*scratch file cleanup:\*\*", body):
         return True
@@ -290,6 +301,8 @@ def main():
             print("  [!] MISSING OVERLAP CHECK: PR body lacks a completed duplicate/overlap guard acknowledgement.")
         if not has_scratch_file_cleanup_ack(body):
             print("  [!] MISSING SCRATCH FILE CLEANUP CHECK: PR body lacks a completed scratch file cleanup acknowledgement.")
+        if not has_pr_size_ack(body):
+            print("  [!] MISSING PR SIZE CHECK: PR body lacks a completed PR size acknowledgement.")
         if "docs-only" in normalized_body or "docs only" in normalized_body:
             if not has_docs_only_verification_ack(body):
                 print("  [!] MISSING DOCS-ONLY VERIFICATION CHECK: PR body claims docs-only but lacks a completed docs-only verification acknowledgement.")
