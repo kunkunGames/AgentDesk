@@ -50,6 +50,7 @@ async fn worker_profile_routes_preserve_execution_auth_and_remove_admin_methods(
             ("GET", "/sessions/example/tmux-output"),
             ("POST", "/sessions/example/force-kill"),
             ("POST", "/turns/123/cancel"),
+            ("POST", "/hook/reset-status"),
             ("GET", "/channels/123/watcher-state"),
         ] {
             assert_eq!(
@@ -75,7 +76,6 @@ async fn worker_profile_routes_preserve_execution_auth_and_remove_admin_methods(
             ("PATCH", "/v1/settings/example"),
             ("POST", "/queue/reset-global"),
             ("POST", "/provider-auth-profiles/codex/login-start"),
-            ("POST", "/hook/reset-status"),
         ] {
             let is_worker = profile == crate::config::RuntimeProfile::Runner;
             let response = app
