@@ -1128,6 +1128,7 @@ server::routes::health_api::unread_tail_attribution_tests::manual_reattach_recor
 server::routes::health_api::unread_tail_attribution_tests::manual_reattach_records_nothing_when_readiness_also_refuses
 server::routes::health_api::unread_tail_attribution_tests::manual_reattach_records_only_when_no_unrelayed_answer_refuses
 server::routes::health_api::unread_tail_attribution_tests::stale_mailbox_repair_names_and_records_an_unmeasured_tail
+server::routes::hooks::tests::test_skill_usage_body_deserialization
 server::routes::kakao_calendar::tests::calendar_mutations_require_stable_nonempty_bounded_keys
 server::routes::kakao_calendar::tests::calendar_requires_real_bearer_not_claimed_identity_or_local_origin
 server::routes::kanban::update_card_validation_tests::update_card_validation_accepts_valid_metadata_json_object
