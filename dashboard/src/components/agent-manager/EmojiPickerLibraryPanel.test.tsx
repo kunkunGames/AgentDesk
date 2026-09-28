@@ -5,15 +5,6 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import EmojiPickerLibraryPanel from "./EmojiPickerLibraryPanel";
 
-vi.mock("../../i18n", () => ({
-  useI18n: () => ({
-    t: (input: { en?: string; ko?: string } | string, enFallback?: string) => {
-      if (typeof input === "string") return enFallback || input;
-      return input.en || input.ko || "";
-    },
-  }),
-}));
-
 vi.mock("emoji-picker-react", () => ({
   default: ({ onEmojiClick }: { onEmojiClick: (data: { emoji: string }) => void }) => (
     <div>
@@ -60,9 +51,7 @@ describe("EmojiPickerLibraryPanel accessibility", () => {
     const buttons = target.querySelectorAll<HTMLButtonElement>("button.epr-emoji");
 
     expect(buttons[0]?.getAttribute("aria-pressed")).toBe("true");
-    expect(buttons[0]?.getAttribute("aria-label")).toBe("Icon 😀");
     expect(buttons[1]?.getAttribute("aria-pressed")).toBe("false");
-    expect(buttons[1]?.getAttribute("aria-label")).toBe("Icon 😃");
 
     await act(async () => {
       root?.render(
@@ -72,6 +61,5 @@ describe("EmojiPickerLibraryPanel accessibility", () => {
 
     expect(buttons[0]?.getAttribute("aria-pressed")).toBe("false");
     expect(buttons[1]?.getAttribute("aria-pressed")).toBe("true");
-    expect(buttons[1]?.getAttribute("aria-label")).toBe("Icon 😃");
   });
 });

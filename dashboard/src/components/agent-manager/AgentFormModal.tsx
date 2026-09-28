@@ -150,12 +150,12 @@ export default function AgentFormModal({
             <div
               className="flex items-center gap-3 rounded"
               role="group"
-              aria-label={tr("아바타 번호", "Avatar Number")}
+              aria-label={tr("스프라이트 번호", "Sprite Number")}
             >
               <div className="flex flex-col items-center gap-1">
                 <button
                   type="button"
-                  aria-label={tr("다음 아바타", "Next Avatar")}
+                  aria-label={tr("다음 스프라이트", "Next Sprite")}
                   tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-1 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{
@@ -174,11 +174,11 @@ export default function AgentFormModal({
                   className="w-14 h-14 rounded-xl overflow-hidden bg-th-bg-surface flex items-center justify-center flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{ border: "2px solid var(--th-input-border)" }}
                   role="spinbutton"
-                  aria-label={tr("아바타", "Avatar")}
+                  aria-label={tr("스프라이트", "Sprite")}
                   aria-valuenow={spriteNum || 0}
                   aria-valuemin={0}
                   aria-valuemax={MAX_AGENT_SPRITE_NUMBER}
-                  aria-valuetext={spriteNum ? tr(`아바타 ${spriteNum}`, `Avatar ${spriteNum}`) : tr("선택 안됨", "Not selected")}
+                  aria-valuetext={spriteNum ? tr(`스프라이트 ${spriteNum}`, `Sprite ${spriteNum}`) : tr("선택 안됨", "Not selected")}
                   tabIndex={0}
                   onKeyDown={(e) => {
                     if (e.currentTarget !== e.target) {
@@ -214,7 +214,7 @@ export default function AgentFormModal({
                 </div>
                 <button
                   type="button"
-                  aria-label={tr("이전 아바타", "Previous Avatar")}
+                  aria-label={tr("이전 스프라이트", "Previous Sprite")}
                   tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-1 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{
