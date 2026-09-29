@@ -4,7 +4,7 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, auto_queue, cluster, cron_api, dispatched_sessions, dispatches, docs,
+    ApiRouter, AppState, auto_queue, cluster, cron_api, dispatches, docs,
     e2e_control, health_api, maintenance, message_outbox, messages, pipeline,
     prompt_manifest_retention, protected_api_domain, provider_cli_api, queue_api, routines,
     scheduled_messages, skills_api,
@@ -137,14 +137,6 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 get(pipeline::get_agent_pipeline).put(pipeline::set_agent_pipeline),
             )
             .route("/pipeline/config/graph", get(pipeline::get_pipeline_graph))
-            .route(
-                "/dispatched-sessions/cleanup",
-                delete(dispatched_sessions::cleanup_sessions),
-            )
-            .route(
-                "/dispatched-sessions/gc-threads",
-                delete(dispatched_sessions::gc_thread_sessions),
-            )
             // #1067: watch-agent-turn skill promotion — capture the last N lines
             // of the tmux pane bound to a session id.
             .route(
