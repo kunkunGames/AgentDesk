@@ -1209,15 +1209,16 @@ pub fn finalize_dispatch_with_backends(
     context: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value> {
     let result = match context {
-        Some(serde_json::Value::Object(map)) => {
-            let mut merged = map.clone();
-            merged.insert(
-                "completion_source".to_string(),
-                serde_json::Value::String(completion_source.to_string()),
-            );
-            serde_json::Value::Object(merged)
+        Some(ctx) => {
+            let mut merged = ctx.clone();
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert(
+                    "completion_source".to_string(),
+                    serde_json::Value::String(completion_source.to_string()),
+                );
+            }
+            merged
         }
-        Some(ctx) => ctx.clone(),
         None => json!({ "completion_source": completion_source }),
     };
     complete_dispatch_inner_with_backends(engine, dispatch_id, &result)
@@ -1505,24 +1506,20 @@ fn infer_phase_gate_verdict_details(
         return None;
     };
 
-    let mut enriched_result = match result {
-        serde_json::Value::Object(map) => {
-            let mut merged = map.clone();
-            merged.insert(
-                "verdict".to_string(),
-                serde_json::Value::String(pass_verdict.clone()),
-            );
-            merged.insert(
-                "verdict_inferred".to_string(),
-                serde_json::Value::Bool(true),
-            );
-            serde_json::Value::Object(merged)
-        }
-        _ => serde_json::json!({
-            "verdict": pass_verdict,
-            "verdict_inferred": true,
-        }),
-    };
+    let mut enriched_result = result.clone();
+    if !enriched_result.is_object() {
+        enriched_result = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(obj) = enriched_result.as_object_mut() {
+        obj.insert(
+            "verdict".to_string(),
+            serde_json::Value::String(pass_verdict.clone()),
+        );
+        obj.insert(
+            "verdict_inferred".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
 
     let declared_check_count = phase_gate_ctx
         .get("required_checks")
