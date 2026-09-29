@@ -6,7 +6,6 @@ import type {
   RoundTableMeetingExpertOption,
 } from "../types";
 import type { GitHubRepoOption } from "../api/client";
-import { getDisplayMeetingReferenceHashes } from "./meetingReferenceHash";
 
 export const STORAGE_KEY = STORAGE_KEYS.meetingChannelId;
 export const FIXED_PARTICIPANTS_STORAGE_KEY = STORAGE_KEYS.meetingFixedParticipants;
@@ -145,11 +144,6 @@ export function pruneFixedParticipantRoleIdsForLoadedChannel(
   return next;
 }
 
-export function getMeetingReferenceHashes(
-  meeting: Pick<RoundTableMeeting, "meeting_hash" | "thread_hash">,
-): string[] {
-  return getDisplayMeetingReferenceHashes(meeting);
-}
 
 export async function openMeetingDetailWithFallback(
   meeting: RoundTableMeeting,
