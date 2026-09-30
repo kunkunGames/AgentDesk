@@ -16,6 +16,7 @@ Every PR must include:
 - Verification commands and results (If the change is docs-only, explicitly state 'docs-only' and list the source files or commands used to verify the documentation)
 - Skipped checks and reasons
 - Risk and rollback notes
+- Lockfile changes (If lockfiles are modified, always include the exact command run, package, version change, and the specific reason it was necessary)
 
 ## Verification Commands
 - **Rust Changes:** `cargo check --all-targets`, `cargo test <narrow-target>`. When executing commands that might terminate the shell session (like `cargo check --all-targets`), wrap them in `bash -c '<command>'` to prevent session loss and preserve environment state.
@@ -31,6 +32,7 @@ Every PR must include:
 ## Agent Execution Plan Guidelines
 - **Groundedness Rule:** Only use tools, test names, and targets that are explicitly confirmed to exist in the trace. Do not guess test commands; verify them via bash first (e.g., using `grep`) or use standard test commands without specific targets.
 - **Completeness Rule:** Execution plans must explicitly include comprehensive final test runs (e.g., `cargo check --all-targets`, `npm run test:policies`, `./scripts/verify-dashboard.sh`, `python3 scripts/generate_inventory_docs.py`) as defined for the specific agent role, rather than relying solely on `git diff`.
+- **No-Change Completeness Rule:** Before the pre-commit step for a no-change report, always insert a plan step to execute `git diff --check` and `git status --porcelain` to explicitly confirm zero file changes.
 - **Pre-commit Step:** The pre-commit step description must use the exact mandatory phrasing: 'Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.'
 - **Specificity Rule:** The step to submit a PR or no-change report must explicitly draft the full text for the description parameter, including all mandatory sections (What changed, Why, WorkFingerprint, duplicate/overlap check, verification commands and results, skipped checks, risk, and rollback notes).
 - **Verification Fallback:** If a required verification check (e.g., `cargo check`) cannot run due to environment limitations or timeouts, explicitly skip it, state the exact reason, and document the residual risk in the PR body.
