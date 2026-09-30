@@ -310,13 +310,13 @@ export default function OfficeManagerModal({
               >
                 <div className="space-y-4">
                   <div>
-                    <label
+                    <div
                       id={iconLabelId}
                       className="block text-xs font-medium mb-1"
                       style={{ color: "var(--th-text-secondary)" }}
                     >
                       {tr("아이콘", "Icon")}
-                    </label>
+                    </div>
                     <div className="flex gap-1.5 flex-wrap" role="radiogroup" aria-labelledby={iconLabelId}>
                       {OFFICE_ICONS.map((ic, idx) => (
                         <button
@@ -366,13 +366,13 @@ export default function OfficeManagerModal({
                     </div>
                   </div>
                   <div>
-                    <label
+                    <div
                       id={colorLabelId}
                       className="block text-xs font-medium mb-1"
                       style={{ color: "var(--th-text-secondary)" }}
                     >
                       {tr("색상", "Color")}
-                    </label>
+                    </div>
                     <div className="flex gap-1.5 flex-wrap" role="radiogroup" aria-labelledby={colorLabelId}>
                       {OFFICE_COLORS.map((c, idx) => (
                         <button
