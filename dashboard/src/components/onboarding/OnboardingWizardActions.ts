@@ -344,7 +344,7 @@ export function useOnboardingWizardActions({
           command_token_2: commandBots.length > 1 ? commandBots[1].token.trim() || null : null,
           command_provider_2: commandBots.length > 1 ? commandBots[1].provider : null,
           guild_id: selectedGuild,
-          owner_id: ownerId || null,
+          owner_id: ownerId.trim() || null,
           provider: primaryProvider,
           template: selectedTemplate || null,
           rerun_policy: hasExistingSetup && confirmRerunOverwrite ? "replace_existing" : "reuse_existing",
