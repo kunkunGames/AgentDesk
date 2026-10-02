@@ -49,9 +49,9 @@ import {
   submitMeetingStartRequest,
 } from "./meetingMinutesModel";
 
+export { getDisplayMeetingReferenceHashes } from "./meetingReferenceHash";
 export {
   filterMeetingExpertsByQuery,
-  getMeetingReferenceHashes,
   openMeetingDetailWithFallback,
   pruneFixedParticipantRoleIdsForLoadedChannel,
   submitMeetingStartRequest,

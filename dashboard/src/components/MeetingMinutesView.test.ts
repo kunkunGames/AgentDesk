@@ -9,7 +9,7 @@ import type {
 import { I18nProvider } from "../i18n";
 import {
   filterMeetingExpertsByQuery,
-  getMeetingReferenceHashes,
+  getDisplayMeetingReferenceHashes,
   default as MeetingMinutesView,
   openMeetingDetailWithFallback,
   pruneFixedParticipantRoleIdsForLoadedChannel,
@@ -406,10 +406,10 @@ describe("openMeetingDetailWithFallback", () => {
   });
 });
 
-describe("getMeetingReferenceHashes", () => {
+describe("getDisplayMeetingReferenceHashes", () => {
   it("returns stable meeting and thread hashes in display order", () => {
     expect(
-      getMeetingReferenceHashes(
+      getDisplayMeetingReferenceHashes(
         meeting({
           meeting_hash: "#meeting-123abc",
           thread_hash: "#thread-456def",
@@ -420,7 +420,7 @@ describe("getMeetingReferenceHashes", () => {
 
   it("filters out missing hashes without changing the remaining stable hash", () => {
     expect(
-      getMeetingReferenceHashes(
+      getDisplayMeetingReferenceHashes(
         meeting({
           meeting_hash: "#meeting-123abc",
           thread_hash: null,
