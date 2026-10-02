@@ -789,7 +789,10 @@ impl CancelToken {
 
     #[cfg(test)]
     pub(crate) fn store_child_process_for_test(&self, process: CapturedProcess) {
-        *self.child_pid.lock().unwrap_or_else(|e| e.into_inner()) = Some(process);
+        *self.child_pid.lock().unwrap_or_else(|e| {
+            tracing::warn!("Recovered poisoned lock for CancelToken state");
+            e.into_inner()
+        }) = Some(process);
     }
 
     #[cfg(test)]
