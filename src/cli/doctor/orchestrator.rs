@@ -766,7 +766,7 @@ fn check_qwen_runtime_artifacts(configured: bool) -> Check {
         );
     }
 
-    let guidance = "Qwen uses local assets like ~/.qwen/extensions, ~/.qwen/skills, <workspace>/.qwen/PROJECT_SUMMARY.md, and <workspace>/.qwen/.env as-is. In a headless environment, check if the project .qwen/.env takes precedence.";
+    let guidance = "Qwen은 ~/.qwen/extensions, ~/.qwen/skills, <workspace>/.qwen/PROJECT_SUMMARY.md, <workspace>/.qwen/.env 같은 로컬 자산을 그대로 사용합니다. headless 환경에서는 project .qwen/.env 우선 여부를 함께 확인하세요.";
     if configured {
         Check::warn(
             "provider_qwen_runtime",
@@ -1205,7 +1205,7 @@ fn check_config_audit(snapshot: &HealthSnapshot) -> Check {
             CheckGroup::Core,
             "Config Audit",
             detail.clone(),
-            "Check the drift summary for agentdesk.yaml, legacy role map, or bot settings. Raw source paths are not exposed in the public health output.",
+            "agentdesk.yaml/legacy role map/bot settings drift summary를 확인하세요. public health에는 raw source path를 노출하지 않습니다.",
         )
         .with_subsystem("config_audit")
         .with_path(health_detail_endpoint(&snapshot.base))
@@ -2686,7 +2686,7 @@ fn check_server_running(snapshot: &HealthSnapshot) -> Check {
                 (
                     "blocked_remote_token",
                     Severity::Critical,
-                    "Use --allow-remote explicitly to send a token to a non-loopback URL.",
+                    "non-loopback URL에 token을 보내려면 명시적으로 --allow-remote를 사용하세요.",
                 )
             } else {
                 (
@@ -2867,7 +2867,7 @@ fn check_service_manager() -> Check {
             CheckGroup::Core,
             "Service Manager",
             format!("launchd — {label} not loaded"),
-            "If operating with launchd, check the plist load state. If running manually, this can be ignored.",
+            "launchd로 운영 중이면 plist 로드 상태를 확인하세요. 수동 실행 환경이면 무시해도 됩니다.",
         )
         .with_expected_actual(
             "launchd job loaded or tmux fallback active",
@@ -3188,7 +3188,7 @@ fn check_file_descriptor_headroom() -> Check {
             CheckGroup::Core,
             "File Descriptor Headroom",
             "launchctl maxfiles limit unavailable",
-            "Unable to read the macOS launchd limit, so tmux/dcserver FD usage cannot be compared against the limit.",
+            "macOS launchd 한도를 읽을 수 없어 tmux/dcserver FD 사용량을 한도와 비교하지 못했습니다.",
         )
         .with_expected_actual("launchctl limit maxfiles readable", "unavailable")
         .with_evidence(evidence)
@@ -3286,7 +3286,7 @@ fn check_service_manager() -> Check {
             CheckGroup::Core,
             "Service Manager",
             "systemd --user — agentdesk-dcserver not enabled",
-            "If planning to operate as a service, verify if the systemd user service is registered.",
+            "서비스로 운영할 계획이면 systemd user service 등록 여부를 확인하세요.",
         )
         .with_expected_actual(
             "systemd user service enabled",
@@ -3401,7 +3401,7 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                 CheckGroup::Core,
                 "PostgreSQL",
                 format!("{summary} — runtime init failed"),
-                "Failed to create an async runtime for verifying the Postgres connection.",
+                "postgres 연결 검증용 async runtime 생성에 실패했습니다.",
             )
             .with_expected_actual(
                 "postgres check runtime initializes",
@@ -3826,7 +3826,7 @@ fn check_disk_usage() -> Check {
                 CheckGroup::Core,
                 "Disk Usage",
                 format!("{} — unreadable ({e})", path.display()),
-                "Check the runtime root permissions.",
+                "runtime root 권한을 확인하세요.",
             )
             .with_path(path.display().to_string())
             .with_expected_actual(
