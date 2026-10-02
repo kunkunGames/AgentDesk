@@ -365,7 +365,7 @@ pub async fn update_entry(
         }
     };
 
-    let Some(pg_pool) = state.pg_pool_ref() else {
+    let Some(pg_pool) = state.pg_pool.clone() else {
         return Err(auto_queue_tuple_error(pg_unavailable_response()));
     };
     update_entry_with_pg(&state, &id, &body, requested_status, &pg_pool).await
@@ -582,7 +582,7 @@ pub async fn add_run_entry(
             Json(json!({"error": "batch_phase must be >= 0"})),
         ));
     }
-    let Some(pg_pool) = state.pg_pool_ref() else {
+    let Some(pg_pool) = state.pg_pool.clone() else {
         return Err(auto_queue_tuple_error(pg_unavailable_response()));
     };
     add_run_entry_with_pg(&state, &run_id, &body, batch_phase, &pg_pool).await
@@ -723,7 +723,7 @@ pub async fn restore_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    let Some(pg_pool) = state.pg_pool_ref() else {
+    let Some(pg_pool) = state.pg_pool.clone() else {
         return Err(auto_queue_tuple_error(pg_unavailable_response()));
     };
     restore_run_with_pg(&state, &run_id, &pg_pool).await

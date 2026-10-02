@@ -281,7 +281,7 @@ pub async fn submit_order(
     {
         return Err(auto_queue_tuple_error(response));
     }
-    let Some(pg_pool) = state.pg_pool_ref() else {
+    let Some(pg_pool) = state.pg_pool.clone() else {
         return Err(auto_queue_tuple_error(pg_unavailable_response()));
     };
     submit_order_with_pg(

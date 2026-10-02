@@ -261,7 +261,7 @@ pub async fn rebind_slot(
         ));
     }
 
-    let Some(pg_pool) = state.pg_pool_ref() else {
+    let Some(pg_pool) = state.pg_pool.clone() else {
         return Err(auto_queue_tuple_error(pg_unavailable_response()));
     };
     rebind_slot_with_pg(&agent_id, slot_index, &body, &pg_pool).await
@@ -315,7 +315,7 @@ pub async fn skip_entry(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    let Some(pg_pool) = state.pg_pool_ref() else {
+    let Some(pg_pool) = state.pg_pool.clone() else {
         return Err(auto_queue_tuple_error(pg_unavailable_response()));
     };
     skip_entry_with_pg(&id, &pg_pool).await
