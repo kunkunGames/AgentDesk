@@ -212,6 +212,8 @@ def is_scratch_file_path(path):
     global_scratch_files = {
         "pr-body.md",
         "pr_body.md",
+        "pr-body.txt",
+        "pr_body.txt",
         "plan.md",
         "plan.txt",
         "prs.json",
@@ -303,6 +305,8 @@ def main():
             print("  [!] MISSING SCRATCH FILE CLEANUP CHECK: PR body lacks a completed scratch file cleanup acknowledgement.")
         if not has_pr_size_ack(body):
             print("  [!] MISSING PR SIZE CHECK: PR body lacks a completed PR size acknowledgement.")
+        if not has_stale_branch_cleanup_ack(body):
+            print("  [!] MISSING STALE BRANCH CLEANUP CHECK: PR body lacks a completed stale branch cleanup acknowledgement.")
         if "docs-only" in normalized_body or "docs only" in normalized_body:
             if not has_docs_only_verification_ack(body):
                 print("  [!] MISSING DOCS-ONLY VERIFICATION CHECK: PR body claims docs-only but lacks a completed docs-only verification acknowledgement.")
@@ -347,8 +351,8 @@ def main():
 
         if is_stale:
             print(f"  [!] STALE BRANCH: Head commit is > 14 days old. Treat as queue debt. Close or recommend closing instead of salvaging in place.")
-            if not has_stale_branch_cleanup_ack(body):
-                print("  [!] MISSING STALE BRANCH CLEANUP CHECK: PR body lacks a completed stale branch cleanup acknowledgement.")
+            if has_stale_branch_cleanup_ack(body):
+                print("  [!] INVALID STALE BRANCH CLEANUP CHECK: PR claims to not salvage a stale branch, but the head commit is > 14 days old.")
 
         # PR #214/#215 lesson: no-change PRs must have 0 changed files
         if "no-change" in title.lower() or "no change" in title.lower():
@@ -361,6 +365,9 @@ def main():
                     print(f"  [i] EMPTY NO-CHANGE PR: No changed files. If no durable queue-hygiene artifact is changed, it is a close candidate (report only).")
                     if not has_overlap_reference(body):
                         print("  [!] MISSING OVERLAP REFERENCE: Empty no-change PR body must explicitly list the exact overlapping PR numbers and branches.")
+        else:
+            if files_data.get("files") is not None and len(files_data["files"]) == 0:
+                print("  [!] EMPTY PR WITHOUT NO-CHANGE TITLE: PR has 0 changed files but title does not indicate it is a no-change PR.")
 
         # PR #199/#200/#201 lesson: check for multiple inventory refreshes
         if "inventory" in title.lower() and "refresh" in title.lower():

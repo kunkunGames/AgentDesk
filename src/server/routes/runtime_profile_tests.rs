@@ -53,13 +53,22 @@ async fn worker_profile_routes_preserve_execution_auth_and_remove_admin_methods(
             ("POST", "/hook/reset-status"),
             ("GET", "/channels/123/watcher-state"),
         ] {
+            let is_worker = profile == crate::config::RuntimeProfile::Runner;
+            // The integrations module (/hook/reset-status) is part of admin_api, which is not mounted in the Runner profile.
+            // When a route is unmounted, Axum returns 404 NOT FOUND before auth middleware runs.
+            let is_admin_api_route = path == "/hook/reset-status";
+
             assert_eq!(
                 app.clone()
                     .oneshot(request(method, path, false))
                     .await
                     .unwrap()
                     .status(),
-                StatusCode::UNAUTHORIZED,
+                if is_worker && is_admin_api_route {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::UNAUTHORIZED
+                },
                 "{profile:?}: {method} {path}"
             );
         }
