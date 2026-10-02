@@ -1,16 +1,6 @@
 use super::*;
 
-pub(in crate::services::discord) fn floor_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() {
-        s.len()
-    } else {
-        let mut i = index;
-        while !s.is_char_boundary(i) {
-            i -= 1;
-        }
-        i
-    }
-}
+pub(in crate::services::discord) use crate::utils::format::floor_char_boundary;
 
 #[cfg(test)]
 pub(super) fn char_count(s: &str) -> usize {
