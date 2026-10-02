@@ -1,0 +1,34 @@
+What changed:
+Replaced `.clone()` with `.as_ref()` when unwrapping `state.pg_pool` in the auto-queue view_admin_routes, order_routes, and slot_routes.
+
+Why:
+`state.pg_pool` is an `Option<sqlx::PgPool>`. `PgPool` is an `Arc` under the hood. While cloning it is cheap, it unnecessarily increments an atomic reference count on an extremely hot path. `state.pg_pool_ref()` does not exist natively on the `AppState`, so `.as_ref()` is the correct and idiomatically sound way to avoid allocations in standard Axum handlers on hot queue endpoints. This provides a minor but explicit determinisitc reduction in CPU cycles per route hit.
+
+WorkFingerprint:
+Agent: Bolt
+Category Boundary: src/services/auto_queue/**
+Primary Files: src/services/auto_queue/view_admin_routes.rs, src/services/auto_queue/order_routes.rs, src/services/auto_queue/slot_routes.rs
+Invariant Protected: Performance and strict allocation tracking
+Public API Impact: None
+Docs Impact: None
+Verification Plan: Run cargo check --lib and git diff --check
+Related PRs/Issues: None
+
+Duplicate/overlap check:
+Checked `gh pr list` / `git branch -r` and verified no overlapping PRs actively touch `src/services/auto_queue/` or `state.pg_pool` in this context.
+
+Verification commands and results:
+`git diff --check`: Clean.
+`cargo check --lib`: Clean (completed successfully without borrow check errors). Full `cargo check --lib --tests` was attempted but failed due to OOM unrelated to these changes.
+
+Skipped checks with reasons:
+Full `cargo check --all-targets` and `cargo test --all-targets`: OOM failures prevented completion, so I fell back to the narrower `cargo check --lib` which covers these files perfectly.
+No dashboard or frontend scripts ran because no dashboard code was changed.
+No policy tests ran because no policies were changed.
+No external database verification because this is a purely internal Rust reference change.
+
+Risk:
+Low. Reusing references instead of cloning `Arc`s natively prevents extra operations without changing any logical state.
+
+Rollback notes:
+Revert the commit to restore the `.clone()` operations if somehow the lifetimes do not cover the awaited functions, though `cargo check` proves they do.
