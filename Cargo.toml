@@ -114,7 +114,7 @@ hex = "0.4"
 subtle = "2"
 
 # From RCC — misc
-rand = "0.8"
+rand = "0.10"
 libc = "0.2"
 croner = "3.0.1"
 tempfile = "3"
