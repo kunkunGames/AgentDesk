@@ -33,11 +33,9 @@ module.exports = function attachOrphanDispatch(timeouts, helpers) {
 
       // Grace period: 서버 부팅 후 10분간은 orphan 판정 유예.
       // 재시작 직후 세션이 아직 복원되지 않은 상태를 orphan으로 오판하는 것을 방지.
-      var bootRows = agentdesk.db.query(
-        "SELECT value FROM kv_meta WHERE key = 'server_boot_at'"
-      );
-      if (bootRows.length > 0) {
-        var bootAt = new Date(bootRows[0].value + "Z");
+      var bootVal = agentdesk.kv.get("server_boot_at");
+      if (bootVal) {
+        var bootAt = new Date(bootVal + "Z");
         var bootElapsedMin = (Date.now() - bootAt.getTime()) / 60000;
         if (bootElapsedMin < 10) {
           return;

@@ -786,7 +786,6 @@ test("timeouts active monitor review fast path leaves non-review sessions on the
 test("timeouts orphan dispatch module emits orphan recovery signals", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     dbQuery: createSqlRouter([
-      { match: "SELECT value FROM kv_meta WHERE key = 'server_boot_at'", result: [] },
       {
         match: "FROM task_dispatches td JOIN kanban_cards kc ON kc.id = td.kanban_card_id",
         result: [

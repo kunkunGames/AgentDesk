@@ -145,11 +145,9 @@ var rules = {
     // 재시작 직후 세션이 disconnected/idle로 보고되면서 진행 중인 카드가 오판되는 것을 방지.
     var isActiveSession = payload.status === "turn_active" || payload.status === "working";
     if (!isActiveSession) {
-      var bootRows = agentdesk.db.query(
-        "SELECT value FROM kv_meta WHERE key = 'server_boot_at'"
-      );
-      if (bootRows.length > 0) {
-        var bootAt = new Date(bootRows[0].value + "Z");
+      var bootVal = agentdesk.kv.get("server_boot_at");
+      if (bootVal) {
+        var bootAt = new Date(bootVal + "Z");
         var bootElapsedMin = (Date.now() - bootAt.getTime()) / 60000;
         if (bootElapsedMin < 10) {
           return;
