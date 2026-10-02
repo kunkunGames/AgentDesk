@@ -18,15 +18,18 @@ fn worker_rest_transport_delivers_without_gateway_queue_chaining() {
 
 #[tokio::test]
 async fn rest_worker_terminal_edits_once_without_a_headless_duplicate() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     let mut driver = TerminalDeliveryDriver::new(ReplaceBehaviour::Edited, 1);
     driver.gateway = Arc::new(DriverGateway {
         chain_locally: false,
+        direct: true,
         marker: driver.marker.clone(),
         observations: driver.observations.clone(),
         completed_publications: driver.completed_publications.clone(),
         published_bodies: driver.published_bodies.clone(),
         replace: ReplaceBehaviour::Edited,
         yields_per_call: 1,
+        check: driver.body_check.clone(),
     });
     let (ctx, state) = driver.parts();
     let output = tokio::time::timeout(DRIVER_TIMEOUT, run_terminal_outcome_delivery(ctx, state))

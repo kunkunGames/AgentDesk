@@ -14,7 +14,13 @@ use crate::services::claude_tui::memento_feedback::{
     PendingMementoFeedbackTracker, PendingMementoFeedbackTransition,
 };
 
+pub(crate) mod adoption_retry;
+pub(crate) mod observation_ingress;
 pub(crate) mod relay_receipts;
+pub(crate) use adoption_retry::retry_deferred_claude_adoptions;
+pub(crate) use observation_ingress::{
+    boot_discovery_done, mark_boot_discovery_complete, note_claude_pane_registration,
+};
 use relay_receipts::{RelayReceiptBegin, RelayReceiptLedger, RelayReceiptPin, RelayReceiptTicket};
 
 const EVENT_BUFFER_CAPACITY: usize = 256;
@@ -142,6 +148,11 @@ impl HookServerState {
     pub fn subscribe(&self) -> broadcast::Receiver<HookEvent> {
         self.event_tx.subscribe()
     }
+
+    #[cfg(test)]
+    pub(crate) fn memento_feedback_pending_for_tests(&self, session_id: &str) -> usize {
+        self.memento_feedback.pending_count(session_id)
+    }
 }
 
 impl Default for HookServerState {
@@ -194,6 +205,7 @@ pub fn subscribe_hook_events() -> broadcast::Receiver<HookEvent> {
 }
 
 pub fn hook_receiver_router() -> Router {
+    observation_ingress::note_receiver_start();
     hook_receiver_router_with_state(HOOK_SERVER_STATE.clone())
 }
 
@@ -268,57 +280,30 @@ async fn receive_hook(
 
     let command_session_id = query.session_id.as_deref().and_then(non_empty_string);
     let observed_payload_session_id = payload_session_id(&payload);
-    if provider == "claude"
-        && let (Some(command_session_id), Some(payload_session_id)) = (
-            command_session_id.as_deref(),
-            observed_payload_session_id.as_deref(),
-        )
-        && command_session_id != payload_session_id
-    {
-        match crate::services::tui_prompt_dedupe::adopt_claude_continuation_session(
-            command_session_id,
-            payload_session_id,
-        ) {
-            Some((tmux_session_name, transcript_path)) => {
-                match crate::services::claude_tui::session::persist_claude_continuation_session(
-                    &tmux_session_name,
-                    payload_session_id,
-                ) {
-                    // #5188: the old wording ("adopted Claude continuation
-                    // session") read as if the whole delivery path had followed
-                    // the rotation. It had not — only the in-memory runtime
-                    // binding was rebound, and the launch-script rehydration pass
-                    // could then revert even that. The message now states exactly
-                    // what this call site changes and defers the rest to the
-                    // rotation ledger, so a reader cannot mistake it for
-                    // end-to-end success.
-                    Ok(changed) => tracing::warn!(
-                        provider,
-                        command_session_id,
-                        payload_session_id,
-                        tmux_session_name,
-                        transcript_path,
-                        persistent_artifacts_changed = changed,
-                        "rebound Claude TUI runtime binding to the continuation session reported by \
-                         the hook payload; rotation queued for delivery-path propagation (#5188)"
-                    ),
-                    Err(error) => tracing::error!(
-                        provider,
-                        command_session_id,
-                        payload_session_id,
-                        tmux_session_name,
-                        error,
-                        "adopted Claude continuation in memory but failed to persist cutover artifacts"
-                    ),
-                }
-            }
-            None => tracing::debug!(
-                provider,
-                command_session_id,
-                payload_session_id,
-                "Claude hook payload session differs from command identity but no safe runtime binding adoption was available"
-            ),
-        }
+    // Persist-before-ACK: nothing below may run for a hook whose binding evidence is not durable.
+    let ingress = observation_ingress::observe_binding_hook(
+        &provider,
+        &event,
+        command_session_id.as_deref(),
+        observed_payload_session_id.as_deref(),
+        &payload,
+        &headers,
+    );
+    if let Some(refused) = observation_ingress::refusal(
+        &state.relay_receipts,
+        receipt_ticket.clone(),
+        ingress,
+        &provider,
+        &event,
+    ) {
+        return refused;
+    }
+    // The sender stopped waiting: a late reply or wake-up would reach the next turn instead.
+    if relay_receipts::reply_window_closed(&headers, Utc::now()) {
+        tracing::info!(provider, event, ?ingress, "late hook observed detached");
+        let body = json!({ "ok": true, "provider": provider, "event": event, "detached": true,
+            "binding_observation": format!("{ingress:?}") });
+        return finish_hook_receipt(&state, receipt_ticket, StatusCode::ACCEPTED, body, true);
     }
     // Keep the launch-time query UUID as the hook wait/routing identity while
     // it is registered; replacing it would strand callers already waiting on
@@ -570,7 +555,8 @@ async fn receive_hook(
         "ok": true,
         "provider": provider,
         "event": event_name,
-        "session_id": session_id
+        "session_id": session_id,
+        "binding_observation": format!("{ingress:?}")
     });
     if let Some(flush) = memento_transition.flush {
         body["memento_tool_feedback_flush"] = flush.to_json();
@@ -707,13 +693,13 @@ fn normalize_hook_event_name(value: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request};
     use tower::ServiceExt;
 
-    static ENDPOINT_TEST_LOCK: LazyLock<std::sync::Mutex<()>> =
+    pub(crate) static ENDPOINT_TEST_LOCK: LazyLock<std::sync::Mutex<()>> =
         LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
@@ -1332,3 +1318,6 @@ mod tests {
         assert_eq!(current_hook_endpoint(), None);
     }
 }
+
+#[cfg(all(test, unix))]
+mod codex_ingress_tests;

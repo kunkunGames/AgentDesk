@@ -272,7 +272,7 @@ fi
 
 if run_check guards "H2 tmux boundary measurer and admission self-tests"; then
 # Baseline gates skip until activation; driver/cfg canary and these unit tests already run in CI.
-"$PYTHON" -m unittest tests.test_h2_measure tests.test_h2_admission tests.test_h2_modmap tests.test_h2_cfg_compare tests.test_h2_cfg_collect tests.test_h2_session_driver tests.test_h2_session
+"$PYTHON" -m unittest tests.test_h2_measure tests.test_h2_admission tests.test_h2_modmap tests.test_h2_cfg_compare tests.test_h2_cfg_collect tests.test_h2_session_driver tests.test_h2_session tests.test_h2_items
 fi
 
 if run_check guards "Reachability row-independence + change-surface gate (#5071 T4-B1)"; then
@@ -348,6 +348,13 @@ if run_check guards "Durable frontier writer per-file call-site allowlist (#5071
 "$PYTHON" -m unittest tests.test_durable_frontier_writer_call_sites
 fi
 
+if run_check guards "TUI O writer census: Legacy send sites and cutover gates"; then
+# Pins every Discord send site's census row and every O cutover gate by exact
+# per-file count; the script docstring declares its lexical limits.
+"$PYTHON" scripts/check_tui_o_writer_census.py
+"$PYTHON" -m unittest tests.test_check_tui_o_writer_census
+fi
+
 if run_check guards "Intake-outbox done writer per-file call-site allowlist (#5071 T2)"; then
 # Pins the pre-T2 `mark_done` owner by exact per-file textual count over src/;
 # the script docstring declares the lexical forms and semantic facts it cannot see.
@@ -359,9 +366,10 @@ fi
 if run_check guards "Comment-only change checker self-tests"; then
 # scripts/check_comment_only_change.py decides whether a diff may skip human
 # review, so a false "comment-only" verdict ships unread code. These tests are
-# what stops that. The checker is an on-demand reviewer tool, not a tree gate:
-# nothing here runs it against this PR.
+# what stops that. ci-pr.yml's changes job also runs it, through
+# scripts/ci/comment_only_gate.py, to skip the heavy test jobs.
 "$PYTHON" -m unittest tests.test_comment_only_change
+"$PYTHON" -m unittest tests.test_comment_only_ci_gate
 fi
 
 if run_check guards "Hotfile LOC ratchet guard (#3565)"; then
@@ -413,6 +421,10 @@ fi
 if run_check guards "Relay-authority fixed mutation gate (#5071)"; then
 "$PYTHON" scripts/check_relay_mutation_sources.py
 "$PYTHON" -m unittest tests.test_relay_authority_mutations
+fi
+
+if run_check guards "Relay-authority mutation wiring digest (#5997)"; then
+"$PYTHON" -m unittest tests.test_relay_mutation_wiring_digest
 fi
 
 if run_check guards "Relay recovery targeted-lane wiring contract (#4423)"; then
@@ -708,6 +720,7 @@ SHELL_TESTS_FAILED=0
 required_shell_suites=(
   tests/test_cluster_deploy_peer_verdict_5189.sh
   tests/test_deploy_migration_floor_fail_forward_6090.sh
+  tests/test_deploy_o_writer_rollback_guard_6325.sh
   tests/test_deploy_smoke_scope.sh
   tests/test_deploy_smoke_warn_scope_4511.sh
   tests/test_deploy_smoke_wedge_coverage_5244.sh
@@ -733,7 +746,8 @@ if run_check cargo "Agent maintenance freshness tests"; then
 fi
 
 if run_check cargo "Maintainability audit tests"; then
-"$PYTHON" -m unittest tests.test_audit_maintainability.FooterViewWritesCheck
+"$PYTHON" -m unittest tests.test_audit_maintainability.FooterViewWritesCheck \
+  tests.test_audit_maintainability.GiantFileRatchetCheck
 fi
 
 if run_check cargo "Maintainability audit"; then

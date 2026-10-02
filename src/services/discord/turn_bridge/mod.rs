@@ -80,7 +80,7 @@ use panel_lifecycle::{
     refresh_session_panel_line_from_lifecycle, refresh_task_panel_line_from_dispatch,
 };
 use response_delivery::{
-    done_result_requires_full_terminal_replay, push_transcript_event,
+    done_result_requires_full_terminal_replay, no_answer, push_transcript_event,
     response_portion_after_offset, terminal_delivery_response_after_offset,
 };
 use std::collections::VecDeque;
@@ -132,8 +132,8 @@ pub(super) use tmux_runtime::cancel_active_token;
 pub(super) use tmux_runtime::cancel_token_has_tmux_session;
 pub(super) use tmux_runtime::handoff_interrupted_message;
 pub(super) use tmux_runtime::stale_inflight_message;
-pub(super) use tmux_runtime::stop_active_turn;
 pub(super) use tmux_runtime::tmux_generation_file_mtime_ns;
+pub(super) use tmux_runtime::{stop_active_turn, stop_approved_turn};
 pub(in crate::services::discord) use two_message_panel::{
     two_message_should_reanchor_panel_on_rollover, two_message_status_edit_generation_is_stale,
 };
@@ -162,7 +162,7 @@ use current_message_anchor::{
 };
 use guards::{make_bridge_guards, resolve_guard_owner_channel};
 use headless_delivery::{
-    cleanup_headless_streaming_placeholder_after_delivery, enqueue_headless_delivery,
+    cleanup_headless_streaming_placeholder_after_delivery, enqueue_claimed_headless_delivery,
     is_synthetic_headless_message_id,
 };
 use memory_lifecycle::{
@@ -178,8 +178,9 @@ use recall_feedback::{
 };
 pub(super) use retry_state::spawn_retry_with_history_with_release;
 use retry_state::{
-    bridge_confirmed_response_sent_offset_seed, bridge_should_reclaim_relay_from_missing_watcher,
-    clear_local_session_state, handle_gemini_retry_boundary, reset_session_for_auto_retry,
+    AutoRetry, bridge_confirmed_response_sent_offset_seed,
+    bridge_should_reclaim_relay_from_missing_watcher, clear_local_session_state,
+    handle_gemini_retry_boundary, reset_session_for_auto_retry,
     rewind_and_persist_delivery_on_reclaim, sync_response_delivery_state,
     sync_terminal_error_delivery_state_for_bridge_owner,
 };
@@ -325,6 +326,7 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
         let mut watcher_owns_assistant_relay =
             matches!(initial_relay_owner_kind, super::inflight::RelayOwnerKind::Watcher);
         let mut watcher_relay_available_for_turn = false;
+        let mut watcher_adopted_after_done = false;
         let mut watcher_delivery_pin = initial_watcher_delivery_pin;
         let mut watcher_handoff_claim_outcome = WatcherHandoffClaimOutcome::None;
         // Durable recovery must honor typed non-bridge owners too. `Unknown`
@@ -669,6 +671,7 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
                 bridge_spans: &mut bridge_spans,
                 status_panel_generation: &mut status_panel_generation,
                 entry_watcher_epoch_current: &mut bridge_entry_watcher_owner_epoch_current,
+                watcher_adopted_after_done: &mut watcher_adopted_after_done,
             },
         )
         .await;
@@ -717,6 +720,7 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
                 standby_relay_owns_output,
                 watcher_owns_assistant_relay,
                 watcher_relay_available_for_turn,
+                watcher_adopted_after_done,
                 bridge_entry_watcher_owner_epoch_current,
                 response_sent_offset,
                 tmux_last_offset,
@@ -926,6 +930,7 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
                 last_status_panel_text,
                 completion_footer_terminal_text,
                 busy_requeue_outcome: terminal_outcome_delivery_output.busy_requeue_outcome,
+                auto_retry: terminal_outcome_delivery_output.auto_retry,
                 spin_idx,
                 status_panel_generation,
                 preserve_inflight_for_cleanup_retry,

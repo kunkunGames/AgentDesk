@@ -720,7 +720,8 @@ pub(in crate::services::discord) fn set_hosted_tui_promote_busy_for_tests(
 /// post-claim busy branch uses (`tui_busy_followup_diagnostic`), so the caller
 /// can defer the promotion BEFORE any user-visible teardown (turn-view
 /// started/⏳ flip, 📬/➕ marker drain, merged queued-card deletion, mailbox
-/// claim). Everything else — no session, no tmux pane, remote profile,
+/// claim). A session the host guard keeps (Herdr, unknown or conflicting host, or with no
+/// name or entry and no legacy row) also defers. Everything else — no tmux pane, remote profile,
 /// non-hosted driver, ready, unknown — returns `false`: fail-open to the normal
 /// dispatch path, whose existing post-claim busy branch owns the defer UX
 /// (queued-card render + 📬 re-attach). This probe must NEVER be load-bearing
@@ -731,11 +732,6 @@ pub(in crate::services::discord) fn set_hosted_tui_promote_busy_for_tests(
 /// discover the hosted TUI was busy — re-queue + re-attach + release + fast
 /// re-kick, every ~2s, forever. Probing the same verdict before teardown
 /// short-circuits the whole cycle with zero visible state change.
-///
-/// Session context (tmux name / current_path / session_id / remote-profile
-/// presence) is resolved here once from the channel session snapshot; the
-/// promote entrypoints have no resolved intake context yet, so nothing is
-/// duplicated.
 pub(in crate::services::discord) async fn hosted_tui_promote_readiness_blocked(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -749,10 +745,12 @@ pub(in crate::services::discord) async fn hosted_tui_promote_readiness_blocked(
         return busy;
     }
 
+    let nameless = super::super::super::host_defer_gate::nameless_channel_deferred;
     let (tmux_session_name, remote_profile_named, current_path, session_id) = {
         let data = shared.core.lock().await;
         let Some(session) = data.sessions.get(&channel_id) else {
-            return false;
+            drop(data);
+            return nameless(shared, provider, channel_id.get()).await;
         };
         let tmux_session_name = if provider.uses_managed_tmux_backend() {
             session
@@ -770,8 +768,12 @@ pub(in crate::services::discord) async fn hosted_tui_promote_readiness_blocked(
         )
     };
     let Some(tmux_session_name) = tmux_session_name else {
-        return false;
+        return nameless(shared, provider, channel_id.get()).await;
     };
+    let host = super::super::super::host_defer_gate::channel_session_deferred;
+    if host(shared, provider, channel_id.get(), &tmux_session_name).await {
+        return true;
+    }
     // `remote_profile_named` (name recorded on the session) is a conservative
     // stand-in for the intake path's settings-resolved profile: a named-but-
     // missing profile makes the probe return `false` (fail-open to normal

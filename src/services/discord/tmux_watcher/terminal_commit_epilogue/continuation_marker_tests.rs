@@ -36,6 +36,7 @@ async fn stop(
         output_path: &a.output_path,
         relay_coord: &Arc::new(TmuxRelayCoord::new(channel_id)),
         turn_delivered: &a.turn_delivered,
+        host: &HostSnapshot::new(WatchHost::Legacy),
     };
     run_terminal_commit_epilogue(
         &context,
@@ -123,7 +124,8 @@ async fn guard(
     .await
 }
 
-// PATH is replaced only in the child, never in the parallel test runner.
+// PATH is replaced only in the child, never in the parallel test runner. The fake tmux
+// confirms the session is gone; a silent failure would be an unanswered probe, not a death.
 #[cfg(unix)]
 fn isolated(name: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -131,7 +133,8 @@ fn isolated(name: &str) {
     let tmux = root.path().join("tmux");
     std::fs::write(
         &tmux,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AGENTDESK_ROOT_DIR/probes\"\nexit 1\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AGENTDESK_ROOT_DIR/probes\"\n\
+         echo \"can't find session\" >&2\nexit 1\n",
     )
     .unwrap();
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -357,6 +360,7 @@ async fn exercise_zero_id_cleanup(name: &str, newer: bool) {
             output_path: &a.output_path,
             relay_coord: &Arc::new(TmuxRelayCoord::new(channel)),
             turn_delivered: &a.turn_delivered,
+            host: &HostSnapshot::new(WatchHost::Legacy),
         };
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(20),

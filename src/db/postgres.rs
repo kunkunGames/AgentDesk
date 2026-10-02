@@ -541,6 +541,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub async fn health_check(pool: &PgPool) -> Result<(), String> {
     run_health_check(pool)
         .await
@@ -662,17 +663,6 @@ pub async fn applied_migration_checksum_mismatch_details(
     }
 
     Ok(mismatches)
-}
-
-// reason: public migration-diagnostics wrapper surfaced by maintenance paths,
-// not by every compile target. See #3034.
-#[allow(dead_code)]
-pub async fn applied_migration_checksum_mismatches(pool: &PgPool) -> Result<Vec<i64>, String> {
-    Ok(applied_migration_checksum_mismatch_details(pool)
-        .await?
-        .into_iter()
-        .map(|mismatch| mismatch.version)
-        .collect())
 }
 
 fn checksum_hex(bytes: &[u8]) -> String {
@@ -959,26 +949,6 @@ async fn move_legacy_agent_references_pg(
                 format!("rewrite postgres legacy references {legacy_id} -> {canonical_id}: {error}")
             })?;
     }
-
-    sqlx::query(
-        "INSERT INTO office_agents (office_id, agent_id, department_id, joined_at)
-         SELECT office_id, $1, department_id, joined_at
-           FROM office_agents
-          WHERE agent_id = $2
-         ON CONFLICT (office_id, agent_id) DO NOTHING",
-    )
-    .bind(canonical_id)
-    .bind(legacy_id)
-    .execute(pool)
-    .await
-    .map_err(|error| {
-        format!("upsert postgres office_agents {legacy_id} -> {canonical_id}: {error}")
-    })?;
-    sqlx::query("DELETE FROM office_agents WHERE agent_id = $1")
-        .bind(legacy_id)
-        .execute(pool)
-        .await
-        .map_err(|error| format!("delete postgres office_agents {legacy_id}: {error}"))?;
 
     sqlx::query(
         "INSERT INTO auto_queue_slots (
@@ -1344,7 +1314,7 @@ pub(crate) async fn connect_test_pool(database_url: &str, label: &str) -> Result
 // PG-backed test DB create/drop so they cannot race. Dropping the guard before
 // the awaits would reintroduce the CI race this lock was added to fix. Test-only.
 #[allow(clippy::await_holding_lock)]
-/// Created through `test_db_reclaim`, which sweeps what killed processes leaked.
+/// Created through `test_db_reclaim`, whose first-create sweep reclaims databases of provably dead test processes.
 pub(crate) async fn create_test_database(
     admin_url: &str,
     database_name: &str,
@@ -2639,9 +2609,9 @@ mod tests {
             serde_json::from_str(&runtime_config_raw).expect("parse runtime-config json");
         assert_eq!(
             runtime_config
-                .get("dispatchPollSec")
+                .get("maxRetries")
                 .and_then(|value| value.as_u64()),
-            Some(30)
+            Some(3)
         );
 
         let repo_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM github_repos WHERE id = $1")
@@ -2651,47 +2621,14 @@ mod tests {
             .expect("count github_repos");
         assert_eq!(repo_count, 1);
 
-        let pipeline_stage_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM pipeline_stages WHERE repo_id = '__default__'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count default pipeline_stages");
-        assert!(
-            pipeline_stage_count >= 1,
-            "startup reseed must materialize default pipeline_stages from YAML"
-        );
-
-        let (first_stage, first_stage_order): (String, i64) = sqlx::query_as(
-            "SELECT stage_name, stage_order
-             FROM pipeline_stages
-             WHERE repo_id = '__default__'
-             ORDER BY stage_order
-             LIMIT 1",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("load first default pipeline stage");
-        assert_eq!(first_stage, "backlog");
-        assert_eq!(first_stage_order, 1);
-
-        let (source_of_truth, file_path, last_synced): (String, Option<String>, bool) =
-            sqlx::query_as(
-                "SELECT source_of_truth, file_path, last_synced_at IS NOT NULL AS last_synced
-                 FROM db_table_metadata
-                 WHERE table_name = 'pipeline_stages'",
-            )
+        let pipeline_stage_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pipeline_stages")
             .fetch_one(&pool)
             .await
-            .expect("load pipeline_stages source metadata");
-        assert_eq!(source_of_truth, "file-canonical");
-        assert!(
-            file_path
-                .as_deref()
-                .is_some_and(|path| path.ends_with("default-pipeline.yaml")),
-            "pipeline_stages metadata should record the source YAML path"
+            .expect("count pipeline_stages");
+        assert_eq!(
+            pipeline_stage_count, 0,
+            "pipeline stages are user-configured; startup must not seed card states into them"
         );
-        assert!(last_synced, "startup reseed must stamp last_synced_at");
 
         let agent_row = sqlx::query(
             "SELECT id, provider, discord_channel_cdx
@@ -2754,13 +2691,7 @@ mod tests {
 
     async fn shared_configuration_snapshot(pool: &PgPool) -> BTreeMap<String, serde_json::Value> {
         let mut snapshot = BTreeMap::new();
-        for table in [
-            "kv_meta",
-            "agents",
-            "github_repos",
-            "pipeline_stages",
-            "db_table_metadata",
-        ] {
+        for table in ["kv_meta", "agents", "github_repos", "pipeline_stages"] {
             let sql = format!(
                 "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb) FROM {table} t"
             );
@@ -2785,7 +2716,7 @@ mod tests {
             .expect("pool");
         startup_reseed(&pool, &leader).await.expect("seed leader");
         for (key, value) in [
-            ("runtime-config", r#"{"dispatchPollSec":83}"#),
+            ("runtime-config", r#"{"maxRetries":8}"#),
             ("escalation-settings-override", r#"{"enabled":false}"#),
             ("workspace_root", "/leader/workspaces"),
         ] {
@@ -2799,7 +2730,7 @@ mod tests {
         worker.policies.dir = std::path::PathBuf::from("missing-worker-local-policy-directory");
         worker.github.repos = vec!["worker/local-only".to_string()];
         worker.agents.clear();
-        worker.runtime.dispatch_poll_sec = Some(7);
+        worker.runtime.max_retries = Some(7);
         worker.runtime.reset_overrides_on_restart = true;
         for role in ["runner", "worker", "auto"] {
             worker.cluster.role = role.parse().unwrap();
@@ -2815,7 +2746,7 @@ mod tests {
 
         // The same reset flag remains effective for the configured owner.
         leader.runtime.reset_overrides_on_restart = true;
-        leader.runtime.dispatch_poll_sec = Some(47);
+        leader.runtime.max_retries = Some(5);
         startup_reseed(&pool, &leader).await.expect("leader reset");
         let raw: String =
             sqlx::query_scalar("SELECT value FROM kv_meta WHERE key = 'runtime-config'")
@@ -2823,7 +2754,7 @@ mod tests {
                 .await
                 .expect("runtime config");
         let runtime: serde_json::Value = serde_json::from_str(&raw).expect("runtime JSON");
-        assert_eq!(runtime["dispatchPollSec"], 47);
+        assert_eq!(runtime["maxRetries"], 5);
         let overrides: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM kv_meta WHERE key = 'escalation-settings-override'",
         )
@@ -3312,16 +3243,6 @@ mod tests {
             .execute(&pool)
             .await
             .expect("insert session");
-        sqlx::query(
-            "INSERT INTO office_agents (office_id, agent_id, department_id) VALUES ($1, $2, $3)",
-        )
-        .bind("office-1")
-        .bind("openclaw-maker")
-        .bind("engineering")
-        .execute(&pool)
-        .await
-        .expect("insert office agent");
-
         startup_reseed(&pool, &config)
             .await
             .expect("startup reseed postgres");
@@ -3376,14 +3297,6 @@ mod tests {
                 .await
                 .expect("load session agent");
         assert_eq!(session_agent.as_deref(), Some("maker"));
-
-        let office_agent: String =
-            sqlx::query_scalar("SELECT agent_id FROM office_agents WHERE office_id = $1")
-                .bind("office-1")
-                .fetch_one(&pool)
-                .await
-                .expect("load office agent");
-        assert_eq!(office_agent, "maker");
 
         close_test_pool(pool, "db::postgres legacy reseed test pool")
             .await

@@ -18,7 +18,7 @@ use crate::services::platform::binary_resolver;
 #[cfg(unix)]
 use crate::services::tmux_common::tmux_exact_target;
 #[cfg(unix)]
-use crate::services::tmux_diagnostics::{build_tmux_death_diagnostic, tmux_session_has_live_pane};
+use crate::services::tmux_diagnostics::build_tmux_death_diagnostic;
 use crate::utils::format::tail_with_ellipsis;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -104,9 +104,19 @@ mod completion_delivery;
 // #3834 r2: behavior-preserving extraction of the restart-path inflight recovery
 // scan (`restore_inflight_turns`) plus its tmux retry/output-path helpers into a
 // leaf module. Entry points are re-exported below so external paths stay stable.
+#[cfg(test)]
+#[path = "recovery_engine/o_cut_recorder.rs"]
+pub(in crate::services::discord) mod o_cut_recorder;
+#[cfg(test)]
+#[path = "recovery_engine/o_recovery_cut_tests.rs"]
+mod o_recovery_cut_tests;
 #[path = "recovery_engine/restore_inflight.rs"]
 mod restore_inflight;
 pub(crate) use completion_delivery::CapturedReadyDeliveryCommit;
+// Unix only, like the `tmux::execution_identity` comparison it calls.
+#[cfg(unix)]
+#[path = "recovery_engine/host_reconcile.rs"]
+pub(in crate::services::discord) mod host_reconcile;
 // #4111: behavior-preserving extraction of guarded Codex rollout persist-outcome
 // handling before restart-path watcher spawn into a leaf module.
 #[path = "recovery_engine/restore_persist_outcome.rs"]
@@ -191,11 +201,15 @@ pub(in crate::services::discord) use self::runtime::reregister_active_turn_from_
 // alias) and so the root's `restore_inflight_turns` reattach call sites stay
 // byte-identical. Its private `reseed_watcher_owned_finalizer_ledger` helper is
 // not re-exported.
-pub(in crate::services::discord) use self::completion_delivery::relay_recovered_terminal_text_to_placeholder;
 use self::completion_delivery::{
-    CapturedRecoveryDelivery, RecoveryCompletionOutcome, complete_recovery_visible_turn,
-    relay_captured_recovery_terminal_notice, relay_captured_recovery_terminal_notice_with_gateway,
-    relay_recovery_terminal_notice, should_advance_recovery_dispatch_after_relay,
+    CapturedRecoveryDelivery, RECOVERED_WITHOUT_TEXT, RecoveryCompletionOutcome,
+    complete_recovery_visible_turn, relay_captured_recovery_terminal_notice,
+    relay_captured_recovery_terminal_notice_with_gateway, relay_recovery_body_notice,
+    relay_recovery_body_to_placeholder, relay_recovery_terminal_notice,
+    should_advance_recovery_dispatch_after_relay,
+};
+pub(in crate::services::discord) use self::completion_delivery::{
+    relay_recovered_body_to_placeholder, relay_recovered_terminal_text_to_placeholder,
 };
 // `detect_live_tmux_output_path` exists only under `#[cfg(unix)]` in the child;
 // a by-name import of a cfg'd-out item is a hard E0432 on non-unix targets.
@@ -207,7 +221,7 @@ pub(in crate::services::discord) use self::restore_inflight::{
 use self::restore_persist_outcome::{RestorePersistOutcome, restore_codex_rollout_output_path};
 pub(super) use self::runtime::reregister_active_turn_from_inflight;
 pub(in crate::services::discord) use self::terminal_text_idempotency::RecoveryDeliveryContext;
-use self::tmux_probe::tmux_session_alive_with_retry;
+use self::tmux_probe::observe_liveness_with_retry;
 // #3479: re-import the analytics + transcript helpers so root call sites stay
 // byte-identical. `recovered_transcript_turn_id` is gated on cfg(test) — the root
 // reaches it only from its unit test (prod calls it inside analytics_transcript).
@@ -217,11 +231,6 @@ use self::analytics_transcript::{
     extract_turn_analytics_from_output, lookup_turn_finished_dispatch_kind,
     persist_recovered_transcript, recovered_turn_duration_ms,
 };
-
-#[cfg(not(unix))]
-fn tmux_session_has_live_pane(_name: &str) -> bool {
-    false
-}
 
 /// #2428 H5: exponential backoff (+ jitter) for the 3-attempt recovery retry
 /// loops in this module. Budget contract (Codex pass-1 review): the old fixed

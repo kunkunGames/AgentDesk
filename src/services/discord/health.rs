@@ -97,18 +97,20 @@ pub use recovery::{
     PostCancelDrainOutcome, ProviderMailboxState, RuntimeTurnStopResult,
     clear_idle_tmux_stale_turn, clear_provider_channel_runtime,
     finish_cancelled_provider_channel_mailbox, force_kill_provider_channel_runtime,
-    handle_rebind_inflight, handle_relay_recovery, hard_stop_runtime_turn,
-    provider_channel_mailbox_state, resolve_tmux_session_for_cancel,
-    schedule_pending_queue_drain_after_cancel, snapshot_pending_queue_state, spawn_stall_watchdog,
-    spawn_watchdog, stop_providerless_runtime_turn_preserving_watcher_strict_ownership,
+    handle_rebind_inflight, handle_relay_recovery, provider_channel_mailbox_state,
+    resolve_tmux_session_for_cancel, schedule_pending_queue_drain_after_cancel,
+    snapshot_pending_queue_state, spawn_stall_watchdog, spawn_watchdog,
+    stop_providerless_runtime_turn_preserving_watcher_strict_ownership,
     stop_runtime_turn_preserving_watcher,
 };
 pub(crate) use recovery::{
     STALL_WATCHDOG_INTERVAL_SECS, channel_has_active_turn, clear_resume_runtime_owner_after_death,
     rebind_channel_provider_session, release_zombie_foreground_turn_by_tmux_name,
-    resume_runtime_for_channel, retain_resume_runtime_owner_before_teardown,
+    resume_runtime_for_channel, retain_resume_runtime_owner_before_teardown, stop_channel_runtime,
     stop_provider_channel_runtime_with_policy,
 };
+#[cfg(test)]
+pub(crate) use runtime_resolve::owner_runtime_for_tests;
 pub use runtime_resolve::{fetch_channel_name, resolve_bot_http};
 use runtime_resolve::{resolve_direct_meeting_runtime, resolve_direct_meeting_shared};
 pub(crate) use runtime_resolve::{resolve_intake_worker_runtime, resolve_utility_bot_http};
@@ -370,6 +372,16 @@ impl HealthRegistry {
         self.utility_bot(role).http.lock().await.clone()
     }
 
+    /// Test-only: installs a utility-bot client pointed at a mock Discord.
+    #[cfg(test)]
+    pub(crate) async fn set_utility_bot_http_for_tests(
+        &self,
+        role: UtilityBotRole,
+        http: Arc<serenity::Http>,
+    ) {
+        *self.utility_bot(role).http.lock().await = Some(http);
+    }
+
     /// Snapshot the announce-role HTTP client. This role is where `Manage
     /// Messages` permissions are concentrated, so pin/unpin lifecycle code
     /// prefers it over per-provider HTTP clients.
@@ -377,20 +389,12 @@ impl HealthRegistry {
         self.utility_bot_http_clone(UtilityBotRole::Announce).await
     }
 
-    pub(in crate::services::discord) async fn register_standby(
-        &self,
-        name: String,
-        shared: Arc<SharedData>,
-    ) {
+    pub(crate) async fn register_standby(&self, name: String, shared: Arc<SharedData>) {
         self.register_with_role(name, shared, ProviderRuntimeRole::Standby)
             .await;
     }
 
-    pub(in crate::services::discord) async fn register_worker(
-        &self,
-        name: String,
-        shared: Arc<SharedData>,
-    ) {
+    pub(crate) async fn register_worker(&self, name: String, shared: Arc<SharedData>) {
         self.register_with_role(name, shared, ProviderRuntimeRole::Worker)
             .await;
     }
@@ -571,6 +575,21 @@ impl HealthRegistry {
             .filter(|entry| entry.name.eq_ignore_ascii_case(provider.as_str()))
             .map(|entry| entry.shared.clone())
             .collect()
+    }
+
+    /// Bot token hashes of the runtimes registered under `provider`, sorted and deduplicated.
+    pub(crate) async fn registered_token_hashes(&self, provider: &ProviderKind) -> Vec<String> {
+        let mut hashes: Vec<String> = self
+            .providers
+            .lock()
+            .await
+            .iter()
+            .filter(|entry| entry.name.eq_ignore_ascii_case(provider.as_str()))
+            .map(|entry| entry.shared.token_hash.clone())
+            .collect();
+        hashes.sort();
+        hashes.dedup();
+        hashes
     }
 
     /// #3293: every registered runtime regardless of provider. Used by the
@@ -918,6 +937,29 @@ mod tests {
                 None => unsafe { std::env::remove_var(&self.key) },
             }
         }
+    }
+
+    // Probe candidates are the hashes of the provider's own runtimes in any role, each once.
+    #[tokio::test]
+    async fn registered_token_hashes_are_the_providers_own_in_any_role() {
+        let registry = HealthRegistry::new();
+        let runtime = |hash: &str| {
+            let mut shared = crate::services::discord::make_shared_data_for_tests();
+            Arc::get_mut(&mut shared).unwrap().token_hash = hash.to_string();
+            shared
+        };
+        registry.register("claude".into(), runtime("h-b")).await;
+        registry
+            .register_standby("Claude".into(), runtime("h-a"))
+            .await;
+        registry
+            .register_worker("claude".into(), runtime("h-b"))
+            .await;
+        registry.register("codex".into(), runtime("h-c")).await;
+        let hashes = |provider| registry.registered_token_hashes(provider);
+        assert_eq!(hashes(&ProviderKind::Claude).await, ["h-a", "h-b"]);
+        assert_eq!(hashes(&ProviderKind::Codex).await, ["h-c"]);
+        assert!(hashes(&ProviderKind::Qwen).await.is_empty());
     }
 
     fn write_test_bot_token(root: &Path, bot_name: &str, token: &str) {

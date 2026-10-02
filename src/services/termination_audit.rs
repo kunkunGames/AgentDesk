@@ -1,3 +1,5 @@
+pub(crate) mod host_terminate;
+
 use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Default)]
@@ -191,5 +193,24 @@ pub fn record_termination_for_tmux(
         probe_snapshot.as_deref(),
         last_offset,
         Some(tmux_alive),
+    );
+}
+
+/// [`record_termination_for_tmux`] for a session the host guard admitted.
+pub(crate) fn record_termination_for_cleared(
+    session: &crate::services::session_host::ClearedHostSession,
+    dispatch_id: Option<&str>,
+    killer_component: &str,
+    reason_code: &str,
+    reason_text: Option<&str>,
+    last_offset: Option<u64>,
+) {
+    record_termination_for_tmux(
+        session.name(),
+        dispatch_id,
+        killer_component,
+        reason_code,
+        reason_text,
+        last_offset,
     );
 }

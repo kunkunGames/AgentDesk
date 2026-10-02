@@ -1,5 +1,6 @@
 mod abandon_request_store;
 mod adk_session;
+pub(crate) mod admin_host_guard;
 pub(crate) mod agent_handoff;
 pub(crate) mod agentdesk_config;
 mod answer_flush_barrier;
@@ -21,6 +22,10 @@ pub(crate) mod formatting;
 mod gateway;
 mod gateway_voice_queue;
 pub(crate) mod health;
+pub(crate) mod host_defer_gate;
+pub(crate) mod host_key_derivation;
+mod host_liveness;
+pub(crate) mod host_teardown_gate;
 pub(crate) mod http;
 mod idle_detector;
 pub(crate) mod idle_recap;
@@ -84,6 +89,7 @@ mod router;
 mod runtime_bootstrap;
 pub(in crate::services::discord) mod semantic_boundaries;
 mod skills_scan;
+mod turn_teardown_clearance;
 // #1446 stall-deadlock recovery: shared post-clear bookkeeping for the THREAD-GUARD
 // + stall-watchdog cleanup paths so neither leaks `global_active` / cancel tokens.
 pub mod runtime_store;
@@ -509,10 +515,6 @@ pub(super) fn status_update_interval() -> Duration {
     *CACHED.get_or_init(|| env_duration_secs("AGENTDESK_STATUS_INTERVAL_SECS", 5))
 }
 
-pub(crate) fn clear_inflight_by_tmux_name(provider: &ProviderKind, tmux_name: &str) -> bool {
-    inflight::clear_inflight_by_tmux_name(provider, tmux_name)
-}
-
 pub(crate) fn clear_inflight_state_for_channel(provider: &ProviderKind, channel_id: u64) {
     inflight::clear_inflight_state(provider, channel_id);
 }
@@ -524,6 +526,8 @@ pub(crate) fn inflight_state_allows_idle_tmux_repair_for_channel(
     inflight::inflight_state_allows_idle_tmux_repair(provider, channel_id)
 }
 
+/// Reads only `channel_id`'s rows and writes nothing, so probing one thread never saves another
+/// thread's row; a row that cannot be read or parsed counts as fresh.
 pub(crate) fn has_fresh_inflight_for_channel(channel_id: u64) -> bool {
     let now_unix_secs = chrono::Local::now().timestamp();
     [
@@ -534,16 +538,21 @@ pub(crate) fn has_fresh_inflight_for_channel(channel_id: u64) -> bool {
         ProviderKind::Qwen,
     ]
     .iter()
-    .flat_map(load_inflight_states)
-    .any(|state| {
-        !state.rebind_origin
-            && state.channel_id == channel_id
-            && !inflight::inflight_state_is_stale(
-                &state,
-                now_unix_secs,
-                inflight::INFLIGHT_STALENESS_THRESHOLD_SECS,
-            )
-    })
+    .any(
+        |provider| match inflight::load_channel_inflight_for_probe(provider, channel_id) {
+            Err(_) => true,
+            Ok(None) => false,
+            Ok(Some(state)) => {
+                !state.rebind_origin
+                    && state.channel_id == channel_id
+                    && !inflight::inflight_state_is_stale(
+                        &state,
+                        now_unix_secs,
+                        inflight::INFLIGHT_STALENESS_THRESHOLD_SECS,
+                    )
+            }
+        },
+    )
 }
 
 async fn has_active_session_for_thread_pg(
@@ -687,6 +696,8 @@ fn increment_counter(counter: &AtomicUsize, reason: &str) -> usize {
 pub(crate) use router::try_intake_runtime_transition_after_redirect;
 #[cfg(test)]
 pub(crate) use session_runtime::resume_launch_state_for_tests;
+#[cfg(all(unix, test))]
+pub(crate) use tui_prompt_relay::rehydration::rehydrate_codex_tui_binding_for_tests;
 
 #[cfg(test)]
 pub(crate) fn register_resume_watcher_for_tests(

@@ -275,6 +275,7 @@ async fn delivered_partial_eof_cannot_finish_or_clear_successor_during_transport
 
 #[tokio::test(flavor = "current_thread")]
 async fn partial_eof_actual_controller_preserves_frozen_prefix_and_streamed_current_anchor() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     use crate::services::agent_protocol::RuntimeHandoffKind;
     use crate::services::discord::formatting::ReplaceLongMessageOutcome;
     use crate::services::discord::outbound::delivery_record as dr;
@@ -563,6 +564,7 @@ async fn partial_eof_actual_controller_preserves_frozen_prefix_and_streamed_curr
                         MessageId::new(41),
                         &text,
                         context,
+                        None,
                     )
                     .await.into()
                 }
@@ -1072,6 +1074,7 @@ async fn partial_eof_actual_fallback_uses_own_anchor_snapshot_and_refuses_foreig
                         MessageId::new(state.current_msg_id),
                         &text,
                         Some(context),
+                        None,
                     )
                     .await;
                     assert!(matches!(outcome, RecoveryRelayOutcome::Delivered));
@@ -1442,6 +1445,7 @@ async fn ready_eof_exact_fallback_receipt_skips_retransport_before_terminal_mirr
                                 MessageId::new(state.current_msg_id),
                                 &text,
                                 context,
+                                None,
                             )
                             .await;
                             CapturedRecoveryDelivery {

@@ -349,7 +349,8 @@ pub(in crate::services::discord) enum AnchorRepostOutcome {
     /// record). The on-disk row was left UNTOUCHED — the caller MUST preserve it
     /// (do NOT clear): a transient `IoError` is re-posted by a later boot whose
     /// bump succeeds, and a `RowAbsent` / stranger (`SuccessorOwned`, a newer
-    /// turn now owns the row) row must never be cleared by this path.
+    /// turn now owns the row) row must never be cleared by this path. A held O output
+    /// identity for the anchor channel refuses the same way, before the bump.
     RefusedPreserveRow,
 }
 
@@ -427,7 +428,6 @@ pub(in crate::services::discord) async fn try_recover_anchor_repost(
     if !super::shared::recovery_anchor_repost_enabled() {
         return AnchorRepostOutcome::NotReposted;
     }
-
     // G2a: never repost a blank body.
     if terminal_text.trim().is_empty() {
         return AnchorRepostOutcome::NotReposted;
@@ -496,6 +496,19 @@ pub(in crate::services::discord) async fn try_recover_anchor_repost(
     else {
         return AnchorRepostOutcome::NotReposted;
     };
+    // O posts the anchor channel's TUI body; Legacy never reposts it. The row's kind counts only
+    // when the anchor lives in the row's own channel, and a held identity preserves the row.
+    let kind = (anchor.panel_channel_id == state.channel_id)
+        .then_some(state.runtime_kind)
+        .flatten();
+    match crate::services::tui_o::cutover::peek_o_owns_tui_output_for_channel(
+        anchor.panel_channel_id,
+        kind,
+    ) {
+        Ok(false) => {}
+        Ok(true) => return AnchorRepostOutcome::NotReposted,
+        Err(_) => return AnchorRepostOutcome::RefusedPreserveRow,
+    }
 
     // G4: the anchor is gone → send a NEW message (placeholder = None → send-new,
     // NOT an edit). Repost into the channel the anchor lived in. The D1 context
@@ -586,15 +599,24 @@ pub(in crate::services::discord) async fn try_recover_anchor_repost(
             (anchor.panel_channel_id, anchor.panel_msg_id),
         )
         .with_record_channel_id(record_channel_id);
-    let outcome = super::super::recovery_engine::relay_recovered_terminal_text_to_placeholder(
+    // Only the repost's POST claims the channel, after every refusal above and its fresh-send lease.
+    let claim = crate::services::tui_o::cutover::BodyClaim::new(anchor.panel_channel_id, kind);
+    let repost = super::super::recovery_engine::relay_recovered_body_to_placeholder(
         http,
         shared,
         anchor_channel_id,
         None,
         terminal_text,
         Some(&recovery_context),
-    )
-    .await;
+        Some(claim),
+    );
+    let outcome = match repost.await {
+        Ok(crate::services::tui_o::cutover::BodySend::Sent(outcome)) => outcome,
+        Ok(crate::services::tui_o::cutover::BodySend::OwnedByO) => {
+            return AnchorRepostOutcome::NotReposted;
+        }
+        Err(_) => return AnchorRepostOutcome::RefusedPreserveRow,
+    };
 
     // #3918: the answer reached Discord — record the durable idempotency marker
     // NOW, before the caller's `dispose_*` clears the row, so that if the clear

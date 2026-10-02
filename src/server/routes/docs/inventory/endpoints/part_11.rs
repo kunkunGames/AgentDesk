@@ -8,13 +8,13 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/campaigns",
             "campaigns",
-            "List durable campaign DAG checkpoints from canonical PostgreSQL, newest updated first.",
+            "List durable campaign DAG checkpoints from canonical PostgreSQL, newest updated first. `live` maps campaign id -> node id -> what the kanban card behind the node's GitHub issue_url is doing now (card_id, card_status, newest dispatch_type/dispatch_status, session_status/session_seen_at of the session holding that dispatch, running, newest auto-queue queue_status); `running` is true only while that session is mid-turn with a fresh heartbeat. It is read per request and never stored in the ledger.",
         )
         .with_params([
             ("limit", query_param("integer", false, "Page size 1..500; default 100.")),
             ("offset", query_param("integer", false, "Zero-based offset; default 0.")),
         ])
-        .with_example(json!({}), json!({"campaigns": [], "limit": 100, "offset": 0}))
+        .with_example(json!({}), json!({"campaigns": [], "live": {}, "limit": 100, "offset": 0}))
         .with_curl("curl -H \"Authorization: Bearer $ADK_AUTH_TOKEN\" \"$ADK_URL/api/campaigns\""),
         ep(
             "POST",
@@ -29,6 +29,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             ("status", body_param("string", true, "planned|active|paused|completed|cancelled")),
             ("round", body_param("integer", true, "Positive campaign round.")),
             ("nodes", body_param("array", false, "Full DAG: id/title/status/stage/group/round, dependencies, assignee/session_id/provider, issue_url/pr_url/head_sha, details/acceptance/findings/evidence/evidence_records/next_action/blocker, optional summary/benefit. Optional group is trimmed; blank/omitted/null stays unclassified, independent of stage/status. See docs/campaign-ledger.md.")),
+            ("auto_queue", body_param("boolean", false, "Hand ready nodes to auto-queue automatically while the campaign is active; default false. The response then carries `handoff`.")),
         ])
         .with_example(
             json!({"body": {"id": "release-a", "title": "Release A", "status": "planned", "round": 1, "nodes": []}}),
@@ -40,10 +41,10 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "GET",
             "/api/campaigns/{id}",
             "campaigns",
-            "Read the canonical checkpoint before resuming after clear, compaction, quota interruption, or provider/session replacement. Recorded running state is not proof of a live process.",
+            "Read the canonical checkpoint before resuming after clear, compaction, quota interruption, or provider/session replacement. Recorded running state is not proof of a live process; check `live` (node id -> card, dispatch, session and queue status of the node's issue card), where `running` means a session is mid-turn on it now.",
         )
         .with_params([("id", path_param("Campaign ID."))])
-        .with_example(json!({"path": {"id": "release-a"}}), json!({"campaign": {"id": "release-a", "title": "Release A", "description": "", "status": "planned", "round": 1, "revision": 1, "nodes": [], "created_at": "2026-09-20T00:00:00Z", "updated_at": "2026-09-20T00:00:00Z"}}))
+        .with_example(json!({"path": {"id": "release-a"}}), json!({"campaign": {"id": "release-a", "title": "Release A", "description": "", "status": "planned", "round": 1, "revision": 1, "nodes": [], "created_at": "2026-09-20T00:00:00Z", "updated_at": "2026-09-20T00:00:00Z"}, "live": {}}))
         .with_curl("curl -H \"Authorization: Bearer $ADK_AUTH_TOKEN\" \"$ADK_URL/api/campaigns/release-a\""),
         ep(
             "PUT",
@@ -59,6 +60,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             ("status", body_param("string", true, "planned|active|paused|completed|cancelled")),
             ("round", body_param("integer", true, "Positive campaign round.")),
             ("nodes", body_param("array", false, "Complete replacement DAG, including durable evidence, next actions and optional group labels. Group changes share revision CAS/history; blank/omitted/null means unclassified.")),
+            ("auto_queue", body_param("boolean", false, "Turn automatic handoff on or off; omitted keeps the stored value. While on and active, pending nodes whose dependencies are done (completed/skipped, or pending/running with a terminal card) join their card agent's live auto-queue run or a new `campaign` run, after every save and every terminal card. The response carries `handoff` {queued, waiting with reasons} or `handoff_error`; see docs/campaign-ledger.md.")),
         ])
         .with_example(json!({"path": {"id": "release-a"}, "body": {"expected_revision": 1, "title": "Release A", "status": "paused", "round": 1, "nodes": []}}), json!({"campaign": {"id": "release-a", "title": "Release A", "description": "", "status": "paused", "round": 1, "revision": 2, "nodes": [], "created_at": "2026-09-20T00:00:00Z", "updated_at": "2026-09-20T00:01:00Z"}}))
         .with_error_example(409, json!({"body": {"expected_revision": 1, "title": "Release A", "status": "paused", "round": 1}}), json!({"error": "campaign revision conflict; reload before retrying", "code": "conflict", "context": {}}))

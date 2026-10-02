@@ -1,32 +1,10 @@
-//! DB retention job (#1093 / 909-4; extended in #3865).
+//! DB retention pass: archives, aggregates or deletes aged rows per table, recording each
+//! step as a [`TableReport`]. Windows are the `*_RETENTION_DAYS` constants; the policy is
+//! described in `docs/storage-retention.md`. `kanban_cards` is never touched: done cards
+//! are permanent history. `intake_outbox` candidates are only counted, never deleted.
 //!
-//! Ten retention policies across the AgentDesk postgres backbone:
-//!
-//! | Table                                   | Retention | Strategy                          |
-//! |-----------------------------------------|-----------|-----------------------------------|
-//! | `agent_quality_event`                   | 90 days   | Monthly aggregate, then DELETE    |
-//! | `session_transcripts`                   | 90 days   | Archive-table copy, then DELETE   |
-//! | `message_outbox` (sent)                 | 7 days    | DELETE (durable sentinels exempt) |
-//! | `auto_queue_entries`                    | 30 days   | DELETE (status='completed')       |
-//! | `task_dispatches`                       | 90 days   | Monthly aggregate, then DELETE    |
-//! | `turn_lifecycle_events`                 | 30 days   | DELETE (on `created_at`)          |
-//! | `skill_usage`                           | 90 days   | DELETE (on `used_at`)             |
-//! | `turns`                                 | 90 days   | Archive-table copy, then DELETE   |
-//! | `scheduled_message_context_snapshots`   | 30 days   | DELETE (all refs terminal + aged) |
-//! | `intake_outbox` (terminal statuses)     | 7 / 30 d  | COUNT candidates only, no DELETE  |
-//!
-//! `kanban_cards` is explicitly **not** touched — done cards are permanent
-//! history. See `docs/source-of-truth.md` §retention for the policy rationale.
-//!
-//! Each operation returns a [`TableReport`] logging action taken and rows
-//! affected, so `/api/cron-jobs` and observability dashboards can diff
-//! retention pressure week-over-week.
-//!
-//! ## Dry-run mode
-//! When `dry_run = true`, every DELETE is rewritten as a `SELECT COUNT(*)` and
-//! every aggregate INSERT is skipped. The returned [`RetentionReport`] is
-//! populated with the would-be counts but the DB is untouched. Used by CI and
-//! staging verification pipelines.
+//! With `dry_run = true` every DELETE becomes a `SELECT COUNT(*)` and no archive or
+//! aggregate write runs, so the DB is untouched.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -80,6 +58,7 @@ impl RetentionReport {
             .sum()
     }
 
+    #[cfg(test)]
     pub fn get(&self, table: &str, action: &str) -> Option<&TableReport> {
         self.tables
             .iter()
@@ -87,20 +66,14 @@ impl RetentionReport {
     }
 }
 
-const TURN_RETENTION_DAYS: i32 = 90;
 const TRANSCRIPT_RETENTION_DAYS: i32 = 90;
 const OUTBOX_RETENTION_DAYS: i32 = 7;
 const AUTO_QUEUE_RETENTION_DAYS: i32 = 30;
 const DISPATCH_RETENTION_DAYS: i32 = 90;
-// #3865 — three INSERT-only tables with no prior prune. These named windows are
-// the configurable retention boundaries for the policies added below.
-const TURN_LIFECYCLE_RETENTION_DAYS: i32 = 30; // pure operational telemetry, highest volume (multi-row/turn)
-const SKILL_USAGE_RETENTION_DAYS: i32 = 90; // dashboard analytics (used_at DESC fast-path)
-const TURNS_RETENTION_DAYS: i32 = 90; // token/cost analytics → archive before delete
-// #4658/#4723 — immutable scheduled-message context snapshots. Reclaimed once
-// every referencing definition is terminal AND older than this window (the FK
-// pointer is nulled with provenance kept, then the snapshot is deleted), so a
-// live recurring reservation's snapshot is never reclaimed.
+const TURN_LIFECYCLE_RETENTION_DAYS: i32 = 30; // operational telemetry, several rows per turn
+const SKILL_USAGE_RETENTION_DAYS: i32 = 90; // dashboard analytics
+const TURNS_RETENTION_DAYS: i32 = 90; // token/cost analytics, archived before delete
+// Applies to both the snapshot's age and its referencing definitions' terminal age.
 const CONTEXT_SNAPSHOT_RETENTION_DAYS: i32 = 30;
 const INTAKE_OUTBOX_DONE_RETENTION_DAYS: i32 = 7;
 // unknown/failed rows are evidence for relay and intake loss investigations.
@@ -109,33 +82,23 @@ const INTAKE_OUTBOX_FAILED_RETENTION_DAYS: i32 = 30;
 const INTAKE_OUTBOX_COUNT_STATEMENT_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 
-/// Run the full retention pass. Returns a per-table report. When
-/// `dry_run = true` no DML is executed — only SELECT COUNT(*) probes.
+/// Runs every retention policy once. With `dry_run = true` it runs only
+/// `SELECT COUNT(*)` probes.
 pub async fn db_retention_job(pool: &PgPool, dry_run: bool) -> Result<RetentionReport> {
     let mut report = RetentionReport {
         dry_run,
         tables: Vec::with_capacity(12),
     };
 
-    // 1. turn analytics (agent_quality_event).
-    retain_turn_analytics(pool, dry_run, &mut report).await?;
-    // 2. session_transcripts archive.
+    // `agent_quality_event` is owned by the hourly observability retention sweep.
     retain_session_transcripts(pool, dry_run, &mut report).await?;
-    // 3. message_outbox (sent rows).
     retain_message_outbox(pool, dry_run, &mut report).await?;
-    // 4. auto_queue_entries.
     retain_auto_queue_entries(pool, dry_run, &mut report).await?;
-    // 5. task_dispatches.
     retain_task_dispatches(pool, dry_run, &mut report).await?;
-    // 6. turn_lifecycle_events (time-window DELETE on created_at). #3865
     retain_turn_lifecycle_events(pool, dry_run, &mut report).await?;
-    // 7. skill_usage (time-window DELETE on used_at). #3865
     retain_skill_usage(pool, dry_run, &mut report).await?;
-    // 8. turns (archive-then-delete on finished_at). #3865
     retain_turns(pool, dry_run, &mut report).await?;
-    // 9. scheduled_message_context_snapshots (all refs terminal + aged). #4658/#4723
     retain_context_snapshots(pool, dry_run, &mut report).await?;
-    // 10. intake_outbox: counts delete candidates only; nothing is deleted yet.
     count_intake_outbox_candidates_bounded(
         pool,
         INTAKE_OUTBOX_COUNT_STATEMENT_TIMEOUT,
@@ -153,78 +116,6 @@ pub async fn db_retention_job(pool: &PgPool, dry_run: bool) -> Result<RetentionR
     Ok(report)
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 1. agent_quality_event (turn_analytics): monthly aggregate then DELETE.
-// ─────────────────────────────────────────────────────────────────────────
-async fn retain_turn_analytics(
-    pool: &PgPool,
-    dry_run: bool,
-    report: &mut RetentionReport,
-) -> Result<()> {
-    if dry_run {
-        let would = sqlx::query(
-            "SELECT COUNT(*)::BIGINT AS n FROM agent_quality_event \
-             WHERE created_at < NOW() - ($1::INT || ' days')::INTERVAL \
-               AND event_type IN ('turn_start','turn_complete','turn_error')",
-        )
-        .bind(TURN_RETENTION_DAYS)
-        .fetch_one(pool)
-        .await?;
-        let n: i64 = would.try_get("n").unwrap_or(0);
-        report.push(TableReport {
-            table_name: "agent_quality_event",
-            action: "delete_would",
-            rows_affected: n,
-        });
-        return Ok(());
-    }
-
-    // Aggregate-into first. ON CONFLICT DO NOTHING keeps prior months stable
-    // (we only backfill *new* month buckets; the most recent month is still
-    // inside the 90d window so its row is never written here).
-    let agg = sqlx::query(
-        "INSERT INTO turn_analytics_monthly_aggregate \
-             (month, total_turns, success_count, error_count, start_count, aggregated_at) \
-         SELECT date_trunc('month', created_at)::DATE AS month, \
-                COUNT(*) FILTER (WHERE event_type IN ('turn_start','turn_complete','turn_error'))::BIGINT, \
-                COUNT(*) FILTER (WHERE event_type = 'turn_complete')::BIGINT, \
-                COUNT(*) FILTER (WHERE event_type = 'turn_error')::BIGINT, \
-                COUNT(*) FILTER (WHERE event_type = 'turn_start')::BIGINT, \
-                NOW() \
-         FROM agent_quality_event \
-         WHERE created_at < NOW() - ($1::INT || ' days')::INTERVAL \
-           AND event_type IN ('turn_start','turn_complete','turn_error') \
-         GROUP BY date_trunc('month', created_at) \
-         ON CONFLICT (month) DO NOTHING",
-    )
-    .bind(TURN_RETENTION_DAYS)
-    .execute(pool)
-    .await?;
-    report.push(TableReport {
-        table_name: "turn_analytics_monthly_aggregate",
-        action: "insert",
-        rows_affected: agg.rows_affected() as i64,
-    });
-
-    let del = sqlx::query(
-        "DELETE FROM agent_quality_event \
-         WHERE created_at < NOW() - ($1::INT || ' days')::INTERVAL \
-           AND event_type IN ('turn_start','turn_complete','turn_error')",
-    )
-    .bind(TURN_RETENTION_DAYS)
-    .execute(pool)
-    .await?;
-    report.push(TableReport {
-        table_name: "agent_quality_event",
-        action: "delete",
-        rows_affected: del.rows_affected() as i64,
-    });
-    Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// 2. session_transcripts: archive-then-delete.
-// ─────────────────────────────────────────────────────────────────────────
 async fn retain_session_transcripts(
     pool: &PgPool,
     dry_run: bool,
@@ -285,13 +176,8 @@ async fn retain_session_transcripts(
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 3. message_outbox: delete sent rows older than 7 days, except permanent
-// dedupe sentinels (`dedupe_key IS NOT NULL AND dedupe_expires_at IS NULL`).
-//
-// Schema uses `sent_at` (not `delivered_at`) — the DoD's "delivered" maps to
-// status='sent' + sent_at set. Treat both as interchangeable here.
-// ─────────────────────────────────────────────────────────────────────────
+// `sent_at` is stamped together with status='sent'. Permanent dedupe sentinels
+// (`dedupe_key` set, `dedupe_expires_at` NULL) are never deleted.
 async fn retain_message_outbox(
     pool: &PgPool,
     dry_run: bool,
@@ -333,9 +219,6 @@ async fn retain_message_outbox(
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 4. auto_queue_entries: delete completed rows older than 30 days.
-// ─────────────────────────────────────────────────────────────────────────
 async fn retain_auto_queue_entries(
     pool: &PgPool,
     dry_run: bool,
@@ -377,9 +260,6 @@ async fn retain_auto_queue_entries(
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 5. task_dispatches: monthly aggregate + delete completed rows older than 90d.
-// ─────────────────────────────────────────────────────────────────────────
 async fn retain_task_dispatches(
     pool: &PgPool,
     dry_run: bool,
@@ -445,12 +325,6 @@ async fn retain_task_dispatches(
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 6. turn_lifecycle_events: delete telemetry rows older than 30 days. #3865
-//
-// Pure operational telemetry (multiple rows per turn) with no downstream
-// aggregate — a plain time-window DELETE on the indexed `created_at` column.
-// ─────────────────────────────────────────────────────────────────────────
 async fn retain_turn_lifecycle_events(
     pool: &PgPool,
     dry_run: bool,
@@ -488,13 +362,7 @@ async fn retain_turn_lifecycle_events(
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 7. skill_usage: delete usage rows older than 90 days. #3865
-//
-// `used_at` is nullable (DEFAULT NOW()); rows are never inserted with NULL, but
-// the `used_at IS NOT NULL` guard mirrors the message_outbox `sent_at` guard so
-// a stray NULL is retained rather than mis-windowed.
-// ─────────────────────────────────────────────────────────────────────────
+// `used_at` is nullable; a row with NULL `used_at` is kept.
 async fn retain_skill_usage(
     pool: &PgPool,
     dry_run: bool,
@@ -534,25 +402,8 @@ async fn retain_skill_usage(
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 8. turns: archive-then-delete on finished_at older than 90 days. #3865
-//
-// Like `retain_session_transcripts` this copies into `turns_archive` (idempotent
-// via WHERE NOT EXISTS) before deleting, but `turns` is high-value token/cost
-// data so the two steps are hardened against an archive-less delete:
-//
-//   * Both statements run inside ONE transaction. Postgres `NOW()` resolves to
-//     `transaction_timestamp()`, which is fixed for the life of the transaction,
-//     so the archive and delete predicates share the *identical* cutoff — a row
-//     can never cross the 90-day boundary between the two steps. (This is
-//     stronger than computing the cutoff app-side, which would add DB/app clock
-//     skew.)
-//   * The DELETE carries an `EXISTS (… turns_archive …)` guard, so it can only
-//     remove rows that are already in the archive — a delete-without-archive is
-//     impossible even if the reasoning above were ever violated.
-//
-// `finished_at` is NOT NULL → no NULL edge cases.
-// ─────────────────────────────────────────────────────────────────────────
+// Both steps share one transaction, so `NOW()` gives them the same cutoff, and the
+// DELETE's EXISTS guard only removes rows already copied to `turns_archive`.
 async fn retain_turns(pool: &PgPool, dry_run: bool, report: &mut RetentionReport) -> Result<()> {
     if dry_run {
         let would = sqlx::query(
@@ -598,9 +449,6 @@ async fn retain_turns(pool: &PgPool, dry_run: bool, report: &mut RetentionReport
         rows_affected: archived.rows_affected() as i64,
     });
 
-    // EXISTS guard: only delete rows that are already archived. Combined with the
-    // shared transaction cutoff, every old row was archived by the INSERT above,
-    // so this deletes exactly the archived set and nothing more.
     let del = sqlx::query(
         "DELETE FROM turns t \
          WHERE t.finished_at < NOW() - ($1::INT || ' days')::INTERVAL \
@@ -621,40 +469,8 @@ async fn retain_turns(pool: &PgPool, dry_run: bool, report: &mut RetentionReport
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// 9. scheduled_message_context_snapshots: reclaim a snapshot once EVERY
-// definition referencing it is terminal AND aged past the 30-day window. #4658,
-// real reclaim landed in #4723.
-//
-// FK / lifecycle trace. `fk_smsg_context_snapshot` runs
-// scheduled_messages.context_snapshot_id (child) → …_snapshots.id (parent), so a
-// snapshot (parent) cannot be deleted while ANY definition (child) references it.
-// Nothing hard-deletes a `scheduled_messages` row — cancel only flips
-// status='canceled' — so a terminal definition keeps its snapshot FK-pinned
-// forever, and #4658's pure-unreferenced predicate almost never fired
-// (rendered_context, ≤32KB/row, leaked indefinitely). Definition lifecycle:
-// active = status IN ('scheduled','firing'); terminal = status IN
-// ('sent','failed','canceled','expired'); every terminal transition bumps
-// updated_at (see db/scheduled_messages.rs), so updated_at is a sound proxy for
-// "became terminal at". A recurring reservation re-arms back to 'scheduled'
-// between fires, so an active repeating definition is never terminal.
-//
-// FK-safe reclaim (chosen over the two deferred options — see #4723). For a
-// snapshot whose every referencing definition is terminal AND aged, null the FK
-// pointer on those terminal definitions (0098 adds context_snapshot_reclaimed_at
-// and relaxes chk_smsg_snapshot_required to admit a 'snapshot' row with a NULL
-// id once reclaimed), then delete the now-unreferenced snapshot. This keeps the
-// "was snapshot strategy" provenance (context_strategy stays 'snapshot',
-// reclaimed_at records the retention event) — resolving Option 2's objection —
-// while staying FK-safe. AC-9 is structural: an active/pending definition is not
-// terminal, so its snapshot is never eligible and is never pruned.
-//
-// Eligibility predicate (evaluated on the snapshot row `s`): aged past the
-// window AND no referencing definition is anything OTHER than terminal+aged.
-// Genuinely-unreferenced aged snapshots (the #4658 case) satisfy it trivially
-// via the empty NOT EXISTS, so this strictly supersedes the old predicate. `$1`
-// (retention days) is referenced twice — Postgres reuses the single bind.
-// ─────────────────────────────────────────────────────────────────────────
+// Aged snapshots whose every referencing definition is terminal with an aged `updated_at`
+// (bumped on each terminal transition). A re-armed recurring definition is never terminal.
 const CONTEXT_SNAPSHOT_RECLAIMABLE_PREDICATE: &str = "created_at < NOW() - ($1::INT || ' days')::INTERVAL \
        AND NOT EXISTS ( \
            SELECT 1 FROM scheduled_messages m \
@@ -687,10 +503,8 @@ async fn retain_context_snapshots(
         return Ok(());
     }
 
-    // Atomic two-step so the DELETE never races a definition transitioning back
-    // to active between the null and the prune: (1) null the FK pointer on the
-    // terminal+aged definitions of every reclaimable snapshot, preserving
-    // provenance; (2) delete the snapshots, now unreferenced.
+    // Null the FK pointers (provenance stays in `context_snapshot_reclaimed_at`) and
+    // delete the snapshots in one transaction so no definition can re-arm in between.
     let mut tx = pool.begin().await?;
 
     let unref = sqlx::query(&format!(
@@ -727,8 +541,8 @@ async fn retain_context_snapshots(
     Ok(())
 }
 
-// 10. intake_outbox: a row is a candidate only when it, its whole (channel_id,
-// user_msg_id) attempt family, and every child are allowlisted terminal and aged.
+// An intake_outbox row is a candidate only when it, its whole (channel_id, user_msg_id)
+// attempt family, and every child are allowlisted terminal and aged.
 fn intake_outbox_aged_terminal(alias: &str) -> String {
     format!(
         "({alias}.status IN ('done', 'unknown', 'failed_pre_accept', 'failed_post_accept') \
@@ -838,25 +652,12 @@ async fn count_intake_outbox_candidates<'e, E: sqlx::PgExecutor<'e>>(
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// #3865 — regression coverage for the three new retention policies.
-//
-// Uses the shared `DispatchPostgresTestDb` harness (same pattern as
-// `engine::ops::kanban_ops` tests): create an ephemeral DB, run all migrations
-// (incl. 0075_turns_archive), seed one stale + one fresh row per table, run the
-// job, and assert old rows are pruned, fresh rows survive, `turns` rows are
-// archived, the report is shaped correctly, dry-run is a no-op, and re-runs are
-// idempotent. Skipped automatically when no local Postgres is reachable.
-// ─────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// Token value larger than INT32::MAX (2_147_483_647). The `turns` token
-    /// columns were widened to BIGINT in 0008; the stale row carries this so the
-    /// archive copy exercises BIGINT fidelity (an INTEGER archive column would
-    /// overflow here and fail the whole pass — guards #3865 review finding #1).
+    /// Exceeds `i32::MAX`; archiving it fails unless the archive token columns are BIGINT.
     const BIG_TOKENS: i64 = 3_000_000_000;
 
     async fn count(pool: &PgPool, sql: &str) -> i64 {
@@ -971,8 +772,8 @@ mod tests {
         db.drop().await;
     }
 
-    /// Insert one `turns` row windowed on `finished_at`, with explicit BIGINT
-    /// token/duration values so archive fidelity can be asserted.
+    /// Inserts one `turns` row aged on `finished_at`, with `tokens` in the duration and
+    /// token columns.
     async fn seed_turn(pool: &PgPool, turn_id: &str, age_days: i32, tokens: i64) {
         sqlx::query(
             "INSERT INTO turns \
@@ -990,11 +791,9 @@ mod tests {
         .unwrap_or_else(|err| panic!("seed turns {turn_id}: {err}"));
     }
 
-    /// Seed one stale row (older than the policy window) and one fresh row in
-    /// each of the three tables. `stale_days` puts the stale row safely past
-    /// the largest (90d) window. The stale `turns` row carries [`BIG_TOKENS`].
+    /// Seeds one stale and one fresh row in each of the three tables; the stale
+    /// `turns` row carries [`BIG_TOKENS`].
     async fn seed_fixtures(pool: &PgPool, stale_days: i32) {
-        // turn_lifecycle_events: stale + fresh.
         for (turn_id, age) in [("tle-old", stale_days), ("tle-new", 0)] {
             sqlx::query(
                 "INSERT INTO turn_lifecycle_events \
@@ -1009,7 +808,6 @@ mod tests {
             .unwrap_or_else(|err| panic!("seed turn_lifecycle_events {turn_id}: {err}"));
         }
 
-        // skill_usage: stale + fresh.
         for (skill_id, age) in [("sk-old", stale_days), ("sk-new", 0)] {
             sqlx::query(
                 "INSERT INTO skill_usage (skill_id, agent_id, session_key, used_at) \
@@ -1022,7 +820,6 @@ mod tests {
             .unwrap_or_else(|err| panic!("seed skill_usage {skill_id}: {err}"));
         }
 
-        // turns: stale (>INT32 tokens) + fresh (windowed on finished_at).
         seed_turn(pool, "turn-old", stale_days, BIG_TOKENS).await;
         seed_turn(pool, "turn-new", 0, 20).await;
     }
@@ -1039,7 +836,6 @@ mod tests {
         // 91 days is past every policy window (max is 90d).
         seed_fixtures(&pool, 91).await;
 
-        // ── Dry-run is a no-op: nothing deleted, would-counts == 1 each. ──
         let dry = db_retention_job(&pool, true)
             .await
             .expect("dry-run retention pass");
@@ -1082,7 +878,6 @@ mod tests {
             Some(1)
         );
 
-        // ── Live run: old rows pruned, fresh rows kept, turn archived. ──
         let report = db_retention_job(&pool, false)
             .await
             .expect("live retention pass");
@@ -1145,8 +940,6 @@ mod tests {
             "stale turns row must be copied into turns_archive before deletion"
         );
 
-        // BIGINT fidelity: the >INT32 token/duration values survive the archive
-        // copy intact (an INTEGER archive column would have overflowed).
         let archived_tokens: i64 =
             sqlx::query("SELECT input_tokens AS n FROM turns_archive WHERE turn_id = 'turn-old'")
                 .fetch_one(&pool)
@@ -1159,7 +952,6 @@ mod tests {
             "archived input_tokens must preserve the >INT32 value without overflow"
         );
 
-        // Report entries reflect the new policies.
         assert_eq!(
             report
                 .get("turn_lifecycle_events", "delete")
@@ -1181,8 +973,6 @@ mod tests {
             Some(1)
         );
 
-        // ── Idempotency: a second run deletes nothing new and creates no
-        //    duplicate archive rows (NOT EXISTS guard). ──
         let rerun = db_retention_job(&pool, false)
             .await
             .expect("second retention pass");
@@ -1208,10 +998,8 @@ mod tests {
         db.drop().await;
     }
 
-    /// #4658 AC-9: a snapshot referenced by an active definition is never
-    /// reclaimed, even when aged past the window; once no definition references
-    /// it (the referencing row is gone) the aged snapshot is deleted. A second
-    /// aged snapshot with no reference is deleted immediately.
+    /// An aged snapshot is kept while an active definition references it and deleted
+    /// once none does; an unreferenced aged snapshot goes on the first pass.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn db_retention_context_snapshot_pg_reference_gate() {
         let db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
@@ -1222,7 +1010,6 @@ mod tests {
         let pool = db.connect_and_migrate().await;
 
         let hex64 = "0".repeat(64);
-        // Two aged snapshots: one referenced by an active definition, one orphan.
         for id in ["smcs_active", "smcs_orphan"] {
             sqlx::query(
                 "INSERT INTO scheduled_message_context_snapshots
@@ -1236,8 +1023,7 @@ mod tests {
             .await
             .expect("seed aged snapshot");
         }
-        // Active push definition referencing smcs_active (push avoids the agents FK;
-        // the retention guard keys only on status + context_snapshot_id).
+        // `push` delivery avoids the agents FK.
         sqlx::query(
             "INSERT INTO scheduled_messages
                 (id, content, target_channel_id, delivery_kind, scheduled_at, status,
@@ -1248,7 +1034,6 @@ mod tests {
         .await
         .expect("seed referencing active definition");
 
-        // First pass: orphan deleted, referenced-active survives.
         db_retention_job(&pool, false)
             .await
             .expect("retention pass 1");
@@ -1271,8 +1056,6 @@ mod tests {
             "snapshot of an active definition must never be deleted (AC-9)"
         );
 
-        // Remove the referencing definition; now the snapshot is reclaimable
-        // (the FK no longer pins it).
         sqlx::query("DELETE FROM scheduled_messages WHERE id = 'smsg_ref'")
             .execute(&pool)
             .await
@@ -1294,13 +1077,8 @@ mod tests {
         db.drop().await;
     }
 
-    /// #4723 real reclaim: a snapshot whose every referencing definition is
-    /// terminal AND aged is reclaimed (FK pointer nulled with provenance kept,
-    /// then snapshot deleted); a snapshot still referenced by an active/pending
-    /// definition (AC-9) or by a terminal-but-not-yet-aged definition survives.
-    /// The active-definition survival is the mutation guard: dropping the
-    /// terminal+aged eligibility from `CONTEXT_SNAPSHOT_RECLAIMABLE_PREDICATE`
-    /// would delete `smcs_active`'s snapshot and fail this test.
+    /// Only a snapshot whose referencing definitions are all terminal and aged is reclaimed;
+    /// `smcs_active` surviving catches that condition being dropped from the predicate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn db_retention_context_snapshot_terminal_reclaim() {
         let db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
@@ -1311,7 +1089,6 @@ mod tests {
         let pool = db.connect_and_migrate().await;
 
         let hex64 = "0".repeat(64);
-        // Three aged snapshots (created 40 days ago), one per referencing case.
         for id in ["smcs_term_aged", "smcs_term_fresh", "smcs_active"] {
             sqlx::query(
                 "INSERT INTO scheduled_message_context_snapshots
@@ -1326,10 +1103,7 @@ mod tests {
             .expect("seed aged snapshot");
         }
 
-        // (a) terminal + aged definition: updated_at 40 days ago → reclaimable.
-        // (b) terminal but freshly transitioned: updated_at now → NOT aged, keep.
-        // (c) active (pending) definition: never terminal → keep (AC-9).
-        // push delivery avoids the agents FK; the guard keys on status + updated_at.
+        // `push` delivery avoids the agents FK.
         for (def_id, snap_id, status, updated) in [
             (
                 "smsg_term_aged",
@@ -1358,7 +1132,6 @@ mod tests {
             .await
             .expect("retention pass");
 
-        // (a) reclaimed: snapshot gone, definition kept with provenance.
         assert_eq!(
             count(
                 &pool,
@@ -1381,7 +1154,6 @@ mod tests {
             "reclaim must keep the definition row, null the FK, preserve 'snapshot' strategy, and stamp reclaimed_at"
         );
 
-        // (b) terminal but not yet aged: snapshot survives, FK intact.
         assert_eq!(
             count(
                 &pool,
@@ -1402,7 +1174,6 @@ mod tests {
             "not-yet-aged terminal definition keeps its FK reference"
         );
 
-        // (c) MUTATION GUARD: active/pending definition's snapshot must survive.
         assert_eq!(
             count(
                 &pool,
@@ -1417,8 +1188,6 @@ mod tests {
         db.drop().await;
     }
 
-    /// The `used_at IS NOT NULL` guard must keep rows whose timestamp is NULL —
-    /// a NULL `used_at` is never older-than the window, so it survives.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn db_retention_keeps_skill_usage_rows_with_null_used_at() {
         let db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
@@ -1428,7 +1197,6 @@ mod tests {
         .await;
         let pool = db.connect_and_migrate().await;
 
-        // NULL used_at (must survive), stale (must delete), fresh (must keep).
         sqlx::query("INSERT INTO skill_usage (skill_id, used_at) VALUES ('sk-null', NULL)")
             .execute(&pool)
             .await
@@ -1481,10 +1249,8 @@ mod tests {
         db.drop().await;
     }
 
-    /// The `turns` window is strict (`finished_at < cutoff`): a row just inside
-    /// the 90d window survives, a row just outside is archived then deleted, and
-    /// the archived row count always equals the deleted row count (no
-    /// delete-without-archive), including on a re-run.
+    /// A `turns` row just inside the 90-day window survives; one just outside is archived
+    /// and deleted, with equal archive and delete counts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn db_retention_turns_window_is_strict_with_no_archive_less_delete() {
         let db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
@@ -1495,7 +1261,6 @@ mod tests {
         let pool = db.connect_and_migrate().await;
 
         // 2-hour margins absorb the ms-level drift between seed and job NOW().
-        // inside: 89d22h old → younger than 90d → kept.
         sqlx::query(
             "INSERT INTO turns (turn_id, channel_id, started_at, finished_at) \
              VALUES ('turn-inside', 'chan', NOW(), NOW() - (INTERVAL '90 days' - INTERVAL '2 hours'))",
@@ -1503,7 +1268,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed inside-window turn");
-        // outside: 90d02h old → older than 90d → archived + deleted.
         sqlx::query(
             "INSERT INTO turns (turn_id, channel_id, started_at, finished_at) \
              VALUES ('turn-outside', 'chan', NOW(), NOW() - (INTERVAL '90 days' + INTERVAL '2 hours'))",
@@ -1544,7 +1308,6 @@ mod tests {
             "the deleted row must have been archived first"
         );
 
-        // Archive insert count == delete count: no delete-without-archive.
         let archived = report
             .get("turns_archive", "insert")
             .map(|t| t.rows_affected);

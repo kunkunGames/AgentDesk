@@ -226,6 +226,21 @@ impl PreparedIncarnation {
         expected: Option<&str>,
         resume: bool,
     ) -> Result<Self, String> {
+        let root = (provider == "claude")
+            .then(configured_claude_projects_root)
+            .flatten();
+        Self::prepare_at(provider, tmux, channel_id, expected, resume, root)
+    }
+
+    /// Records `provider_root` as the source root the launched child will write under.
+    pub(crate) fn prepare_at(
+        provider: &str,
+        tmux: &str,
+        channel_id: Option<u64>,
+        expected: Option<&str>,
+        resume: bool,
+        provider_root: Option<PathBuf>,
+    ) -> Result<Self, String> {
         let context = BindingContext {
             schema: 1,
             provider: provider.to_owned(),
@@ -237,9 +252,7 @@ impl PreparedIncarnation {
             host: stable_host_identity(),
             expected_native_session_id: expected.map(str::to_owned),
             launch_mode: if resume { "resume" } else { "fresh" }.to_owned(),
-            provider_root: (provider == "claude")
-                .then(configured_claude_projects_root)
-                .flatten(),
+            provider_root,
         };
         sweep(
             provider,
@@ -316,6 +329,21 @@ impl PreparedIncarnation {
 
 fn read_context(path: &Path) -> io::Result<BindingContext> {
     serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)
+}
+
+/// `fresh` or `resume` as recorded when execution `nonce` was prepared.
+pub(crate) fn launch_mode(provider: &str, nonce: &str) -> Option<String> {
+    let context = read_context(&context_path(provider, nonce).ok()?).ok()?;
+    (context.execution_nonce == nonce).then_some(context.launch_mode)
+}
+
+pub(super) fn pane_context(tmux: &str, nonce: &str) -> Option<BindingContext> {
+    let ctx = read_hook_context(&context_path("claude", nonce).ok()?).ok()?;
+    (ctx.schema == 1
+        && ctx.provider == "claude"
+        && ctx.tmux_session == tmux
+        && ctx.execution_nonce == nonce)
+        .then_some(ctx)
 }
 
 fn read_hook_context(path: &Path) -> io::Result<BindingContext> {
@@ -420,6 +448,16 @@ pub(crate) mod tests {
     pub(crate) fn fixture() -> (tempfile::TempDir, [Guard; 2]) {
         let root = tempfile::tempdir().unwrap();
         let env = Guard::set_path("AGENTDESK_ROOT_DIR", root.path());
+        with_config(root, env)
+    }
+    /// `fixture` for a caller that already holds the shared env lock, so it can
+    /// take that lock before `TEST_LOCK` (the env -> dedupe order).
+    pub(crate) fn fixture_after_shared_test_env_lock() -> (tempfile::TempDir, [Guard; 2]) {
+        let root = tempfile::tempdir().unwrap();
+        let env = Guard::set_path_after_shared_test_env_lock("AGENTDESK_ROOT_DIR", root.path());
+        with_config(root, env)
+    }
+    fn with_config(root: tempfile::TempDir, env: Guard) -> (tempfile::TempDir, [Guard; 2]) {
         let config = root.path().join("config.yaml");
         fs::write(&config, "server: {}").unwrap();
         let config_env = Guard::set_path_after_shared_test_env_lock("AGENTDESK_CONFIG", &config);
@@ -457,7 +495,7 @@ pub(crate) mod tests {
         let stub = "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$AGENTDESK_ROOT_DIR/tmux.calls\"\n";
         fs::write(root.join("tmux"), stub).unwrap();
         fs::set_permissions(root.join("tmux"), fs::Permissions::from_mode(0o700)).unwrap();
-        Guard::set_path_after_shared_test_env_lock("PATH", root)
+        Guard::prepend_path_after_shared_test_env_lock(root)
     }
     pub(crate) fn launch_failures(
         mut launch: impl FnMut(&str) -> Result<(), String>,
@@ -476,6 +514,24 @@ pub(crate) mod tests {
             );
         }
         assert!(!root.path().join("tmux.calls").exists());
+    }
+
+    /// Tests that spawn by bare name never take the env lock, so the fake tmux must
+    /// shadow `tmux` without hiding the system tools they run while it is installed.
+    #[test]
+    fn binding_context_fake_tmux_keeps_system_tools_resolvable() {
+        let (root, _env) = fixture();
+        let _tmux = fake_tmux(root.path());
+        let found = std::process::Command::new("sh")
+            .args(["-c", "sleep 0 && command -v tmux"])
+            .output()
+            .expect("sh must resolve from PATH while the fake tmux is installed");
+        assert!(found.status.success(), "{found:?}");
+        let stub = root.path().join("tmux");
+        assert_eq!(
+            String::from_utf8_lossy(&found.stdout).trim(),
+            stub.to_str().unwrap()
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sqlx::Row as SqlxRow;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::app_state::AppState;
 use crate::error::{AppError, AppResult, ErrorCode};
@@ -33,6 +33,8 @@ mod activate_command;
 mod activate_preflight;
 #[path = "activate_route.rs"]
 mod activate_route;
+#[path = "campaign_handoff.rs"]
+mod campaign_handoff;
 #[path = "command.rs"]
 mod command;
 #[path = "control_routes.rs"]
@@ -61,8 +63,6 @@ mod planning;
 mod query;
 #[path = "route_generate.rs"]
 mod route_generate;
-#[path = "route_request_generate.rs"]
-mod route_request_generate;
 #[path = "route_types.rs"]
 mod route_types;
 #[path = "slot_routes.rs"]
@@ -82,7 +82,6 @@ pub use order_routes::{OrderBody, submit_order};
 pub use phase_gate_catalog::{DEFAULT_PHASE_GATE_KIND, catalog as phase_gate_catalog};
 pub use phase_gate_violations::violations_route;
 pub use route_generate::generate;
-pub use route_request_generate::request_generate;
 pub use route_types::{
     ActivateBody, AddRunEntryBody, CancelQuery, GenerateBody, GenerateEntryBody, HistoryQuery,
     PauseBody, RebindSlotBody, ReorderBody, RepairPhaseGateBody, ResetBody, ResetGlobalBody,
@@ -92,6 +91,7 @@ pub use slot_routes::{rebind_slot, skip_entry};
 pub use view_admin_routes::{add_run_entry, history, restore_run, status, update_entry};
 
 pub(crate) use activate_command::activate_with_deps_pg;
+pub(crate) use campaign_handoff::{hand_off_auto_campaigns_pg, hand_off_ready_nodes_pg};
 pub(crate) use fsm::{AutoQueueActivateDeps, activate_with_bridge_pg};
 
 use activate_preflight::*;
@@ -107,7 +107,7 @@ use phase_gate::*;
 use planning::*;
 use query::*;
 use route_types::{
-    AUTO_QUEUE_REVIEW_MODE_DISABLED, AUTO_QUEUE_REVIEW_MODE_ENABLED, DependencyParseResult,
-    GenerateCandidate, PlannedEntry, RESET_GLOBAL_CONFIRMATION_TOKEN,
+    AUTO_QUEUE_REVIEW_MODE_DISABLED, AUTO_QUEUE_REVIEW_MODE_ENABLED,
+    RESET_GLOBAL_CONFIRMATION_TOKEN,
 };
 use view::*;

@@ -155,6 +155,8 @@ struct Recorder {
     bodies: Arc<Mutex<Vec<String>>>,
     visible: Arc<Mutex<std::collections::BTreeMap<u64, String>>>,
     terminal_gate: Arc<tokio::sync::Notify>,
+    /// When set, every content-bearing request is checked against the watched adoption on arrival.
+    check: Arc<std::sync::OnceLock<crate::services::tui_o::channel_policy::BodyCheck>>,
     http: Arc<serenity::Http>,
     server: tokio::task::AbortHandle,
 }
@@ -197,9 +199,12 @@ async fn recorder_for_cycle(channel: ChannelId, delete_ok: bool, cycle: bool) ->
     let captured_gate = terminal_gate.clone();
     let next_id = Arc::new(std::sync::atomic::AtomicU64::new(SERVER_MSG));
     let channel_text = channel.get().to_string();
+    let check = Arc::new(std::sync::OnceLock::<crate::services::tui_o::channel_policy::BodyCheck>::new());
+    let captured_check = check.clone();
     let app = Router::new().fallback(any(move |method: Method, uri: Uri, body: Bytes| {
         let (recorded, channel_text, bodies) =
             (recorded.clone(), channel_text.clone(), captured_bodies.clone());
+        let body_check = captured_check.clone();
         let (visible, terminal_gate, next_id) =
             (captured_visible.clone(), captured_gate.clone(), next_id.clone());
         async move {
@@ -216,6 +221,7 @@ async fn recorder_for_cycle(channel: ChannelId, delete_ok: bool, cycle: bool) ->
                 return (status, String::new()).into_response();
             }
             if let Some(content) = payload["content"].as_str() {
+                if let Some(check) = body_check.get() { check.sink_request(method.as_str(), uri.path(), content); }
                 bodies.lock().unwrap().push(content.to_owned());
                 if content.encode_utf16().count() > 2000 {
                     return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
@@ -255,7 +261,7 @@ async fn recorder_for_cycle(channel: ChannelId, delete_ok: bool, cycle: bool) ->
             .build(),
     );
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    Recorder { calls, bodies, visible, terminal_gate, http, server: server.abort_handle() }
+    Recorder { calls, bodies, visible, terminal_gate, check, http, server: server.abort_handle() }
 }
 
 #[rustfmt::skip]
@@ -289,16 +295,28 @@ async fn run_tick(
     fx: &Fixture,
     delivered: bool,
 ) -> StreamingStatusTickOutcome {
+    run_tick_body(locals, rec, shared, fx, delivered, TRAILING_BODY).await
+}
+
+#[rustfmt::skip]
+async fn run_tick_body(
+    locals: &mut TickLocals,
+    rec: &Recorder,
+    shared: &Arc<SharedData>,
+    fx: &Fixture,
+    delivered: bool,
+    body: &str,
+) -> StreamingStatusTickOutcome {
     locals.last = tokio::time::Instant::now()
         - crate::services::discord::status_update_interval()
         - Duration::from_millis(1);
     let tools = WatcherToolState::new();
     let delivered_flag = Arc::new(AtomicBool::new(delivered));
-    let full = TRAILING_BODY.to_string();
+    let full = body.to_string();
     let ctx = StreamingStatusTickContext {
         http: &rec.http, shared, channel_id: fx.channel, watcher_provider: &fx.provider,
         tmux_session_name: &fx.tmux, output_path: &fx.output_path,
-        turn_delivered: &delivered_flag,
+        turn_delivered: &delivered_flag, host: &HostSnapshot::new(WatchHost::Legacy),
     };
     let turn = StreamingStatusTickTurn {
         data_start_offset: 0, current_offset: full.len() as u64, full_response: &full,
@@ -537,6 +555,7 @@ fn committed_progress_pinned_identity_suppresses_trailing_body() {
 
 #[test]
 fn active_progress_tick_emits_once() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     let (_lock, guard) = isolate_root();
     capture_warns(async {
         let fx = seed_row(guard.root.path(), 12, false, false);
@@ -563,10 +582,138 @@ fn active_progress_tick_emits_once() {
     });
 }
 
+/// A delegated TUI session with a live placeholder and a body long enough to roll over
+/// writes none of that body to Discord, while the Legacy owner of the same tick does.
+#[test]
+fn o_delegated_rollover_tick_writes_no_body() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
+    if !crate::services::tui_o::cutover::test_override::isolated_binding_case(concat!(
+        module_path!(),
+        "::o_delegated_rollover_tick_writes_no_body"
+    )) {
+        return;
+    }
+
+    let (_lock, guard) = isolate_root();
+    capture_warns(async {
+        let body: String = (0..300)
+            .map(|line| format!("ADK-W02 rollover line {line}\n"))
+            .collect();
+        for (case, delegated) in [(14, false), (15, true)] {
+            let fx = seed_row(guard.root.path(), case, false, false);
+            let shared = crate::services::discord::make_shared_data_for_tests();
+            let rec = recorder(fx.channel, true).await;
+            let mut locals = tick_locals(&fx, Some(PLACEHOLDER_MSG));
+            let _bound = delegated.then(|| {
+                crate::services::tui_o::cutover::test_override::bind_claude_tui_session(
+                    &fx.tmux,
+                    &fx.output_path,
+                )
+            });
+            let _forced = delegated.then(|| {
+                crate::services::tui_o::cutover::test_override::force_channels(&[(
+                    fx.channel.get(),
+                    crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
+                )])
+            });
+            run_tick_body(&mut locals, &rec, &shared, &fx, false, &body).await;
+            let body_writes = rec
+                .bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|content| content.contains("ADK-W02 rollover line"))
+                .count();
+            if delegated {
+                assert_eq!(
+                    body_writes, 0,
+                    "O owns the body: no rollover edit or tail send"
+                );
+                assert_eq!(
+                    locals.placeholder,
+                    msg(PLACEHOLDER_MSG),
+                    "placeholder untouched"
+                );
+            } else {
+                assert!(
+                    body_writes >= 2,
+                    "Legacy control must reach the rollover writes"
+                );
+            }
+        }
+    });
+}
+
+/// A tick that writes no body (whitespace only, a frame the provider guard holds, or a display
+/// already shown) leaves a pending adoption; the tick that writes the body ends it first.
+#[test]
+fn only_a_status_tick_that_writes_a_body_ends_a_pending_adoption() {
+    use crate::services::tui_o::channel_policy::{Adoption, BodyCheck};
+    use crate::services::tui_o::cutover::test_override;
+    let _boot = test_override::force_channels(&[]);
+    if !test_override::isolated_binding_case(concat!(
+        module_path!(),
+        "::only_a_status_tick_that_writes_a_body_ends_a_pending_adoption"
+    )) {
+        return;
+    }
+    const BODY: &str = "ADK-C1A watcher tick body";
+    let (_lock, guard) = isolate_root();
+    capture_warns(async {
+        for (case, body, expected) in [
+            (16, " \n", Adoption::Pending),
+            (18, "safe prefix [SYSTEM NOTIF", Adoption::Pending),
+            (17, "ADK-C1A watcher tick body\n", Adoption::Released),
+        ] {
+            let fx = seed_row(guard.root.path(), case, false, false);
+            let shared = crate::services::discord::make_shared_data_for_tests();
+            let _bound = test_override::bind_claude_tui_session(&fx.tmux, &fx.output_path);
+            let _pending = test_override::force_candidates(&[(
+                fx.channel.get(),
+                crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
+            )]);
+            let check = BodyCheck::watch(fx.channel.get(), BODY);
+            let rec = recorder(fx.channel, true).await;
+            rec.check.set(check.clone()).unwrap();
+            let mut locals = tick_locals(&fx, Some(PLACEHOLDER_MSG));
+            run_tick_body(&mut locals, &rec, &shared, &fx, false, body).await;
+            check.assert_settled();
+            assert_eq!(check.adoption(), expected, "{body:?}");
+            let shown = rec.bodies.lock().unwrap().clone();
+            let writes = shown.iter().filter(|c| c.contains(BODY)).count();
+            assert_eq!(writes > 0, expected == Adoption::Released, "{shown:?}");
+        }
+
+        let fx = seed_row(guard.root.path(), 19, false, false);
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let _bound = test_override::bind_claude_tui_session(&fx.tmux, &fx.output_path);
+        let rec = recorder(fx.channel, true).await;
+        let mut locals = tick_locals(&fx, Some(PLACEHOLDER_MSG));
+        run_tick_body(&mut locals, &rec, &shared, &fx, false, BODY).await;
+        let shown_before = rec.bodies.lock().unwrap().len();
+        assert!(shown_before > 0, "the first tick shows the body with O off");
+        let _pending = test_override::force_candidates(&[(
+            fx.channel.get(),
+            crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
+        )]);
+        let check = BodyCheck::watch(fx.channel.get(), BODY);
+        locals.spin = 0;
+        run_tick_body(&mut locals, &rec, &shared, &fx, false, BODY).await;
+        assert_eq!(
+            rec.bodies.lock().unwrap().len(),
+            shown_before,
+            "the same display is not rewritten"
+        );
+        check.assert_settled();
+        assert_eq!(check.adoption(), Adoption::Pending);
+    });
+}
+
 /// #5833: isolate the visible HTTP boundary from collector admission. A recovered
 /// SBR row alone must not be mistaken for proof that the streaming tick ran.
 #[test]
 fn recovered_session_bound_codex_stream_tick_reaches_http() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     let (_lock, guard) = isolate_root();
     capture_warns(async {
         let (fx, _) = native_collector_tests::seed_recovered_row(guard.root.path(), 5833);

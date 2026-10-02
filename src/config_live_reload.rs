@@ -306,9 +306,8 @@ pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str>
     if section_changed(&old.data, &new.data) {
         changed.push("data");
     }
-    // Most cluster runtime and wait-queue snapshots are installed at boot. The
-    // owner-authority channel allowlist is a planner telemetry scope read from
-    // `current()` per intake, so exclude only that field from the boot fingerprint.
+    // Exclude decision-time settings from the cluster boot fingerprint:
+    // the intake telemetry allowlist and gateway handback breaker configuration.
     let mut old_cluster = old.cluster.clone();
     let mut new_cluster = new.cluster.clone();
     old_cluster
@@ -319,6 +318,7 @@ pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str>
         .intake_routing
         .owner_authority_channel_ids
         .clear();
+    old_cluster.gateway_handback_breaker = new_cluster.gateway_handback_breaker.clone();
     if old_cluster != new_cluster {
         changed.push("cluster");
     }
@@ -387,6 +387,13 @@ pub fn restart_required_changes(old: &Config, new: &Config) -> Vec<&'static str>
     // The file watcher itself is created (or skipped) from the boot value.
     if old.config_hot_reload != new.config_hot_reload {
         changed.push("config_hot_reload");
+    }
+    if crate::services::tui_o::channel_policy::boot()
+        .map(|boot| boot.selected().clone())
+        .unwrap_or_else(|| crate::services::tui_o::channel_policy::configured_channels(old))
+        != crate::services::tui_o::channel_policy::configured_channels(new)
+    {
+        changed.push("tui_o.writer.channels");
     }
     changed
 }
@@ -719,6 +726,22 @@ mod tests {
         new = old.clone();
         new.policies.hook_timeout_ms = old.policies.hook_timeout_ms.wrapping_add(1);
         assert_eq!(restart_required_changes(&old, &new), vec!["policies"]);
+    }
+
+    #[test]
+    fn gateway_handback_breaker_changes_need_no_restart() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.cluster.gateway_handback_breaker.enabled = false;
+        new.cluster.gateway_handback_breaker.window_secs += 1;
+        new.cluster.gateway_handback_breaker.max_empty += 1;
+        new.cluster.gateway_handback_breaker.suppress_secs += 1;
+        assert!(restart_required_changes(&old, &new).is_empty());
+        assert!(restart_required_changes(&new, &old).is_empty());
+
+        new.cluster.lease_ttl_secs += 1;
+        assert_eq!(restart_required_changes(&old, &new), vec!["cluster"]);
+        assert_eq!(restart_required_changes(&new, &old), vec!["cluster"]);
     }
 
     #[test]

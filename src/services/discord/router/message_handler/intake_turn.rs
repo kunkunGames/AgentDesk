@@ -1121,7 +1121,7 @@ pub(super) async fn handle_text_message(
     };
 
     if dispatch_reset_provider_state || dispatch_recreate_tmux {
-        super::super::super::commands::reset_channel_provider_state(
+        let reset = super::super::super::commands::reset_channel_provider_state(
             http,
             shared,
             &provider,
@@ -1136,6 +1136,13 @@ pub(super) async fn handle_text_message(
             dispatch_recreate_tmux,
         )
         .await;
+        // A refused reset stops the dispatch before its turn and hands its input back.
+        if reset.report(http, channel_id, "dispatch reset").await {
+            let restore = super::super::super::admin_host_guard::return_intake_input;
+            let input = (pending_uploads, session_was_cleared);
+            restore(shared, original_channel_id, input).await;
+            return Ok(());
+        }
         session_id = None;
         memento_context_loaded = false;
         session_strategy_reason =
@@ -1815,11 +1822,14 @@ pub(super) async fn handle_text_message(
     );
     #[cfg(unix)]
     reconcile_managed_tmux_runtime_kind_for_config(
+        shared,
         &provider,
         channel_id,
+        adk_session_key.as_deref(),
         tmux_session_name.as_deref(),
         prelaunch_runtime_kind,
-    );
+    )
+    .await;
 
     let model_for_turn =
         super::super::super::commands::resolve_model_for_turn(shared, channel_id, &provider).await;
@@ -2379,6 +2389,14 @@ pub(super) async fn handle_text_message(
     }
     let provider_for_blocking = provider.clone();
     let execution_pool = shared.pg_pool.clone();
+    let teardown_clearance = super::super::super::turn_teardown_clearance::for_turn(
+        shared.pg_pool.as_ref(),
+        &provider,
+        channel_id.get(),
+        adk_session_key.as_deref(),
+        tmux_session_name.as_deref(),
+    )
+    .await;
     tokio::task::spawn_blocking(move || {
         let _upload_lifetime = materialized_uploads;
         let result = crate::services::platform::with_provider_execution_context(
@@ -2397,6 +2415,7 @@ pub(super) async fn handle_text_message(
                             cancel: cancel_token_clone,
                             remote_profile: remote_profile.as_ref(),
                             tmux_session_name: tmux_session_name.as_deref(),
+                            teardown: teardown_clearance.as_ref(),
                             channel_id: channel_id.get(),
                             model: model_for_turn.as_deref(),
                             native_fast_mode: native_fast_mode_override,

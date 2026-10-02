@@ -123,12 +123,21 @@ pub(super) async fn handle_known_owner(
                 "  [{ts}] 👁 tmux watcher owns assistant relay; bridge skipped direct response delivery (channel {})",
                 ctx.channel_id
             );
-            if should_delete_bridge_created_watcher_orphan_response(
-                shared_owned.ui.status_panel_v2_enabled,
-                ctx.watcher_handoff_claim_outcome,
-                ctx.bridge_created_response_placeholder_msg_id,
-                ctx.current_msg_id,
-            ) {
+            // On O's channel the placeholder never carries a body, so the turn's end retires it.
+            let o_panel = super::super::terminal_controller_cutover::bridge_o_body_peek_decision(
+                ctx.channel_id,
+                inflight_state,
+                gateway.can_deliver_directly(),
+            ) == Ok(true)
+                && optional_durable_current_msg_id_from_detached(ctx.current_msg_id).is_some();
+            if o_panel
+                || should_delete_bridge_created_watcher_orphan_response(
+                    shared_owned.ui.status_panel_v2_enabled,
+                    ctx.watcher_handoff_claim_outcome,
+                    ctx.bridge_created_response_placeholder_msg_id,
+                    ctx.current_msg_id,
+                )
+            {
                 // #3607: preserve committed terminal anchors; delete, record,
                 // and retry only genuine non-terminal orphan spinners.
                 cleanup_or_preserve_watcher_orphan_spinner(
@@ -227,7 +236,7 @@ pub(super) fn detached_delivery_body(
         inflight_state.turn_start_offset,
     );
     if cancelled {
-        Some(cancel_prompt_replace::cancelled_terminal_response(
+        Some(cancelled_terminal_response(
             full_response,
             response_sent_offset,
             cancel_token.restart_mode(),
@@ -422,7 +431,19 @@ pub(super) async fn resume_with_gateway(
             full_response: &snapshot.full_response,
         })
     };
-    let mut delivered = snapshot.delivery_receipts.len() == chunks.len()
+    // O posts this destination's TUI body: settle the custody without posting or recording it.
+    // A held destination identity keeps the custody for a later retry.
+    let kind = (snapshot.local.channel_id == snapshot.channel_id)
+        .then_some(snapshot.local.runtime_kind)
+        .flatten();
+    let Ok(o_owns_body) = crate::services::tui_o::cutover::peek_o_owns_tui_output_for_channel(
+        snapshot.channel_id,
+        kind,
+    ) else {
+        return Ok(false);
+    };
+    let mut delivered = o_owns_body
+        || snapshot.delivery_receipts.len() == chunks.len()
         || decision() == rowless_receipt::TerminalReceiptDisposition::AlreadyDelivered;
     let mut held_lease = None;
     if !delivered {
@@ -448,25 +469,38 @@ pub(super) async fn resume_with_gateway(
         // Recheck after acquiring; an actor may have completed just before this
         // lease became available. NoRange remains the existing honest exemption.
         delivered = decision() == rowless_receipt::TerminalReceiptDisposition::AlreadyDelivered;
+        // Only the post itself claims the channel, after every skip above.
         if !delivered {
             // Reuse the ordinary chunk formatter and gateway. Persist each
             // acknowledged prefix before another await, while the SAME source
             // lease and custody file lock remain held across the whole loop.
-            for chunk in chunks.iter().skip(snapshot.delivery_receipts.len()) {
-                let id = TurnGateway::send_message(gateway, channel, chunk).await?;
-                if super::super::headless_delivery::is_synthetic_headless_message_id(id) {
-                    return Err("terminal POST returned no real Discord receipt".into());
+            let claim = crate::services::tui_o::cutover::BodyClaim::new(snapshot.channel_id, kind);
+            let (snap, chunks) = (&mut *snapshot, &chunks);
+            let post = move || async move {
+                for chunk in chunks.iter().skip(snap.delivery_receipts.len()) {
+                    let id = TurnGateway::send_message(gateway, channel, chunk).await?;
+                    if super::super::headless_delivery::is_synthetic_headless_message_id(id) {
+                        return Err("terminal POST returned no real Discord receipt".into());
+                    }
+                    snap.delivery_receipts.push(id.get());
+                    let value = serde_json::to_value(&*snap).map_err(|e| e.to_string())?;
+                    checkpoint.persist(&value)?;
                 }
-                snapshot.delivery_receipts.push(id.get());
-                checkpoint
-                    .persist(&serde_json::to_value(&*snapshot).map_err(|e| e.to_string())?)?;
+                Ok::<(), String>(())
+            };
+            match crate::services::tui_o::cutover::claim_then_send(Some(claim), post).await {
+                Ok(crate::services::tui_o::cutover::BodySend::Sent(posted)) => posted?,
+                // O took the channel since the peek: settle the custody as O's.
+                Ok(crate::services::tui_o::cutover::BodySend::OwnedByO) => {}
+                Err(_) => return Ok(false),
             }
         }
         // Custody never advances a read cursor, clears the foreign row or
         // adopts its anchor. Drop releases only this held lease.
         held_lease = Some(lease);
     }
-    if let Some(admitted) = snapshot.admitted.as_ref()
+    if !o_owns_body
+        && let Some(admitted) = snapshot.admitted.as_ref()
         && let Some(message_id) = snapshot.delivery_receipts.last()
         && admitted.identity.matches_state(&snapshot.local)
         && admitted.result == snapshot.full_response
@@ -535,4 +569,26 @@ pub(super) async fn resume_with_gateway(
         status
             .is_some_and(|status| matches!(status.as_str(), "completed" | "failed" | "cancelled")),
     )
+}
+
+/// Render the existing cancellation/restart terminal body independently of its
+/// transport, so a detached episode can POST it without touching a foreign card.
+pub(super) fn cancelled_terminal_response(
+    full_response: &str,
+    response_sent_offset: usize,
+    restart_mode: Option<crate::services::discord::restart_mode::InflightRestartMode>,
+    banner: &crate::services::discord::session_banner::DiscordTurnSessionBanner<'_>,
+) -> String {
+    let remaining_response = response_portion_after_offset(full_response, response_sent_offset);
+    let response = if let Some(restart_mode) = restart_mode {
+        handoff_interrupted_message(restart_mode, remaining_response)
+    } else if remaining_response.trim().is_empty() {
+        "[Stopped]".to_string()
+    } else {
+        format!(
+            "{}\n\n[Stopped]",
+            banner.format_discord_body(remaining_response)
+        )
+    };
+    banner.prefix(response_sent_offset == 0, response)
 }

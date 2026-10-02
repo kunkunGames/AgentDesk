@@ -1,5 +1,23 @@
 use super::*;
 
+/// Claude reports the continuation's transcript, here next to the one the pane is bound to.
+fn adopt(command: &str, payload: &str) -> Option<(String, String)> {
+    let tmux = resolve_tmux_session_name("claude", command).unwrap();
+    let bound = runtime_binding_for_tmux_session(&tmux).unwrap().output_path;
+    let path = std::path::Path::new(&bound).with_file_name(format!("{payload}.jsonl"));
+    let payload_json = serde_json::json!({ "transcript_path": path });
+    let hook = binding_events::HookSignal::from_payload("stop", &payload_json);
+    adopt_claude_continuation_session(command, payload, &hook).expect("no binding event failure")
+}
+
+/// A Claude transcript's first line, which names its session.
+fn first_row(session: &str) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type": "mode", "sessionId": session})
+    )
+}
+
 fn reset_state() {
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
     *state = TuiPromptDedupeState::default();
@@ -64,8 +82,8 @@ fn claude_hook_payload_adopts_sibling_continuation_once_without_cursor_reset() {
     let new_session = uuid::Uuid::new_v4().to_string();
     let old_path = tmp.path().join(format!("{old_session}.jsonl"));
     let new_path = tmp.path().join(format!("{new_session}.jsonl"));
-    std::fs::write(&old_path, b"old\n").unwrap();
-    std::fs::write(&new_path, b"new\n").unwrap();
+    std::fs::write(&old_path, first_row(&old_session)).unwrap();
+    std::fs::write(&new_path, first_row(&new_session)).unwrap();
     let tmux = format!("tmux-4423-continuation-{}", std::process::id());
     register_provider_session("claude", &old_session, &tmux);
     register_tmux_runtime_binding(
@@ -81,8 +99,7 @@ fn claude_hook_payload_adopts_sibling_continuation_once_without_cursor_reset() {
         },
     );
 
-    let adopted = adopt_claude_continuation_session(&old_session, &new_session)
-        .expect("safe sibling continuation adoption");
+    let adopted = adopt(&old_session, &new_session).expect("safe sibling continuation adoption");
     assert_eq!(adopted.0, tmux);
     assert_eq!(adopted.1, new_path.display().to_string());
     let binding = runtime_binding_for_tmux_session(&tmux).unwrap();
@@ -95,11 +112,11 @@ fn claude_hook_payload_adopts_sibling_continuation_once_without_cursor_reset() {
         "future waits must keep using the live process's cached hook command UUID"
     );
 
-    assert!(adopt_claude_continuation_session(&old_session, &new_session).is_some());
+    assert!(adopt(&old_session, &new_session).is_some());
     let mut progressed = runtime_binding_for_tmux_session(&tmux).unwrap();
     progressed.last_offset = 4;
     register_tmux_runtime_binding(&tmux, progressed);
-    assert!(adopt_claude_continuation_session(&old_session, &new_session).is_some());
+    assert!(adopt(&old_session, &new_session).is_some());
     assert_eq!(
         runtime_binding_for_tmux_session(&tmux).unwrap().last_offset,
         4,
@@ -117,18 +134,22 @@ fn claude_hook_payload_can_advance_multiple_continuation_hops_but_not_rewind() {
     let command_session = uuid::Uuid::new_v4().to_string();
     let first_continuation = uuid::Uuid::new_v4().to_string();
     let second_continuation = uuid::Uuid::new_v4().to_string();
-    let stale_continuation = uuid::Uuid::new_v4().to_string();
+    // The stale payload is a hop the pane already left; its log history is what refuses it.
+    let stale_continuation = first_continuation.clone();
     let command_path = tmp.path().join(format!("{command_session}.jsonl"));
     let first_path = tmp.path().join(format!("{first_continuation}.jsonl"));
     let second_path = tmp.path().join(format!("{second_continuation}.jsonl"));
-    let stale_path = tmp.path().join(format!("{stale_continuation}.jsonl"));
-    for path in [&command_path, &first_path, &second_path, &stale_path] {
-        std::fs::write(path, b"{}\n").unwrap();
+    for (path, session) in [
+        (&command_path, &command_session),
+        (&first_path, &first_continuation),
+        (&second_path, &second_continuation),
+    ] {
+        std::fs::write(path, first_row(session)).unwrap();
     }
-    filetime::set_file_mtime(&first_path, filetime::FileTime::from_unix_time(20, 0)).unwrap();
-    filetime::set_file_mtime(&second_path, filetime::FileTime::from_unix_time(30, 0)).unwrap();
-    filetime::set_file_mtime(&stale_path, filetime::FileTime::from_unix_time(10, 0)).unwrap();
+    let log_root = tempfile::tempdir().unwrap();
+    binding_events::set_test_root(Some(log_root.path()));
     let tmux = format!("tmux-4423-multihop-{}", std::process::id());
+    register_tmux_channel(&tmux, 7_090);
     register_provider_session("claude", &command_session, &tmux);
     register_tmux_runtime_binding(
         &tmux,
@@ -143,9 +164,8 @@ fn claude_hook_payload_can_advance_multiple_continuation_hops_but_not_rewind() {
         },
     );
 
-    adopt_claude_continuation_session(&command_session, &first_continuation)
-        .expect("first continuation hop");
-    adopt_claude_continuation_session(&command_session, &second_continuation)
+    adopt(&command_session, &first_continuation).expect("first continuation hop");
+    adopt(&command_session, &second_continuation)
         .expect("newer second continuation hop through cached command UUID");
     let binding = runtime_binding_for_tmux_session(&tmux).unwrap();
     assert_eq!(
@@ -153,7 +173,7 @@ fn claude_hook_payload_can_advance_multiple_continuation_hops_but_not_rewind() {
         Some(second_continuation.as_str())
     );
     assert!(
-        adopt_claude_continuation_session(&command_session, &stale_continuation).is_none(),
+        adopt(&command_session, &stale_continuation).is_none(),
         "a delayed historical payload must not rewind the current continuation"
     );
     assert_eq!(
@@ -163,6 +183,8 @@ fn claude_hook_payload_can_advance_multiple_continuation_hops_but_not_rewind() {
             .as_deref(),
         Some(second_continuation.as_str())
     );
+    binding_events::forget_channel_for_tests(7_090);
+    binding_events::set_test_root(None);
 }
 
 /// #5212. Every hook after the first one takes the "already adopted" early
@@ -186,7 +208,7 @@ fn hook_re_report_restates_the_adopted_session_authority() {
     let command_session = uuid::Uuid::new_v4().to_string();
     let payload_session = uuid::Uuid::new_v4().to_string();
     let adopted_path = tmp.path().join(format!("{payload_session}.jsonl"));
-    std::fs::write(&adopted_path, b"{}\n").unwrap();
+    std::fs::write(&adopted_path, first_row(&payload_session)).unwrap();
     let tmux = format!("tmux-5212-readopt-{}", std::process::id());
     // The pane already adopted `payload_session`; the live Claude process still
     // addresses hooks with its cached launch-time UUID.
@@ -204,7 +226,7 @@ fn hook_re_report_restates_the_adopted_session_authority() {
         },
     );
 
-    let adopted = adopt_claude_continuation_session(&command_session, &payload_session)
+    let adopted = adopt(&command_session, &payload_session)
         .expect("a re-report of the adopted session still resolves the pane");
     assert_eq!(adopted, (tmux.clone(), adopted_path.display().to_string()));
     assert!(
@@ -225,7 +247,7 @@ fn hook_re_report_restates_the_adopted_session_authority() {
 
     // The pane is alive and keeps reporting, which is what makes 12h
     // unreachable in production.
-    adopt_claude_continuation_session(&command_session, &payload_session)
+    adopt(&command_session, &payload_session)
         .expect("a still-bound pane keeps adopting on every later hook");
     assert_eq!(
         hook_adopted_claude_session_id(&tmux).as_deref(),
@@ -1629,6 +1651,7 @@ fn local_compact_entry_id_is_recorded_only_after_a_successful_note_delivery() {
         observed_at: now,
         external_input_lease_generation: EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
         ssh_direct_observation_generation: SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
+        hook_prompt_id: None,
     });
     assert_eq!(
         observe_prompt_by_tmux_with_entry_id_at(
@@ -1693,6 +1716,7 @@ fn local_note_delivery_ack_does_not_record_nonlocal_entries() {
         observed_at: now,
         external_input_lease_generation: EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
         ssh_direct_observation_generation: SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
+        hook_prompt_id: None,
     };
 
     record_local_only_entry_id_after_note_delivery(&nonlocal);
@@ -2849,6 +2873,8 @@ fn extract_yields_none_entry_id_when_uuid_absent() {
 // test fails if the acquisition is moved after the read.
 #[test]
 fn reconcile_holds_source_authority_across_read_decision_and_replacement() {
+    // The authority key follows the runtime root env, so no other test may move it mid-probe.
+    let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let _guard = TEST_LOCK
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());

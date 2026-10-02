@@ -81,6 +81,7 @@ async fn run_from_postloop_with_source_advance(
             standby_relay_owns_output: false,
             watcher_owns_assistant_relay: false,
             watcher_relay_available_for_turn: false,
+            watcher_adopted_after_done: false,
             bridge_entry_watcher_owner_epoch_current: true,
             response_sent_offset: state.response_sent_offset,
             tmux_last_offset: ctx.tmux_last_offset,
@@ -170,6 +171,7 @@ async fn receipted_rowless_turn_never_patches_active_card_before_terminal_gate_5
 
 #[tokio::test]
 async fn unreceipted_rowless_turn_keeps_active_card_and_terminal_delivery_5521() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     let driver = TerminalDeliveryDriver::new(ReplaceBehaviour::Edited, 1);
     let (ctx, mut state, _) = receipt_parts(&driver, ProviderKind::Claude);
     open_card(&driver, &ctx, &mut state).await;
@@ -188,6 +190,7 @@ async fn unreceipted_rowless_turn_keeps_active_card_and_terminal_delivery_5521()
 
 #[tokio::test]
 async fn aborted_delivery_future_preserves_same_user_and_zero_id_successor_5071() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     for user_msg_id in [DRIVER_USER_MSG_ID, 0] {
         let driver = TerminalDeliveryDriver::new(ReplaceBehaviour::Edited, 1);
         let (mut ctx, mut state) = driver.parts();
@@ -236,6 +239,7 @@ async fn aborted_delivery_future_preserves_same_user_and_zero_id_successor_5071(
 
 #[tokio::test]
 async fn aborted_delivery_future_hands_off_its_own_placeholder_5071() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     let driver = TerminalDeliveryDriver::new(ReplaceBehaviour::Edited, 1);
     let (mut ctx, state) = driver.parts();
     ctx.user_msg_id = None;

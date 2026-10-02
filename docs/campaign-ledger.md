@@ -2,7 +2,8 @@
 
 Campaigns use the existing server and its configured canonical PostgreSQL pool.
 All nodes and dependency edges are one atomic revision. There is no local JSON
-copy, session-bound owner, automatic task execution, or restart replay. After a
+copy, session-bound owner, or restart replay, and nothing runs unless a campaign
+opts into the auto-queue handoff below. After a
 clear, compaction, quota stop, provider switch or server restart, load the same
 campaign ID before doing more work. A `running` node is a saved checkpoint, not
 proof that its old process remains alive: inspect its session and evidence before
@@ -20,18 +21,37 @@ the durability boundary; no dashboard cache is authoritative.
 ## API
 
 All routes are under `/api` and use the same protected admin middleware as
-`/offices` and `/settings`, including the configured server Bearer token.
+`/departments` and `/settings`, including the configured server Bearer token.
 
 | Method | Route | Result |
 | --- | --- | --- |
-| GET | `/campaigns?limit=100&offset=0` | `{campaigns: Campaign[], limit, offset}`; latest updated first, limit 1–500 |
+| GET | `/campaigns?limit=100&offset=0` | `{campaigns: Campaign[], live, limit, offset}`; latest updated first, limit 1–500 |
 | POST | `/campaigns` | HTTP 201 `{campaign}`; optional client ID, otherwise UUID; existing ID returns 409 |
-| GET | `/campaigns/{id}` | `{campaign}`; missing ID returns 404 |
+| GET | `/campaigns/{id}` | `{campaign, live}`; missing ID returns 404 |
 | PUT | `/campaigns/{id}` | `{campaign}`; requires `expected_revision`, replaces complete aggregate |
 | GET | `/campaigns/{id}/history` | `{revisions: Campaign[]}`; the retained newest 10 revisions, descending; older ones are deleted, not archived |
 
+`live` is the execution projection the ledger itself does not hold. For each node
+whose `issue_url` is a GitHub issue that has a kanban card, it reports `card_id`,
+`card_status`, the card's newest `dispatch_id`/`dispatch_type`/`dispatch_status`, the
+`session_status` and `session_seen_at` heartbeat of the session holding that
+dispatch, and the newest auto-queue `queue_status` (list: campaign id → node id →
+status; single read: node id → status). A dispatch row can stay `dispatched` after
+its session is gone, so only `running` claims work is happening now: any dispatch
+on the card is `dispatched` and has a `turn_active` or `awaiting_bg` session with a
+heartbeat inside the stale-turn grace window. The nullable `working_dispatch_id`,
+`working_dispatch_type`, `working_session_id` (database ID as text),
+`working_session_status`, and `working_session_seen_at` identify a matching pair,
+preferring the freshest heartbeat. Newer pending or completed sidecars do not
+hide older running work. The dashboard uses this pair for running labels and
+session details; the existing dispatch/session fields retain their latest-record
+meaning. `live` is computed on every read and never written back, so it can
+disagree with a node's saved `status`.
+
 Campaign fields: `id`, `title`, `description`, `status`, `round`, `revision`,
-`nodes`, `created_at`, `updated_at`. Status is `planned`, `active`, `paused`,
+`auto_queue`, `nodes`, `created_at`, `updated_at`. `auto_queue` defaults to false;
+a POST or PUT that omits it keeps the stored value, so older writers cannot turn
+it off by accident. Status is `planned`, `active`, `paused`,
 `completed`, or `cancelled`. Round is a positive integer; revision starts at 1.
 
 Node fields: `id`, `title`, `status`, `stage`, `group`, `round`, `assignee`, `session_id`,
@@ -70,9 +90,40 @@ Duplicate node IDs, duplicate/missing dependencies, self edges and cycles return
 skipped. The API validates structure, not the truth of a claimed test result;
 callers must verify their evidence before marking work complete.
 
+## Auto-queue handoff
+
+The campaign decides which nodes may start; auto-queue only runs them. A node is
+ready when it is saved as `pending` and every dependency is saved as `completed`
+or `skipped`, or is saved as `pending` or `running` while its issue card has
+reached a terminal pipeline state (a dependency saved as `blocked` or `failed`
+holds its dependents even when its card finished). A ready
+node whose issue card is not finished and has no live auto-queue entry or
+dispatch joins the auto-queue run of the card's assigned agent: the newest
+active run for that repo and agent, in a new lane of its current phase, or a new
+run labelled `campaign` with phase gates off (up to four lanes at once). Backlog
+cards are moved to ready first, as `/api/queue/generate` does. Auto-queue's
+minute tick dispatches the new entries. The ledger is never written: the node's
+card and `live` show its progress, and a person still saves the node's status.
+
+Ready nodes that cannot be queued are listed in `waiting` with a reason:
+`no_issue_card`, `no_assigned_agent`, `previous_attempt_stopped` (its last queue
+entry failed or was skipped or cancelled; reset the card or skip the node),
+`card_not_ready` (the card is in another workflow step), `not_enqueueable`,
+`run_paused` (that agent's queue is paused; the handoff never starts a second
+run beside it), `queue_not_started` (a generated or pending queue for that agent
+waits to be started; the node joins it once it runs), `campaign_changed` (the
+campaign was saved again meanwhile), or `already_in_run`.
+
+With `auto_queue: true` this happens after every save of an active campaign
+(the response carries `handoff`, or `handoff_error` when the save succeeded but
+the handoff failed) and whenever any card reaches a terminal state. Saving the
+campaign again retries waiting nodes. Pausing the campaign stops further
+handoffs; entries already queued keep running in auto-queue.
+
 ## Dashboard navigation
 
-The first screen leads with running, then blocked, tasks as cards: gist (`summary`,
+The first screen leads with running, then blocked, tasks as cards (running follows
+the "Running now" rule below): gist (`summary`,
 else the title), a seven-step bar (investigate → design → implement → review → fix →
 merge → deploy check) inferred from the free-text `stage` by the stage keyword
 written first (unmatched stages show their short text), `benefit`, and `blocker`
@@ -91,7 +142,10 @@ task dependency view rather than a miniature rendering of the entire campaign.
 Aggregated group relationships can be cyclic even when the task DAG is acyclic.
 The task view shows direct predecessors and successors across groups and filters,
 with explicit omitted counts and a complete connection list for high fan-in/out.
-The saved `running` status remains a checkpoint, not a live process-health signal.
+The saved `running` status remains a checkpoint, not a live process-health signal;
+the list row and task details show the `live` card, dispatch, session and queue state
+beside it. "Running now" counts nodes saved as `running`, plus nodes not saved as
+completed or skipped whose `live.running` is true.
 
 ## CLI usage
 

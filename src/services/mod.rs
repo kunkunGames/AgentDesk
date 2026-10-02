@@ -19,9 +19,12 @@ pub mod codex;
 pub mod codex_remote_policy;
 pub mod codex_tmux_wrapper;
 pub mod codex_tui;
+// Storage primitives remain dormant until the input actor is wired.
 pub mod cswap;
 pub mod discord;
 pub mod discord_config_audit;
+#[allow(dead_code)]
+pub(crate) mod tui_input;
 // Read only by its tests until the `adk custody status` wiring lands on top of it.
 #[allow(dead_code)]
 pub(crate) mod discord_custody;
@@ -30,16 +33,13 @@ pub(crate) mod discord_custody;
 // tests keep working without churn.
 #[allow(unused_imports)]
 pub(crate) use dispatches::discord_delivery;
+pub(crate) mod calendar_sync;
 pub mod discord_dm_reply_store;
 pub mod disk_monitor;
 pub mod dispatch_gate;
 pub mod dispatch_watchdog;
 pub mod dispatched_sessions;
 pub mod dispatches;
-// #3034: 1 residual dead-code items; scoped here so the lint stays
-// live on clean sibling modules. Remove during dispatches_followup dead-code cleanup.
-pub(crate) mod calendar_sync;
-#[allow(dead_code)]
 pub mod dispatches_followup;
 pub mod escalation_settings;
 pub mod explicit_auth_route;
@@ -49,14 +49,12 @@ pub mod github_issue_creation;
 pub(crate) mod hang_forensics;
 pub mod health_active_session_audit;
 pub mod health_diagnostics;
+pub(crate) mod herdr_launch;
 pub mod issue_announcements;
 pub mod kakao;
 pub mod kakao_message;
 pub mod kanban;
 pub mod kanban_cards;
-// #3034: 81 residual dead-code items; scoped here so the lint stays
-// live on clean sibling modules. Remove during maintenance dead-code cleanup.
-#[allow(dead_code)]
 pub mod maintenance;
 pub(crate) mod manual_steer;
 pub mod mcp_config;
@@ -105,13 +103,11 @@ pub mod provider_exec;
 pub mod provider_hosting;
 pub(crate) mod provider_output_guard;
 pub mod provider_runtime;
+pub(crate) mod provider_teardown;
 pub mod queue;
 pub mod qwen;
 pub mod qwen_tmux_wrapper;
 pub(crate) mod release_source;
-// #3034: 2 residual dead-code items; scoped here so the lint stays
-// live on clean sibling modules. Remove during remote_stub dead-code cleanup.
-#[allow(dead_code)]
 pub mod remote_stub;
 pub mod retrospectives;
 pub mod review_decision;
@@ -148,10 +144,18 @@ pub mod tmux_wrapper;
 pub mod tool_output_guard;
 #[allow(dead_code)]
 pub(crate) mod writer_protocol;
-// Shadow-only output track; unreferenced until its spawn is wired behind the off-by-default flag.
+// Output track: the shadow and the dormant writer store, each behind an off-by-default flag.
 #[allow(dead_code)]
 pub(crate) mod tui_o {
+    pub(crate) mod alarm;
+    pub(crate) mod channel_policy;
+    pub(crate) mod cutover;
+    pub(crate) mod ownership;
     pub(crate) mod shadow;
+    pub(crate) mod shadow_host;
+    pub(crate) mod store;
+    pub(crate) mod topology;
+    pub(crate) mod writer;
 }
 // #3034: 4 residual dead-code items; scoped here so the lint stays
 // live on clean sibling modules. Remove during tui_prompt_dedupe dead-code cleanup.

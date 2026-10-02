@@ -4,6 +4,7 @@ use crate::services::provider::cancel_token_cleanup::executor::{
     CleanupRequest, TmuxCleanupIntent,
 };
 use crate::services::provider::{CancelToken, ProviderKind};
+use crate::services::session_host::{HostKind, HostSessionRef, host_for};
 use std::time::Duration;
 
 // #3479: behavior-preserving decomposition of this giant module. The pure
@@ -16,6 +17,7 @@ mod interrupt_policy;
 mod pid_exit;
 mod process_backend_cancel;
 mod process_table;
+mod stop_host;
 
 use claude_stop_delivery::interrupt_claude_turn_session_preserving;
 use interrupt_policy::*;
@@ -24,6 +26,7 @@ use process_backend_cancel::{
     hard_stop_unresponsive_process_backend_turn, interrupt_process_backend_turn,
 };
 use process_table::{provider_cli_pid_in_tmux, send_sigint};
+use stop_host::StopTarget;
 
 // #3169: `mod.rs`'s cancel epilogue records this sentinel via the
 // `tmux_runtime::ANONYMOUS_TURN_BRIDGE_TEARDOWN_REASON` path, so re-export it
@@ -114,30 +117,30 @@ fn tmux_ready_for_input_without_tui_pane(tmux_session_name: &str, provider: &Pro
     .is_some_and(crate::services::pane_readiness::FallbackPaneReadiness::is_ready)
 }
 
+#[cfg(test)]
 pub(in crate::services::discord) async fn interrupt_provider_cli_turn(
     provider: &ProviderKind,
     token: &Arc<CancelToken>,
     reason: &str,
 ) -> ProviderTurnInterruptOutcome {
-    let tmux_session = token.tmux_session_name();
+    interrupt_on(&StopTarget::for_token(token), provider, token, reason).await
+}
+
+async fn interrupt_on(
+    target: &StopTarget,
+    provider: &ProviderKind,
+    token: &Arc<CancelToken>,
+    reason: &str,
+) -> ProviderTurnInterruptOutcome {
     let tracked_child_pid = token.child_pid_value();
-    if tmux_session.is_none() {
-        return interrupt_process_backend_turn(provider, tracked_child_pid, reason);
-    }
-    let Some(tmux_session_name) = tmux_session.as_deref() else {
-        tracing::error!(
-            "provider turn interrupt skipped: provider={} reason={} error=cancel_token_missing_tmux_session",
-            provider.as_str(),
-            reason
-        );
-        return ProviderTurnInterruptOutcome {
-            tmux_session,
-            sent_keys: false,
-            fallback_sigint_pid: None,
-            missing_tmux_session: true,
-            sigint_target_missing: false,
-        };
+    let tmux_session_name = match target {
+        StopTarget::Process => {
+            return interrupt_process_backend_turn(provider, tracked_child_pid, reason);
+        }
+        StopTarget::LegacyTmux(name) => name.as_str(),
+        _ => return stop_host::interrupt_unhosted(target, provider, token, reason).await,
     };
+    let tmux_session = Some(tmux_session_name.to_string());
     let Some(plan) = provider_turn_interrupt_plan(provider) else {
         return ProviderTurnInterruptOutcome {
             tmux_session,
@@ -447,6 +450,10 @@ pub(in crate::services::discord) fn bind_cancel_token_tmux_runtime(
     } else {
         token.bind_unmanaged_session_name(tmux_session_name);
     }
+    // Another host's pane is never searched for a PID, so no kill can target one.
+    if !super::super::host_liveness::local_tmux(tmux_session_name, None) {
+        return None;
+    }
 
     let tracked_child_pid = token.child_pid_value();
     let provider_pid = provider_cli_pid_in_tmux(tmux_session_name, provider, tracked_child_pid);
@@ -493,13 +500,43 @@ pub(in crate::services::discord) async fn stop_active_turn(
     cleanup_policy: TmuxCleanupPolicy,
     reason: &str,
 ) -> bool {
-    let interrupt_outcome = interrupt_provider_cli_turn(provider, token, reason).await;
-    let termination_recorded = cancel_active_token(token, cleanup_policy, reason);
+    let target = StopTarget::for_token(token);
+    stop_active_turn_on(&target, provider, token, cleanup_policy, reason).await
+}
+
+/// [`stop_active_turn`], or for a force-kill whose verdict approved `Some(name)` (`None`: a process
+/// turn) a stop that reads no marker again and refuses a token naming another session.
+pub(in crate::services::discord) async fn stop_approved_turn(
+    provider: &ProviderKind,
+    token: &Arc<CancelToken>,
+    approved: Option<Option<&str>>,
+    cleanup_policy: TmuxCleanupPolicy,
+    reason: &str,
+) -> bool {
+    let target = match approved {
+        Some(approved) => StopTarget::approved(token, approved),
+        None => StopTarget::for_token(token),
+    };
+    stop_active_turn_on(&target, provider, token, cleanup_policy, reason).await
+}
+
+/// Every stage acts on `target`, never on a name the token holds by then.
+async fn stop_active_turn_on(
+    target: &StopTarget,
+    provider: &ProviderKind,
+    token: &Arc<CancelToken>,
+    cleanup_policy: TmuxCleanupPolicy,
+    reason: &str,
+) -> bool {
+    let interrupt_outcome = interrupt_on(target, provider, token, reason).await;
+    let termination_recorded = cancel_active_token_on(Some(target), token, cleanup_policy, reason);
+    let outcome = &interrupt_outcome;
     hard_stop_unresponsive_provider_cli_turn(
         provider,
         token,
+        target,
         cleanup_policy,
-        &interrupt_outcome,
+        outcome,
         reason,
     )
     .await;
@@ -509,18 +546,16 @@ pub(in crate::services::discord) async fn stop_active_turn(
 async fn hard_stop_unresponsive_provider_cli_turn(
     provider: &ProviderKind,
     token: &Arc<CancelToken>,
+    target: &StopTarget,
     cleanup_policy: TmuxCleanupPolicy,
     interrupt_outcome: &ProviderTurnInterruptOutcome,
     reason: &str,
 ) {
-    if cleanup_policy.should_cleanup_tmux() {
+    if cleanup_policy.should_cleanup_tmux() || !target.reaches_legacy_host() {
         return;
     }
 
-    let tmux_session_name = interrupt_outcome
-        .tmux_session
-        .clone()
-        .or_else(|| token.tmux_session_name());
+    let tmux_session_name = target.legacy_name().map(|name| name.as_str().to_string());
     let Some(tmux_session_name) = tmux_session_name else {
         hard_stop_unresponsive_process_backend_turn(provider, token, interrupt_outcome, reason)
             .await;
@@ -553,7 +588,10 @@ async fn hard_stop_unresponsive_provider_cli_turn(
     let provider_for_probe = provider.clone();
     let session_for_probe = tmux_session_name.clone();
     let probe = tokio::task::spawn_blocking(move || {
-        let pane_pid = crate::services::platform::tmux::pane_pid(&session_for_probe);
+        let pane_pid = host_for(HostKind::Tmux)
+            .execution_pid(HostSessionRef::tmux(&session_for_probe))
+            .ok()
+            .flatten();
         let session_alive = pane_pid.is_some();
         let ready_for_input =
             tmux_ready_for_input_without_tui_pane(&session_for_probe, &provider_for_probe);
@@ -689,9 +727,26 @@ pub(in crate::services::discord) fn cancel_active_token(
     cleanup_policy: TmuxCleanupPolicy,
     reason: &str,
 ) -> bool {
+    cancel_active_token_on(None, token, cleanup_policy, reason)
+}
+
+/// With a stop's `target`, another host keeps its session and the executor refuses a
+/// destructive cleanup once the token's binding no longer names that target.
+fn cancel_active_token_on(
+    target: Option<&StopTarget>,
+    token: &Arc<CancelToken>,
+    cleanup_policy: TmuxCleanupPolicy,
+    reason: &str,
+) -> bool {
+    let cleanup_policy = target.map_or(cleanup_policy, |target| {
+        target.effective_policy(cleanup_policy)
+    });
     token.set_restart_mode(cleanup_policy.preserves_inflight());
     let child_pid = token.child_pid_value();
-    let has_tmux_session = token.tmux_session_name().is_some();
+    let has_tmux_session = target.map_or_else(
+        || token.tmux_session_name().is_some(),
+        |target| !matches!(target, StopTarget::Process),
+    );
     if !has_tmux_session
         && cleanup_policy.should_cleanup_tmux()
         && let Some(pid) = child_pid
@@ -708,14 +763,17 @@ pub(in crate::services::discord) fn cancel_active_token(
             (TmuxCleanupIntent::PreserveSession, None)
         }
     };
-    token
-        .request_cleanup(CleanupRequest {
-            cancel_source: reason.to_string(),
-            intent,
-            termination_reason,
-            hard_stop_target: None,
-        })
-        .termination_confirmed()
+    let request = CleanupRequest {
+        cancel_source: reason.to_string(),
+        intent,
+        termination_reason,
+        hard_stop_target: None,
+    };
+    match target {
+        Some(target) => token.request_cleanup_expecting(request, target.expected_binding()),
+        None => token.request_cleanup(request),
+    }
+    .termination_confirmed()
 }
 
 #[cfg(unix)]
@@ -809,7 +867,7 @@ mod tests {
 {"agent_path":"/tmp/private-agent","status":{"completed":"Read-only review complete.\n\n1. Check relay path."}}
 </subagent_notification>"#;
     const CHROME_RAW_SUBAGENT: &str = "No response requested.\n<subagent_notification>{\"agent_path\":\"/tmp/private-agent\",\"status\":{\"completed\":\"Read-only review complete.\"}}</subagent_notification>";
-    static SIGINT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    pub(super) static SIGINT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn stale_inflight_message_hides_raw_subagent_notification() {

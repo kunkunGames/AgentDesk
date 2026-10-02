@@ -14,13 +14,13 @@ use super::outbound::delivery_record as dr; // #3089 B2c
 use super::turn_bridge::TurnBridgeContext;
 use super::turn_view_reconciler::note_tui_anchor_started as started;
 use crate::services::agent_protocol::{RuntimeHandoffKind, StreamMessage};
-use crate::services::claude_tui::hook_server::{HookEventKind, subscribe_hook_events};
+use crate::services::claude_tui::hook_server::{HookEvent, HookEventKind, subscribe_hook_events};
 use crate::services::memory::TokenUsage;
 use crate::services::provider::{CancelToken, ProviderKind, ReadOutputResult};
 use crate::services::tui_prompt_dedupe::{
     ExternalInputRelayLease, ExternalInputRelayOwner, ObservedTuiPrompt,
-    extract_prompt_from_hook_payload, observe_prompt_by_provider_session_at,
-    subscribe_observed_prompts,
+    extract_prompt_from_hook_payload, extract_prompt_id_from_hook_payload,
+    observe_prompt_by_provider_session_with_prompt_id_at, subscribe_observed_prompts,
 };
 use tracing::Instrument;
 
@@ -42,6 +42,8 @@ use self::observed_prompt_decision::{
     RelayObservedPromptInjectionDecision, relay_observed_prompt_injected_prompt_decision,
 };
 
+mod idle_tail_state;
+pub(in crate::services::discord) use self::idle_tail_state::claude_idle_tail_running;
 mod idle_transcript_scan;
 use self::idle_transcript_scan::{
     ClaudeIdleTranscriptScan, CodexIdleRolloutScan, claude_idle_compaction_reanchor,
@@ -77,7 +79,8 @@ pub(in crate::services::discord) use self::anchor_completion::{
 };
 use self::bridge_completion::ensure_tui_direct_bridge_delivery_committed;
 use self::bridge_gateway::TuiDirectBridgeGateway;
-
+#[cfg(unix)]
+pub(in crate::services::discord) mod herdr_source;
 #[cfg(unix)]
 mod launch_script;
 #[cfg(unix)]
@@ -150,20 +153,22 @@ mod claude_idle_bridge;
 mod claude_idle_runtime;
 #[cfg(unix)]
 mod claude_idle_tail;
+mod headless;
 // #5188: session-rotation settle pass (pure planner always compiled + tested).
 mod session_rotation_settle;
 #[cfg(unix)]
 #[allow(unused_imports)]
 use self::claude_idle_bridge::build_tui_direct_bridge_inflight_state;
+#[cfg(unix)]
+use self::claude_idle_bridge::{
+    buffer_idle_prefix, idle_stream_message_is_content, idle_tail_tool_opens,
+    stream_tui_idle_response_through_bridge,
+    tui_idle_tail_stream_should_commit_runtime_binding_offset,
+};
 #[cfg(all(unix, test))]
 use self::claude_idle_bridge::{
     compose_tui_idle_response, forward_idle_stream_into_bridge,
     tui_idle_tail_should_commit_runtime_binding_offset,
-};
-#[cfg(unix)]
-use self::claude_idle_bridge::{
-    idle_stream_message_is_content, stream_tui_idle_response_through_bridge,
-    tui_idle_tail_stream_should_commit_runtime_binding_offset,
 };
 #[cfg(unix)]
 pub(super) use self::claude_idle_runtime::resolve_rehydrated_claude_tmux_channel_id;
@@ -273,15 +278,29 @@ pub(super) fn spawn_tui_prompt_relay(shared: Arc<SharedData>, provider: Provider
     // turn-starts for this provider before the observer loop runs, so a dcserver
     // restart mid-wait neither loses the wakeup turn nor resubmits its prompt.
     restore_pending_starts(&shared, &provider);
+    let relay = move |prompt| -> futures::future::BoxFuture<'static, ()> {
+        let shared = shared.clone();
+        Box::pin(async move { relay_observed_prompt(&shared, prompt).await })
+    };
+    spawn_tui_prompt_relay_observer(
+        provider.as_str().to_string(),
+        subscribe_hook_events(),
+        relay,
+    );
+}
 
-    let provider_name = provider.as_str().to_string();
+/// Hook prompts and observed-prompt relay share one loop; tests pass their own hooks and relay.
+fn spawn_tui_prompt_relay_observer(
+    provider_name: String,
+    mut hook_rx: tokio::sync::broadcast::Receiver<HookEvent>,
+    mut relay: impl FnMut(ObservedTuiPrompt) -> futures::future::BoxFuture<'static, ()> + Send + 'static,
+) {
     let observer_span = tracing::info_span!(
         "tui_prompt_relay_observer",
         provider = %provider_name
     );
     // Subscribe before spawning so callers can publish immediately after this
     // function returns without racing the observer task's first poll.
-    let mut hook_rx = subscribe_hook_events();
     let mut observed_rx = subscribe_observed_prompts();
     super::task_supervisor::spawn_observed("tui_prompt_relay_observer", async move {
         loop {
@@ -292,15 +311,20 @@ pub(super) fn spawn_tui_prompt_relay(shared: Arc<SharedData>, provider: Provider
                             && event.kind == HookEventKind::UserPromptSubmit =>
                         {
                             if let Some(prompt) = extract_prompt_from_hook_payload(&event.payload) {
-                                let observation = observe_prompt_by_provider_session_at(
+                                let prompt_id = (event.provider == "claude")
+                                    .then(|| extract_prompt_id_from_hook_payload(&event.payload))
+                                    .flatten();
+                                let observation = observe_prompt_by_provider_session_with_prompt_id_at(
                                     &event.provider,
                                     &event.session_id,
                                     &prompt,
+                                    prompt_id.as_deref(),
                                     event.received_at,
                                 );
                                 tracing::debug!(
                                     provider = %event.provider,
                                     session_id = %event.session_id,
+                                    prompt_id = prompt_id.as_deref().unwrap_or(""),
                                     observation = ?observation,
                                     "observed TUI UserPromptSubmit hook"
                                 );
@@ -320,7 +344,7 @@ pub(super) fn spawn_tui_prompt_relay(shared: Arc<SharedData>, provider: Provider
                 observed = observed_rx.recv() => {
                     match observed {
                         Ok(prompt) if prompt.provider == provider_name => {
-                            relay_observed_prompt(&shared, prompt).await;
+                            relay(prompt).await;
                         }
                         Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -339,6 +363,7 @@ pub(super) fn spawn_tui_prompt_relay(shared: Arc<SharedData>, provider: Provider
 }
 
 async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiPrompt) {
+    let _unannounced_prompt_id = synthetic_start_wiring::UnannouncedPromptIdGuard(&prompt);
     // Local-only controls were classified before publication, so this relay path
     // never needs to repair pre-publish lease/SSH state. A missing or lagged
     // receiver therefore cannot strand a local `/compact` relay lease.
@@ -586,11 +611,16 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             )
         };
         let notification_anchor_message_id = if let Some(message_id) = task_card_anchor {
+            synthetic_start_wiring::record_prompt_id_after_post(&prompt, None);
             message_id
         } else {
             match channel_id.say(&*notify_http, content).await {
-                Ok(message) => message.id,
+                Ok(message) => {
+                    synthetic_start_wiring::record_prompt_id_after_post(&prompt, None);
+                    message.id
+                }
                 Err(error) => {
+                    synthetic_start_wiring::record_prompt_id_after_post(&prompt, Some(&error));
                     tracing::warn!(
                         provider = %prompt.provider,
                         channel_id = channel_id.get(),

@@ -13,22 +13,35 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(test)]
 #[path = "streaming_baseline_tests.rs"]
 mod streaming_baseline_tests;
+
+#[path = "o_delegated_watcher_tests.rs"]
+mod o_delegated_watcher_tests;
+
+#[cfg(test)]
+#[path = "post_stream_exit_host_tests.rs"]
+mod post_stream_exit_host_tests;
 
 const CHILD: &str = "ADK_STREAMING_HARNESS_CHILD";
 const CLAUDE: ProviderKind = ProviderKind::Claude;
 static LOG: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 // `$1` after global flags. Builtins only: a failed read or an unknown state is recorded,
-// never mistaken for another pane state.
+// never mistaken for another pane state. `deadpane` keeps the session with a dead pane,
+// `unanswered` has no server socket, `listfail` fails only `list-panes`; kills are logged.
 const FAKE_TMUX: &str = r#"#!/bin/sh
 while [ "${1#-}" != "$1" ]; do shift; done
+echo "$*" >> "ROOT/tmux-calls"
 read -r state < "ROOT/pane" || state="unreadable"
-case "$state" in busy|idle|dead) ;; *) echo "$* on pane '$state'" >> "ROOT/tmux-errors"; exit 97 ;; esac
+case "$state" in busy|idle|dead|deadpane|unanswered|listfail) ;; *) echo "$* on pane '$state'" >> "ROOT/tmux-errors"; exit 97 ;; esac
 case "$1" in
-  has-session) [ "$state" = dead ] && { echo "can't find session" >&2; exit 1; }; exit 0 ;;
-  list-panes) [ "$state" = dead ] && echo 1 || echo 0; exit 0 ;;
+  has-session) [ "$state" = dead ] && { echo "can't find session" >&2; exit 1; }
+    [ "$state" = unanswered ] && { echo "error connecting to ROOT/no-socket" >&2; exit 1; }; exit 0 ;;
+  list-panes) [ "$state" = listfail ] && exit 1
+    case "$state" in dead|deadpane) echo 1 ;; *) echo 0 ;; esac; exit 0 ;;
+  kill-session) echo "$*" >> "ROOT/tmux-kills"; exit 0 ;;
   capture-pane) [ "$state" = busy ] && printf '%s\n' '⏺ Running 1 shell command…' '· Actioning… (4m 7s · esc to interrupt)'; exit 0 ;;
 esac
 exit 0
@@ -49,6 +62,11 @@ impl std::io::Write for Capture {
 /// True inside the isolated child. The parent re-runs `test` there with its own
 /// runtime root, fake `tmux` on `PATH` and a zero streaming interval, then checks it passed.
 pub(super) fn isolated(test: &str) -> bool {
+    isolated_in("streaming_baseline_tests", test, &[])
+}
+
+/// `isolated` for a test in the sibling module `submodule`, with extra child env.
+pub(super) fn isolated_in(submodule: &str, test: &str, envs: &[(&str, &str)]) -> bool {
     if std::env::var_os(CHILD).is_some() {
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -56,7 +74,10 @@ pub(super) fn isolated(test: &str) -> bool {
             .with_env_filter(
                 "agentdesk::relay_flight_recorder=info,agentdesk::inflight_remove=warn,\
                  agentdesk::services::discord::tmux::tmux_watcher::cancel_handoff=info,\
-                 agentdesk::services::discord::tmux::tmux_watcher::turn_stream_collector=info",
+                 agentdesk::services::discord::tmux::tmux_watcher::turn_stream_collector=info,\
+                 agentdesk::services::discord::host_liveness=info,\
+                 agentdesk::services::discord::tmux::tmux_watcher::post_stream_exit::host_gate=debug,\
+                 agentdesk::services::discord::tmux::watcher_lifecycle::watch_host=debug",
             )
             .with_writer(|| Capture)
             .finish();
@@ -70,9 +91,15 @@ pub(super) fn isolated(test: &str) -> bool {
     std::fs::write(&tmux, FAKE_TMUX.replace("ROOT", &dir)).unwrap();
     std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o700)).unwrap();
     let module = module_path!().split_once("::").unwrap().1;
-    let exact = format!("{module}::streaming_baseline_tests::{test}");
+    let exact = format!("{module}::{submodule}::{test}");
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+        // The empty writer list unless the case names its own; later envs win.
+        .env(
+            crate::services::tui_o::cutover::test_override::CHANNELS_ENV,
+            "[]",
+        )
+        .envs(envs.iter().copied())
         .env(CHILD, "1")
         .env("AGENTDESK_ROOT_DIR", root.path())
         .env("PATH", root.path())
@@ -121,6 +148,52 @@ struct Discord {
     visible: BTreeMap<u64, String>,
     shown: Vec<String>,
     calls: usize,
+    post_retry: Option<Arc<PostRetry>>,
+}
+
+/// Rejects one matching POST without storing it, then holds its retry for state inspection.
+struct PostRetry {
+    content: &'static str,
+    attempts: AtomicU64,
+    release: tokio::sync::Notify,
+}
+
+impl PostRetry {
+    fn new(content: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            content,
+            attempts: AtomicU64::new(0),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    async fn intercept(&self, method: &Method, uri: &Uri, body: &Bytes) -> Option<Response> {
+        let payload: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();
+        if method != Method::POST
+            || !uri.path().ends_with("/messages")
+            || !payload["content"]
+                .as_str()
+                .is_some_and(|s| s.contains(self.content))
+        {
+            return None;
+        }
+        match self.attempts.fetch_add(1, Ordering::AcqRel) {
+            0 => Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(
+                        serde_json::json!({"message": "temporary card POST failure", "code": 0}),
+                    ),
+                )
+                    .into_response(),
+            ),
+            1 => {
+                self.release.notified().await;
+                None
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Discord {
@@ -202,6 +275,11 @@ pub(super) struct Harness {
 impl Harness {
     /// A watcher-less channel over `seed`, with the pane busy.
     pub(super) async fn new(case: u64, seed: &str) -> Self {
+        Self::on(case, seed, None).await
+    }
+
+    /// [`Harness::new`] on a runtime whose stored rows live in `pool`.
+    pub(super) async fn on(case: u64, seed: &str, pool: Option<sqlx::PgPool>) -> Self {
         let root = std::env::var("AGENTDESK_ROOT_DIR").unwrap();
         let channel = ChannelId::new(6_284_100 + case);
         let tmux = CLAUDE.build_tmux_session_name(&format!("i6284-harness-{case}"));
@@ -216,6 +294,12 @@ impl Harness {
             move |method: Method, uri: Uri, body: Bytes| {
                 let discord = discord.clone();
                 async move {
+                    let retry = discord.lock().unwrap().post_retry.clone();
+                    if let Some(retry) = retry
+                        && let Some(response) = retry.intercept(&method, &uri, &body).await
+                    {
+                        return response;
+                    }
                     discord
                         .lock()
                         .unwrap()
@@ -232,7 +316,7 @@ impl Harness {
         );
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let harness = Self {
-            shared: crate::services::discord::make_shared_data_for_tests(),
+            shared: crate::services::discord::make_shared_data_for_tests_with_storage(pool),
             channel,
             tmux,
             path,
@@ -255,8 +339,9 @@ impl Harness {
             std::fs::write(marker, "dead").unwrap();
         }
         let live = crate::services::tmux_diagnostics::tmux_session_has_live_pane(&self.tmux);
-        let busy = super::super::liveness::watcher_pane_actively_streaming(&self.tmux);
-        let expected = (state != "dead", state == "busy");
+        let legacy = HostSnapshot::new(WatchHost::Legacy);
+        let busy = super::super::liveness::watcher_pane_actively_streaming(&self.tmux, &legacy);
+        let expected = (matches!(state, "busy" | "idle"), state == "busy");
         assert_eq!((live, busy), expected, "fake tmux {state}");
     }
 
@@ -295,9 +380,7 @@ impl Harness {
     /// Registers and starts a watcher at `offset`; a running one is cancelled first,
     /// which hands its turn over through cancellation custody.
     pub(super) fn spawn(&mut self, offset: u64) {
-        if let Some(old) = self.watcher.take() {
-            old.cancel.store(true, Ordering::Release);
-        }
+        self.cancel();
         let cancel = Arc::new(AtomicBool::new(false));
         let resume = Arc::new(Mutex::new(None));
         let paused = Arc::new(AtomicBool::new(false));
@@ -360,8 +443,46 @@ impl Harness {
         std::fs::metadata(&self.path).unwrap().len()
     }
 
+    /// Cancels the running watcher, if any.
+    pub(super) fn cancel(&self) {
+        if let Some(watcher) = self.watcher.as_ref() {
+            watcher.cancel.store(true, Ordering::Release);
+        }
+    }
+
+    /// `kill-session` calls the fake `tmux` received for this session.
+    pub(super) fn kills(&self) -> usize {
+        let root = std::env::var("AGENTDESK_ROOT_DIR").unwrap();
+        let kills = std::fs::read_to_string(format!("{root}/tmux-kills")).unwrap_or_default();
+        kills
+            .lines()
+            .filter(|line| line.contains(&self.tmux))
+            .count()
+    }
+
+    /// Fake `tmux` calls naming this session since the last take, oldest first.
+    pub(super) fn take_tmux_calls(&self) -> Vec<String> {
+        let root = std::env::var("AGENTDESK_ROOT_DIR").unwrap();
+        let log = format!("{root}/tmux-calls");
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(log);
+        calls
+            .lines()
+            .filter(|line| line.contains(&self.tmux))
+            .map(str::to_string)
+            .collect()
+    }
+
     pub(super) fn watcher_finished(&self) -> bool {
         self.watcher.as_ref().is_some_and(|w| w.task.is_finished())
+    }
+
+    /// Waits for the watcher to end and fails on a panic or a cancelled task.
+    pub(super) async fn exited(&mut self, what: &str) {
+        self.until(what, Self::watcher_finished).await;
+        let task = self.watcher.take().unwrap().task;
+        task.await
+            .unwrap_or_else(|e| panic!("watcher task {what}: {e}"));
     }
 
     pub(super) fn showing(&self, text: &str) -> bool {
@@ -445,7 +566,7 @@ impl Harness {
         end
     }
 
-    fn heartbeat(&self) -> i64 {
+    pub(super) fn heartbeat(&self) -> i64 {
         self.watcher.as_ref().unwrap().beat.load(Ordering::Acquire)
     }
 

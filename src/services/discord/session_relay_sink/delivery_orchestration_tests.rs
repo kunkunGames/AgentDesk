@@ -1,6 +1,10 @@
 use super::tests::{inflight_with_identity_offset, matched, terminal_frame_offset};
 use super::*;
 use crate::services::discord::inflight::RelayOwnerKind;
+use crate::services::tui_o::channel_policy::SinkOp;
+
+#[path = "o_delivery_e2e_tests.rs"]
+mod o_delivery_e2e_tests;
 
 // Kills M6: removing the fenced-terminal disjunct must lose this terminal outcome.
 #[tokio::test]
@@ -28,6 +32,7 @@ async fn fenced_terminal_without_parser_delivery_is_terminal_not_delivered() {
 // Kills M8: transport errors must escape instead of folding into NotDelivered.
 #[tokio::test]
 async fn relay_deliver_propagates_injected_transport_error() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     let temp = tempfile::tempdir().expect("temp runtime root");
     let _root = crate::config::set_agentdesk_root_for_test(temp.path());
     let channel_id = 44_002;
@@ -73,6 +78,7 @@ async fn relay_deliver_propagates_injected_transport_error() {
 // Kills M10 and anchor-drop: persisted proof stays Delivered and records the tail anchor.
 #[tokio::test]
 async fn relay_deliver_preserves_tail_anchor_and_observes_persisted_proof() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     if std::env::var_os("ADK_5927_RELAY_FIXTURE_CHILD").is_none() {
         let qualified = format!(
             "{}::relay_deliver_preserves_tail_anchor_and_observes_persisted_proof",
@@ -498,6 +504,7 @@ async fn native_codex_restart_sink_fixture() {
 // Kills M11: stale proof must remain distinguishable from Delivered before public folding.
 #[tokio::test]
 async fn relay_deliver_observes_landed_stale_proof() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     let temp = tempfile::tempdir().expect("temp runtime root");
     let _root = crate::config::set_agentdesk_root_for_test(temp.path());
     let channel_id = 44_004;
@@ -564,6 +571,7 @@ async fn relay_deliver_observes_landed_stale_proof() {
 
 #[tokio::test]
 async fn relay_deliver_observes_landed_unrecorded_proof() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     let temp = tempfile::tempdir().expect("temp runtime root");
     let _root = crate::config::set_agentdesk_root_for_test(temp.path());
     let channel_id = 44_005;
@@ -611,6 +619,87 @@ async fn relay_deliver_observes_landed_unrecorded_proof() {
     crate::services::discord::inflight::clear_inflight_state(&ProviderKind::Claude, channel_id);
 }
 
+// An O-delegated idle range is consumed once: no transport, no delivery record, frontier committed.
+#[tokio::test]
+async fn o_delegated_idle_range_is_consumed_once_without_transport_or_evidence() {
+    if !crate::services::tui_o::cutover::test_override::isolated_binding_case(concat!(
+        module_path!(),
+        "::o_delegated_idle_range_is_consumed_once_without_transport_or_evidence"
+    )) {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("temp runtime root");
+    let _root = crate::config::set_agentdesk_root_for_test(temp.path());
+    let channel_id = 44_010;
+    let channel = ChannelId::new(channel_id);
+    let binding = matched(&channel_id.to_string());
+    let session = &binding.expected_session_name;
+    let generation_path = crate::services::tmux_common::session_temp_path(session, "generation");
+    std::fs::create_dir_all(std::path::Path::new(&generation_path).parent().unwrap()).unwrap();
+    std::fs::write(&generation_path, b"o-delegated").expect("generation marker");
+    let generation = dr::current_generation_mtime_ns(session);
+    let started_at = "2026-08-03T00:00:10Z";
+    let mut inflight = inflight_with_identity_offset(channel_id, session, 710, started_at, Some(0));
+    inflight.set_relay_owner_kind(RelayOwnerKind::SessionBoundRelay);
+    inflight.current_msg_id = 88_010;
+    crate::services::discord::inflight::save_inflight_state(&inflight).expect("persist inflight");
+    let registry = Arc::new(HealthRegistry::new());
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    registry
+        .register(ProviderKind::Claude.as_str().to_string(), shared.clone())
+        .await;
+    let gateway = Arc::new(RelayContractFakeGateway::edited());
+    let mut sink = SessionBoundDiscordRelaySink::new(registry);
+    sink.test_gateway = Some(gateway.clone());
+    let payload = concat!(
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]}}\n",
+        "{\"type\":\"result\",\"result\":\"answer\"}\n"
+    );
+    let rollout = std::path::Path::new(&binding.expected_rollout_path);
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    std::fs::write(rollout, format!("{payload: <256}")).unwrap();
+    let mut idle = terminal_frame_offset(&binding, payload, 1, 256, 710, started_at, Some(0));
+    idle.relay_generation_mtime_ns = Some(generation);
+    idle.relay_range = Some((0, 256));
+    let _tui = crate::services::tui_o::cutover::test_override::bind_claude_tui_session(
+        session,
+        &binding.expected_rollout_path,
+    );
+    let _o = crate::services::tui_o::cutover::test_override::force_channels(&[(
+        channel_id,
+        crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
+    )]);
+
+    for attempt in ["first", "replay"] {
+        let outcome = sink.deliver(&idle).await.expect("delegated idle range");
+        assert_eq!(outcome, RelaySinkOutcome::TerminalDelivered, "{attempt}");
+        let transport = (
+            gateway.send_calls.load(Ordering::Acquire),
+            gateway.replace_calls.load(Ordering::Acquire),
+        );
+        assert_eq!(transport, (0, 0), "{attempt}: O posts this body");
+        assert_eq!(
+            dr::effective_committed_offset(
+                &shared,
+                &ProviderKind::Claude,
+                channel,
+                session,
+                Some(256)
+            ),
+            256,
+            "{attempt}: the consumed range stays committed"
+        );
+    }
+    assert!(
+        dr::read_record(&ProviderKind::Claude, channel_id)
+            .and_then(|record| record.delivered_frontier)
+            .is_none(),
+        "a delegated range writes no delivery record frontier"
+    );
+    crate::services::discord::inflight::clear_inflight_state(&ProviderKind::Claude, channel_id);
+}
+
 struct RelayContractFakeGateway {
     replace_outcome: ReplaceLongMessageOutcome,
     transport_error: Option<String>,
@@ -619,6 +708,8 @@ struct RelayContractFakeGateway {
     send_calls: AtomicU64,
     sent_contents: Mutex<Vec<String>>,
     on_transport: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// When set, each send or replace is checked against the watched adoption on entry.
+    check: std::sync::OnceLock<crate::services::tui_o::channel_policy::BodyCheck>,
 }
 
 impl RelayContractFakeGateway {
@@ -631,6 +722,7 @@ impl RelayContractFakeGateway {
             send_calls: AtomicU64::new(0),
             sent_contents: Mutex::new(Vec::new()),
             on_transport: None,
+            check: std::sync::OnceLock::new(),
         }
     }
 
@@ -644,10 +736,13 @@ impl RelayContractFakeGateway {
 impl crate::services::discord::gateway::TurnGateway for RelayContractFakeGateway {
     fn send_message<'a>(
         &'a self,
-        _channel_id: ChannelId,
+        channel_id: ChannelId,
         content: &'a str,
     ) -> crate::services::discord::gateway::GatewayFuture<'a, Result<MessageId, String>> {
         Box::pin(async move {
+            if let Some(check) = self.check.get() {
+                check.sink(channel_id.get(), SinkOp::Post, content);
+            }
             self.send_calls.fetch_add(1, Ordering::AcqRel);
             self.sent_contents.lock().unwrap().push(content.to_string());
             if let Some(on_transport) = &self.on_transport {
@@ -671,7 +766,7 @@ impl crate::services::discord::gateway::TurnGateway for RelayContractFakeGateway
 
     fn replace_message_with_outcome<'a>(
         &'a self,
-        _channel_id: ChannelId,
+        channel_id: ChannelId,
         _message_id: MessageId,
         _content: &'a str,
     ) -> crate::services::discord::gateway::GatewayFuture<
@@ -679,6 +774,9 @@ impl crate::services::discord::gateway::TurnGateway for RelayContractFakeGateway
         Result<ReplaceLongMessageOutcome, String>,
     > {
         Box::pin(async move {
+            if let Some(check) = self.check.get() {
+                check.sink(channel_id.get(), SinkOp::Patch, _content);
+            }
             self.replace_calls.fetch_add(1, Ordering::AcqRel);
             if let Some(on_transport) = &self.on_transport {
                 on_transport();
@@ -734,4 +832,57 @@ impl SessionBoundDiscordRelaySink {
     pub(in crate::services::discord) fn enable_delivery_for_test(&self) {
         SESSION_BOUND_DISCORD_DELIVERY_ENABLED.store(true, Ordering::Release);
     }
+}
+
+// With a non-empty writer list, an unknown destination is held before typed IDs or transport.
+#[tokio::test]
+async fn writer_channel_unknown_destination_is_held_before_transport() {
+    use crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui;
+
+    let temp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("temp runtime root");
+    let _root = crate::config::set_agentdesk_root_for_test(temp.path());
+    let binding = matched("0");
+    let registry = Arc::new(HealthRegistry::new());
+    registry
+        .register(
+            ProviderKind::Claude.as_str().to_string(),
+            crate::services::discord::make_shared_data_for_tests(),
+        )
+        .await;
+    let gateway = Arc::new(RelayContractFakeGateway::edited());
+    let mut sink = SessionBoundDiscordRelaySink::new(registry);
+    sink.test_gateway = Some(gateway.clone());
+    let payload = concat!(
+        "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"unknown destination body\"}]}}\n",
+        "{\"type\":\"result\",\"result\":\"unknown destination body\"}\n"
+    );
+    let terminal = terminal_frame_offset(
+        &binding,
+        payload,
+        1,
+        256,
+        0,
+        "2026-09-29T00:00:00Z",
+        Some(0),
+    );
+    let _o = crate::services::tui_o::cutover::test_override::force_channels(&[(44_011, ClaudeTui)]);
+
+    let error = sink
+        .deliver(&terminal)
+        .await
+        .expect_err("unknown destination must be held");
+
+    assert!(
+        matches!(&error, RelaySinkError::Transient(reason)
+        if reason == "TUI output identity held: Discord destination channel is unknown"),
+        "the real parser-to-sink boundary must preserve the identity failure: {error:?}"
+    );
+    assert_eq!(gateway.send_calls.load(Ordering::Acquire), 0);
+    assert_eq!(gateway.replace_calls.load(Ordering::Acquire), 0);
+    assert!(
+        crate::services::tui_o::alarm::health_reasons()
+            .iter()
+            .any(|reason| reason == "tui_o:halted:0"),
+        "the unknown destination hold must remain visible in process health"
+    );
 }

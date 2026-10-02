@@ -102,18 +102,6 @@ test("timeouts helper module ignores synthetic reattach placeholders for infligh
   assert.equal(progress, null);
 });
 
-test("timeouts reconciliation module scans pending fallback dispatch keys", () => {
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    dbQuery: createSqlRouter([
-      { match: "SELECT key, value FROM kv_meta WHERE key LIKE 'reconcile_dispatch:%'", result: [] }
-    ])
-  });
-
-  policy._section_R();
-
-  assert.match(state.queries[0].sql, /reconcile_dispatch:%/);
-});
-
 test("timeouts card timeout module marks requested dispatches failed before retry", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     config: { requested_timeout_min: 30 },
@@ -390,189 +378,6 @@ test("timeouts failed-dispatch retry tolerates a dispatch create failure", () =>
   assert.match(state.logs.error[0], /Failed to create retry dispatch for card card-retry-2/);
 });
 
-test("timeouts reconcile fallback does not advance a completed scope-assessment (#3605)", () => {
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    config: { pm_decision_gate_enabled: true },
-    cards: {
-      "card-scope-r": {
-        id: "card-scope-r",
-        status: "requested",
-        priority: "medium",
-        assigned_agent_id: "agent-1",
-        deferred_dod_json: null
-      }
-    },
-    dbQuery: createSqlRouter([
-      {
-        match: "SELECT key, value FROM kv_meta WHERE key LIKE 'reconcile_dispatch:%'",
-        result: [{ key: "reconcile_dispatch:dispatch-scope-r", value: "dispatch-scope-r" }]
-      },
-      {
-        match: "SELECT id, kanban_card_id, to_agent_id, dispatch_type, chain_depth, status, result, context FROM task_dispatches WHERE id = ?",
-        result: [
-          {
-            id: "dispatch-scope-r",
-            kanban_card_id: "card-scope-r",
-            to_agent_id: "agent-1",
-            dispatch_type: "scope-assessment",
-            chain_depth: 0,
-            status: "completed",
-            result: JSON.stringify({ scope_depth: "direct" }),
-            context: "{}"
-          }
-        ]
-      },
-
-      {
-        // #3605 (T2): the fallback now records scope_depth via the shared
-        // recorder, which reads the card metadata first.
-        match: "SELECT metadata FROM kanban_cards WHERE id = ?",
-        result: [{ metadata: JSON.stringify({ scope_depth: "direct", scope_assessment_status: "completed" }) }]
-      },
-      // #3594 (T3): the fallback now also GATES the depth flow (direct → impl).
-      // With no linked auto-queue entry it defers to the activate path (no
-      // dispatch created), so the no-review-advance assertions below still hold.
-      { match: "FROM auto_queue_entries e", result: [] }
-    ])
-  });
-
-  policy._section_R();
-
-  // Missed-hook fallback must mirror kanban-rules.js onDispatchCompleted: a
-  // completed scope-assessment never advances the card to REVIEW (no setStatus
-  // to review), grants no XP, and runs no PM-gate-driven status change. (T3 may
-  // create a depth-gated NEXT dispatch, but only when an auto-queue entry is
-  // linked — none here, so it defers.)
-  assert.deepEqual(state.statusCalls, []);
-  assert.deepEqual(state.reviewStatusCalls, []);
-  assert.deepEqual(state.reviewStateSyncs, []);
-  // XP UPDATE (agents SET xp = xp + ?) must not fire for a side-path.
-  assert.equal(
-    state.executions.filter((e) => /UPDATE agents SET xp = xp/.test(e.sql)).length,
-    0
-  );
-  // #3605 (T2): but the fallback MUST still record scope_depth (parity with the
-  // live hook) — previously it only `continue`d and lost the result entirely.
-  const metaWrite = state.executions.find((e) =>
-    /UPDATE kanban_cards SET metadata = \?/.test(e.sql)
-  );
-  assert.ok(metaWrite, "fallback must persist scope-assessment metadata");
-  const meta = metaWrite.params[0];
-  assert.equal(meta.scope_depth, "direct");
-  assert.equal(meta.scope_assessment_status, "completed");
-});
-
-test("timeouts reconcile fallback applies full fallback for an unparsable scope-assessment (#3605)", () => {
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    config: { pm_decision_gate_enabled: true },
-    cards: {
-      "card-scope-fb": {
-        id: "card-scope-fb",
-        status: "requested",
-        priority: "medium",
-        assigned_agent_id: "agent-1",
-        deferred_dod_json: null
-      }
-    },
-    dbQuery: createSqlRouter([
-      {
-        match: "SELECT key, value FROM kv_meta WHERE key LIKE 'reconcile_dispatch:%'",
-        result: [{ key: "reconcile_dispatch:dispatch-scope-fb", value: "dispatch-scope-fb" }]
-      },
-      {
-        match: "SELECT id, kanban_card_id, to_agent_id, dispatch_type, chain_depth, status, result, context FROM task_dispatches WHERE id = ?",
-        result: [
-          {
-            id: "dispatch-scope-fb",
-            kanban_card_id: "card-scope-fb",
-            to_agent_id: "agent-1",
-            dispatch_type: "scope-assessment",
-            chain_depth: 0,
-            status: "completed",
-            result: "not json at all",
-            context: "{}"
-          }
-        ]
-      },
-
-      {
-        match: "SELECT metadata FROM kanban_cards WHERE id = ?",
-        result: [{ metadata: "{}" }]
-      },
-      // #3594 (T3): full-fallback depth gates to a plan dispatch; no linked
-      // auto-queue entry → defers (no dispatch created), so the card stays inert.
-      { match: "FROM auto_queue_entries e", result: [] }
-    ])
-  });
-
-  policy._section_R();
-
-  // Unparsable result → cautious "full" fallback, recorded even on the
-  // missed-hook path; card never advances to review (no setStatus).
-  assert.deepEqual(state.statusCalls, []);
-  const metaWrite = state.executions.find((e) =>
-    /UPDATE kanban_cards SET metadata = \?/.test(e.sql)
-  );
-  assert.ok(metaWrite, "fallback must persist scope metadata even when unparsable");
-  assert.equal(metaWrite.params[0].scope_depth, "full");
-  assert.match(metaWrite.params[0].scope_reason, /fallback to full/);
-});
-
-test("timeouts reconcile fallback gates depth flow when an auto-queue entry is linked (#3594 T3)", () => {
-  // Parity with the live hook: a missed scope-assessment completion whose card
-  // has a linked auto-queue entry must create the depth-gated next dispatch
-  // (direct → implementation) so the run does not stall waiting for a hook that
-  // was dropped.
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    config: { pm_decision_gate_enabled: true },
-    cards: {
-      "card-scope-g": {
-        id: "card-scope-g",
-        status: "requested",
-        priority: "medium",
-        assigned_agent_id: "agent-1",
-        deferred_dod_json: null
-      }
-    },
-    dbQuery: createSqlRouter([
-      {
-        match: "SELECT key, value FROM kv_meta WHERE key LIKE 'reconcile_dispatch:%'",
-        result: [{ key: "reconcile_dispatch:dispatch-scope-g", value: "dispatch-scope-g" }]
-      },
-      {
-        match: "SELECT id, kanban_card_id, to_agent_id, dispatch_type, chain_depth, status, result, context FROM task_dispatches WHERE id = ?",
-        result: [
-          {
-            id: "dispatch-scope-g",
-            kanban_card_id: "card-scope-g",
-            to_agent_id: "agent-1",
-            dispatch_type: "scope-assessment",
-            chain_depth: 0,
-            status: "completed",
-            result: JSON.stringify({ scope_depth: "direct" }),
-            context: "{}"
-          }
-        ]
-      },
-
-      {
-        match: "SELECT metadata FROM kanban_cards WHERE id = ?",
-        result: [{ metadata: JSON.stringify({ scope_depth: "direct", scope_assessment_status: "completed" }) }]
-      },
-      { match: "FROM auto_queue_entries e", result: [{ id: "entry-g", agent_id: "agent-1" }] }
-    ])
-  });
-
-  policy._section_R();
-
-  // No review advance, but the gated implementation dispatch IS created.
-  assert.deepEqual(state.statusCalls, []);
-  assert.equal(state.dispatchCreates.length, 1);
-  assert.equal(state.dispatchCreates[0].dispatchType, "implementation");
-  assert.equal(state.autoQueueStatusUpdates[0].status, "dispatched");
-  assert.equal(state.autoQueueStatusUpdates[0].reason, "scope_gate_direct_reconcile");
-});
-
 test("timeouts review timeout module escalates overdue DoD waits", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     dbQuery: createSqlRouter([
@@ -768,18 +573,28 @@ test("timeouts dispatch maintenance module re-enqueues unnotified pending dispat
   ]);
 });
 
-test("timeouts active monitor normalizes typed liveness without exec", () => {
-  for (const [value, expected] of [["live", "live"], ["dead", "dead"], ["unknown", "unknown"], [true, "unknown"], [null, "unknown"], ["other", "unknown"], [new Error("probe"), "unknown"]]) {
+test("timeouts active monitor normalizes the full-key host observation without exec", () => {
+  const sessionKey = "claude/tok/mac-mini:AgentDesk-claude-x";
+  for (const [value, expected, reason] of [
+    [{ state: "live", tmux_name: "t" }, "live", undefined],
+    [{ state: "dead", tmux_name: "t" }, "dead", undefined],
+    [{ state: "unknown", reason: "herdr" }, "unknown", "herdr"],
+    [{ state: "other" }, "unknown", "unknown"],
+    [null, "unknown", "unknown"],
+    [new Error("probe"), "unknown", "error: Error: probe"]
+  ]) {
     const { policy, state } = loadPolicy("policies/timeouts.js", {
-      sessionHasLivePane(name) {
-        assert.equal(name, "test-pane");
+      sessionHost(key) {
+        assert.equal(key, sessionKey);
         if (value instanceof Error) throw value;
         return value;
       }
     });
-    assert.equal(policy._tmuxPaneLiveness("test-pane"), expected);
-    assert.equal(policy._tmuxPaneLiveness("  "), "unknown");
-    assert.deepEqual(state.sessionLivenessCalls, ["test-pane"]);
+    const host = policy._sessionHost(sessionKey);
+    assert.equal(host.state, expected);
+    assert.equal(host.reason, reason);
+    assert.equal(policy._sessionHost("  ").state, "unknown");
+    assert.deepEqual(state.timeoutHostObservations, [sessionKey]);
     assert.equal(state.execCalls.length, 0);
   }
 });
@@ -829,6 +644,7 @@ test("timeouts active monitor module treats synthetic reattach placeholders as a
           session_key: sessionKey,
           agent_id: "agent-1",
           active_dispatch_id: "dispatch-1",
+          active_turn_nonce: null,
           last_heartbeat: "2026-04-29 10:00:00"
         }
       ]
@@ -842,9 +658,10 @@ test("timeouts active monitor module treats synthetic reattach placeholders as a
 
   assert.equal(state.deadlockAlerts.length, 0);
   assert.equal(state.httpPosts.length, 0);
-  assert.deepEqual(toPlain(state.timeoutMarkSessionIdleCalls), [
-    { sessionKey, options: { clear_active_dispatch_id: false } }
-  ]);
+  assert.deepEqual(toPlain(state.timeoutRepairCalls), [{ sessionKey, request: {
+    session_id: 1, active_dispatch_id: "dispatch-1", active_turn_nonce: null, observed: "live",
+    fail_dispatch: false, fail_reason: "", clear_active_dispatch_id: false
+  } }]);
 });
 
 test("S7 active monitor exempts synthetic turns without force-kill or repeated logs", () => {
@@ -873,7 +690,7 @@ test("S7 active monitor exempts synthetic turns without force-kill or repeated l
       assert.equal(state.kv.has(key), false);
       assert.equal(state.httpPosts.length, 0);
       assert.equal(state.timeoutTerminationRecords.length, 0);
-      assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+      assert.equal(state.timeoutRepairCalls.length, 0);
     }
   }
 });
@@ -1250,7 +1067,7 @@ test("timeouts idle-kill module does not count live-activity guard skips toward 
   assert.doesNotMatch(state.logs.error.join("\n"), /tmux was alive but kill failed/);
 });
 
-test("timeouts idle-kill module does not count provider busy or unknown skips toward budget", () => {
+test("timeouts idle-kill module does not count provider busy, unknown or host-refused skips toward budget", () => {
   const guardKeys = [
     "provider:AgentDesk-claude-guard-1",
     "provider:AgentDesk-claude-guard-2",
@@ -1277,6 +1094,7 @@ test("timeouts idle-kill module does not count provider busy or unknown skips to
       { match: (sql) => sql.includes("WHERE status = 'idle'") && sql.includes("active_dispatch_id IS NOT NULL") && sql.includes("INTERVAL '24 hours'"), result: [] }
     ]),
     httpPost(url) {
+      if (url.includes("guard-2")) return { ok: false, refused: true, reason: "herdr_unsupported" };
       return url.includes("live-after-guard")
         ? { ok: true, tmux_was_alive: true, tmux_killed: true }
         : { ok: true, tmux_was_alive: true, tmux_killed: false, skipped_provider_activity_guard: true };
@@ -1288,7 +1106,8 @@ test("timeouts idle-kill module does not count provider busy or unknown skips to
   assert.equal(state.httpPosts.length, 4);
   assert.ok(state.httpPosts.some((p) => p.url.includes("live-after-guard")));
   assert.match(state.logs.info.join("\n"), /provider idle state not proven/);
-  assert.doesNotMatch(state.logs.error.join("\n"), /tmux was alive but kill failed/);
+  assert.match(state.logs.warn.join("\n"), /refused by host guard for provider:AgentDesk-claude-guard-2 \(herdr_unsupported/);
+  assert.doesNotMatch(state.logs.error.join("\n"), /tmux was alive but kill failed|kill-tmux API failed/);
 });
 
 test("timeouts idle-kill module counts genuine kill failures (tmux alive but kill failed) toward budget", () => {
@@ -1421,32 +1240,6 @@ test("S7 ordinary successor clears a legacy synthetic marker without a silence c
 
 });
 
-test("timeouts reconciliation uses typed card facade for title instead of db.query", () => {
-  const { policy, state, agentdesk } = loadPolicy("policies/timeouts.js", {
-    dbQuery: createSqlRouter([
-      { match: "SELECT key, value FROM kv_meta WHERE key LIKE 'reconcile_dispatch:%'", result: [{ key: "reconcile_dispatch:dp123", value: "dp123" }] },
-      { match: "SELECT id, kanban_card_id, to_agent_id", result: [{ id: "dp123", kanban_card_id: "kc123", dispatch_type: "plan", status: "completed" }] },
-      { match: "DELETE FROM kv_meta", result: [] },
-      { match: "SELECT title FROM kanban_cards", result: () => { throw new Error("Unexpected title query"); } }
-    ]),
-    cardsGet: function(id) {
-      return { id: id, status: "in_progress", title: "Test Card Title", metadata: { scope_depth: "full" } };
-    }
-  });
-
-  agentdesk.reviewState.sync = function() {};
-  agentdesk.kanban.setStatus = function() {};
-
-  assert.doesNotThrow(() => {
-    policy._section_R();
-  });
-
-  var pmDecisions = state.pmDecisions || [];
-  if (pmDecisions.length > 0) {
-    assert.equal(pmDecisions[0].title, "Test Card Title");
-  }
-});
-
 test("active monitor preserves productive turns beyond four and six hours", () => {
   for (const ageMinutes of [241, 361, 1440]) {
     for (const outputAge of [1, 121, 1440]) {
@@ -1468,52 +1261,79 @@ test("active monitor preserves productive turns beyond four and six hours", () =
     assert.equal(state.httpPosts.length, 0, "productive turn must not be killed or require extension");
     assert.equal(state.kv.has(key), false);
     assert.equal(state.timeoutTerminationRecords.length, 0);
-    assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+    assert.equal(state.timeoutRepairCalls.length, 0);
     }
   }
 });
 
 
-test("active monitor defers unknown in both loops and refreshes its tick cache", () => {
-  for (const liveness of ["live", "dead", "unknown"]) {
-    for (const hasInflight of [false, true]) {
-      const sessionKey = "provider:__proto__";
-      const row = { session_key: sessionKey, active_dispatch_id: "d1", active_dispatch_status: "pending" };
-      let observation = liveness;
-      const { policy, state } = loadPolicy("policies/timeouts.js", {
-        sessionHasLivePane() { return observation; },
-        inflights: hasInflight ? [{
-          session_key: sessionKey, tmux_session_name: "__proto__", provider: "codex",
-          channel_id: "test-channel", dispatch_id: "d1", request_owner_user_id: 1,
-          started_at: timestampMinutesAgo(45), updated_at: timestampMinutesAgo(35)
-        }] : [],
-        timeouts: { staleWorkingSessions: [row], deadlockCandidates: [row] }
-      });
-      const key = "deadlock_check:" + sessionKey;
-      state.kv.set(key, "preserved");
-      policy._section_I();
-      const defer = liveness === "unknown";
-      const recover = !defer && (liveness === "dead" || !hasInflight);
-      assert.equal(state.dispatchMarkFailedCalls.length, recover ? 1 : 0);
-      assert.deepEqual(toPlain(state.timeoutMarkSessionIdleCalls), recover ? [
-        { sessionKey, options: { clear_active_dispatch_id: true } },
-        { sessionKey, options: { clear_active_dispatch_id: false } }
-      ] : []);
-      assert.equal(state.kv.has(key), defer);
-      assert.equal(state.logs.warn.filter((line) => line.includes("Pane liveness unknown")).length, defer ? 1 : 0);
-      assert.deepEqual(state.sessionLivenessCalls, ["__proto__"]);
-      assert.equal(state.execCalls.length, 0);
-      assert.equal(state.sessionKillCalls.length, 0);
-      assert.equal(state.httpPosts.length, 0);
-      assert.equal(state.timeoutTerminationRecords.length, 0);
-      assert.equal(state.timeoutInactiveCounterCleanups, 1);
-      assert.equal(state.timeoutClearFreshCounterCalls.length, 1);
-      assert.equal(state.timeoutHistoryCleanupCalls.length, 1);
-      observation = "dead";
-      policy._section_I();
-      assert.deepEqual(state.sessionLivenessCalls, ["__proto__", "__proto__"]);
-      assert.equal(state.dispatchMarkFailedCalls.length, (recover ? 1 : 0) + 1);
-      assert.equal(state.kv.has(key), false);
-    }
+test("active monitor defers every unresolved host in both loops and refreshes its tick cache", () => {
+  const observations = [
+    { state: "live" }, { state: "dead" },
+    ...["probe_failed", "herdr", "host_unknown", "host_conflict", "row_conflict", "session_missing", "lookup_failed"]
+      .map((reason) => ({ state: "unknown", reason }))
+  ];
+  const cases = observations.flatMap((observed) => [false, true].flatMap((hasInflight) =>
+    (observed.state === "dead" ? ["pending", "dispatched", "completed"] : ["pending"])
+      .map((dispatchStatus) => ({ observed, hasInflight, dispatchStatus }))));
+  for (const { observed, hasInflight, dispatchStatus } of cases) {
+    const sessionKey = "claude/tok/mac-mini:__proto__";
+    const row = { session_key: sessionKey, active_dispatch_id: "d1", active_dispatch_status: dispatchStatus, active_turn_nonce: "turn-1" };
+    let observation = observed;
+    const { policy, state } = loadPolicy("policies/timeouts.js", {
+      sessionHost() { return Object.assign({ session_id: 7, tmux_name: "__proto__" }, observation); },
+      inflights: hasInflight ? [{
+        session_key: sessionKey, tmux_session_name: "__proto__", provider: "codex",
+        channel_id: "test-channel", dispatch_id: "d1", request_owner_user_id: 1,
+        started_at: timestampMinutesAgo(45), updated_at: timestampMinutesAgo(35)
+      }] : [],
+      timeouts: { staleWorkingSessions: [row], deadlockCandidates: [row] }
+    });
+    const key = "deadlock_check:" + sessionKey;
+    state.kv.set(key, "preserved");
+    policy._section_I();
+    const defer = observed.state === "unknown";
+    const recover = !defer && (observed.state === "dead" || !hasInflight);
+    const repair = (stale) => ({ sessionKey, request: {
+      session_id: 7, active_dispatch_id: "d1", active_turn_nonce: "turn-1", observed: observed.state,
+      fail_dispatch: stale && dispatchStatus !== "completed",
+      fail_reason: stale ? "Stale working session recovery — no active tmux session after 10min" : "",
+      clear_active_dispatch_id: stale
+    } });
+    const label = JSON.stringify(observed) + " inflight=" + hasInflight + " dispatch=" + dispatchStatus;
+    assert.deepEqual(toPlain(state.timeoutRepairCalls), recover ? [repair(true), repair(false)] : [], label);
+    assert.equal(state.dispatchMarkFailedCalls.length, 0, label);
+    assert.equal(state.kv.has(key), defer, label);
+    assert.equal(state.logs.warn.filter((line) => line.includes("(" + observed.reason + "); deferring")).length, defer ? 1 : 0, label);
+    assert.deepEqual(state.timeoutHostObservations, [sessionKey], label);
+    assert.equal(state.execCalls.length, 0);
+    assert.equal(state.sessionKillCalls.length, 0);
+    assert.equal(state.httpPosts.length, 0);
+    assert.equal(state.timeoutTerminationRecords.length, 0);
+    assert.equal(state.timeoutInactiveCounterCleanups, 1);
+    assert.equal(state.timeoutClearFreshCounterCalls.length, 1);
+    assert.equal(state.timeoutHistoryCleanupCalls.length, 1);
+    observation = { state: "dead" };
+    policy._section_I();
+    assert.deepEqual(state.timeoutHostObservations, [sessionKey, sessionKey], label);
+    assert.equal(state.timeoutRepairCalls.length, (recover ? 2 : 0) + 2, label);
+    assert.equal(state.kv.has(key), false, label);
   }
+});
+
+test("active monitor reports a repair the facade refused without an idle log", () => {
+  const sessionKey = "claude/tok/mac-mini:AgentDesk-claude-swapped";
+  const row = { session_key: sessionKey, active_dispatch_id: "d1", active_dispatch_status: "pending" };
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    sessionHost() { return { state: "dead", session_id: 7, tmux_name: "AgentDesk-claude-swapped" }; },
+    timeouts: {
+      staleWorkingSessions: [row], deadlockCandidates: [row],
+      repairStaleSession() { return { ok: true, repaired: false, deferred: "row_changed" }; }
+    }
+  });
+  policy._section_I();
+  assert.equal(state.timeoutRepairCalls.length, 2);
+  assert.equal(state.logs.warn.filter((line) => line.includes("Repair deferred (row_changed)")).length, 2);
+  assert.equal(state.logs.info.filter((line) => line.includes("→ idle")).length, 0);
+  assert.equal(state.logs.warn.filter((line) => line.includes("Failed stale dispatch")).length, 0);
 });

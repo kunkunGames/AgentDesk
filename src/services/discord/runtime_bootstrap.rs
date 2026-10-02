@@ -1,7 +1,11 @@
 use super::*;
+use crate::services::cluster::node_registry::GatewayWaiterGuard;
 
 mod deferred_restart;
 mod framework_setup;
+mod gateway_handback_breaker;
+#[cfg(test)]
+mod gateway_handback_integration_tests;
 mod gateway_lease;
 mod gateway_lease_recovery;
 #[cfg(test)]
@@ -12,6 +16,7 @@ pub(super) mod intake_delivery_capability;
 #[cfg(unix)]
 mod intake_delivery_reconciler;
 mod intake_delivery_sweep;
+mod o_writer_host;
 mod orphan_recovery;
 mod queued_placeholders;
 mod queued_recovery;
@@ -26,6 +31,7 @@ mod startup_doctor;
 mod voice;
 
 use self::framework_setup::{run_bot_build_slash_commands, run_bot_framework_setup};
+use self::gateway_handback_breaker::GatewayHandbackBreaker;
 use self::gateway_lease::{
     GatewayLeaseOutcome, run_bot_acquire_gateway_lease, run_bot_spawn_gateway_lease_keepalive,
 };
@@ -315,6 +321,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     // Resolve the gateway role before spawning the intake worker. Both gateway
     // and confirmed-standby runtimes start it in observe/enforce mode, while an
     // indeterminate lease failure leaves no health-blind detached worker.
+    let mut handback_breaker = GatewayHandbackBreaker::for_owner(provider.as_str(), &token_hash);
     let gateway_outcome = run_bot_acquire_gateway_lease(
         &shared,
         &token_hash,
@@ -323,6 +330,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         &startup_doctor_started,
         &health_registry,
         api_port,
+        &mut handback_breaker,
     )
     .await;
     if !gateway_outcome.starts_provider_runtime() {
@@ -338,8 +346,9 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     // wall clock. The files remain owned by the external persistence barrier
     // and are never deleted by the respawned binary.
 
-    let gateway_lease = match gateway_outcome {
-        GatewayLeaseOutcome::Proceed(lease) => lease,
+    let (gateway_lease, gateway_waiter) = match gateway_outcome {
+        GatewayLeaseOutcome::Proceed(Some(acquired)) => (Some(acquired.lease), acquired.waiter),
+        GatewayLeaseOutcome::Proceed(None) => (None, None),
         GatewayLeaseOutcome::Standby => {
             // Standby can execute full turns through the intake worker. Always
             // register its SharedData so detailed health proves either the real
@@ -353,7 +362,13 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
             #[cfg(unix)]
             spawns::run_bot_spawn_reachability_observation(&shared, &provider);
             run_bot_maybe_spawn_intake_worker(&shared, &provider);
-            spawn_standby_gateway_retry(shared.clone(), token_hash.clone(), provider.clone()).await;
+            spawn_standby_gateway_retry(
+                shared.clone(),
+                token_hash.clone(),
+                provider.clone(),
+                handback_breaker,
+            )
+            .await;
             // Keep this provider's shutdown-barrier slot: the marker poller
             // consumes it exactly once after fencing and persisting state.
             return;
@@ -372,6 +387,9 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     #[cfg(unix)]
     spawns::run_bot_spawn_reachability_observation(&shared, &provider);
     run_bot_maybe_spawn_intake_worker(&shared, &provider);
+    crate::services::tui_o::shadow_host::spawn_if_enabled(boot_config.tui_o.as_ref());
+    let pg_gateway = gateway_lease.is_some();
+    o_writer_host::spawn(&shared, &provider, boot_config.tui_o.as_ref(), pg_gateway);
 
     run_bot_start_gateway_runtime(
         token,
@@ -390,6 +408,8 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         voice_config,
         voice_receiver,
         gateway_lease,
+        gateway_waiter,
+        handback_breaker,
         &restored_model_overrides,
         &restored_fast_mode_channels,
     )
@@ -842,6 +862,7 @@ agents:
     /// `mark_reconcile_complete`, so the reason was permanent for the process.
     #[tokio::test]
     async fn standby_registration_settles_the_reconcile_obligation() {
+        let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
         let registry = Arc::new(health::HealthRegistry::new());
         let shared = crate::services::discord::make_shared_data_for_tests();
         // A real boot starts unreconciled; the test helper starts settled.
@@ -857,15 +878,19 @@ agents:
             "standby must settle its reconcile: nothing downstream of this branch calls mark_reconcile_complete"
         );
         assert_eq!(registry.registered_provider_count().await, 1);
-        let reasons = serde_json::to_value(
+        let snapshot = serde_json::to_value(
             crate::services::discord::health::build_health_snapshot(&registry).await,
         )
-        .expect("serialize standby health")["degraded_reasons"]
-            .clone();
-        assert_eq!(
-            reasons,
-            serde_json::json!(["provider:codex:gateway_standby"])
-        );
+        .expect("serialize standby health");
+        // TUI-O writer alarms are process-global and raised by concurrent tests.
+        let reasons: Vec<&str> = snapshot["degraded_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|reason| reason.as_str())
+            .filter(|reason| !reason.starts_with("tui_o:"))
+            .collect();
+        assert_eq!(reasons, ["provider:codex:gateway_standby"]);
     }
 
     /// The startup doctor observes the registration through the registry's

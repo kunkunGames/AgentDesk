@@ -15,6 +15,8 @@ pub(in crate::services::discord) mod delivery_obligation;
 pub(in crate::services::discord) mod delivery_record; // #3089 B0
 pub(crate) mod manual_delivery;
 pub(crate) mod message;
+pub(crate) mod o_writer_io;
+pub(in crate::services::discord) mod o_writer_legacy;
 pub(crate) mod policy;
 pub(in crate::services::discord) mod reaction_control;
 // #5071 T4-B3: read-only projection over `delivery_record`'s durable evidence.

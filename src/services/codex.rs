@@ -1,6 +1,8 @@
 mod process_session_launch;
 use process_session_launch::execute_streaming_local_process_codex;
 
+#[cfg(test)]
+mod c1_teardown_tests;
 #[cfg(unix)]
 mod followup_reader;
 #[cfg(unix)]
@@ -34,6 +36,7 @@ use crate::services::provider::{
     fold_read_output_result, is_readonly_tool_policy, register_child_pid, spawn_cancel_watchdog,
     tmux_followup_fallback_after_read_error,
 };
+use crate::services::provider_teardown::TeardownClearance;
 use crate::services::remote::RemoteProfile;
 use crate::services::session_backend::{
     insert_process_session, process_session_is_alive, process_session_probe,
@@ -41,9 +44,12 @@ use crate::services::session_backend::{
     send_process_session_input, terminate_process_handle,
 };
 #[cfg(unix)]
-use crate::services::tmux_diagnostics::{
-    record_tmux_exit_reason, should_recreate_session_after_followup_fifo_error,
-    tmux_session_exists, tmux_session_has_live_pane,
+use crate::services::{
+    provider_teardown::{report_tmux_death, teardown_tmux},
+    session_host::legacy_collapse::{tmux_live_pane_bool, tmux_present_bool},
+    tmux_diagnostics::{
+        record_tmux_exit_reason, should_recreate_session_after_followup_fifo_error,
+    },
 };
 
 const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
@@ -435,10 +441,14 @@ fn codex_resume_supports_hook_trust_bypass(
     }
 }
 
+/// Direct TUI hooks are on unless `AGENTDESK_CODEX_DIRECT_TUI_HOOKS` is "0", "false", "off" or "no".
 pub(crate) fn codex_direct_tui_hook_overrides_enabled() -> bool {
-    std::env::var("AGENTDESK_CODEX_DIRECT_TUI_HOOKS")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    std::env::var("AGENTDESK_CODEX_DIRECT_TUI_HOOKS").map_or(true, |value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
 }
 
 fn codex_config_overrides(options: &CodexLaunchOptions) -> Vec<String> {
@@ -587,12 +597,12 @@ fn direct_tui_material_fallback_reason(options: &CodexLaunchOptions) -> Option<&
 fn register_codex_tui_idle_relay_binding(
     tmux_session_name: &str,
     tail_result: &crate::services::codex_tui::rollout_tail::CodexTuiTailResult,
-) {
-    crate::services::codex_tui::session::install_codex_tui_runtime_binding(
+) -> bool {
+    crate::services::codex_tui::session::install_launched_codex_tui_runtime_binding(
         tmux_session_name,
         None,
         codex_tui_idle_relay_binding(tmux_session_name, tail_result),
-    );
+    )
 }
 
 fn codex_tui_idle_relay_binding(
@@ -1204,6 +1214,7 @@ pub fn execute_command_streaming(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     remote_profile: Option<&RemoteProfile>,
     tmux_session_name: Option<&str>,
+    teardown: Option<&TeardownClearance>,
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
     model: Option<&str>,
@@ -1322,6 +1333,7 @@ pub fn execute_command_streaming(
                     sender,
                     cancel_token,
                     tmux_name,
+                    teardown,
                     report_channel_id,
                     report_provider,
                     developer_instructions.as_deref(),
@@ -1344,6 +1356,7 @@ pub fn execute_command_streaming(
                 sender,
                 cancel_token,
                 tmux_name,
+                teardown,
                 report_channel_id,
                 report_provider,
                 developer_instructions.as_deref(),
@@ -1351,6 +1364,8 @@ pub fn execute_command_streaming(
                 force_fresh_provider_session,
             );
         }
+        #[cfg(not(unix))]
+        let _ = teardown;
         // ProcessBackend fallback for Codex (no tmux or non-unix)
         log_codex_runtime_kind(
             "codex.execute_command_streaming",
@@ -1645,7 +1660,7 @@ fn dispatch_codex_tui_rollout_tail(
             rollout_modified_since,
             sender,
             cancel_token,
-            || tmux_session_has_live_pane(tmux_session_name),
+            || tmux_live_pane_bool(tmux_session_name),
             tmux_session_name,
             Some(prompt),
         )
@@ -1655,7 +1670,7 @@ fn dispatch_codex_tui_rollout_tail(
             rollout_modified_since,
             sender,
             cancel_token,
-            || tmux_session_has_live_pane(tmux_session_name),
+            || tmux_live_pane_bool(tmux_session_name),
             tmux_session_name,
             Some(prompt),
         )
@@ -1674,6 +1689,7 @@ fn execute_streaming_local_tui_tmux(
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     tmux_session_name: &str,
+    teardown: Option<&TeardownClearance>,
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
     developer_instructions: Option<&str>,
@@ -1691,9 +1707,7 @@ fn execute_streaming_local_tui_tmux(
         ProviderKind::Codex,
         tmux_session_name,
     )?;
-    let auth_env_lines =
-        crate::services::provider_auth_profile::overlay_shell_env_lines(&auth_overlay);
-    let session_exists = tmux_session_exists(tmux_session_name);
+    let session_exists = tmux_present_bool(tmux_session_name);
     let profile_matches = crate::services::tmux_common::tmux_session_auth_profile_matches(
         tmux_session_name,
         &auth_overlay.profile_id,
@@ -1733,6 +1747,7 @@ fn execute_streaming_local_tui_tmux(
             sender,
             cancel_token,
             tmux_session_name,
+            teardown,
             report_channel_id,
             report_provider,
             developer_instructions,
@@ -1741,7 +1756,7 @@ fn execute_streaming_local_tui_tmux(
         );
     }
 
-    let has_live_pane = tmux_session_has_live_pane(tmux_session_name) && profile_matches;
+    let has_live_pane = tmux_live_pane_bool(tmux_session_name) && profile_matches;
     let mut warm_fallback_reason = None;
     let mut warm_fallback_pane_stopped = false;
 
@@ -1803,7 +1818,7 @@ fn execute_streaming_local_tui_tmux(
         report_channel_id,
         report_provider,
         warm_followup_enabled,
-        &auth_env_lines,
+        &auth_overlay,
     )?;
     if let Some(channel_id) = report_channel_id {
         crate::services::tui_prompt_dedupe::register_tmux_channel(tmux_session_name, channel_id);
@@ -1969,11 +1984,17 @@ fn resolve_codex_tui_tail_result(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once between a ready composer and the RuntimeReady recheck.
+    pub(crate) static AFTER_READINESS_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Post-tail StreamMessage emission for the Codex Direct TUI launch: handles
 /// the cancel-suppression guards, the SessionDied failure `Done`, the idle
 /// relay binding, and the gated RuntimeReady handoff (with its readiness /
 /// session-death / timeout outcomes). Always returns `Ok(())`; early returns
-/// stand in for the orchestrator's post-cancel suppression paths.
+/// stand in for post-cancel suppression and for a source a hook already replaced.
 #[cfg(unix)]
 pub(crate) fn emit_codex_tui_post_tail_handoff(
     tail_result: crate::services::codex_tui::rollout_tail::CodexTuiTailResult,
@@ -2028,7 +2049,10 @@ pub(crate) fn emit_codex_tui_post_tail_handoff(
         // different: it scans Codex's rollout after the bridge has gone idle,
         // so it still needs the rollout binding even when RuntimeReady is
         // suppressed by the post-turn readiness guard.
-        register_codex_tui_idle_relay_binding(tmux_session_name, &tail_result);
+        if !register_codex_tui_idle_relay_binding(tmux_session_name, &tail_result) {
+            // A hook moved the pane, or with hooks on its history is unreadable: a handoff could reclaim it.
+            return Ok(());
+        }
 
         // #2325: gate the RuntimeReady handoff on the Codex TUI composer
         // actually being ready for input. RuntimeReady is the signal the
@@ -2053,27 +2077,38 @@ pub(crate) fn emit_codex_tui_post_tail_handoff(
         //   - Session dead → emit failure Done; tmux death is
         //     observable synchronously so the verdict reaches the
         //     bridge inside the drain window.
-        //   - Composer not yet redrawn within the probe budget → emit
-        //     RuntimeReady anyway with a tracing warning. The
-        //     assistant response has already shipped via the tail
-        //     `Done`; preserving the handoff is the safe default for
-        //     recovery / watcher-relay even if the visual composer is
-        //     still settling. Making this case hard-fail would require
-        //     cross-bridge cooperation tracked separately.
+        //   - Composer not yet redrawn within the probe budget → suppress
+        //     RuntimeReady (see the timeout arm below).
         match crate::services::codex_tui::input::wait_until_codex_tui_input_ready(
             tmux_session_name,
             crate::services::codex_tui::input::PromptReadinessKind::PostTurnHandoff,
             cancel_token_for_post_tail.as_ref(),
         ) {
             Ok(()) => {
-                let _ = sender.send(StreamMessage::RuntimeReady {
+                #[cfg(test)]
+                if let Some(seam) = AFTER_READINESS_WAIT.with_borrow_mut(Option::take) {
+                    seam();
+                }
+                let ready = StreamMessage::RuntimeReady {
                     handoff: RuntimeHandoff::CodexTui {
                         rollout_path: tail_result.rollout_path.display().to_string(),
-                        thread_id: tail_result.session_id,
+                        thread_id: tail_result.session_id.clone(),
                         tmux_session_name: tmux_session_name.to_string(),
                         last_offset: tail_result.final_offset,
                     },
-                });
+                };
+                if !codex_direct_tui_hook_overrides_enabled() {
+                    let _ = sender.send(ready);
+                } else if !crate::services::tui_prompt_dedupe::publish_unless_codex_tail_retired(
+                    &codex_tui_idle_relay_binding(tmux_session_name, &tail_result),
+                    tmux_session_name,
+                    || drop(sender.send(ready)),
+                ) {
+                    tracing::info!(
+                        tmux_session = tmux_session_name,
+                        "Codex tail source was replaced during the readiness wait; suppressing RuntimeReady"
+                    );
+                }
             }
             Err(error)
                 if crate::services::codex_tui::input::is_prompt_ready_cancelled_error(&error) =>
@@ -2156,6 +2191,7 @@ fn execute_streaming_local_tmux(
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     tmux_session_name: &str,
+    teardown: Option<&TeardownClearance>,
     report_channel_id: Option<u64>,
     report_provider: Option<ProviderKind>,
     developer_instructions: Option<&str>,
@@ -2168,7 +2204,7 @@ fn execute_streaming_local_tmux(
     )?;
     let auth_env_lines =
         crate::services::provider_auth_profile::overlay_shell_env_lines(&auth_overlay);
-    let session_exists = tmux_session_exists(tmux_session_name);
+    let session_exists = tmux_present_bool(tmux_session_name);
     let profile_matches = crate::services::tmux_common::tmux_session_auth_profile_matches(
         tmux_session_name,
         &auth_overlay.profile_id,
@@ -2186,7 +2222,7 @@ fn execute_streaming_local_tmux(
     // Accept either the new persistent location or the legacy /tmp location
     // so that dcserver restarts that lost /tmp files still re-attach to a
     // live tmux pane owned by an older wrapper. See issue #892.
-    let has_live_pane = tmux_session_has_live_pane(tmux_session_name) && profile_matches;
+    let has_live_pane = tmux_live_pane_bool(tmux_session_name) && profile_matches;
     let resolved_output =
         crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, "jsonl");
     let resolved_input =
@@ -2216,21 +2252,9 @@ fn execute_streaming_local_tmux(
         )? {
             FollowupResult::Delivered => return Ok(()),
             FollowupResult::RecreateSession { error } => {
-                record_codex_tmux_termination(
-                    tmux_session_name,
-                    "codex_provider",
-                    "followup_failed_recreate",
-                    &format!("followup failed, recreating: {error}"),
-                    None,
-                );
-                record_tmux_exit_reason(
-                    tmux_session_name,
-                    &format!("followup failed, recreating: {}", error),
-                );
-                crate::services::platform::tmux::kill_session(
-                    tmux_session_name,
-                    &format!("followup failed, recreating: {}", error),
-                );
+                let reason = format!("followup failed, recreating: {error}");
+                let code = "followup_failed_recreate";
+                teardown_tmux(teardown, tmux_session_name, "codex_provider", code, &reason)?;
                 // Fall through to new session creation below
             }
         }
@@ -2260,20 +2284,10 @@ fn execute_streaming_local_tmux(
             "live Codex tmux session {tmux_session_name} was selected for reuse but wrapper I/O is unavailable; refusing stale cleanup/recreate"
         ));
     } else if session_exists {
-        let cleanup_reason =
+        let cleanup =
             codex_wrapper_existing_session_termination_reason(force_fresh_provider_session);
-        record_codex_tmux_termination(
-            tmux_session_name,
-            "codex_provider",
-            cleanup_reason.reason_code,
-            cleanup_reason.reason_text,
-            None,
-        );
-        record_tmux_exit_reason(tmux_session_name, cleanup_reason.reason_text);
-        crate::services::platform::tmux::kill_session(
-            tmux_session_name,
-            cleanup_reason.reason_text,
-        );
+        let (code, reason) = (cleanup.reason_code, cleanup.reason_text);
+        teardown_tmux(teardown, tmux_session_name, "codex_provider", code, reason)?;
     }
 
     crate::services::tmux_common::cleanup_session_temp_files(tmux_session_name);
@@ -2395,11 +2409,14 @@ fn execute_streaming_local_tmux(
             });
         }
         crate::services::provider::ReadOutputResult::SessionDied { offset } => {
-            record_codex_tmux_termination(
+            let reason = "codex tmux session ended before turn completion";
+            // A kept session is not reported dead; the turn still ends with `Done`.
+            let _ = report_tmux_death(
+                teardown,
                 tmux_session_name,
                 "codex_provider",
                 "session_died",
-                "codex tmux session ended before turn completion",
+                reason,
                 Some(offset),
             );
             let _ = sender.send(StreamMessage::Done {
@@ -3408,6 +3425,7 @@ mod remote_dispatch_gate_tests {
             None,
             Some(&profile),
             tmux_session_name,
+            None,
             None,
             None,
             None,

@@ -11,10 +11,13 @@ use url::Url;
 
 use crate::services::claude_tui::hook_server::relay_receipts::{
     RELAY_DEADLINE_HEADER, RELAY_PUBLISHED_AT_HEADER, RELAY_REQUEST_ID_HEADER,
+    RELAY_RESPOND_BY_HEADER,
 };
 use crate::services::claude_tui::memento_feedback;
 
 mod ordered_queue;
+mod response_window;
+mod transport_retry;
 pub(crate) use ordered_queue::OrderedHookRelayRecoveryOwner;
 #[cfg(all(test, unix))]
 use ordered_queue::relay_queue_dir;
@@ -468,6 +471,7 @@ fn relay_hook_event_with_request(
     request_id: &str,
     published_at: DateTime<Utc>,
     delivery_deadline: DateTime<Utc>,
+    respond_by: Option<DateTime<Utc>>,
     binding: Option<&HookBindingEnvelope>,
 ) -> Result<(), String> {
     post_hook_event_with_request_timeout(
@@ -477,7 +481,13 @@ fn relay_hook_event_with_request(
         session_id,
         payload,
         RELAY_TIMEOUT,
-        Some((request_id, published_at, delivery_deadline, binding)),
+        Some((
+            request_id,
+            published_at,
+            delivery_deadline,
+            respond_by,
+            binding,
+        )),
     )
     .map(|_| ())
 }
@@ -508,6 +518,7 @@ fn relay_hook_event_response_with_request_timeout(
     request_id: &str,
     published_at: DateTime<Utc>,
     delivery_deadline: DateTime<Utc>,
+    respond_by: Option<DateTime<Utc>>,
     binding: Option<&HookBindingEnvelope>,
     timeout: Duration,
 ) -> Result<Value, String> {
@@ -518,7 +529,13 @@ fn relay_hook_event_response_with_request_timeout(
         session_id,
         payload,
         timeout,
-        Some((request_id, published_at, delivery_deadline, binding)),
+        Some((
+            request_id,
+            published_at,
+            delivery_deadline,
+            respond_by,
+            binding,
+        )),
     )?;
     response
         .into_json()
@@ -539,6 +556,15 @@ fn post_hook_event_with_timeout(
     )
 }
 
+/// `(request id, published at, delivery deadline, respond by, binding)` of a queued request.
+type RelayRequestHeaders<'a> = (
+    &'a str,
+    DateTime<Utc>,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+    Option<&'a HookBindingEnvelope>,
+);
+
 #[allow(clippy::too_many_arguments)]
 fn post_hook_event_with_request_timeout(
     endpoint: &str,
@@ -547,19 +573,14 @@ fn post_hook_event_with_request_timeout(
     session_id: &str,
     payload: Value,
     timeout: Duration,
-    request: Option<(
-        &str,
-        DateTime<Utc>,
-        DateTime<Utc>,
-        Option<&HookBindingEnvelope>,
-    )>,
+    request: Option<RelayRequestHeaders<'_>>,
 ) -> Result<ureq::Response, String> {
     let url = hook_url(endpoint, provider, event, session_id)?;
     let agent = ureq::AgentBuilder::new().timeout(timeout).build();
     let mut request_builder = agent
         .post(url.as_str())
         .set("Content-Type", "application/json");
-    if let Some((request_id, published_at, delivery_deadline, binding)) = request {
+    if let Some((request_id, published_at, delivery_deadline, respond_by, binding)) = request {
         let header = binding
             .unwrap_or(&HookBindingEnvelope::legacy_request())
             .encode()?;
@@ -568,6 +589,10 @@ fn post_hook_event_with_request_timeout(
             .set(RELAY_REQUEST_ID_HEADER, request_id)
             .set(RELAY_PUBLISHED_AT_HEADER, &published_at.to_rfc3339())
             .set(RELAY_DEADLINE_HEADER, &delivery_deadline.to_rfc3339());
+        if let Some(respond_by) = respond_by {
+            request_builder =
+                request_builder.set(RELAY_RESPOND_BY_HEADER, &respond_by.to_rfc3339());
+        }
     }
     let response = match request_builder.send_json(payload) {
         Ok(response) => response,
@@ -1603,6 +1628,8 @@ mod tests {
         )
         .unwrap();
         let stop_endpoint = endpoint.clone();
+        // Stop 응답 창에는 시험이 일부러 붙잡는 search 보류가 들어가므로 운영 상한(750ms) 대신
+        // 아래 단계별 대기 합(ingress 500ms + 보류 100ms + drain 2s×2)보다 긴 창을 준다.
         let stop_relay = std::thread::spawn(move || {
             handoff_ordered_hook_event_response_with_timeout(
                 &stop_endpoint,
@@ -1610,7 +1637,7 @@ mod tests {
                 "Stop",
                 session_id,
                 serde_json::json!({}),
-                STOP_RELAY_TIMEOUT,
+                Duration::from_secs(5),
             )
         });
         let ingress_dir = relay_queue_dir("claude", session_id)

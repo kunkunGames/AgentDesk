@@ -391,7 +391,7 @@ fn planned_restart_retention_secs(restart_mode: InflightRestartMode) -> u64 {
 }
 
 /// Thread-local test seam for `tmux_pane_alive_for_stale_check`. Production
-/// always calls `tmux_diagnostics::tmux_session_has_live_pane`; tests inject a
+/// always takes the host-aware pane liveness; tests inject a
 /// known-alive name set via `set_test_tmux_alive_override` so the override
 /// behaviour can be exercised without spawning real tmux.
 #[cfg(test)]
@@ -406,7 +406,12 @@ pub(super) fn set_test_tmux_alive_override(names: Option<&[&str]>) {
     *guard = names.map(|slice| slice.iter().map(|s| (*s).to_string()).collect());
 }
 
-fn tmux_pane_alive_for_stale_check(name: &str) -> bool {
+/// A stale row is kept unless tmux confirms its pane dead; another host keeps it too.
+fn tmux_pane_alive_for_stale_check(name: &str, state: &InflightTurnState) -> bool {
+    use crate::services::discord::host_liveness;
+    if !host_liveness::local_tmux(name, Some(state)) {
+        return true;
+    }
     #[cfg(test)]
     {
         if let Some(lock) = TEST_TMUX_ALIVE_OVERRIDE.get()
@@ -416,7 +421,7 @@ fn tmux_pane_alive_for_stale_check(name: &str) -> bool {
             return set.contains(name);
         }
     }
-    crate::services::tmux_diagnostics::tmux_session_has_live_pane(name)
+    host_liveness::not_dead(host_liveness::observe_liveness(name, Some(state)))
 }
 
 pub(super) fn stale_removal_reason(
@@ -454,7 +459,7 @@ pub(super) fn stale_removal_reason(
                 // probe per stale row, gated by all the cheaper checks above.
                 if matches!(restart_mode, InflightRestartMode::DrainRestart)
                     && let Some(name) = state.tmux_session_name.as_deref()
-                    && tmux_pane_alive_for_stale_check(name)
+                    && tmux_pane_alive_for_stale_check(name, state)
                 {
                     tracing::info!(
                         "  ⚠ inflight stale-age ({age_secs}s > {max_age}s) overridden — tmux pane '{name}' still alive (channel {})",
@@ -472,7 +477,7 @@ pub(super) fn stale_removal_reason(
         None => {
             if age_secs > INFLIGHT_MAX_AGE_SECS {
                 if let Some(name) = state.tmux_session_name.as_deref()
-                    && tmux_pane_alive_for_stale_check(name)
+                    && tmux_pane_alive_for_stale_check(name, state)
                 {
                     tracing::info!(
                         "  ⚠ inflight stale-age ({age_secs}s > {INFLIGHT_MAX_AGE_SECS}s) overridden — tmux pane '{name}' still alive (channel {})",
@@ -559,6 +564,32 @@ fn relock(
         Err(error) => Err(Box::new(RowVerdict::Skip(
             error.kind() != std::io::ErrorKind::NotFound,
         ))),
+    }
+}
+
+/// One channel's row as the probe scan shows it, without the finalizer backfill a scan writes
+/// into every row it reads; `Err` when the root or the row cannot be read or parsed.
+pub(in crate::services::discord) fn load_channel_inflight_for_probe(
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> Result<Option<InflightTurnState>, String> {
+    let root = super::inflight_runtime_root().ok_or("inflight root unavailable")?;
+    let path = super::inflight_state_path(&root, provider, channel_id);
+    match fs::metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+        Ok(_) => {}
+    }
+    let allocation = crate::services::discord::runtime_store::process_generation_binding();
+    match classify_inflight_row(&path, provider, allocation) {
+        RowVerdict::Keep(state, _) | RowVerdict::KeepGateRefused(state, _) => Ok(Some(state)),
+        RowVerdict::Skip(true) => Err(format!("inflight row unreadable: {}", path.display())),
+        RowVerdict::HideMalformed(..) => {
+            Err(format!("inflight row unparseable: {}", path.display()))
+        }
+        RowVerdict::Skip(false) | RowVerdict::HideStale(..) | RowVerdict::HideForeign(..) => {
+            Ok(None)
+        }
     }
 }
 
@@ -1203,6 +1234,47 @@ mod nondestructive_loader_tests {
         out
     }
 
+    // The archive-defer probe of one thread saves no other thread's row, even one a full scan
+    // would backfill; an unreadable row of the probed thread defers it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn archive_defer_probe_reads_only_the_probed_thread() {
+        let env = Env::new();
+        let mut other = row(5_996_101, Some("AgentDesk-claude-p4r-b"));
+        other.born_generation = G;
+        let other = env.seed(&other, 0);
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&other).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("finalizer_turn_id");
+        fs::write(&other, raw.to_string()).unwrap();
+        let before = snapshot(&other);
+        let defer = crate::services::discord::should_defer_thread_archive_pg;
+        assert_eq!(defer(None, "5996100").await, Ok(false));
+        assert_eq!(
+            snapshot(&other),
+            before,
+            "another thread's row is not saved"
+        );
+        assert_eq!(defer(None, "5996101").await, Ok(true), "a fresh row defers");
+        assert_eq!(
+            snapshot(&other),
+            before,
+            "nor is the probed thread's own row"
+        );
+        let unreadable = inflight_state_path(&env.dir(), &CLAUDE, 5_996_102);
+        fs::create_dir_all(unreadable).unwrap();
+        assert_eq!(
+            defer(None, "5996102").await,
+            Ok(true),
+            "an unreadable row defers"
+        );
+        let malformed = inflight_state_path(&env.dir(), &CLAUDE, 5_996_103);
+        fs::write(&malformed, "{ malformed json ]").unwrap();
+        let before = snapshot(&malformed);
+        let deferred = defer(None, "5996103").await;
+        assert_eq!(deferred, Ok(true), "an unparseable row defers");
+        assert_eq!(snapshot(&malformed), before, "and is left as it was");
+    }
+
     // R1-R4: every production read wrapper hides the rows it used to unlink.
     #[test]
     fn production_readers_hide_but_never_unlink_retirable_rows() {
@@ -1468,5 +1540,86 @@ mod nondestructive_loader_tests {
         env.seed(&row(5_996_081, None), STALE);
         let second = reap_inflight_rows_at_boot_with_guard(&guard, &CLAUDE, None).await;
         assert_eq!((second.already_ran, path.exists()), (true, true));
+    }
+}
+
+#[cfg(test)]
+mod host_liveness_stale_tests {
+    use super::*;
+    use crate::services::session_host::test_support::InjectedLivenessGuard;
+    use crate::services::session_host::{HostKind, HostLiveness, HostSessionRef};
+
+    fn aged(name: &str) -> InflightTurnState {
+        let text = "p4b1 stale row".to_string();
+        let tmux = Some(name.to_string());
+        InflightTurnState::new(
+            CLAUDE_KIND,
+            5_340_401,
+            None,
+            1,
+            2,
+            3,
+            text,
+            None,
+            tmux,
+            None,
+            None,
+            0,
+        )
+    }
+
+    const CLAUDE_KIND: ProviderKind = ProviderKind::Claude;
+
+    // An aged row whose pane tmux would read dead still stays when its marker or its own
+    // locator names another host; with neither, the confirmed dead pane retires it as in main.
+    #[test]
+    fn stale_row_stays_when_its_host_evidence_is_not_tmux() {
+        let _root = crate::config::TestRuntimeRootGuard::new();
+        let age = INFLIGHT_MAX_AGE_SECS + 1;
+        let dead = |name: &str| {
+            InjectedLivenessGuard::set(HostSessionRef::tmux(name), HostLiveness::DeadOrAbsent)
+        };
+        let marker = |name: &str, text: &str| {
+            let path = crate::services::tmux_common::session_temp_path(name, "host_kind");
+            std::fs::create_dir_all(Path::new(&path).parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+
+        let name = "AgentDesk-claude-p4b1-stale-herdr";
+        let _pane = dead(name);
+        marker(name, "herdr");
+        assert_eq!(
+            stale_removal_reason(&aged(name), age, 7),
+            None,
+            "herdr marker"
+        );
+
+        let name = "AgentDesk-claude-p4b1-stale-locator";
+        let _pane = dead(name);
+        let mut row = aged(name);
+        row.host_locator = Some(super::super::host_locator::PersistedHostLocator::Known(
+            crate::services::session_host::HostedRuntimeLocator {
+                execution_node: None,
+                host_kind: HostKind::Herdr,
+                host_session_id: "w1".to_string(),
+                pane: Some("w1-1".to_string()),
+            },
+        ));
+        assert_eq!(stale_removal_reason(&row, age, 7), None, "row locator");
+        let mut row = aged(name);
+        row.runtime_kind_unknown_on_disk = true;
+        assert_eq!(
+            stale_removal_reason(&row, age, 7),
+            None,
+            "unknown runtime kind"
+        );
+
+        let name = "AgentDesk-claude-p4b1-stale-tmux";
+        let _pane = dead(name);
+        marker(name, "tmux");
+        assert!(
+            stale_removal_reason(&aged(name), age, 7).is_some(),
+            "tmux dead pane"
+        );
     }
 }

@@ -1,4 +1,16 @@
 use super::*;
+use binding_events::{BindingPersistError, CauseSource, HookSignal, Proposal};
+mod adopt_skip;
+mod claude_source;
+#[cfg(test)]
+pub(crate) use claude_source::{AFTER_CHECK, BEFORE_AUTHORITY, after_check, before_authority};
+pub(crate) use claude_source::{Persisted, Record, reclaim_with_current_prompt};
+mod codex_hook;
+pub(crate) use codex_hook::{
+    codex_tail_source_retired, observe_codex_hook, publish_unless_codex_tail_retired,
+};
+pub(crate) mod pane_registration;
+pub(crate) use adopt_skip::*;
 
 fn with_runtime_binding_state_under_source_authority<R>(
     authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
@@ -122,15 +134,72 @@ pub(crate) fn register_tmux_runtime_binding(tmux_session_name: &str, binding: Tu
 pub(crate) fn register_tmux_runtime_binding_under_source_authority(
     authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
     binding: TuiRuntimeBinding,
+) -> bool {
+    let cause = CauseSource::Observed;
+    publish_runtime_binding(authority, binding, None, cause, Record::Stat)
+        .is_some_and(Persisted::published)
+}
+
+/// Launch paths let the execution's context name the cause of a new source.
+pub(crate) fn register_launched_tmux_runtime_binding(
+    tmux_session_name: &str,
+    binding: TuiRuntimeBinding,
 ) {
+    crate::services::tmux_common::with_tmux_source_authority(tmux_session_name, |authority| {
+        register_launched_tmux_runtime_binding_under_source_authority(authority, binding)
+    });
+}
+
+pub(crate) fn register_launched_tmux_runtime_binding_under_source_authority(
+    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
+    binding: TuiRuntimeBinding,
+) -> bool {
+    publish_runtime_binding(authority, binding, None, CauseSource::Launch, Record::Stat)
+        .is_some_and(Persisted::published)
+}
+
+/// Persists the binding event first; nothing is published on failure (`None`) or when a pin refuses.
+fn publish_runtime_binding(
+    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
+    binding: TuiRuntimeBinding,
+    channel_id: Option<u64>,
+    cause: CauseSource,
+    record: Record,
+) -> Option<Persisted> {
     let tmux_session_name = authority.session();
     if tmux_session_name.is_empty() || binding.output_path.trim().is_empty() {
-        return;
+        return None;
     }
     if binding.relay_output_path().trim().is_empty() {
-        return;
+        return None;
     }
     with_runtime_binding_state_under_source_authority(authority, |state| {
+        let channel_id = channel_id.or_else(|| {
+            state
+                .channel_by_tmux
+                .get(tmux_session_name)
+                .map(|e| e.value)
+        });
+        let replaced = state
+            .runtime_by_tmux
+            .get(tmux_session_name)
+            .map(|e| &e.value);
+        let proposal =
+            Proposal::for_binding(channel_id, tmux_session_name, &binding, replaced, cause);
+        let persisted = match proposal.map(|proposal| record.persist(&proposal)) {
+            Some(Err(error)) => {
+                tracing::error!(
+                    tmux_session_name,
+                    channel_id,
+                    %error,
+                    "binding event log append failed; runtime binding left unchanged"
+                );
+                return None;
+            }
+            Some(Ok(persisted)) if !persisted.published() => return Some(persisted),
+            Some(Ok(persisted)) => persisted,
+            None => record.unlogged(),
+        };
         state.runtime_by_tmux.insert(
             tmux_session_name.to_string(),
             TimedValue {
@@ -138,7 +207,8 @@ pub(crate) fn register_tmux_runtime_binding_under_source_authority(
                 recorded_at: Instant::now(),
             },
         );
-    });
+        Some(persisted)
+    })
 }
 
 pub(crate) fn register_rehydrated_tmux_runtime_binding(
@@ -146,9 +216,10 @@ pub(crate) fn register_rehydrated_tmux_runtime_binding(
     tmux_session_name: &str,
     channel_id: u64,
     binding: TuiRuntimeBinding,
-) {
+) -> bool {
     #[rustfmt::skip]
-    crate::services::tmux_common::with_tmux_source_authority(tmux_session_name, |authority| register_rehydrated_tmux_runtime_binding_under_source_authority(authority, provider, channel_id, binding));
+    let registered = crate::services::tmux_common::with_tmux_source_authority(tmux_session_name, |authority| register_rehydrated_tmux_runtime_binding_under_source_authority(authority, provider, channel_id, binding));
+    registered
 }
 
 pub(crate) fn register_rehydrated_tmux_runtime_binding_under_source_authority(
@@ -156,7 +227,20 @@ pub(crate) fn register_rehydrated_tmux_runtime_binding_under_source_authority(
     provider: &str,
     channel_id: u64,
     binding: TuiRuntimeBinding,
-) {
+) -> bool {
+    let record = Record::Stat;
+    register_rehydrated_under_source_authority(authority, provider, channel_id, binding, record)
+        .is_some_and(Persisted::published)
+}
+
+/// `None` when nothing was published; otherwise what the record left, published only if it says so.
+fn register_rehydrated_under_source_authority(
+    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
+    provider: &str,
+    channel_id: u64,
+    binding: TuiRuntimeBinding,
+    record: Record,
+) -> Option<Persisted> {
     let provider = normalize_provider(provider);
     let tmux_session_name = authority.session();
     if provider.is_empty()
@@ -165,10 +249,15 @@ pub(crate) fn register_rehydrated_tmux_runtime_binding_under_source_authority(
         || binding.output_path.trim().is_empty()
         || binding.relay_output_path().trim().is_empty()
     {
-        return;
+        return None;
     }
+    let binding = codex_hook::restored_source(authority, &provider, channel_id, binding)?;
     let session_id = binding.session_id.clone();
-    register_tmux_runtime_binding_under_source_authority(authority, binding);
+    let cause = CauseSource::Observed;
+    let persisted = publish_runtime_binding(authority, binding, Some(channel_id), cause, record)?;
+    if !persisted.published() {
+        return Some(persisted);
+    }
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
     state.purge_expired();
     state.channel_by_tmux.insert(
@@ -191,6 +280,7 @@ pub(crate) fn register_rehydrated_tmux_runtime_binding_under_source_authority(
             },
         );
     }
+    Some(persisted)
 }
 
 /// Resolve and optionally replace one binding while its source authority stays held.
@@ -204,7 +294,11 @@ pub(crate) fn reconcile_rehydrated_tmux_runtime_binding(
         let (binding, replace) = decide(runtime_binding_for_tmux_session_under_source_authority(authority))?;
         if replace {
             observe_before_replace();
-            register_rehydrated_tmux_runtime_binding_under_source_authority(authority, provider, channel_id, binding.clone());
+            // An unpublished binding reports none; a published one reports what restore stored.
+            if !register_rehydrated_tmux_runtime_binding_under_source_authority(authority, provider, channel_id, binding.clone()) {
+                return None;
+            }
+            return runtime_binding_for_tmux_session_under_source_authority(authority);
         }
         Some(binding)
     })
@@ -580,61 +674,96 @@ pub(crate) fn runtime_binding_for_tmux_session_under_source_authority(
 /// transcript writes to a new `<uuid>.jsonl`.  The hook command therefore still
 /// addresses the old UUID while stdin carries the new one.  This update is
 /// deliberately limited to an existing ClaudeTui binding reached through the
-/// command UUID and to a real sibling transcript file. For a second or later
-/// continuation hop, the candidate must also be newer than the transcript
-/// currently bound to that pane. It never guesses across project directories.
+/// command UUID and to the payload's own transcript, which must pass the Claude
+/// source check under the bound transcript's projects root; a session the pane
+/// left comes back only on a hook published after the pane's last transition.
 pub(crate) fn adopt_claude_continuation_session(
     command_session_id: &str,
     payload_session_id: &str,
+    hook: &HookSignal,
+) -> Result<Option<(String, String)>, BindingPersistError> {
+    adopt_claude_continuation_explained(command_session_id, payload_session_id, hook)
+        .map(|(adopted, _)| adopted)
+}
+
+/// `failure` is set only when the adoption was decided but its binding event could not be persisted.
+/// `skip` names why nothing was adopted or logged; each check below sets it before it can return.
+fn adopt_continuation(
+    command_session_id: &str,
+    payload_session_id: &str,
+    hook: &HookSignal,
+    failure: &mut Option<BindingPersistError>,
+    skip: &mut Option<AdoptSkip>,
 ) -> Option<(String, String)> {
     let command_session_id = command_session_id.trim();
     let payload_session_id = payload_session_id.trim();
+    *skip = Some(AdoptSkip::PayloadNotUuid);
+    let same = command_session_id == payload_session_id;
+    #[cfg(test)]
+    let same = same && !crate::services::claude_tui::source_verify::n2b_mutant("r5-ingress-start");
     if command_session_id.is_empty()
         || payload_session_id.is_empty()
-        || command_session_id == payload_session_id
+        || same
         || uuid::Uuid::parse_str(payload_session_id).is_err()
     {
         return None;
     }
+    *skip = Some(AdoptSkip::PayloadPathMissing);
+    let payload_path = hook.transcript_path.as_deref().map(str::trim);
+    let payload_path = PathBuf::from(payload_path.filter(|path| !path.is_empty())?);
+    // Up to 1 MiB of first line is read before the binding state is locked.
+    let opened = crate::services::claude_tui::source_verify::observe_transcript(&payload_path);
 
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
     state.purge_expired();
     let command_key = PromptKey::new("claude", command_session_id);
-    let tmux_session_name = state
-        .tmux_by_provider_session
-        .get(&command_key)?
-        .value
-        .clone();
-    let binding = state.runtime_by_tmux.get(&tmux_session_name)?;
+    let (tmux_session_name, binding) = AdoptSkip::bound_pane(&state, &command_key, skip)?;
+    *skip = Some(AdoptSkip::NotClaudeTui);
     if binding.value.runtime_kind != RuntimeHandoffKind::ClaudeTui {
         return None;
     }
+    *skip = Some(AdoptSkip::MalformedBindingPath);
     let old_output_path = PathBuf::from(&binding.value.output_path);
-    let new_output_path = old_output_path
-        .parent()?
-        .join(format!("{payload_session_id}.jsonl"));
-    if !new_output_path.is_file() {
+    // Projects root of the account this pane launched under, not the receiver's own.
+    let root = old_output_path.parent()?.parent()?;
+    let new_output_path =
+        crate::services::claude_tui::source_verify::normalize_payload_path(root, &payload_path);
+    let (candidate, replaced) = (new_output_path.display().to_string(), binding.value.clone());
+    let hook = &HookSignal {
+        transcript_path: Some(candidate.clone()),
+        ..hook.clone()
+    };
+    let channel_id = state
+        .channel_by_tmux
+        .get(&tmux_session_name)
+        .map(|e| e.value);
+    let proposal = channel_id.filter(|id| *id != 0).map(|channel_id| Proposal {
+        channel_id,
+        provider: "claude",
+        tmux_session: &tmux_session_name,
+        session_id: Some(payload_session_id),
+        path: &candidate,
+        replaced: Some((&replaced.output_path, replaced.session_id.as_deref())),
+        cause: CauseSource::Hook(hook.cause()),
+        hook: Some(hook),
+    });
+    let judged = claude_source::Candidate {
+        proposal,
+        tmux_session: &tmux_session_name,
+        bound: &replaced,
+        root,
+        command_session_id,
+        payload_session_id,
+        hook,
+        opened: &opened,
+    };
+    if !judged.judge(failure, skip) {
         return None;
     }
-    if let Some(current_session_id) = binding.value.session_id.as_deref()
-        && current_session_id != command_session_id
-        && current_session_id != payload_session_id
-    {
-        let current_mtime = std::fs::metadata(&old_output_path)
-            .and_then(|metadata| metadata.modified())
-            .ok()?;
-        let candidate_mtime = std::fs::metadata(&new_output_path)
-            .and_then(|metadata| metadata.modified())
-            .ok()?;
-        if candidate_mtime <= current_mtime {
-            return None;
-        }
-    }
-    let new_output_path = new_output_path.display().to_string();
-
-    if binding.value.session_id.as_deref() == Some(payload_session_id)
-        && binding.value.output_path == new_output_path
-    {
+    let new_output_path = candidate;
+    let same_session = binding.value.session_id.as_deref() == Some(payload_session_id)
+        && binding.value.output_path == new_output_path;
+    if same_session {
         // Subsequent hooks still carry the launch-time query UUID. Do not reset
         // the already-adopted continuation cursor to zero on every event.
         //
@@ -798,6 +927,28 @@ pub(crate) fn runtime_bindings_for_kind(
         .collect()
 }
 
+/// Live sessions of `kinds` with their cached owner channel, copied without purging relay state;
+/// `None` when the lock is busy.
+pub(crate) fn peek_tui_session_channels(
+    kinds: &[RuntimeHandoffKind],
+) -> Option<Vec<(String, u64)>> {
+    let state = match STATE.try_lock() {
+        Ok(state) => state,
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    let live = |at: &Instant| at.elapsed() <= SESSION_MAPPING_TTL;
+    let sessions = state
+        .runtime_by_tmux
+        .iter()
+        .filter(|(_, entry)| kinds.contains(&entry.value.runtime_kind) && live(&entry.recorded_at));
+    let owned = sessions.filter_map(|(tmux, _)| {
+        let owner = state.channel_by_tmux.get(tmux)?;
+        live(&owner.recorded_at).then(|| (tmux.clone(), owner.value))
+    });
+    Some(owned.collect())
+}
+
 pub(crate) fn advance_tmux_runtime_binding_offset(
     tmux_session_name: &str,
     output_path: &str,
@@ -841,4 +992,140 @@ pub(crate) fn advance_tmux_runtime_binding_offset_under_source_authority(
         entry.recorded_at = Instant::now();
         true
     })
+}
+
+#[cfg(test)]
+mod shadow_session_tests {
+    use super::*;
+
+    /// Every map `purge_expired` prunes, rendered so any removed or refreshed entry shows.
+    fn relay_state() -> Vec<String> {
+        let state = STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut rows: Vec<String> = Vec::new();
+        rows.extend(
+            state
+                .channel_by_tmux
+                .iter()
+                .map(|e| format!("channel {e:?}")),
+        );
+        rows.extend(
+            state
+                .runtime_by_tmux
+                .iter()
+                .map(|e| format!("runtime {e:?}")),
+        );
+        rows.extend(
+            state
+                .pending_by_tmux
+                .iter()
+                .map(|e| format!("pending {e:?}")),
+        );
+        let leases = state.external_input_relay_lease_by_tmux.iter();
+        rows.extend(leases.map(|e| format!("lease {e:?}")));
+        let relayed = state.relayed_entry_ids_by_tmux.iter();
+        rows.extend(relayed.map(|e| format!("relayed {e:?}")));
+        rows.sort();
+        rows
+    }
+
+    #[test]
+    fn observer_discovery_lists_live_sessions_without_changing_relay_state() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        reset_state_for_tests();
+        let expired = Instant::now() - SESSION_MAPPING_TTL - Duration::from_secs(1);
+        let binding = |runtime_kind| TuiRuntimeBinding {
+            runtime_kind,
+            output_path: "/t/s.jsonl".into(),
+            relay_output_path: None,
+            input_fifo_path: None,
+            session_id: None,
+            last_offset: 0,
+            relay_last_offset: None,
+        };
+        {
+            let mut state = STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+            let rows = [
+                (
+                    "live",
+                    7,
+                    RuntimeHandoffKind::ClaudeTui,
+                    Instant::now(),
+                    Instant::now(),
+                ),
+                (
+                    "other",
+                    9,
+                    RuntimeHandoffKind::CodexTui,
+                    Instant::now(),
+                    Instant::now(),
+                ),
+                (
+                    "stale-binding",
+                    7,
+                    RuntimeHandoffKind::CodexTui,
+                    expired,
+                    Instant::now(),
+                ),
+                (
+                    "stale-owner",
+                    7,
+                    RuntimeHandoffKind::ClaudeTui,
+                    Instant::now(),
+                    expired,
+                ),
+            ];
+            for (name, channel, kind, bound_at, owned_at) in rows {
+                let value = binding(kind);
+                let runtime = TimedValue {
+                    value,
+                    recorded_at: bound_at,
+                };
+                state.runtime_by_tmux.insert(name.to_string(), runtime);
+                let owner = TimedValue {
+                    value: channel,
+                    recorded_at: owned_at,
+                };
+                state.channel_by_tmux.insert(name.to_string(), owner);
+            }
+            let victim = PromptKey::new("claude", "stale-binding");
+            let pending = TimedValue {
+                value: "p".to_string(),
+                recorded_at: expired,
+            };
+            state
+                .pending_by_tmux
+                .insert(victim.clone(), VecDeque::from([pending]));
+            let lease = ExternalInputRelayLease::unassigned(Some(7));
+            let lease = TimedValue {
+                value: lease,
+                recorded_at: expired,
+            };
+            state
+                .external_input_relay_lease_by_tmux
+                .insert(victim.clone(), lease);
+            let entry = TimedValue {
+                value: "e".to_string(),
+                recorded_at: expired,
+            };
+            state
+                .relayed_entry_ids_by_tmux
+                .insert(victim, VecDeque::from([entry]));
+        }
+        let before = relay_state();
+        let targets = crate::services::tui_o::shadow_host::discover_targets(&[7]);
+        let after = relay_state();
+        reset_state_for_tests();
+        let listed: Vec<(u64, &str)> = targets
+            .iter()
+            .map(|t| (t.channel_id, t.tmux_session.as_str()))
+            .collect();
+        assert_eq!(listed, [(7, "live")]);
+        assert_eq!(
+            (before.len(), &after),
+            (11, &before),
+            "discovery must not touch relay state"
+        );
+    }
 }

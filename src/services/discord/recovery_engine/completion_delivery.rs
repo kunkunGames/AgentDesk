@@ -7,6 +7,7 @@
 //! module-local visibility required by the new child-module boundary.
 
 use super::*;
+use crate::services::tui_o::cutover::{BodyClaim, BodySend, IdentityError, claim_then_send};
 
 pub(super) fn should_advance_recovery_dispatch_after_relay(relay_ok: bool) -> bool {
     relay_ok
@@ -95,25 +96,39 @@ pub(super) async fn relay_captured_recovery_terminal_notice_with_gateway(
     text: &str,
     gateway: &dyn super::super::gateway::TurnGateway,
 ) -> CapturedRecoveryDelivery {
-    if state.requires_pinned_terminal_recovery() {
-        #[cfg(unix)]
-        let committed = super::super::turn_bridge::publish_retained_terminal_recovery(
-            shared, gateway, state, text,
-        )
-        .await;
-        #[cfg(not(unix))]
-        let committed = {
-            let _ = gateway;
-            false
-        };
-        return if committed {
-            RecoveryRelayOutcome::Delivered
-        } else {
-            RecoveryRelayOutcome::TransientFailure
-        }
-        .into();
+    // O posts this channel's TUI body: consume the captured range without sending or recording it.
+    match o_owns_recovery_body(state, state.channel_id) {
+        Ok(false) => {}
+        Ok(true) => return RecoveryRelayOutcome::Delivered.into(),
+        Err(_) => return RecoveryRelayOutcome::TransientFailure.into(),
     }
-    relay_recovery_terminal_notice_with_capture(http, shared, provider, state, text, true).await
+    let claim = carries_body(state, text).then(|| recovery_body_claim(state, state.channel_id));
+    if !state.requires_pinned_terminal_recovery() {
+        let relay = relay_recovery_terminal_notice_with_capture(
+            http, shared, provider, state, text, true, claim,
+        );
+        return match relay.await {
+            Ok(BodySend::Sent(delivery)) => delivery,
+            Ok(BodySend::OwnedByO) => RecoveryRelayOutcome::Delivered.into(),
+            Err(_) => RecoveryRelayOutcome::TransientFailure.into(),
+        };
+    }
+    #[cfg(unix)]
+    let committed = super::super::turn_bridge::publish_retained_terminal_recovery(
+        shared, gateway, state, text, claim,
+    )
+    .await;
+    #[cfg(not(unix))]
+    let committed = {
+        let _ = (gateway, claim);
+        false
+    };
+    if committed {
+        RecoveryRelayOutcome::Delivered
+    } else {
+        RecoveryRelayOutcome::TransientFailure
+    }
+    .into()
 }
 
 pub(super) async fn relay_recovery_terminal_notice(
@@ -123,9 +138,13 @@ pub(super) async fn relay_recovery_terminal_notice(
     state: &super::inflight::InflightTurnState,
     text: &str,
 ) -> RecoveryRelayOutcome {
-    relay_recovery_terminal_notice_with_capture(http, shared, provider, state, text, false)
-        .await
-        .outcome
+    let relay = relay_recovery_terminal_notice_with_capture(
+        http, shared, provider, state, text, false, None,
+    );
+    match relay.await {
+        Ok(BodySend::Sent(delivery)) => delivery.outcome,
+        Ok(BodySend::OwnedByO) | Err(_) => RecoveryRelayOutcome::TransientFailure,
+    }
 }
 
 async fn relay_recovery_terminal_notice_with_capture(
@@ -135,13 +154,16 @@ async fn relay_recovery_terminal_notice_with_capture(
     state: &super::inflight::InflightTurnState,
     text: &str,
     capture_anchor: bool,
-) -> CapturedRecoveryDelivery {
+    claim: Option<BodyClaim<'_>>,
+) -> Result<BodySend<CapturedRecoveryDelivery>, IdentityError> {
     let Some(channel_id) = super::inflight::opt_channel_id(state.channel_id) else {
         tracing::warn!(
             provider = %provider.as_str(),
             "recovery terminal notice skipped because persisted channel id is zero"
         );
-        return RecoveryRelayOutcome::TransientFailure.into();
+        return Ok(BodySend::Sent(
+            RecoveryRelayOutcome::TransientFailure.into(),
+        ));
     };
     let recovery_context = RecoveryDeliveryContext::from_state(
         shared,
@@ -157,21 +179,136 @@ async fn relay_recovery_terminal_notice_with_capture(
             context
         }
     });
-    let outcome = relay_recovered_terminal_text_to_placeholder(
+    let outcome = relay_recovered_body_to_placeholder(
         http,
         shared,
         channel_id,
         super::inflight::opt_message_id(state.current_msg_id),
         text,
         recovery_context.as_ref(),
+        claim,
     )
-    .await;
-    CapturedRecoveryDelivery {
+    .await?;
+    let BodySend::Sent(outcome) = outcome else {
+        return Ok(BodySend::OwnedByO);
+    };
+    Ok(BodySend::Sent(CapturedRecoveryDelivery {
         outcome,
         pending_anchor: recovery_context
             .as_ref()
             .and_then(RecoveryDeliveryContext::pending_anchor_after_delivery),
+    }))
+}
+
+/// The recovery notice for a turn that left no answer text.
+pub(super) const RECOVERED_WITHOUT_TEXT: &str = "(복구됨 — 응답 텍스트 없음)";
+
+/// Recorded kind counts only for the row's own channel; any other destination is unknown.
+/// Only a relay carrying the recovered answer claims the channel, as it is sent.
+fn recovery_body_claim(
+    state: &super::inflight::InflightTurnState,
+    destination: u64,
+) -> BodyClaim<'static> {
+    let kind = (state.channel_id == destination)
+        .then_some(state.runtime_kind)
+        .flatten();
+    BodyClaim::new(destination, kind)
+}
+
+fn o_owns_recovery_body(
+    state: &super::inflight::InflightTurnState,
+    destination: u64,
+) -> Result<bool, IdentityError> {
+    let kind = (state.channel_id == destination)
+        .then_some(state.runtime_kind)
+        .flatten();
+    crate::services::tui_o::cutover::peek_o_owns_tui_output_for_channel(destination, kind)
+}
+
+/// Whether `text` carries the turn's answer: blank text and the empty-response notice (the O
+/// marker) do not.
+fn carries_body(state: &super::inflight::InflightTurnState, text: &str) -> bool {
+    !text.trim().is_empty()
+        && text != RECOVERED_WITHOUT_TEXT
+        && text != interrupted_recovery_message(state, "")
+}
+
+/// The body-free marker Notice to show instead of a recovered body on an O-owned destination.
+fn o_recovery_marker(
+    state: &super::inflight::InflightTurnState,
+    destination: ChannelId,
+) -> Result<Option<String>, IdentityError> {
+    Ok(o_owns_recovery_body(state, destination.get())?
+        .then(|| interrupted_recovery_message(state, "")))
+}
+
+/// Recovered-body relay: unchanged for Legacy; on an O-owned channel only the marker, and
+/// without a recovery context so no delivery evidence is recorded for O's body.
+pub(super) async fn relay_recovery_body_to_placeholder(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    state: &super::inflight::InflightTurnState,
+    channel_id: ChannelId,
+    placeholder: Option<MessageId>,
+    text: &str,
+    recovery_context: Option<&RecoveryDeliveryContext>,
+) -> RecoveryRelayOutcome {
+    let Ok(marker) = o_recovery_marker(state, channel_id) else {
+        return RecoveryRelayOutcome::TransientFailure;
+    };
+    let claim = (marker.is_none() && carries_body(state, text))
+        .then(|| recovery_body_claim(state, channel_id.get()));
+    let (text, recovery_context) = match marker.as_deref() {
+        Some(marker) => (marker, None),
+        None => (text, recovery_context),
+    };
+    let relay = relay_recovered_body_to_placeholder(
+        http,
+        shared,
+        channel_id,
+        placeholder,
+        text,
+        recovery_context,
+        claim,
+    );
+    match relay.await {
+        Ok(BodySend::Sent(outcome)) => outcome,
+        // O took the channel since the peek; the retry shows its marker instead.
+        Ok(BodySend::OwnedByO) | Err(_) => RecoveryRelayOutcome::TransientFailure,
     }
+}
+
+/// `relay_recovery_terminal_notice` for notices that carry the recovered body.
+pub(super) async fn relay_recovery_body_notice(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    state: &super::inflight::InflightTurnState,
+    text: &str,
+) -> RecoveryRelayOutcome {
+    let channel_id = super::inflight::opt_channel_id(state.channel_id);
+    let owned = channel_id.map_or(Ok(false), |channel_id| {
+        o_owns_recovery_body(state, channel_id.get())
+    });
+    let channel_id = match (owned, channel_id) {
+        (Ok(true), Some(channel_id)) => channel_id,
+        (Err(_), _) => return RecoveryRelayOutcome::TransientFailure,
+        (_, channel) => {
+            let claim = channel
+                .filter(|_| carries_body(state, text))
+                .map(|channel| recovery_body_claim(state, channel.get()));
+            let notice = relay_recovery_terminal_notice_with_capture(
+                http, shared, provider, state, text, false, claim,
+            );
+            return match notice.await {
+                Ok(BodySend::Sent(delivery)) => delivery.outcome,
+                Ok(BodySend::OwnedByO) | Err(_) => RecoveryRelayOutcome::TransientFailure,
+            };
+        }
+    };
+    let placeholder = super::inflight::opt_message_id(state.current_msg_id);
+    relay_recovery_body_to_placeholder(http, shared, state, channel_id, placeholder, text, None)
+        .await
 }
 
 /// Deliver the recovered terminal text to Discord: edit the placeholder in
@@ -191,6 +328,32 @@ pub(in crate::services::discord) async fn relay_recovered_terminal_text_to_place
     text: &str,
     recovery_context: Option<&RecoveryDeliveryContext>,
 ) -> RecoveryRelayOutcome {
+    let relay = relay_recovered_body_to_placeholder(
+        http,
+        shared,
+        channel_id,
+        placeholder,
+        text,
+        recovery_context,
+        None,
+    );
+    match relay.await {
+        Ok(BodySend::Sent(outcome)) => outcome,
+        Ok(BodySend::OwnedByO) | Err(_) => RecoveryRelayOutcome::TransientFailure,
+    }
+}
+
+/// [`relay_recovered_terminal_text_to_placeholder`] for a body that ends a pending O adoption:
+/// `claim` is taken only at the transport, after the durable-anchor and lease checks.
+pub(in crate::services::discord) async fn relay_recovered_body_to_placeholder(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    placeholder: Option<MessageId>,
+    text: &str,
+    recovery_context: Option<&RecoveryDeliveryContext>,
+    claim: Option<BodyClaim<'_>>,
+) -> Result<BodySend<RecoveryRelayOutcome>, IdentityError> {
     let mut reused_recorded_anchor = false;
     let placeholder = match placeholder {
         Some(placeholder) => Some(placeholder),
@@ -203,7 +366,7 @@ pub(in crate::services::discord) async fn relay_recovered_terminal_text_to_place
                     anchor_msg_id = anchor.get(),
                     "recovery no-anchor delivery: durable range already delivered; skipping Discord POST"
                 );
-                return RecoveryRelayOutcome::Delivered;
+                return Ok(BodySend::Sent(RecoveryRelayOutcome::Delivered));
             }
             Some(terminal_text_idempotency::RecoveryAnchorReuse::InflightAnchor(anchor)) => {
                 reused_recorded_anchor = true;
@@ -234,7 +397,7 @@ pub(in crate::services::discord) async fn relay_recovered_terminal_text_to_place
             if cc::recovery_short_replace_should_cutover(true, text) {
                 let gateway =
                     DiscordGateway::new(http.clone(), shared.clone(), ProviderKind::Claude, None);
-                return cc::deliver_recovery_replace_via_controller(
+                let outcome = cc::deliver_recovery_replace_via_controller(
                     &gateway,
                     shared,
                     &ProviderKind::Claude,
@@ -243,18 +406,25 @@ pub(in crate::services::discord) async fn relay_recovered_terminal_text_to_place
                     placeholder,
                     text,
                     recovery_context,
+                    claim,
                 )
                 .await;
+                return Ok(BodySend::Sent(outcome));
             }
-            terminal_text_idempotency::replace_anchored_terminal_text(
-                http,
-                channel_id,
-                placeholder,
-                text,
-                shared,
-                recovery_context,
-            )
-            .await
+            let replace = || {
+                terminal_text_idempotency::replace_anchored_terminal_text(
+                    http,
+                    channel_id,
+                    placeholder,
+                    text,
+                    shared,
+                    recovery_context,
+                )
+            };
+            match claim_then_send(claim, replace).await? {
+                BodySend::Sent(delivery) => delivery,
+                BodySend::OwnedByO => return Ok(BodySend::OwnedByO),
+            }
         }
         None => {
             return terminal_text_idempotency::relay_no_anchor_terminal_text(
@@ -263,11 +433,12 @@ pub(in crate::services::discord) async fn relay_recovered_terminal_text_to_place
                 channel_id,
                 text,
                 recovery_context,
+                claim,
             )
             .await;
         }
     };
-    match delivery {
+    let outcome = match delivery {
         Ok(()) => RecoveryRelayOutcome::Delivered,
         Err(error) => {
             let classified =
@@ -278,7 +449,8 @@ pub(in crate::services::discord) async fn relay_recovered_terminal_text_to_place
             )
             .await
         }
-    }
+    };
+    Ok(BodySend::Sent(outcome))
 }
 
 /// Outcome of `complete_recovery_visible_turn` exposed to callers so they can

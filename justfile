@@ -152,7 +152,7 @@ test-non-pg:
     # froze silently, so keep it in a curated lane.
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::tmux_watcher::terminal_relay_plan::soft_terminal_direct_send_authority_tests -- --skip _pg --skip pg_ --skip postgres --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::recovery_engine::runtime::reregister_ledger_reseed_tests -- --test-threads=1
-    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::placeholder_sweeper::abandon_guard::tests -- --test-threads=1
+    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::placeholder_sweeper::abandon_guard::tests -- --skip _pg --skip pg_ --skip postgres --test-threads=1
     # #4892: keep the live panel and spinner-merged latest-tool contracts in the retained lane.
     env -u AGENTDESK_ROOT_DIR cargo test --lib placeholder_live_events -- --skip _pg --skip pg_ --skip postgres
     env -u AGENTDESK_ROOT_DIR cargo test --lib single_message_panel::tests -- --skip _pg --skip pg_ --skip postgres
@@ -210,5 +210,16 @@ test-postgres:
     cargo test --lib frozen_busy_jsonl -- --nocapture --test-threads=1
     cargo test --lib idle_tmux_snapshot_missing_output_path -- --nocapture --test-threads=1
     cargo test --lib dispatched_sessions::kill_tmux_resume_tests -- --nocapture --test-threads=1
+
+# Main's PG matrix job: shard 0 runs the whole recipe on its part of the
+# selection and shard 1 only its part, so the targeted commands run once.
+test-postgres-shard:
+    @case "${PG_INCLUDE_SHARD:-}" in 0|1) ;; *) echo "PG_INCLUDE_SHARD must be 0 or 1" >&2; exit 1 ;; esac
+    if [ "$PG_INCLUDE_SHARD" = 0 ]; then just test-postgres; else just test-postgres-selection; fi
+
+# The first command of test-postgres alone.
+test-postgres-selection:
+    @test -n "${POSTGRES_TEST_DATABASE_URL_BASE:-}" || (echo "POSTGRES_TEST_DATABASE_URL_BASE must name the dedicated PostgreSQL test server with an explicit host and port" >&2; exit 1)
+    source scripts/ci/non-pg-test-filter.sh && cargo test --lib -- "${PG_INCLUDE_ARGS[@]}" --nocapture --test-threads=1
 
 check: fmt-check lint cargo-check test

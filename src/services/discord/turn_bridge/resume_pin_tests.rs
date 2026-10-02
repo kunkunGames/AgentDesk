@@ -230,6 +230,7 @@ fn sa2_actual_postlude_rejects_foreign_or_stale_pg() {
 }
 
 fn actual_postlude_runtime_proof(response: Option<&str>, case: &str) {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     let _lock = crate::config::shared_test_env_lock()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -387,6 +388,7 @@ watcher_owner_channel_id: owner,
 bridge_relay_delegated_to_watcher: false,
 is_prompt_too_long: false,
 resume_failure_detected: false,
+auto_retry: Default::default(),
 recovery_retry: false,
 rx_disconnected: false,
 tmux_handed_off: false,

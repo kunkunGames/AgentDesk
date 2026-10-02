@@ -9,11 +9,12 @@
         "src/cli/utils.rs": 1,
         "src/engine/ops/exec_ops.rs": 2,
         "src/server/routes/provider_auth_profiles.rs": 2,
-        "src/services/claude.rs": 6,
+        "src/services/claude.rs": 1,
         "src/services/claude_tui/hosting/warm_followup.rs": 4,
-        "src/services/codex.rs": 4,
+        "src/services/codex.rs": 2,
         "src/services/codex_tui/warm_followup.rs": 1,
-        "src/services/discord/commands/control.rs": 2,
+        "src/services/discord/commands/control.rs": 1,
+        "src/services/discord/commands/tmux_recreate.rs": 1,
         "src/services/discord/health/recovery.rs": 4,
         "src/services/discord/health/relay_auto_heal.rs": 2,
         "src/services/discord/health/snapshot.rs": 2,
@@ -33,6 +34,7 @@
         "src/services/discord/watchers/lifecycle/restore.rs": 1,
         "src/services/dispatched_sessions/tmux_cleanup.rs": 1,
         "src/services/provider/cancel_token_cleanup/executor.rs": 1,
+        "src/services/provider_teardown.rs": 1,
         "src/services/qwen/session_lifecycle.rs": 3,
         "src/services/session_resume.rs": 1,
         "src/services/tmux_turn_liveness.rs": 1,
@@ -154,6 +156,10 @@
         "src/services/discord/router/intake_gate/stale_turn.rs": 1,
         "src/services/stale_turn_reconciler.rs": 1
       }
+    },
+    "host_terminate": {
+      "comment": "Herdr close RPC spellings (pane.close, server.stop, their method names and aliases). Owner-only: any count outside src/services/termination_audit/host_terminate.rs fails regardless of this map, and an owner count needs a reviewed diff here.",
+      "files": {}
     }
   }
 }

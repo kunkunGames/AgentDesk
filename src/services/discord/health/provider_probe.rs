@@ -22,6 +22,10 @@ pub(super) struct ProviderHealthSnapshot {
     /// #5951 — per-channel re-mint fence cells; never pruned, so this only
     /// grows with the distinct channels the runtime has served.
     remint_fence_cells: usize,
+    /// Boot writer channels this node leaves to the gateway; present only when there are some, since
+    /// readiness reads it as proof the restriction is all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tui_output_gateway_channels: Option<usize>,
 }
 
 pub(super) struct ProviderProbe {
@@ -47,6 +51,9 @@ struct ProviderProbeSignals {
     deferred_hooks: usize,
     queue_depth: usize,
     recovering_channels: usize,
+    /// This node leaves some of the provider's writer channels to the gateway, cannot tell, or
+    /// refuses the provider's intake outright.
+    tui_output_requires_gateway: bool,
 }
 
 struct ProviderHealthClassification {
@@ -107,6 +114,7 @@ pub(super) async fn probe_provider(entry: &ProviderEntry) -> ProviderProbe {
         .lock()
         .ok()
         .and_then(|g| g.clone());
+    let gateway_channels = tui_output_gateway(&entry.name, entry.role);
 
     let classification = classify_provider(
         &entry.name,
@@ -119,6 +127,7 @@ pub(super) async fn probe_provider(entry: &ProviderEntry) -> ProviderProbe {
             deferred_hooks,
             queue_depth,
             recovering_channels,
+            tui_output_requires_gateway: gateway_channels != Some(0),
         },
     );
 
@@ -135,6 +144,7 @@ pub(super) async fn probe_provider(entry: &ProviderEntry) -> ProviderProbe {
             restart_pending,
             last_turn_at,
             remint_fence_cells: entry.shared.mailboxes.remint_fence_cells(),
+            tui_output_gateway_channels: gateway_channels.filter(|count| *count > 0),
         },
         status: classification.status,
         fully_recovered: classification.fully_recovered,
@@ -161,6 +171,13 @@ fn classify_provider(
     } else if role == ProviderRuntimeRole::Standby {
         status = status.worsen(HealthStatus::Degraded);
         degraded_reasons.push(format!("provider:{provider_name}:gateway_standby"));
+    }
+    if signals.tui_output_requires_gateway {
+        status = status.worsen(HealthStatus::Degraded);
+        degraded_reasons.push(format!(
+            "provider:{provider_name}:{}",
+            crate::services::tui_o::topology::TUI_OUTPUT_REQUIRES_GATEWAY
+        ));
     }
     if signals.restart_pending {
         status = status.worsen(HealthStatus::Unhealthy);
@@ -210,6 +227,25 @@ fn classify_provider(
         fully_recovered,
         degraded_reasons,
     }
+}
+
+/// Writer channels this entry's role leaves to the gateway; `None` when the boot list is unknown.
+fn tui_output_gateway(provider_name: &str, role: ProviderRuntimeRole) -> Option<usize> {
+    use crate::services::tui_o::channel_policy::BootChannels;
+    use crate::services::tui_o::topology::{self, HostRole};
+    let role = match role {
+        ProviderRuntimeRole::Gateway => HostRole::Gateway,
+        ProviderRuntimeRole::Standby => HostRole::Standby,
+        ProviderRuntimeRole::Worker => HostRole::Runner,
+    };
+    let channels = |boot: Option<&BootChannels>| {
+        let enabled = crate::services::tui_o::cutover::writer_enabled();
+        topology::gateway_only_channels(enabled, provider_name, role, boot)
+    };
+    #[cfg(test)]
+    return crate::services::tui_o::cutover::test_override::with_channels(channels);
+    #[cfg(not(test))]
+    channels(crate::services::tui_o::channel_policy::boot())
 }
 
 /// Whether an unfinished reconcile has outlived its boot-relative deadline and
@@ -290,6 +326,7 @@ mod tests {
                 deferred_hooks: 0,
                 queue_depth: 0,
                 recovering_channels: 0,
+                tui_output_requires_gateway: false,
             },
         );
 
@@ -311,6 +348,7 @@ mod tests {
                 deferred_hooks: 2,
                 queue_depth: 3,
                 recovering_channels: 1,
+                tui_output_requires_gateway: false,
             },
         );
 
@@ -331,6 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn registered_idle_standby_is_degraded_but_http_ready() {
+        let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
         let registry = HealthRegistry::new();
         let shared = crate::services::discord::make_shared_data_for_tests();
         registry.register_standby("codex".to_string(), shared).await;
@@ -343,10 +382,15 @@ mod tests {
         let json = serde_json::to_value(snapshot).expect("serialize standby health");
         assert_eq!(json["providers"][0]["connected"], false);
         assert_eq!(json["providers"][0]["runtime_state_complete"], true);
-        assert_eq!(
-            json["degraded_reasons"],
-            serde_json::json!(["provider:codex:gateway_standby"])
-        );
+        // TUI-O writer alarms are process-global and raised by concurrent tests.
+        let reasons: Vec<&str> = json["degraded_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|reason| reason.as_str())
+            .filter(|reason| !reason.starts_with("tui_o:"))
+            .collect();
+        assert_eq!(reasons, ["provider:codex:gateway_standby"]);
     }
 
     /// #5951 — the fence cell of a purged channel stays, and health says so.
@@ -368,6 +412,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_profile_health_does_not_require_gateway_or_hide_recovery_failure() {
+        let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
         let registry = HealthRegistry::new();
         let shared = crate::services::discord::make_shared_data_for_tests();
         registry
@@ -457,6 +502,7 @@ mod tests {
                 deferred_hooks: 2,
                 queue_depth: 3,
                 recovering_channels: 1,
+                tui_output_requires_gateway: false,
             },
         );
 
@@ -475,6 +521,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn refused_tui_intake_is_a_degraded_reason_on_every_non_gateway_role() {
+        for (role, expected) in [
+            (
+                ProviderRuntimeRole::Standby,
+                &[
+                    "provider:claude:gateway_standby",
+                    "provider:claude:tui_output_requires_gateway",
+                ][..],
+            ),
+            (
+                ProviderRuntimeRole::Worker,
+                &["provider:claude:tui_output_requires_gateway"][..],
+            ),
+        ] {
+            let result = classify_provider(
+                "claude",
+                role,
+                ProviderProbeSignals {
+                    tui_output_requires_gateway: true,
+                    ..reconcile_pending_signals(Duration::ZERO)
+                },
+            );
+            assert_eq!(result.status, HealthStatus::Degraded, "{role:?}");
+            assert_eq!(
+                &result.degraded_reasons[..expected.len()],
+                expected,
+                "{role:?}"
+            );
+        }
+    }
+
     fn reconcile_pending_signals(reconcile_age: Duration) -> ProviderProbeSignals {
         ProviderProbeSignals {
             connected: true,
@@ -484,6 +562,7 @@ mod tests {
             deferred_hooks: 0,
             queue_depth: 0,
             recovering_channels: 0,
+            tui_output_requires_gateway: false,
         }
     }
 

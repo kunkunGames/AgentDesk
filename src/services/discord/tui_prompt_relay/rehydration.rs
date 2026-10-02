@@ -4,15 +4,31 @@
 //! tmux-session→channel registry / dedupe mirror for sessions that survived a
 //! compact/restart/rebind but lost their watcher slot.
 //!
-//! They are Discord-IO/`SharedData`-COUPLED but cohesive: every dependency
-//! (SharedData methods, the sibling launch-script/offset/channel helpers, and
+//! They are Discord-IO/`SharedData`-COUPLED but cohesive: every dependency but the launch
+//! transcript helpers (SharedData methods, sibling launch-script/offset/channel helpers, and
 //! the dedupe/platform/tmux_diagnostics modules) is reached via the `use
 //! super::*;` glob, so the move is behavior-identical and the parent's call
 //! sites (and the `#[cfg(test)] mod tests` block) stay byte-identical via the
 //! `use self::rehydration::{...}` re-import.
 
+use super::super::host_defer_gate::mirror_evict_admitted as host_admits;
+use super::super::recovery_engine::host_reconcile::names_another_host;
+use super::launch_script::{claude_tui_launch_transcript, claude_tui_rehydrated_binding};
 use super::*;
 use std::collections::HashMap;
+
+#[cfg(not(test))]
+use super::resolve_rehydrated_claude_tmux_channel_id as claude_channel;
+#[cfg(not(test))]
+use crate::services::{
+    platform::tmux::list_session_names as claude_session_names,
+    tmux_diagnostics::tmux_session_has_live_pane as claude_pane_live,
+};
+#[cfg(test)]
+use claude_pass_tests::{claude_channel, claude_pane_live, claude_session_names};
+#[cfg(test)]
+#[path = "../../claude_tui/hook_server/rehydration_ingress_tests.rs"]
+mod claude_pass_tests;
 
 /// #3105 (codex P1 sub-case B): a tmux session whose dedupe mirror still holds a
 /// stale ClaudeTui binding but which is genuinely dead/orphaned — pane gone AND no
@@ -38,11 +54,11 @@ pub(super) fn claude_tui_session_is_dead_orphaned(
         return false;
     }
     pane_is_confirmed_dead_orphaned(
-        || crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_session_name),
+        || claude_pane_live(tmux_session_name),
         || crate::services::tmux_diagnostics::tmux_session_pane_liveness(tmux_session_name),
         DEAD_ORPHANED_PANE_PROBE_SAMPLES,
         Some(DEAD_ORPHANED_PANE_PROBE_DELAY),
-    )
+    ) && host_admits(shared, &ProviderKind::Claude, tmux_session_name)
 }
 
 /// #3105 (codex P2): pure, testable core of the dead/orphaned pane decision (the
@@ -155,7 +171,7 @@ fn codex_tui_session_is_dead_orphaned(shared: &Arc<SharedData>, tmux_session_nam
         || crate::services::tmux_diagnostics::tmux_session_pane_liveness(tmux_session_name),
         DEAD_ORPHANED_PANE_PROBE_SAMPLES,
         Some(DEAD_ORPHANED_PANE_PROBE_DELAY),
-    )
+    ) && host_admits(shared, &ProviderKind::Codex, tmux_session_name)
 }
 
 #[cfg(all(unix, test))]
@@ -218,12 +234,14 @@ fn evict_dead_orphaned_codex_tui_mirrors(shared: &Arc<SharedData>) {
 
 #[cfg(unix)]
 pub(super) fn rehydrate_existing_claude_tui_bindings(shared: &Arc<SharedData>) {
+    // Deferred hook adoptions go first so this pass sees their binding.
+    crate::services::claude_tui::hook_server::retry_deferred_claude_adoptions();
     // #3105 (codex P1 sub-case B): tombstone stale mirrors for dead/orphaned
     // sessions BEFORE anything else, so the per-poll drift/skip WARN spam stops
     // even when the session is not present in `list_session_names()` at all.
     evict_dead_orphaned_claude_tui_mirrors(shared);
 
-    let sessions = match crate::services::platform::tmux::list_session_names() {
+    let sessions = match claude_session_names() {
         Ok(sessions) => sessions,
         Err(error) => {
             tracing::debug!(error = %error, "Claude TUI binding rehydrate skipped; tmux sessions unavailable");
@@ -232,148 +250,170 @@ pub(super) fn rehydrate_existing_claude_tui_bindings(shared: &Arc<SharedData>) {
     };
 
     for tmux_session_name in sessions {
-        let existing_binding = crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(
-            &tmux_session_name,
-        );
-        // #3018: dedupe lookup here is a diagnostic/mirror rehydration hint only
-        // (subordinate to the freshly resolved channel below), never a routing
-        // authority — the authoritative resolver is owner_channel_for_tmux_session.
-        let existing_channel =
-            crate::services::tui_prompt_dedupe::owner_channel_for_tmux_session(&tmux_session_name);
-        let fresh_binding = rehydrated_claude_tui_binding_for_tmux_session(&tmux_session_name);
-        // #3105: prefer the settings-derived (authoritative) channel; only fall
-        // back to the dedupe mirror's last-seen channel for the dedupe binding
-        // refresh below. The mirror's value must NOT be promoted into the
-        // authoritative registry — see the repair gate below.
-        let authoritative_channel = resolve_rehydrated_claude_tmux_channel_id(&tmux_session_name);
-        let channel_id = match authoritative_channel.or(existing_channel) {
-            Some(channel_id) => channel_id,
-            None => continue,
-        };
-        if !crate::services::tmux_diagnostics::tmux_session_has_live_pane(&tmux_session_name) {
-            // #3105: the restored owner binding is only valid for a LIVE session;
-            // drop it once the pane is gone so a dead session can never resolve.
-            shared
-                .tmux_watchers
-                .clear_restored_owner_for_tmux_session(&tmux_session_name);
-            // #3105 (codex P1 sub-case B): a listed-but-dead pane with no live
-            // watcher is orphaned — also tombstone its stale dedupe mirror so the
-            // idle relay loop stops re-emitting the per-poll drift/skip WARN for
-            // it (the dead-pane branch previously only cleared the restored owner
-            // and left the mirror to spam). `clear_restored_owner_*` above already
-            // ran, so the dead-orphaned predicate cannot be masked by a stale
-            // restored owner here.
-            if claude_tui_session_is_dead_orphaned(shared, &tmux_session_name) {
-                let permanent_loss_count =
-                    super::super::idle_relay_drift::record_confirmed_dead_orphan_loss(
-                        &ProviderKind::Claude,
-                        &tmux_session_name,
-                        channel_id,
-                    );
-                if crate::services::tui_prompt_dedupe::evict_dead_tmux_mirror(&tmux_session_name) {
-                    tracing::warn!(
-                        tmux_session_name = %tmux_session_name,
-                        provider = "claude",
-                        permanent_loss_count,
-                        "evicted stale dedupe mirror for dead/orphaned Claude TUI session \
-                         (listed pane dead, no live watcher)"
-                    );
-                }
-            }
-            continue;
+        rehydrate_claude_tui_pane(shared, &tmux_session_name);
+    }
+    crate::services::claude_tui::hook_server::mark_boot_discovery_complete();
+}
+
+/// One pane of the rehydrate pass; a durable Pending is restored before the binding judgment.
+#[cfg(unix)]
+fn rehydrate_claude_tui_pane(shared: &Arc<SharedData>, tmux_session_name: &str) {
+    let existing_binding =
+        crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name);
+    // #3018: dedupe lookup here is a diagnostic/mirror rehydration hint only
+    // (subordinate to the freshly resolved channel below), never a routing
+    // authority — the authoritative resolver is owner_channel_for_tmux_session.
+    let existing_channel =
+        crate::services::tui_prompt_dedupe::owner_channel_for_tmux_session(tmux_session_name);
+    let fresh_binding = rehydrated_claude_tui_binding_for_tmux_session(tmux_session_name);
+    // #3105: prefer the settings-derived (authoritative) channel; only fall
+    // back to the dedupe mirror's last-seen channel for the dedupe binding
+    // refresh below. The mirror's value must NOT be promoted into the
+    // authoritative registry — see the repair gate below.
+    let authoritative_channel = claude_channel(tmux_session_name);
+    let channel_id = match authoritative_channel.or(existing_channel) {
+        Some(channel_id) if !names_another_host(tmux_session_name) => channel_id,
+        _ => return,
+    };
+    if !claude_pane_live(tmux_session_name) {
+        if !host_admits(shared, &ProviderKind::Claude, tmux_session_name) {
+            return;
         }
-        // #3105: self-heal the authoritative tmux-session→channel registry for a
-        // LIVE Claude TUI session that has no live watcher handle (e.g. the slot
-        // was evicted by a compact/restart/rebind and never re-claimed because
-        // the user is typing directly into the pane). Without this the #3018
-        // "registry is the single authority, never fall back to the mirror" rule
-        // turns a transient registry miss into a PERMANENT relay drop. We promote
-        // ONLY the settings-derived channel (authoritative, resolves both base
-        // and thread-suffixed tmux names) — never the dedupe mirror — and emit a
-        // single bounded incident instead of the per-poll drift warning.
-        if let Some(authoritative_channel) = authoritative_channel {
-            let repaired = shared.tmux_watchers.restore_owner_channel_for_tmux_session(
-                &tmux_session_name,
-                ChannelId::new(authoritative_channel),
-            );
-            if repaired {
+        // #3105: the restored owner binding is only valid for a LIVE session;
+        // drop it once the pane is gone so a dead session can never resolve.
+        shared
+            .tmux_watchers
+            .clear_restored_owner_for_tmux_session(tmux_session_name);
+        // #3105 (codex P1 sub-case B): a listed-but-dead pane with no live
+        // watcher is orphaned — also tombstone its stale dedupe mirror so the
+        // idle relay loop stops re-emitting the per-poll drift/skip WARN for
+        // it (the dead-pane branch previously only cleared the restored owner
+        // and left the mirror to spam). `clear_restored_owner_*` above already
+        // ran, so the dead-orphaned predicate cannot be masked by a stale
+        // restored owner here.
+        if claude_tui_session_is_dead_orphaned(shared, tmux_session_name) {
+            let permanent_loss_count =
+                super::super::idle_relay_drift::record_confirmed_dead_orphan_loss(
+                    &ProviderKind::Claude,
+                    tmux_session_name,
+                    channel_id,
+                );
+            if crate::services::tui_prompt_dedupe::evict_dead_tmux_mirror(tmux_session_name) {
                 tracing::warn!(
                     tmux_session_name = %tmux_session_name,
-                    channel_id = authoritative_channel,
                     provider = "claude",
-                    "repaired authoritative tmux-session→channel registry for live TUI session \
-                     (no live watcher slot); idle relay can route again"
+                    permanent_loss_count,
+                    "evicted stale dedupe mirror for dead/orphaned Claude TUI session \
+                     (listed pane dead, no live watcher)"
                 );
             }
         }
-        // #5188 (R1): both gates below consult the session id a live hook payload
-        // most recently reported for this pane. A `/clear` rotates Claude onto a
-        // new transcript while the launch script keeps naming the launch-time
-        // UUID forever, so that payload is the only evidence which outranks the
-        // stale artifact. Both decisions live in `session_rotation_settle` — they
-        // were unreachable from any test while inlined here, and production takes
-        // no other path to them.
-        if let (Some(existing), Some(_)) = (&existing_binding, existing_channel)
-            && super::session_rotation_settle::existing_claude_binding_outranks_launch_script(
-                &tmux_session_name,
+        return;
+    }
+    // #3105: self-heal the authoritative tmux-session→channel registry for a
+    // LIVE Claude TUI session that has no live watcher handle (e.g. the slot
+    // was evicted by a compact/restart/rebind and never re-claimed because
+    // the user is typing directly into the pane). Without this the #3018
+    // "registry is the single authority, never fall back to the mirror" rule
+    // turns a transient registry miss into a PERMANENT relay drop. We promote
+    // ONLY the settings-derived channel (authoritative, resolves both base
+    // and thread-suffixed tmux names) — never the dedupe mirror — and emit a
+    // single bounded incident instead of the per-poll drift warning.
+    if let Some(authoritative_channel) = authoritative_channel {
+        let repaired = shared.tmux_watchers.restore_owner_channel_for_tmux_session(
+            tmux_session_name,
+            ChannelId::new(authoritative_channel),
+        );
+        if repaired {
+            tracing::warn!(
+                tmux_session_name = %tmux_session_name,
+                channel_id = authoritative_channel,
+                provider = "claude",
+                "repaired authoritative tmux-session→channel registry for live TUI session \
+                 (no live watcher slot); idle relay can route again"
+            );
+        }
+    }
+    // A restore that registered the pane, or found its log corrupt, leaves the launch binding out.
+    let launch = claude_launch_transcript(tmux_session_name);
+    let restored = crate::services::tui_prompt_dedupe::pending::restore_claude_pane(
+        tmux_session_name,
+        channel_id,
+        launch,
+        claude_tui_rehydrated_binding,
+    );
+    if super::headless::restore_holds(tmux_session_name, restored) {
+        return;
+    }
+    let fresh_binding = super::headless::tui_binding(shared, tmux_session_name, fresh_binding);
+    // #5188 (R1): both gates below consult the session id a live hook payload
+    // most recently reported for this pane. A `/clear` rotates Claude onto a
+    // new transcript while the launch script keeps naming the launch-time
+    // UUID forever, so that payload is the only evidence which outranks the
+    // stale artifact. Both decisions live in `session_rotation_settle` — they
+    // were unreachable from any test while inlined here, and production takes
+    // no other path to them.
+    if let (Some(existing), Some(_)) = (&existing_binding, existing_channel)
+        && super::session_rotation_settle::existing_claude_binding_outranks_launch_script(
+            tmux_session_name,
+            existing,
+            fresh_binding.as_ref(),
+        )
+    {
+        crate::services::claude_tui::hook_server::note_claude_pane_registration(
+            tmux_session_name,
+            existing.session_id.as_deref(),
+            true,
+        );
+        return;
+    }
+    if let Some(fresh) = fresh_binding {
+        let should_refresh = match existing_binding.as_ref() {
+            // Second gate on purpose: the first one requires a resolved
+            // `existing_channel`, and a pane whose dedupe mirror has no
+            // channel yet would otherwise still be reverted here.
+            Some(existing) => super::session_rotation_settle::launch_script_may_replace_binding(
+                tmux_session_name,
                 existing,
-                fresh_binding.as_ref(),
-            )
-        {
-            continue;
+                &fresh,
+            ),
+            None => true,
+        };
+        if should_refresh {
+            crate::services::tui_prompt_dedupe::pane_registration::register_claude_pane(
+                tmux_session_name,
+                channel_id,
+                fresh.clone(),
+            );
+            tracing::info!(
+                tmux_session_name = %tmux_session_name,
+                channel_id,
+                transcript_path = %fresh.output_path,
+                last_offset = fresh.last_offset,
+                "rehydrated Claude TUI direct relay binding from launch script"
+            );
+            return;
         }
-        if let Some(fresh) = fresh_binding {
-            let should_refresh = match existing_binding.as_ref() {
-                // Second gate on purpose: the first one requires a resolved
-                // `existing_channel`, and a pane whose dedupe mirror has no
-                // channel yet would otherwise still be reverted here.
-                Some(existing) => {
-                    super::session_rotation_settle::launch_script_may_replace_binding(
-                        &tmux_session_name,
-                        existing,
-                        &fresh,
-                    )
-                }
-                None => true,
-            };
-            if should_refresh {
-                crate::services::tui_prompt_dedupe::register_rehydrated_tmux_runtime_binding(
-                    ProviderKind::Claude.as_str(),
-                    &tmux_session_name,
-                    channel_id,
-                    fresh.clone(),
-                );
-                tracing::info!(
-                    tmux_session_name = %tmux_session_name,
-                    channel_id,
-                    transcript_path = %fresh.output_path,
-                    last_offset = fresh.last_offset,
-                    "rehydrated Claude TUI direct relay binding from launch script"
-                );
-                continue;
-            }
+    }
+    if let Some(binding) = existing_binding {
+        if binding.runtime_kind != RuntimeHandoffKind::ClaudeTui {
+            return;
         }
-        if let Some(binding) = existing_binding {
-            if binding.runtime_kind != RuntimeHandoffKind::ClaudeTui {
-                continue;
-            }
-            if Path::new(&binding.output_path).exists() {
-                crate::services::tui_prompt_dedupe::register_rehydrated_tmux_runtime_binding(
-                    ProviderKind::Claude.as_str(),
-                    &tmux_session_name,
-                    channel_id,
-                    binding.clone(),
-                );
-                tracing::info!(
-                    tmux_session_name = %tmux_session_name,
-                    channel_id,
-                    transcript_path = %binding.output_path,
-                    last_offset = binding.last_offset,
-                    "rehydrated Claude TUI direct relay channel binding"
-                );
-            }
-            continue;
+        if Path::new(&binding.output_path).exists() {
+            crate::services::tui_prompt_dedupe::pane_registration::register_claude_pane(
+                tmux_session_name,
+                channel_id,
+                binding.clone(),
+            );
+            tracing::info!(
+                tmux_session_name = %tmux_session_name,
+                channel_id,
+                transcript_path = %binding.output_path,
+                last_offset = binding.last_offset,
+                "rehydrated Claude TUI direct relay channel binding"
+            );
         }
+        return;
     }
 }
 
@@ -411,6 +451,9 @@ pub(super) fn rehydrate_existing_codex_tui_bindings(shared: &Arc<SharedData>) {
         };
 
         if !codex_pass_pane_is_live(&tmux_session_name) {
+            if !host_admits(shared, &ProviderKind::Codex, &tmux_session_name) {
+                continue;
+            }
             shared
                 .tmux_watchers
                 .clear_restored_owner_for_tmux_session(&tmux_session_name);
@@ -569,34 +612,44 @@ fn rehydrate_codex_tui_binding_transaction(
     )
 }
 
+/// One boot restore pass for a live pane, with no other pane's claims.
+#[cfg(all(unix, test))]
+pub(crate) fn rehydrate_codex_tui_binding_for_tests(
+    tmux_session_name: &str,
+    channel_id: u64,
+) -> Option<crate::services::tui_prompt_dedupe::TuiRuntimeBinding> {
+    let none = HashSet::new();
+    let claims = claimed_codex_tui_rollout_paths();
+    rehydrate_codex_tui_binding_transaction(
+        tmux_session_name,
+        channel_id,
+        &claims,
+        &none,
+        &none,
+        false,
+        || {},
+    )
+}
+
+#[cfg(unix)]
+fn claude_launch_transcript(
+    tmux_session_name: &str,
+) -> Option<crate::services::tui_prompt_dedupe::pending::LaunchTranscript> {
+    #[cfg(test)]
+    let home = claude_pass_tests::claude_home();
+    #[cfg(not(test))]
+    let home: Option<PathBuf> = None;
+    claude_tui_launch_transcript(tmux_session_name, home.as_deref())
+}
+
 #[cfg(unix)]
 pub(super) fn rehydrated_claude_tui_binding_for_tmux_session(
     tmux_session_name: &str,
 ) -> Option<crate::services::tui_prompt_dedupe::TuiRuntimeBinding> {
-    let launch_script_path = crate::services::tmux_common::resolve_session_temp_path(
-        tmux_session_name,
-        crate::services::tmux_common::CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
-    )?;
-    let launch = parse_claude_tui_launch_script(Path::new(&launch_script_path)).ok()?;
-    let transcript_path = crate::services::claude_tui::transcript_tail::claude_transcript_path(
-        &launch.working_dir,
-        &launch.session_id,
-        None,
-    )
-    .ok()?;
-    if !transcript_path.exists() {
-        return None;
-    }
-    let start_offset = claude_tui_rehydrate_start_offset(&transcript_path);
-    Some(crate::services::tui_prompt_dedupe::TuiRuntimeBinding {
-        runtime_kind: RuntimeHandoffKind::ClaudeTui,
-        output_path: transcript_path.display().to_string(),
-        relay_output_path: None,
-        input_fifo_path: None,
-        session_id: Some(launch.session_id),
-        last_offset: start_offset,
-        relay_last_offset: None,
-    })
+    let launch = claude_launch_transcript(tmux_session_name)?;
+    let transcript_path = launch.transcript.as_path();
+    (transcript_path.exists())
+        .then(|| claude_tui_rehydrated_binding(&launch.session_id, transcript_path))
 }
 
 #[cfg(unix)]
@@ -1143,5 +1196,171 @@ mod tests {
             plan.markerless_fallback_allowed_sessions.is_empty(),
             "two live sessions with no usable rollout identity in the same cwd must skip fallback"
         );
+    }
+
+    /// The rehydration pass's dead-pane eviction against the rows stored for each session.
+    mod host_defer {
+        use super::*;
+        use crate::db::dispatched_sessions::hosted_execution;
+        use crate::db::dispatched_sessions::hosted_execution::HostedState;
+        use crate::db::dispatched_sessions::hosted_execution::tests::{
+            future_schema, owner, record, wire,
+        };
+        use crate::services::discord::host_defer_gate::tests::{
+            Case, ScriptedTmux, postgres, with_second_bot,
+        };
+        use crate::services::discord::host_teardown_gate::test_support::Stored;
+
+        fn binding(
+            kind: RuntimeHandoffKind,
+        ) -> crate::services::tui_prompt_dedupe::TuiRuntimeBinding {
+            crate::services::tui_prompt_dedupe::TuiRuntimeBinding {
+                runtime_kind: kind,
+                output_path: "/runtime/p4c1-rehydrate.jsonl".to_string(),
+                relay_output_path: None,
+                input_fifo_path: None,
+                session_id: None,
+                last_offset: 0,
+                relay_last_offset: None,
+            }
+        }
+
+        // A dead pane's relay mirror and restored owner are dropped only for a session the host
+        // guard admits, in the unlisted sweep and the listed-pane pass of both providers.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_dead_pane_mirror_is_evicted_only_for_what_the_host_guard_admits_pg() {
+            let _root = crate::config::TestRuntimeRootGuard::new();
+            let _dedupe = crate::services::tui_prompt_dedupe::TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            crate::services::tui_prompt_dedupe::reset_state_for_tests();
+            let tmux = ScriptedTmux::install();
+            let (db, pool) = postgres().await;
+            let bot_b = "p4c1-bot-b";
+            let (shared, _registry) = with_second_bot(&pool, bot_b).await;
+            let providers = [
+                (ProviderKind::Claude, RuntimeHandoffKind::ClaudeTui),
+                (ProviderKind::Codex, RuntimeHandoffKind::CodexTui),
+            ];
+            let mut sessions = Vec::new();
+            for (p, (provider, kind)) in providers.iter().enumerate() {
+                for listed in [false, true] {
+                    for (n, case) in Case::ALL.into_iter().enumerate() {
+                        let at = (p * 2 + usize::from(listed)) * 10 + n;
+                        let channel = 1_479_671_301_387_065_000 + at as u64;
+                        let name = format!("AgentDesk-{}-p4c1-evict-{at}", provider.as_str());
+                        let key =
+                            crate::services::discord::adk_session::build_namespaced_session_key(
+                                &shared.token_hash,
+                                provider,
+                                &name,
+                            );
+                        case.seed(&pool, &key, &name, channel).await;
+                        crate::services::tui_prompt_dedupe::register_tmux_runtime_binding(
+                            &name,
+                            binding(*kind),
+                        );
+                        crate::services::tui_prompt_dedupe::register_tmux_channel(&name, channel);
+                        let owner = ChannelId::new(channel);
+                        shared
+                            .tmux_watchers
+                            .restore_owner_channel_for_tmux_session(&name, owner);
+                        sessions.push((name, key, listed, case));
+                    }
+                }
+            }
+            // A second bot's rows sit under its own hash, which only the registry names.
+            let mut second = Vec::new();
+            for (n, stored) in [Stored::Legacy, Stored::Hosted, Stored::Future]
+                .into_iter()
+                .enumerate()
+            {
+                let channel = 1_479_671_301_387_065_800 + n as u64;
+                let name = format!("AgentDesk-claude-p4c1-bot-b-{n}");
+                let claude = ProviderKind::Claude;
+                let key = crate::services::discord::adk_session::build_namespaced_session_key(
+                    bot_b, &claude, &name,
+                );
+                let mut row_owner = owner(&channel.to_string());
+                row_owner.discord_token_hash = bot_b.to_string();
+                let raw = match stored {
+                    Stored::Hosted => Some(wire(&record(&row_owner, "n1", HostedState::Bound))),
+                    Stored::Future => Some(future_schema(&row_owner)),
+                    _ => None,
+                };
+                let seed = crate::services::discord::host_key_derivation::tests::seed_row;
+                seed(&pool, "claude", Some(bot_b), &key, channel, raw).await;
+                let tui = binding(RuntimeHandoffKind::ClaudeTui);
+                crate::services::tui_prompt_dedupe::register_tmux_runtime_binding(&name, tui);
+                crate::services::tui_prompt_dedupe::register_tmux_channel(&name, channel);
+                second.push((name, stored == Stored::Legacy));
+            }
+            let unread = "AgentDesk-claude-p4c1-evict-unread";
+            let key = crate::services::discord::host_teardown_gate::test_support::channel_key;
+            let legacy = Stored::Legacy;
+            let unread_channel = 1_479_671_301_387_065_900;
+            Case::Stored(legacy)
+                .seed(&pool, &key(&shared, unread), unread, unread_channel)
+                .await;
+            let listed: Vec<&str> = sessions
+                .iter()
+                .filter(|(_, _, listed, _)| *listed)
+                .map(|(name, ..)| name.as_str())
+                .collect();
+            let rows = |keys: Vec<String>| {
+                let pool = pool.clone();
+                async move {
+                    let mut rows = Vec::new();
+                    for key in keys {
+                        let key = hosted_execution::HostedLookupKey::SessionKey(&key);
+                        let row = hosted_execution::load_hosted_execution_pg(&pool, key).await;
+                        rows.push(format!("{row:?}"));
+                    }
+                    rows
+                }
+            };
+            let keys = || sessions.iter().map(|(_, key, ..)| key.clone()).collect();
+            let rows_before = rows(keys()).await;
+            tmux.list(&listed);
+            let pass = shared.clone();
+            tokio::task::spawn_blocking(move || {
+                rehydrate_existing_claude_tui_bindings(&pass);
+                rehydrate_existing_codex_tui_bindings(&pass);
+            })
+            .await
+            .expect("rehydrate pass");
+            assert_eq!(rows(keys()).await, rows_before, "eviction is memory only");
+            for (name, _, listed, case) in &sessions {
+                let mirrored =
+                    crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(name)
+                        .is_some();
+                let owned = shared
+                    .tmux_watchers
+                    .owner_channel_for_tmux_session(name)
+                    .is_some();
+                let label = format!("{name} listed={listed} {case:?}");
+                assert_eq!(mirrored, !case.admitted(), "{label}: mirror");
+                assert_eq!(owned, !case.admitted(), "{label}: restored owner");
+            }
+
+            for (name, admitted) in &second {
+                let mirrored =
+                    crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(name)
+                        .is_some();
+                assert_eq!(mirrored, !admitted, "{name}: second bot's mirror");
+            }
+
+            let claude_tui = binding(RuntimeHandoffKind::ClaudeTui);
+            crate::services::tui_prompt_dedupe::register_tmux_runtime_binding(unread, claude_tui);
+            crate::services::tui_prompt_dedupe::register_tmux_channel(unread, unread_channel);
+            pool.close().await;
+            let pass = shared.clone();
+            tokio::task::spawn_blocking(move || rehydrate_existing_claude_tui_bindings(&pass))
+                .await
+                .expect("rehydrate pass");
+            let kept = crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(unread);
+            assert!(kept.is_some(), "a failed row read is not a legacy answer");
+            db.drop().await;
+        }
     }
 }

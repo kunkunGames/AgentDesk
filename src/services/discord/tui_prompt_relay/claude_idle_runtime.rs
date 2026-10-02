@@ -361,21 +361,19 @@ async fn relay_idle_claude_bindings(shared_ref: &Arc<SharedData>) {
                 prompt,
                 line_end_offset,
                 entry_id,
+                prompt_id,
                 ..
             } => {
                 let observed_at = chrono::Utc::now();
-                // #3540: pass the entry's STABLE identity so an
-                // already-relayed prompt re-encountered after a watermark
-                // reset / jsonl head rotation is suppressed by identity
-                // (`SuppressedReplayedEntry`) and never mints a phantom
-                // synthetic inflight. `entry_id == None` falls back to the
-                // content-keyed 30s recent-observed dedup (pre-#3540).
+                // Row uuid and `promptId` suppress a re-scanned or hook-relayed
+                // prompt by identity; without them only the 30s content window applies.
                 let observation =
-                    crate::services::tui_prompt_dedupe::observe_prompt_by_tmux_with_entry_id_at(
+                    crate::services::tui_prompt_dedupe::observe_prompt_by_tmux_with_row_ids_at(
                         ProviderKind::Claude.as_str(),
                         &tmux_session_name,
                         &prompt,
                         entry_id.as_deref(),
+                        prompt_id.as_deref(),
                         observed_at,
                     );
                 tracing::info!(
@@ -383,6 +381,7 @@ async fn relay_idle_claude_bindings(shared_ref: &Arc<SharedData>) {
                     channel_id = channel_id.get(),
                     observation = ?observation,
                     entry_id = entry_id.as_deref().unwrap_or(""),
+                    prompt_id = prompt_id.as_deref().unwrap_or(""),
                     "Claude idle transcript relay observed prompt"
                 );
                 advance_claude_tmux_runtime_binding_offset(
@@ -635,7 +634,13 @@ pub(super) fn freshest_claude_transcript_for_session(
     // closing #4423, where the old transcript remains on disk forever after
     // Claude compaction moves the live pane to a new UUID.
     let bound_path = PathBuf::from(&binding.output_path);
-    if bound_path.exists() {
+    let bound_exists = bound_path.exists();
+    // A headless SDK transcript in the same project dir is never this pane's TUI transcript.
+    let bound_is_headless = bound_exists
+        && crate::services::claude_tui::transcript_tail::claude_transcript_is_headless_sdk(
+            &bound_path,
+        );
+    if bound_exists && !bound_is_headless {
         // This function runs in the 500ms idle poll. Keep the ordinary
         // (<10-minute-stale) path to one local stat and return before the
         // blocking tmux/session inventory and project-directory scan.
@@ -663,7 +668,7 @@ pub(super) fn freshest_claude_transcript_for_session(
         };
         let candidate_mtime = transcript_mtime(&candidate_path);
         if candidate_mtime <= bound_mtime
-            || !crate::services::tmux_diagnostics::tmux_session_has_live_pane(tmux_session_name)
+            || !super::claude_idle_tail::local_tmux_pane_live(tmux_session_name)
         {
             return Some((bound_path, binding.session_id.clone()));
         }
@@ -732,27 +737,19 @@ pub(super) fn freshest_claude_transcript_for_session(
         );
         return Some((candidate_path, session_id));
     }
-    // Bound transcript is gone — fall back to the freshest project transcript,
-    // excluding files that authoritatively belong to other live Claude TUI tmux
-    // sessions (live watcher path + launch-script transcript + registered
-    // binding) so we still never steal another session's transcript.
-    let claimed_by_other_sessions = other_session_claimed_transcripts(shared, tmux_session_name);
-    claude_tui_launch_context(tmux_session_name)
-        .and_then(|(cwd, launch_mtime)| {
-            crate::services::claude_tui::transcript_tail::latest_claude_transcript_for_cwd(
-                &cwd,
-                launch_mtime,
-                None,
-                &claimed_by_other_sessions,
-            )
-        })
-        .map(|path| {
-            let session_id = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .map(str::to_string);
-            (path, session_id)
-        })
+    if bound_is_headless {
+        return super::headless::claude_tui_transcript_replacing_headless(
+            shared,
+            tmux_session_name,
+            &bound_path,
+        );
+    }
+    // Bound transcript is gone: take the freshest project transcript no other live session claims,
+    // unless a restore bound this exact path before it existed and only that file may bind.
+    if crate::services::tui_prompt_dedupe::pending::awaits_exact_path(tmux_session_name, binding) {
+        return None;
+    }
+    super::headless::freshest_unclaimed_claude_transcript(shared, tmux_session_name)
 }
 
 /// #2843: re-register the runtime binding to a freshly-resolved transcript so
@@ -794,14 +791,16 @@ pub(super) fn resolved_claude_idle_relay_transcript_path(
     binding: &crate::services::tui_prompt_dedupe::TuiRuntimeBinding,
 ) -> Option<PathBuf> {
     let (transcript_path, resolved_session_id) =
-        freshest_claude_transcript_for_session(shared, tmux_session_name, binding).unwrap_or_else(
+        freshest_claude_transcript_for_session(shared, tmux_session_name, binding).or_else(
             || {
-                (
-                    PathBuf::from(&binding.output_path),
-                    binding.session_id.clone(),
-                )
+                let bound_path = PathBuf::from(&binding.output_path);
+                // With no TUI transcript to move to, a headless SDK binding is not tailed at all.
+                (!crate::services::claude_tui::transcript_tail::claude_transcript_is_headless_sdk(
+                    &bound_path,
+                ))
+                .then(|| (bound_path, binding.session_id.clone()))
             },
-        );
+        )?;
 
     if Path::new(&binding.output_path) != transcript_path {
         refresh_claude_runtime_binding(

@@ -83,6 +83,9 @@ pub(in crate::services::discord) mod terminal_long_chunks;
 #[path = "tmux_watcher/terminal_direct_fallback.rs"]
 mod terminal_direct_fallback;
 
+#[path = "tmux_watcher/o_delegated_arm.rs"]
+mod o_delegated_arm;
+
 #[path = "tmux_watcher/task_response_authority.rs"]
 mod task_response_authority;
 
@@ -237,6 +240,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
     else {
         return;
     };
+    let host = HostSnapshot::read(&shared, &watcher_provider, channel_id, &tmux_session_name).await;
     let watcher_thread_channel_id =
         crate::services::discord::adk_session::parse_thread_channel_id_from_name(
             &watcher_channel_name,
@@ -312,6 +316,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         output_path: &output_path,
         watcher_thread_channel_id,
         watcher_instance_id,
+        host: &host,
     };
     let poll_controls = PollWatcherControls {
         cancel: &cancel,
@@ -699,6 +704,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 watcher_provider: &watcher_provider,
                 tmux_session_name: &tmux_session_name,
                 output_path: &output_path,
+                host: &host,
             };
             let terminal_preflight_locals = TerminalPreflightLocals {
                 current_offset,
@@ -752,6 +758,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 watcher_provider: &watcher_provider,
                 tmux_session_name: &tmux_session_name,
                 output_path: &output_path,
+                host: &host,
             };
             let terminal_preflight_suppression_locals = TerminalPreflightSuppressionLocals {
                 current_offset,
@@ -923,6 +930,14 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         let watcher_will_direct_send = watcher_direct_fallback_after_session_bound_ack
             && has_direct_terminal_response
             && !direct_terminal_response_refused_duplicate;
+        // O posts this body: consume the range without a lease, journal or transport; read only.
+        let o_ownership = crate::services::tui_o::cutover::peek_o_owns_tui_output_for_channel_tmux(
+            channel_id.get(),
+            Some(&tmux_session_name),
+        );
+        let o_delegated_session = o_ownership.unwrap_or(true);
+        let o_delegated_terminal = o_ownership == Ok(true) && watcher_will_direct_send;
+        let watcher_will_direct_send = watcher_will_direct_send && !o_delegated_session;
         // #3089/#3998: the unified controller owns one lease for eligible non-task
         // terminals. Task responses keep the watcher lease around card+reference send;
         // empty/TUI-gated and placeholderless fresh sends remain legacy.
@@ -1119,8 +1134,42 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 "watcher: refused degenerate-key duplicate terminal response without committing delivery; waiting for fresh in-range output"
             );
             false
+        } else if o_ownership.is_err() {
+            false
+        } else if o_delegated_terminal {
+            match o_delegated_arm::consume_delegated_terminal(o_delegated_arm::DelegatedTerminal {
+                http: &http,
+                shared: &shared,
+                provider: &watcher_provider,
+                channel_id,
+                tmux_session_name: &tmux_session_name,
+                placeholder_msg_id,
+                inflight_before_relay: inflight_before_relay.as_ref(),
+                inflight_identity_before_relay: inflight_identity_before_relay.as_ref(),
+                consumed_end: terminal_event_consumed_offset(current_offset, &all_data),
+                response_sent_offset,
+                last_edit_text: &last_edit_text,
+                turn_data_start_offset,
+                observed_generation_mtime_ns: &mut last_observed_generation_mtime_ns,
+                task_card: task_notification_kind.and(task_notification_context.as_ref()),
+            })
+            .await {
+                Ok(()) => {
+                    tui_direct_anchor_terminal_body_visible = true;
+                    last_relayed_offset = Some(turn_data_start_offset);
+                    true
+                }
+                Err(error) => {
+                    retry_terminal_delivery_from_offset = matches!(
+                        error, task_response_authority::PrepareWatcherTaskResponseError::Transient(_)
+                    );
+                    false
+                }
+            }
         } else if watcher_direct_fallback_after_session_bound_ack {
-            terminal_direct_fallback::apply_watcher_direct_fallback_send(
+            let claims = watcher_will_direct_send && task_notification_kind.is_none();
+            let body_claim = o_delegated_arm::direct_body_claim(claims, channel_id, &tmux_session_name);
+            let sent = Box::pin(terminal_direct_fallback::apply_watcher_direct_fallback_send(
                 &http,
                 &shared,
                 &watcher_provider,
@@ -1153,6 +1202,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                 external_input_lease_generation_before_relay,
                 prompt_anchor_present_before_relay,
                 ssh_direct_pending,
+                body_claim,
                 terminal_direct_fallback::WatcherDirectFallbackLocals {
                     tui_direct_anchor_terminal_body_visible:
                         &mut tui_direct_anchor_terminal_body_visible,
@@ -1174,8 +1224,12 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                     last_observed_generation_mtime_ns: &mut last_observed_generation_mtime_ns,
                     task_response_claim: &mut watcher_task_response_claim,
                 },
-            )
-            .await
+            ))
+            .await;
+            // O took the channel since the peek: retry, and the next pass consumes it for O.
+            retry_terminal_delivery_from_offset |=
+                !sent && o_delegated_arm::o_took_channel(channel_id, &tmux_session_name);
+            sent
         } else if watcher_direct_fallback_requested {
             false
         } else if relay_decision.suppressed {
@@ -1689,12 +1743,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
                         &mut last_status_panel_text,
                         task_notification_kind,
                         Some(tmux_session_name.clone()),
-                        |tmux_session_name| async move {
-                            crate::services::discord::tmux::sniff_background_agent_pending_for_completion(
-                                tmux_session_name.as_deref(),
-                            )
-                            .await
-                        },
+                        |name| host_gate::background_agent_pending(&host, name),
                         status_panel_completion_user_msg_id,
                         turn_is_external_input_for_session,
                         turn_is_non_managed_tui_mirror,
@@ -1901,6 +1950,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             && !lifecycle_stage_paused
             && !completion_chrome_timed_out
             && !single_message_panel_footer_mode
+            && !o_delegated_session
             && let Some(placeholder) = placeholder_msg_id
             && let Some(finalized) = finalize_watcher_streaming_footer(
                 single_message_panel_footer_mode,
@@ -2357,6 +2407,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             output_path: &output_path,
             relay_coord: &relay_coord,
             turn_delivered: &turn_delivered,
+            host: &host,
         };
         let terminal_commit_epilogue_locals = TerminalCommitEpilogueLocals {
             terminal_output_committed,
@@ -2405,12 +2456,8 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
             session_bound_relay_owns_terminal_delivery,
         );
         let tmux_alive_for_missing_inflight =
-            if inflight_missing_for_fallback && resolved_did.is_none() && terminal_output_committed
-            {
-                probe_tmux_session_liveness(&tmux_session_name).await
-            } else {
-                true
-            };
+            !(inflight_missing_for_fallback && resolved_did.is_none() && terminal_output_committed)
+                || host_gate::marker_alive(&shared, &tmux_session_name, channel_id, &host).await;
         let recent_turn_stop =
             recent_turn_stop_for_watcher_range(channel_id, &tmux_session_name, data_start_offset);
         let placeholder_cleanup_committed = placeholder_msg_id.is_some_and(|msg_id| {
@@ -2513,6 +2560,7 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         cancel,
         watcher_turn_identity,
         watcher_instance_id,
+        host,
     })
     .await;
 }

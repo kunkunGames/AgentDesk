@@ -792,11 +792,14 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owne
     );
     #[cfg(unix)]
     reconcile_managed_tmux_runtime_kind_for_config(
+        shared,
         &provider,
         channel_id,
+        adk_session_key.as_deref(),
         tmux_session_name.as_deref(),
         prelaunch_runtime_kind,
-    );
+    )
+    .await;
 
     // Routine turns execute in a synthetic child channel, while their model is
     // configured on the real agent channel carried in routine metadata. Resolve
@@ -979,6 +982,14 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owne
     let prompt_owned = prompt.to_string();
     let provider_for_blocking = provider.clone();
     let execution_pool = shared.pg_pool.clone();
+    let teardown_clearance = super::super::super::turn_teardown_clearance::for_turn(
+        shared.pg_pool.as_ref(),
+        &provider,
+        channel_id.get(),
+        adk_session_key.as_deref(),
+        tmux_session_name.as_deref(),
+    )
+    .await;
     tokio::task::spawn_blocking(move || {
         let _upload_lifetime = materialized_uploads;
         let result = crate::services::platform::with_provider_execution_context(
@@ -997,6 +1008,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owne
                             cancel: cancel_token_clone,
                             remote_profile: remote_profile.as_ref(),
                             tmux_session_name: tmux_session_name.as_deref(),
+                            teardown: teardown_clearance.as_ref(),
                             channel_id: channel_id.get(),
                             model: model_for_turn.as_deref(),
                             native_fast_mode: native_fast_mode_override,

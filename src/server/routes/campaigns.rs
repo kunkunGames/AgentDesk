@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::AppState;
-use crate::db::campaigns::{self, CampaignError, CampaignInput};
+use crate::db::campaigns::{self, Campaign, CampaignError, CampaignInput, CampaignStatus};
 use crate::error::{AppError, AppResult, ErrorCode};
 
 /// A ledger write carries the whole DAG, so campaign routes need far more than the
@@ -84,18 +84,24 @@ pub async fn list(
 ) -> AppResult<Json<Value>> {
     let limit = i64::from(query.limit.unwrap_or(100).clamp(1, 500));
     let offset = i64::from(query.offset.unwrap_or(0));
-    let campaigns = campaigns::list(pool(&state)?, limit, offset)
+    let pool = pool(&state)?;
+    let campaigns = campaigns::list(pool, limit, offset).await.map_err(error)?;
+    let live = campaigns::live_status(pool, &campaigns)
         .await
         .map_err(error)?;
     Ok(Json(
-        json!({ "campaigns": campaigns, "limit": limit, "offset": offset }),
+        json!({ "campaigns": campaigns, "live": live, "limit": limit, "offset": offset }),
     ))
 }
 
 pub async fn get(State(state): State<AppState>, Path(id): Path<String>) -> AppResult<Json<Value>> {
-    Ok(Json(
-        json!({ "campaign": campaigns::get(pool(&state)?, &id).await.map_err(error)? }),
-    ))
+    let pool = pool(&state)?;
+    let campaign = campaigns::get(pool, &id).await.map_err(error)?;
+    let mut live = campaigns::live_status(pool, std::slice::from_ref(&campaign))
+        .await
+        .map_err(error)?;
+    let live = live.remove(&campaign.id).unwrap_or_default();
+    Ok(Json(json!({ "campaign": campaign, "live": live })))
 }
 
 pub async fn history(
@@ -112,10 +118,14 @@ pub async fn create(
     Json(body): Json<CreateCampaign>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
     let id = body.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let campaign = campaigns::create(pool(&state)?, id, body.campaign)
+    let pool = pool(&state)?;
+    let campaign = campaigns::create(pool, id, body.campaign)
         .await
         .map_err(error)?;
-    Ok((StatusCode::CREATED, Json(json!({ "campaign": campaign }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(saved_with_handoff(&state, pool, campaign).await),
+    ))
 }
 
 pub async fn replace(
@@ -123,10 +133,31 @@ pub async fn replace(
     Path(id): Path<String>,
     Json(body): Json<ReplaceCampaign>,
 ) -> AppResult<Json<Value>> {
-    let campaign = campaigns::replace(pool(&state)?, &id, body.expected_revision, body.campaign)
+    let pool = pool(&state)?;
+    let campaign = campaigns::replace(pool, &id, body.expected_revision, body.campaign)
         .await
         .map_err(error)?;
-    Ok(Json(json!({ "campaign": campaign })))
+    Ok(Json(saved_with_handoff(&state, pool, campaign).await))
+}
+
+/// A saved write already succeeded, so a failed handoff is reported beside it, not as an error.
+async fn saved_with_handoff(state: &AppState, pool: &sqlx::PgPool, campaign: Campaign) -> Value {
+    if !campaign.auto_queue || campaign.status != CampaignStatus::Active {
+        return json!({ "campaign": campaign });
+    }
+    match crate::services::auto_queue::route::hand_off_ready_nodes_pg(
+        pool,
+        &state.engine,
+        &campaign,
+    )
+    .await
+    {
+        Ok(handoff) => json!({ "campaign": campaign, "handoff": handoff }),
+        Err(message) => {
+            tracing::warn!(campaign = %campaign.id, %message, "campaign handoff after save failed");
+            json!({ "campaign": campaign, "handoff_error": message })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -266,6 +297,19 @@ mod tests {
         let (_, history) =
             request(&app, Method::GET, "/campaigns/api-test/history", None, true).await;
         assert_eq!(history["revisions"].as_array().unwrap().len(), 2);
+        let mut opt_in = updated["campaign"].clone();
+        opt_in["expected_revision"] = json!(2);
+        opt_in["status"] = json!("active");
+        opt_in["auto_queue"] = json!(true);
+        let (status, saved) =
+            request(&app, Method::PUT, "/campaigns/api-test", Some(opt_in), true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["campaign"]["auto_queue"], true);
+        assert_eq!(
+            saved["handoff"],
+            json!({"queued": [], "waiting": []}),
+            "an active opted-in save hands off in the same response"
+        );
         assert_eq!(
             request(&app, Method::GET, "/campaigns/absent", None, true)
                 .await

@@ -19,7 +19,7 @@ REQUIRED_CHECK_MIRROR_SHA256 = (
     "57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d"
 )
 CI_RUNNER_HARDENING_SHA256 = (
-    "3734874adee95f0edf070e41c3c975f6ca7fcb451c11927c067f81e234cb1057"
+    "0c67a7933577ad27b11c16b16631dcdc4d0c2411fc5088ba5da14be4ebf4921e"
 )
 PR_WORKFLOW = REPO_ROOT / ".github/workflows/ci-pr.yml"
 # Path-filtered required contexts: (mirror job, required name, runner job,
@@ -197,7 +197,7 @@ EXPECTED_TEST_NON_PG_COMMANDS = (
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::tmux_watcher::placeholder_reclaim::redrive_reclaim_e2e_tests::live_tmux_redrive_reclaim_cycle_terminates_4299 -- --exact --test-threads=1",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tmux::tmux_watcher::terminal_relay_plan::soft_terminal_direct_send_authority_tests -- --skip _pg --skip pg_ --skip postgres --test-threads=1",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::recovery_engine::runtime::reregister_ledger_reseed_tests -- --test-threads=1",
-    "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::placeholder_sweeper::abandon_guard::tests -- --test-threads=1",
+    "env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::placeholder_sweeper::abandon_guard::tests -- --skip _pg --skip pg_ --skip postgres --test-threads=1",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib placeholder_live_events -- --skip _pg --skip pg_ --skip postgres",
     "env -u AGENTDESK_ROOT_DIR cargo test --lib single_message_panel::tests -- --skip _pg --skip pg_ --skip postgres",
     "cargo test --lib services::discord::outbound::serenity_reference::tests::lifecycle_notice_nonce_is_stable_and_semantic_event_scoped -- --exact",
@@ -306,16 +306,8 @@ def replace_last(source: str, old: str, new: str) -> str:
 
 
 def comment_out_in_filter(workflow: str, block: str, selector: str) -> str:
-    """Comment one pattern out of ONE named filter block.
-
-    A whole-file `replace_last` used to land on `cross_os_rust` only because it
-    was the last block naming these paths. #5997 added a second paths-filter
-    step, inside `relay-authority-contract` and further down the file, that
-    repeats some of them, so an unscoped edit silently mutates that block
-    instead and leaves the block under test intact. The search therefore stops
-    at the next block header: a selector this block does not list has to raise
-    rather than be commented out of a later one, where `assertNotIn` on THIS
-    block's survivors would then pass having proved nothing.
+    """Restrict edits to the named filter so repeated selectors in other jobs
+    cannot make a missing-path regression test pass without changing its input.
     """
     head, separator, rest = workflow.partition(f"            {block}:\n")
     if not separator:
@@ -583,48 +575,55 @@ class FastCheckCiWiringTests(unittest.TestCase):
 
     def test_pr_cross_os_lane_allows_only_targeted_writer_runtime(self) -> None:
         workflow = PR_WORKFLOW.read_text(encoding="utf-8")
-        job = job_block(workflow, "check_fast_cross_os")
-        parsed = yaml.safe_load(job_block(workflow, "check_fast_cross_os"))[
-            "check_fast_cross_os"
-        ]
-        steps = parsed["steps"]
+        jobs = yaml.safe_load(workflow)["jobs"]
+        check, targets = jobs["check_fast_cross_os"], jobs["check_fast_cross_os_targets"]
         python_step_name = (
             "Provision Python 3.11 (tomllib owner for "
             "check_test_target_integrity, a2a-C PR-1)"
         )
-        python_steps = [
-            (i, step)
-            for i, step in enumerate(steps)
-            if step.get("name") == python_step_name
-        ]
-        self.assertEqual(len(python_steps), 1)
-        python_index, python_step = python_steps[0]
-        rust = next(
-            i
-            for i, step in enumerate(steps)
-            if step.get("name") == "Install Rust toolchain"
+        self.assertEqual(check["name"], "Fast check + non-PG tests (${{ matrix.os }})")
+        self.assertEqual(targets["name"], "Windows exact targets (${{ matrix.os }})")
+        for key in ("needs", "if", "runs-on", "env", "strategy"):
+            self.assertEqual(targets[key], check[key], key)
+        self.assertEqual(check["strategy"], {"fail-fast": False, "matrix": {"os": ["windows-latest"]}})
+        self.assertEqual(
+            check["if"],
+            "needs.changes.outputs.rust_compile == 'true' && needs.changes.outputs.cross_os_rust == 'true'",
         )
-        cargo_check = next(i for i, step in enumerate(steps) if step.get("name") == "cargo check")
-        writer = next(i for i, step in enumerate(steps) if step.get("name") == "Writer namespace exact Windows targets")
-
-        self.assertIn("name: Fast check + non-PG tests (${{ matrix.os }})", job)
-        self.assertIn("os: [windows-latest]", job)
-        self.assertIn("- name: cargo check", job)
-        self.assertEqual(parsed["strategy"]["matrix"]["os"], ["windows-latest"])
+        # Both runners share the setup prefix that ends at the dependency cache.
+        setup = [step.get("name", step.get("uses")) for step in check["steps"]]
+        setup = setup[: setup.index("Cache Cargo dependencies") + 1]
+        self.assertEqual(check["steps"][: len(setup)], targets["steps"][: len(setup)])
+        self.assertLess(setup.index(python_step_name), setup.index("Install Rust toolchain"))
+        python_step = check["steps"][setup.index(python_step_name)]
         self.assertEqual(python_step["uses"], "actions/setup-python@v5")
         self.assertEqual(python_step["with"]["python-version"], "3.11")
-        self.assertLess(python_index, rust)
-        self.assertLess(cargo_check, writer)
-        self.assertEqual(steps[writer]["if"], "runner.os == 'Windows'")
-        self.assertEqual(steps[writer]["timeout-minutes"], 30)
-        self.assertEqual(steps[writer]["shell"], "bash")
-        self.assertEqual(steps[writer]["run"], "./scripts/ci/run-writer-namespace-windows-targets.sh")
-        self.assertEqual(job.count("run-writer-namespace-windows-targets.sh"), 1)
-        self.assertIn("needs.changes.outputs.rust_compile == 'true' && needs.changes.outputs.cross_os_rust == 'true'", job)
-        self.assertIn("FILTER_OUTPUT: ${{ needs.changes.outputs.cross_os_rust }}", job_block(workflow, "check_fast_cross_os_required_context"))
-        self.assertNotIn("cargo test", job)
-        self.assertNotRegex(job, r"(?m)^\s*cargo test\b")
-        self.assertNotIn("- name: cargo test", job)
+
+        # The two runners together execute exactly the pre-split command set.
+        runs = [
+            (job_id, step["run"])
+            for job_id in ("check_fast_cross_os", "check_fast_cross_os_targets")
+            for step in jobs[job_id]["steps"][len(setup) :]
+            if step.get("name") != "sccache stats"
+        ]
+        self.assertEqual(
+            runs,
+            [
+                ("check_fast_cross_os", "cargo check --workspace --all-targets"),
+                ("check_fast_cross_os_targets", "./scripts/ci/run-writer-namespace-windows-targets.sh"),
+            ],
+        )
+        writer = targets["steps"][len(setup)]
+        self.assertEqual(writer["name"], "Writer namespace exact Windows targets")
+        self.assertEqual(writer["if"], "runner.os == 'Windows'")
+        self.assertEqual(writer["timeout-minutes"], 30)
+        self.assertEqual(writer["shell"], "bash")
+        for job_id in ("check_fast_cross_os", "check_fast_cross_os_targets"):
+            # A job-level continue-on-error reports failure to the mirror as success.
+            self.assertNotIn("continue-on-error", jobs[job_id])
+            job = job_block(workflow, job_id)
+            self.assertNotRegex(job, r"(?m)^\s*cargo test\b")
+            self.assertNotIn("- name: cargo test", job)
         filters = paths_filter_definitions(workflow)
         proof_paths = (
             "scripts/ci/run-writer-namespace-windows-targets.sh",
@@ -634,7 +633,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
             for proof_path in proof_paths:
                 self.assertEqual(filters[selector].count(proof_path), 1)
         self.assertEqual(filters["cross_os_rust"].count("src/services/writer_protocol/**"), 1)
-        self.assertNotIn(proof_paths[1], job)
+        self.assertNotIn(proof_paths[1], job_block(workflow, "check_fast_cross_os_targets"))
         for proof_path in proof_paths:
             filter_line = f"              - '{proof_path}'"
             mutations = (
@@ -742,22 +741,29 @@ class FastCheckCiWiringTests(unittest.TestCase):
             "needs.changes.outputs.cross_os_rust == 'true'",
         )
         self.assertEqual(cross_os["strategy"]["matrix"]["os"], ["windows-latest"])
-        self.assertEqual(mirror["needs"], ["changes", "check_fast_cross_os"])
+        self.assertEqual(
+            mirror["needs"],
+            ["changes", "check_fast_cross_os", "check_fast_cross_os_targets"],
+        )
         self.assertEqual(mirror["if"], "always()")
-        mirror_step = next(
+        mirror_steps = [
             step
             for step in mirror["steps"]
             if step.get("run") == "./scripts/required-check-mirror.sh"
-        )
+        ]
         self.assertEqual(
-            mirror_step["env"],
-            {
-                "CHANGED_PATHS_RESULT": "${{ needs.changes.result }}",
-                "FILTER_NAME": "cross_os_rust",
-                "FILTER_OUTPUT": "${{ needs.changes.outputs.cross_os_rust }}",
-                "UPSTREAM_JOB_NAME": "check_fast_cross_os",
-                "UPSTREAM_RESULT": "${{ needs.check_fast_cross_os.result }}",
-            },
+            [step["env"] for step in mirror_steps],
+            [
+                {
+                    "BASH_ENV": "/dev/null",
+                    "CHANGED_PATHS_RESULT": "${{ needs.changes.result }}",
+                    "FILTER_NAME": "cross_os_rust",
+                    "FILTER_OUTPUT": "${{ needs.changes.outputs.cross_os_rust }}",
+                    "UPSTREAM_JOB_NAME": runner,
+                    "UPSTREAM_RESULT": "${{ needs.%s.result }}" % runner,
+                }
+                for runner in ("check_fast_cross_os", "check_fast_cross_os_targets")
+            ],
         )
 
     def test_provider_and_session_host_trees_select_native_windows_lane(self) -> None:
@@ -808,8 +814,49 @@ class FastCheckCiWiringTests(unittest.TestCase):
             EXPECTED_TEST_NON_PG_COMMANDS,
         )
 
-        main_job = job_block(MAIN_WORKFLOW.read_text(encoding="utf-8"), "full_non_pg")
-        self.assertIn("- name: just check\n        run: just check", main_job)
+        # Main runs the PR library sweep step verbatim, so both adjudicate the
+        # same manifest-derived selection; fmt/clippy/policy JS move to `lint`.
+        main_jobs = yaml.safe_load(MAIN_WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        pr_jobs = yaml.safe_load(PR_WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        sweep_step = "Library sweep (selection-set gated)"
+
+        def named(job: dict, name: str) -> list[dict]:
+            return [step for step in job["steps"] if step.get("name") == name]
+
+        self.assertEqual(
+            named(main_jobs["full_non_pg"], sweep_step),
+            named(pr_jobs["library_sweep"], sweep_step),
+        )
+        self.assertEqual(len(named(main_jobs["full_non_pg"], sweep_step)), 1)
+        # Every non-`--lib` line of `test-non-pg` still runs on main: the sweep
+        # covers the lib, so `--all-targets` lines run on the non-lib targets
+        # under the canonical non-PG filter that ci-main must source.
+        recipe = just_recipe_commands(justfile, "test-non-pg")
+        non_lib = [
+            command.replace(" --all-targets", " --bins --test '*'").replace(
+                "-- --skip _pg --skip pg_ --skip postgres",
+                '-- "${NON_PG_SKIP_ARGS[@]}"',
+            )
+            for command in recipe
+            if "cargo test --lib " not in command
+        ]
+        self.assertIn("cargo test --doc ClaudeBinary", non_lib)
+        self.assertEqual(
+            [
+                line.strip()
+                for step in main_jobs["lint"]["steps"]
+                for line in str(step.get("run", "")).splitlines()
+                if line.strip()
+            ],
+            [
+                "npm run test:policies",
+                "just fmt-check",
+                "just lint",
+                "source scripts/ci/non-pg-test-filter.sh",
+                *non_lib,
+                "sccache --show-stats || true",
+            ],
+        )
 
         nightly = NIGHTLY_WORKFLOW.read_text(encoding="utf-8")
         for job_name in ("full_macos", "full_windows"):
@@ -835,36 +882,32 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertIn("run: cargo test --test e2e -- --test-threads=1", postgres)
 
     def test_relay_authority_contract_job_uses_pinned_recipe(self) -> None:
-        job = job_block(
-            PR_WORKFLOW.read_text(encoding="utf-8"), "relay-authority-contract"
+        workflow = PR_WORKFLOW.read_text(encoding="utf-8")
+        jobs = yaml.safe_load(workflow)["jobs"]
+        job = job_block(workflow, "relay_authority_targets")
+        setup = []
+        for job_id, cap in (("relay_authority_targets", 30), ("relay_authority_mutations", 45)):
+            runner = jobs[job_id]
+            self.assertNotIn("if", runner)
+            self.assertNotIn("needs", runner)
+            self.assertEqual(runner["runs-on"], "ubuntu-latest")
+            self.assertEqual(runner["timeout-minutes"], cap)
+            self.assertEqual(runner["env"]["CARGO_PROFILE_DEV_DEBUG"], "0")
+            self.assertEqual(runner["env"]["CARGO_PROFILE_TEST_DEBUG"], "0")
+            setup.append([step for step in runner["steps"] if "uses" in step and step.get("id") != "mutation_paths"])
+        # The mutation job alone keeps HEAD^1 for its wiring digest; the rest of setup is shared.
+        self.assertEqual(setup[1][0], {"uses": "actions/checkout@v4", "with": {"fetch-depth": 2}})
+        setup[1][0] = {"uses": "actions/checkout@v4"}
+        self.assertEqual(
+            setup[0],
+            [{key: value for key, value in step.items() if key != "if"} for step in setup[1]],
         )
-        self.assertRegex(
-            job,
-            r"(?m)^  relay-authority-contract:\n"
-            r"    name: relay-authority-contract\n"
-            r"    runs-on: ubuntu-latest\n"
-            r"    timeout-minutes: 50\n"
-            r"    env:\n"
-            r'      CARGO_PROFILE_DEV_DEBUG: "0"\n'
-            r'      CARGO_PROFILE_TEST_DEBUG: "0"\n'
-            r"    steps:\n"
-            r"      - uses: actions/checkout@v4\n\n"
-            # #5997: the mutation-surface filter sits between checkout and the
-            # toolchain so the gated step below can read its output.
-            r"(?:      #[^\n]*\n)+"
-            r"      - name: Detect relay-authority mutation sources\n"
-            r"        id: mutation_paths\n"
-            r"        uses: dorny/paths-filter@v3\n"
-            r"        with:\n"
-            r"          filters: \|\n"
-            r"            mutation_sources:\n"
-            r"(?:              - '[^']+'\n)+"
-            r"\n"
-            r"      - name: Install Rust toolchain\n"
-            r"        uses: dtolnay/rust-toolchain@master\n"
-            r"        with:\n"
-            r'          toolchain: "1\.94\.1"$',
-        )
+        self.assertEqual(setup[0][0], {"uses": "actions/checkout@v4"})
+        self.assertEqual(setup[0][1]["with"]["toolchain"], "1.94.1")
+        mutation = jobs["relay_authority_mutations"]
+        self.assertEqual(mutation["strategy"], {"fail-fast": False, "matrix": {"shard": [0, 1, 2]}})
+        self.assertEqual(mutation["env"]["RELAY_AUTHORITY_MUTATION_SHARD_INDEX"], "${{ matrix.shard }}")
+        self.assertEqual(mutation["env"]["RELAY_AUTHORITY_MUTATION_SHARD_TOTAL"], "3")
         self.assertRegex(
             job,
             r"(?m)^      - name: Run named relay-authority contract targets\n"
@@ -887,11 +930,10 @@ class FastCheckCiWiringTests(unittest.TestCase):
             r"          env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::tui_prompt_relay::local_model_queue_wake_e2e -- --test-threads=1$",
         )
         self.assertRegex(
-            job,
+            job_block(workflow, "relay_authority_mutations"),
             r"(?m)^      - name: Require relay-authority mutations to be killed\n"
-            # #5997: the negative form is load-bearing -- a missing or empty
-            # filter output has to run the gate rather than skip it.
-            r"        if: steps\.mutation_paths\.outputs\.mutation_sources != 'false'\n"
+            r"        if: steps\.mutation_paths\.outputs\.mutation_sources != 'false'"
+            r" \|\| steps\.mutation_wiring\.outputs\.wiring_changed != 'false'\n"
             r"        env:\n"
             r"          BASH_ENV: /dev/null\n"
             r'          CARGO_PROFILE_DEV_DEBUG: "0"\n'
@@ -900,6 +942,48 @@ class FastCheckCiWiringTests(unittest.TestCase):
             r"        timeout-minutes: 45\n"
             r"        run: bash scripts/run_relay_authority_mutations\.sh$",
         )
+
+    def assert_mutation_dependency_preparation(self, job: dict) -> None:
+        condition = (
+            "steps.mutation_paths.outputs.mutation_sources != 'false'"
+            " || steps.mutation_wiring.outputs.wiring_changed != 'false'"
+        )
+        self.assertNotIn("if", job)
+        self.assertNotIn("continue-on-error", job)
+        steps = job["steps"]
+        self.assertEqual(steps[0], {"uses": "actions/checkout@v4", "with": {"fetch-depth": 2}})
+        path_filter = steps[1]
+        self.assertEqual(path_filter.get("id"), "mutation_paths")
+        self.assertEqual(path_filter.get("uses"), "dorny/paths-filter@v3")
+        self.assertNotIn("if", path_filter)
+        self.assertNotIn("continue-on-error", path_filter)
+        names = [step.get("name") for step in steps]
+        mutation_index = names.index("Require relay-authority mutations to be killed")
+        self.assertEqual(steps[mutation_index].get("if"), condition)
+        preparation = (
+            "Install Rust toolchain",
+            "Setup sccache",
+            "Cache Cargo dependencies",
+            "Fetch Cargo dependencies",
+        )
+        for name in preparation:
+            self.assertIn(name, names, f"missing mutation preparation step: {name}")
+            index = names.index(name)
+            self.assertGreater(index, 1, f"{name} must follow the path filter")
+            self.assertLess(index, mutation_index, f"{name} must precede mutations")
+            self.assertEqual(steps[index].get("if"), condition, name)
+            self.assertNotIn("continue-on-error", steps[index], name)
+        fetch = steps[names.index("Fetch Cargo dependencies")]
+        self.assertEqual(fetch.get("run", "").strip(), "cargo fetch --locked")
+        self.assertEqual(fetch.get("shell"), "bash")
+        self.assertEqual(fetch.get("env", {}).get("BASH_ENV"), "/dev/null")
+        self.assertEqual(fetch.get("timeout-minutes"), 10)
+
+    def test_mutation_job_prepares_online_dependencies_before_offline_mutations(self) -> None:
+        job = yaml.safe_load(PR_WORKFLOW.read_text(encoding="utf-8"))["jobs"][
+            "relay_authority_mutations"
+        ]
+        self.assert_mutation_dependency_preparation(job)
 
     def test_required_relay_job_backstops_mirror_content_hash(self) -> None:
         workflow = PR_WORKFLOW.read_text(encoding="utf-8")
@@ -910,7 +994,8 @@ class FastCheckCiWiringTests(unittest.TestCase):
             CI_RUNNER_HARDENING_SHA256,
         )
         relay_job = yaml.safe_load(workflow)["jobs"]["relay-authority-contract"]
-        self.assertNotIn("if", relay_job)
+        self.assertEqual(relay_job["if"], "always()")
+        self.assertEqual(relay_job["needs"], ["relay_authority_targets", "relay_authority_mutations"])
         pin_steps = {
             step["name"]: step
             for step in relay_job["steps"]
@@ -1307,23 +1392,98 @@ class FastCheckCiWiringTests(unittest.TestCase):
                     result.stderr,
                 )
 
-    def test_relay_authority_publisher_rejects_job_condition(self) -> None:
+    def test_relay_authority_graph_rejects_fail_open_mutations(self) -> None:
         workflow = PR_WORKFLOW.read_text(encoding="utf-8")
-        relay = job_block(workflow, "relay-authority-contract")
-        mutated_relay = relay.replace(
-            "    name: relay-authority-contract\n",
-            "    name: relay-authority-contract\n    if: always()\n",
-            1,
+        publisher = job_block(workflow, "relay-authority-contract")
+        mutations = [
+            (publisher, publisher.replace("    if: always()\n", "", 1), "publisher must carry `if: always()`"),
+            (publisher, publisher.replace("    if: always()\n", "    if: success()\n", 1), "publisher must carry `if: always()`"),
+            (publisher, publisher.replace("      - relay_authority_mutations\n", "", 1), "required unconditional needs closure changed"),
+        ]
+        for job_id in ("relay_authority_targets", "relay_authority_mutations"):
+            runner = job_block(workflow, job_id)
+            mutations.append((runner, runner.replace("    runs-on:", "    needs: changes\n    runs-on:", 1), "needs closure must not include changes"))
+            mutations.append((runner, runner.replace("    runs-on:", "    if: always()\n    runs-on:", 1), "must not define an if key"))
+        for original, changed, diagnostic in mutations:
+            with self.subTest(mutation=changed.splitlines()[:6]):
+                self.assertNotEqual(original, changed)
+                result = self.run_hardening_fixture(workflow.replace(original, changed, 1))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(diagnostic, result.stderr)
+
+    def test_relay_authority_mirror_rejects_unsuccessful_runner_results(self) -> None:
+        jobs = yaml.safe_load(PR_WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+        mirrors = jobs["relay-authority-contract"]["steps"][2:]
+        self.assertEqual(len(mirrors), 2)
+        for step in mirrors:
+            for result in ("success", "failure", "cancelled", "skipped", ""):
+                with self.subTest(step=step["name"], result=result):
+                    env = {**os.environ, **step["env"], "UPSTREAM_RESULT": result}
+                    process = subprocess.run(["bash", "scripts/required-check-mirror.sh"], cwd=REPO_ROOT, env=env, text=True, capture_output=True, check=False)
+                    self.assertEqual(process.returncode == 0, result == "success", process.stderr)
+
+    def run_cross_os_mirror(self, mirror: dict, cross_os_rust: str, results: dict[str, str]) -> bool:
+        """Evaluate the mirror steps as Actions would; unlisted needs read as ''."""
+        context = {"changes": "success", **results}
+
+        def expand(value: str) -> str:
+            def lookup(match: re.Match[str]) -> str:
+                job, field = match.groups()
+                if job not in mirror["needs"]:
+                    return ""
+                return cross_os_rust if field == "outputs.cross_os_rust" else context[job]
+
+            return re.sub(r"\$\{\{ needs\.([\w-]+)\.(result|outputs\.\w+) \}\}", lookup, value)
+
+        for step in mirror["steps"]:
+            if "run" not in step:
+                continue
+            env = {**os.environ, **{key: expand(value) for key, value in step["env"].items()}}
+            process = subprocess.run(["bash", "-c", step["run"]], cwd=REPO_ROOT, env=env, text=True, capture_output=True, check=False)
+            if process.returncode != 0:
+                return False
+        return True
+
+    def test_cross_os_required_context_fails_closed_on_either_runner(self) -> None:
+        mirror = yaml.safe_load(PR_WORKFLOW.read_text(encoding="utf-8"))["jobs"][
+            "check_fast_cross_os_required_context"
+        ]
+        outcomes = ("success", "failure", "cancelled", "skipped")
+        for cross_os_rust in ("true", "false"):
+            for check in outcomes:
+                for targets in outcomes:
+                    with self.subTest(cross_os_rust=cross_os_rust, check=check, targets=targets):
+                        allowed = {"success"} if cross_os_rust == "true" else {"success", "skipped"}
+                        self.assertEqual(
+                            self.run_cross_os_mirror(
+                                mirror,
+                                cross_os_rust,
+                                {"check_fast_cross_os": check, "check_fast_cross_os_targets": targets},
+                            ),
+                            check in allowed and targets in allowed,
+                        )
+
+    def test_cross_os_split_rejects_fail_open_mutations(self) -> None:
+        workflow = PR_WORKFLOW.read_text(encoding="utf-8")
+        mirror = job_block(workflow, "check_fast_cross_os_required_context")
+        targets = job_block(workflow, "check_fast_cross_os_targets")
+        targets_mirror = step_block(mirror, "Mirror check_fast_cross_os_targets result for branch protection")
+        writer = step_block(targets, "Writer namespace exact Windows targets")
+        mutations = (
+            (mirror, mirror.replace("      - check_fast_cross_os_targets\n", "", 1), "cross-OS required-context mirror must retain exact needs"),
+            (mirror, mirror.replace("    if: always()\n", "", 1), "cross-OS required-context mirror must retain exact if"),
+            (mirror, mirror.replace(targets_mirror, "", 1), 'must retain exactly one "Mirror check_fast_cross_os_targets result for branch protection" step'),
+            (mirror, mirror.replace(targets_mirror, targets_mirror.replace("${{ needs.changes.outputs.cross_os_rust }}", "'false'"), 1), "must pin exact step env"),
+            (targets, targets.replace("    runs-on:", "    continue-on-error: true\n    runs-on:", 1), "cross-OS exact targets job must not be allowed to continue on error"),
+            (targets, targets.replace("    if: needs.changes.outputs.rust_compile == 'true' && ", "    if: ", 1), "cross-OS exact targets job must retain exact if"),
+            (targets, targets.replace(writer, "", 1), 'must retain exactly one "Writer namespace exact Windows targets" step'),
         )
-        self.assertNotEqual(mutated_relay, relay)
-        mutated = workflow.replace(relay, mutated_relay, 1)
-        result = self.run_hardening_fixture(mutated)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn(
-            "relay-authority-contract must not define an if key so the "
-            "independent publisher always runs",
-            result.stderr,
-        )
+        for original, changed, diagnostic in mutations:
+            with self.subTest(diagnostic=diagnostic):
+                self.assertNotEqual(original, changed)
+                result = self.run_hardening_fixture(workflow.replace(original, changed, 1))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(diagnostic, result.stderr)
 
     def test_required_job_needs_closure_has_role_specific_scheduling_policy(self) -> None:
         workflow = PR_WORKFLOW.read_text(encoding="utf-8")
@@ -1335,6 +1495,8 @@ class FastCheckCiWiringTests(unittest.TestCase):
             "scripts_contracts",
             "scripts_required_context",
             "relay-authority-contract",
+            "relay_authority_targets",
+            "relay_authority_mutations",
         }
         closure: set[str] = set()
         frontier = ["scripts_required_context", "relay-authority-contract"]
@@ -1348,8 +1510,10 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertEqual(closure, expected_closure)
 
         self.assertEqual(jobs["scripts_required_context"]["if"], "always()")
+        self.assertEqual(jobs["relay-authority-contract"]["if"], "always()")
         for job_id in (
-            "relay-authority-contract",
+            "relay_authority_targets",
+            "relay_authority_mutations",
             "changes",
             "scripts",
             "scripts_guards",
@@ -1372,7 +1536,8 @@ class FastCheckCiWiringTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stderr)
 
         for job_id in (
-            "relay-authority-contract",
+            "relay_authority_targets",
+            "relay_authority_mutations",
             "changes",
             "scripts",
             "scripts_guards",
@@ -1904,7 +2069,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
 
     def test_unregistered_target_step_forbidden_runtime_env_is_rejected(self) -> None:
         workflow = PR_WORKFLOW.read_text(encoding="utf-8")
-        relay_job = job_block(workflow, "relay-authority-contract")
+        relay_job = job_block(workflow, "relay_authority_targets")
         mutated_relay_job = relay_job.replace(
             "      - uses: actions/checkout@v4\n\n",
             "      - uses: actions/checkout@v4\n\n"
@@ -1921,7 +2086,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
             REPO_ROOT / "scripts/check-ci-runner-hardening.sh"
         ).read_text(encoding="utf-8")
         repinned_hardening = self._repin_job_hash(
-            hardening, mutated_workflow, "relay-authority-contract"
+            hardening, mutated_workflow, "relay_authority_targets"
         )
         repinned_gate_sha256 = hashlib.sha256(repinned_hardening.encode()).hexdigest()
         mutated_workflow = mutated_workflow.replace(
@@ -1945,7 +2110,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
                 ),
                 ("Run script checks", "must not continue on error"),
             ),
-            "relay-authority-contract": (
+            "relay_authority_targets": (
                 (
                     "Verify named relay-authority targets and selection floors",
                     "must retain exact continue-on-error policy",
@@ -1954,6 +2119,8 @@ class FastCheckCiWiringTests(unittest.TestCase):
                     "Run named relay-authority contract targets",
                     "must retain exact continue-on-error policy",
                 ),
+            ),
+            "relay_authority_mutations": (
                 (
                     "Require relay-authority mutations to be killed",
                     "must retain exact continue-on-error policy",
@@ -2574,6 +2741,38 @@ puts Digest::SHA256.hexdigest(JSON.generate(canonical))
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_hardening_rejects_main_windows_warm_that_misses_pr_cache_key(self) -> None:
+        source = MAIN_WORKFLOW.read_text(encoding="utf-8")
+        warm = source.index("\n  # Warms the shared cargo registry cache")
+        variants = {
+            "missing": (source[:warm] + "\n", "windows_cache_warm is missing"),
+            "save-if": (
+                source[:warm] + source[warm:].replace(
+                    "${{ github.ref == 'refs/heads/main' }}",
+                    "${{ github.event_name == 'pull_request' }}",
+                ),
+                "rust-cache must save the shared key from main only",
+            ),
+            "env drift": (
+                source[:warm] + source[warm:].replace(
+                    '      CARGO_PROFILE_TEST_DEBUG: "0"\n    steps:', "    steps:", 1
+                ),
+                "env must equal check_fast_cross_os",
+            ),
+            "runs tests": (
+                source.replace("cargo test --lib --no-run", "cargo test --lib"),
+                "without running tests",
+            ),
+        }
+        for name, (mutated, reason) in variants.items():
+            with self.subTest(name):
+                self.assertNotEqual(mutated, source)
+                result = self.run_hardening_fixture(
+                    PR_WORKFLOW.read_text(encoding="utf-8"), {"ci-main.yml": mutated}
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+
     def test_hardening_rejects_flow_sequence_manual_trigger(self) -> None:
         source = PR_WORKFLOW.read_text(encoding="utf-8")
         mutated = re.sub(
@@ -2811,6 +3010,7 @@ jobs:
         workflow = PR_WORKFLOW.read_text(encoding="utf-8")
         mirror = job_block(workflow, "scripts_required_context")
         relay = job_block(workflow, "relay-authority-contract")
+        targets = job_block(workflow, "relay_authority_targets")
         relay_pin = step_block(relay, "Pin required-check mirror content (#5321)")
         cases = (
             (
@@ -2875,9 +3075,9 @@ jobs:
             (
                 "job timeout leading zero is not decimal 30",
                 workflow.replace(
-                    relay,
-                    relay.replace(
-                        "    timeout-minutes: 30", "    timeout-minutes: 036", 1
+                    targets,
+                    targets.replace(
+                        "    timeout-minutes: 30\n", "    timeout-minutes: 036\n", 1
                     ),
                     1,
                 ),
@@ -2886,6 +3086,7 @@ jobs:
         )
         for label, mutated, expected_rc in cases:
             with self.subTest(case=label):
+                self.assertNotEqual(mutated, workflow)
                 result = self.run_hardening_fixture(mutated)
                 self.assertEqual(result.returncode, expected_rc, result.stderr)
 

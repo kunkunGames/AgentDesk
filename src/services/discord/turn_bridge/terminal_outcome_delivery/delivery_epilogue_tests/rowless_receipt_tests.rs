@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod o_after_done_chain_tests;
 #[cfg(test)]
 mod pg_tests;
 mod preloop_cleanup_tests;
@@ -210,6 +211,7 @@ async fn exact_receipt_rowless_terminal_preserves_foreign_anchor_and_successor_5
 
 #[tokio::test]
 async fn exact_receipt_rowless_terminal_foreign_anchor_fallback_and_dual_failure_5521() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     for post_fails in [false, true] {
         let driver = TerminalDeliveryDriver::new(
             if post_fails {
@@ -301,6 +303,7 @@ async fn drain_custody(driver: &TerminalDeliveryDriver) -> Result<usize, String>
 
 #[tokio::test]
 async fn exact_receipt_rowless_terminal_uncovered_or_stale_still_publishes_5521() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     for case in [
         "uncovered",
         "stale",
@@ -423,55 +426,115 @@ async fn exact_receipt_rowless_terminal_survives_newer_frontier_at_another_ancho
 // settlement run through the production caller.
 #[rustfmt::skip]
 async fn run_postlude(driver: &TerminalDeliveryDriver, output: TerminalOutcomeDeliveryOutput, footer: bool, cancelled: bool) {
+    run_postlude_for_owner(driver, output, footer, cancelled, None).await;
+}
+
+async fn run_postlude_for_owner(
+    driver: &TerminalDeliveryDriver,
+    output: TerminalOutcomeDeliveryOutput,
+    footer: bool,
+    cancelled: bool,
+    owner: Option<super::super::super::BridgeOutputOwner>,
+) {
     use super::super::super::{completion_postlude as postlude, guards};
     let channel_id = ChannelId::new(DRIVER_CHANNEL_ID);
     let (_, rx) = std::sync::mpsc::channel();
     let fence = tokio::sync::OnceCell::new();
-    let _ = super::super::super::capture_bridge_clear_fence(&driver.shared, channel_id, rx, &fence).await;
+    let _ = super::super::super::capture_bridge_clear_fence(&driver.shared, channel_id, rx, &fence)
+        .await;
     let user_id = output.inflight_state.user_msg_id;
-    let is_external_input_tui_direct = output.inflight_state.turn_source == inflight::TurnSource::ExternalInput;
-    let mut completion_guard = guards::CompletionGuard::for_completion_test(driver.shared.clone(), channel_id, user_id);
+    let is_external_input_tui_direct =
+        output.inflight_state.turn_source == inflight::TurnSource::ExternalInput;
+    let mut completion_guard =
+        guards::CompletionGuard::for_completion_test(driver.shared.clone(), channel_id, user_id);
     output.handoff_completion_authority(&mut completion_guard);
-    let inflight_guard = guards::InflightCleanupGuard::for_completion_test(&output.inflight_state, driver.shared.token_hash.clone());
+    let inflight_guard = guards::InflightCleanupGuard::for_completion_test(
+        &output.inflight_state,
+        driver.shared.token_hash.clone(),
+    );
     let ctx = postlude::CompletionPostludeContext {
-        shared_owned: output.shared_owned, gateway: output.gateway, channel_id,
-        provider: output.provider, cancel_token: output.cancel_token,
-        user_msg_id: (user_id != 0).then(|| MessageId::new(user_id)), turn_id: output.turn_id,
-        request_owner_name: String::new(), final_session_status: "idle", status_panel_started_at: 0,
-        has_queued_turns: false, defer_watcher_resume: true, can_chain_locally: true,
-        single_message_panel_footer_mode: footer, is_external_input_tui_direct,
-        context_window_tokens: 0, context_compact_percent: 0,
-        clear_fence: fence.into_inner().unwrap(), turn_start: output.turn_start,
+        shared_owned: output.shared_owned,
+        gateway: output.gateway,
+        channel_id,
+        provider: output.provider,
+        cancel_token: output.cancel_token,
+        user_msg_id: (user_id != 0).then(|| MessageId::new(user_id)),
+        turn_id: output.turn_id,
+        request_owner_name: String::new(),
+        final_session_status: "idle",
+        status_panel_started_at: 0,
+        has_queued_turns: false,
+        defer_watcher_resume: true,
+        can_chain_locally: true,
+        single_message_panel_footer_mode: footer,
+        is_external_input_tui_direct,
+        context_window_tokens: 0,
+        context_compact_percent: 0,
+        clear_fence: fence.into_inner().unwrap(),
+        turn_start: output.turn_start,
     };
     let state = postlude::CompletionPostludeState {
         watcher_delivery_pin: driver.parts().0.watcher_delivery_pin,
-        full_response: output.full_response, user_text_owned: output.user_text_owned,
-        role_binding: None, adk_session_key: None, adk_session_name: None, adk_session_info: None,
-        adk_cwd: None, dispatch_id: None, dispatch_kind: None, new_session_id: None,
+        full_response: output.full_response,
+        user_text_owned: output.user_text_owned,
+        role_binding: None,
+        adk_session_key: None,
+        adk_session_name: None,
+        adk_session_info: None,
+        adk_cwd: None,
+        dispatch_id: None,
+        dispatch_kind: None,
+        new_session_id: None,
         new_raw_provider_session_id: None,
         status_panel_terminal_committed: output.status_panel_terminal_committed,
         bridge_should_emit_completion: output.bridge_should_emit_completion,
         current_msg_id: MessageId::new(DRIVER_CURRENT_MSG_ID),
-        status_panel_msg_id: Some(MessageId::new(DRIVER_CURRENT_MSG_ID)),
+        status_panel_msg_id: Some(MessageId::new(
+            output
+                .inflight_state
+                .status_message_id
+                .unwrap_or(DRIVER_CURRENT_MSG_ID),
+        )),
         last_status_panel_text: "working".into(),
         completion_footer_terminal_text: output.completion_footer_terminal_text,
-        busy_requeue_outcome: output.busy_requeue_outcome, spin_idx: 0, status_panel_generation: 0,
+        busy_requeue_outcome: output.busy_requeue_outcome,
+        spin_idx: 0,
+        status_panel_generation: 0,
         preserve_inflight_for_cleanup_retry: output.preserve_inflight_for_cleanup_retry,
-        tmux_last_offset: Some(64), watcher_owner_channel_id: channel_id,
-        bridge_relay_delegated_to_watcher: false, is_prompt_too_long: false,
-        resume_failure_detected: false, recovery_retry: false, rx_disconnected: false,
-        tmux_handed_off: false, bridge_output_owner: None,
+        tmux_last_offset: Some(64),
+        watcher_owner_channel_id: channel_id,
+        bridge_relay_delegated_to_watcher: owner.is_some(),
+        is_prompt_too_long: false,
+        resume_failure_detected: false,
+        auto_retry: output.auto_retry,
+        recovery_retry: false,
+        rx_disconnected: false,
+        tmux_handed_off: false,
+        bridge_output_owner: owner,
         terminal_delivery_committed: output.terminal_delivery_committed,
-        terminal_session_reset_required: false, transcript_events: Vec::new(),
-        accumulated_input_tokens: 0, accumulated_cache_create_tokens: 0,
-        accumulated_cache_read_tokens: 0, accumulated_output_tokens: 0,
-        accumulated_memory_input_tokens: 0, accumulated_memory_output_tokens: 0,
-        transport_error: false, api_friction_reports: Vec::new(), cancelled,
+        terminal_session_reset_required: false,
+        transcript_events: Vec::new(),
+        accumulated_input_tokens: 0,
+        accumulated_cache_create_tokens: 0,
+        accumulated_cache_read_tokens: 0,
+        accumulated_output_tokens: 0,
+        accumulated_memory_input_tokens: 0,
+        accumulated_memory_output_tokens: 0,
+        transport_error: false,
+        api_friction_reports: Vec::new(),
+        cancelled,
         restart_followup_pending: None,
         bridge_skip_holder_owns_inflight: output.bridge_skip_holder_owns_inflight,
-        completion_guard, inflight_guard, inflight_state: output.inflight_state,
+        completion_guard,
+        inflight_guard,
+        inflight_state: output.inflight_state,
     };
-    tokio::time::timeout(DRIVER_TIMEOUT, postlude::run_completion_postlude(ctx, state)).await.unwrap();
+    tokio::time::timeout(
+        DRIVER_TIMEOUT,
+        postlude::run_completion_postlude(ctx, state),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -536,6 +599,7 @@ async fn exact_receipt_rowless_terminal_postlude_preserves_same_user_and_zero_id
 
 #[tokio::test]
 async fn exact_receipt_rowless_terminal_custody_respects_owner_and_live_lease_5521() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     for owner in [
         Some(BridgeOutputOwner::WatcherRelay),
         Some(BridgeOutputOwner::StandbyRelay),
@@ -588,6 +652,7 @@ async fn exact_receipt_rowless_terminal_custody_respects_owner_and_live_lease_55
 
 #[tokio::test]
 async fn exact_receipt_rowless_terminal_custody_long_partial_ack_survives_retry_5521() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     let driver = TerminalDeliveryDriver::new(ReplaceBehaviour::FailSecondPostOnce, 1)
         .with_body("long answer ".repeat(700));
     let (mut ctx, state, _) = receipt_parts(&driver, ProviderKind::Codex);
@@ -677,6 +742,7 @@ fn assert_no_completed_signal(
 
 #[tokio::test]
 async fn exact_receipt_rowless_terminal_custody_empty_cancel_and_ptl_match_normal_body_5521() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     for cancel in [true, false] {
         let mut normal_body = None;
         for foreign in [false, true] {
@@ -739,6 +805,7 @@ async fn exact_receipt_rowless_terminal_custody_empty_cancel_and_ptl_match_norma
 
 #[tokio::test]
 async fn exact_receipt_rowless_terminal_custody_empty_recovery_stays_inside_source_range_5521() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     for (provider, recovered, completed, native_claude) in [
         (ProviderKind::Claude, "", true, false),
         (ProviderKind::Claude, "A answer", true, false),
@@ -985,6 +1052,7 @@ async fn exact_receipt_rowless_terminal_consumes_captured_claude_source_without_
 
 #[tokio::test]
 async fn exact_receipt_short_fallback_settles_original_actor_and_preserves_successor_5521() {
+    let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     use crate::services::discord::turn_finalizer::{CompletionAdmissionPlan, TurnKey};
     for replace_actor in [false, true] {
         let driver = TerminalDeliveryDriver::new(ReplaceBehaviour::FallbackAfterEditFailure, 2);
@@ -1117,4 +1185,221 @@ async fn exact_receipt_short_fallback_settles_original_actor_and_preserves_succe
         }
         assert_eq!(driver.completed_publications(), 1);
     }
+}
+
+/// Custody parked before O owned the channel follows its real destination on resume: an
+/// O-owned destination settles without posting, and an unknown selected kind keeps the record.
+#[tokio::test]
+async fn o_delegated_foreign_custody_follows_destination_membership() {
+    use crate::services::agent_protocol::RuntimeHandoffKind::CodexTui;
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(CapturingWriter(buffer.clone()))
+        .finish();
+    crate::logging::test_capture::pin_callsite_interest();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let (a, b) = (DRIVER_CHANNEL_ID, DRIVER_CHANNEL_ID + 100);
+    // (case, parked owner, listed channel, recorded kind, Legacy posts, held)
+    let cases = [
+        ("listed_destination", a, Some(a), true, 0, false),
+        ("unlisted_destination", a, Some(b), true, 1, false),
+        ("empty_membership", a, None, true, 1, false),
+        ("destination_listed_owner_not", b, Some(a), true, 0, false),
+        ("owner_listed_destination_not", b, Some(b), true, 1, false),
+        ("listed_unknown_kind", a, Some(a), false, 0, true),
+    ];
+    for (name, owner, listed, kind_known, posts, held_identity) in cases {
+        buffer.lock().unwrap().clear();
+        let driver = TerminalDeliveryDriver::new(ReplaceBehaviour::Edited, 1);
+        let (mut ctx, state, _) = receipt_parts(&driver, ProviderKind::Codex);
+        let held = bridge_delivery_lease_for_inflight(
+            &driver.shared,
+            ctx.watcher_owner_channel_id,
+            driver.shared.restart.current_generation,
+            &state.inflight_state,
+            ctx.tmux_last_offset,
+        );
+        assert!(matches!(held, BridgeLeaseAcquire::Held(_)), "{name}");
+        let mut successor = state.inflight_state.clone();
+        successor.turn_nonce = Some("successor".into());
+        inflight::save_inflight_state(&successor).unwrap();
+        ctx.bridge_output_owner = None;
+        let output = run(ctx, state).await;
+        assert!(
+            matches!(
+                output.outcome,
+                TerminalOutcomeDeliveryOutcome::DeferredToCustody { .. }
+            ),
+            "{name}"
+        );
+        run_postlude(&driver, output, false, false).await;
+        drop(held);
+        let channels: Vec<_> = listed.map(|id| (id, CodexTui)).into_iter().collect();
+        let _o = crate::services::tui_o::cutover::test_override::force_channels(&channels);
+        let settled = crate::services::discord::terminal_delivery_custody::drain_for_test(
+            |mut payload, checkpoint| {
+                let (shared, gateway) = (driver.shared.clone(), driver.gateway.clone());
+                payload["watcher_owner_channel_id"] = owner.into();
+                if !kind_known {
+                    payload["local"]["runtime_kind"] = serde_json::Value::Null;
+                }
+                async move {
+                    let outcome =
+                        super::super::foreign_terminal_handoff::resume_payload_with_gateway(
+                            &shared,
+                            gateway.as_ref(),
+                            &mut payload,
+                            &checkpoint,
+                        )
+                        .await;
+                    (payload, outcome)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logs.contains("tui_o output identity held"),
+            held_identity,
+            "{name}: {logs}"
+        );
+        assert_eq!(settled, usize::from(!held_identity), "{name}");
+        assert_eq!(
+            custody_records(&driver).len(),
+            usize::from(held_identity),
+            "{name}: a held identity keeps the custody for retry"
+        );
+        assert_eq!(driver.completed_publications(), posts, "{name}");
+        if posts == 0 {
+            assert!(driver.observations().is_empty(), "{name}: no Discord write");
+        }
+    }
+}
+
+/// Custody whose chunk was acknowledged before the resume settles without posting and leaves a
+/// pending adoption; custody that still posts its body ends the adoption first and posts once.
+#[tokio::test]
+async fn only_a_foreign_custody_that_posts_ends_a_pending_adoption() {
+    use crate::services::agent_protocol::RuntimeHandoffKind::CodexTui;
+    use crate::services::tui_o::channel_policy::{Adoption, BodyCheck};
+    for acknowledged in [true, false] {
+        let driver = TerminalDeliveryDriver::new(ReplaceBehaviour::Edited, 1);
+        let (mut ctx, state, _) = receipt_parts(&driver, ProviderKind::Codex);
+        let held = bridge_delivery_lease_for_inflight(
+            &driver.shared,
+            ctx.watcher_owner_channel_id,
+            driver.shared.restart.current_generation,
+            &state.inflight_state,
+            ctx.tmux_last_offset,
+        );
+        let mut successor = state.inflight_state.clone();
+        successor.turn_nonce = Some("successor".into());
+        inflight::save_inflight_state(&successor).unwrap();
+        ctx.bridge_output_owner = None;
+        let output = run(ctx, state).await;
+        run_postlude(&driver, output, false, false).await;
+        drop(held);
+        let _pending = crate::services::tui_o::cutover::test_override::force_candidates(&[(
+            DRIVER_CHANNEL_ID,
+            CodexTui,
+        )]);
+        let check = BodyCheck::watch(DRIVER_CHANNEL_ID, DRIVER_BODY);
+        driver.body_check.set(check.clone()).unwrap();
+        let settled = crate::services::discord::terminal_delivery_custody::drain_for_test(
+            |mut payload, checkpoint| {
+                let (shared, gateway) = (driver.shared.clone(), driver.gateway.clone());
+                payload["watcher_owner_channel_id"] = DRIVER_CHANNEL_ID.into();
+                if acknowledged {
+                    payload["delivery_receipts"] = serde_json::json!([DRIVER_CURRENT_MSG_ID]);
+                }
+                async move {
+                    let outcome =
+                        super::super::foreign_terminal_handoff::resume_payload_with_gateway(
+                            &shared,
+                            gateway.as_ref(),
+                            &mut payload,
+                            &checkpoint,
+                        )
+                        .await;
+                    (payload, outcome)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(settled, 1, "acknowledged={acknowledged}");
+        check.assert_settled();
+        let expected = if acknowledged {
+            (0, Adoption::Pending)
+        } else {
+            (1, Adoption::Released)
+        };
+        let seen = (driver.completed_publications(), check.adoption());
+        assert_eq!(seen, expected, "acknowledged={acknowledged}");
+    }
+}
+
+/// The real postlude, after its two-message completion edit on O's channel, moves the completed
+/// panel below a body O posts once the turn has closed.
+#[tokio::test]
+async fn the_postlude_moves_a_completed_o_panel_below_a_later_o_post() {
+    use crate::services::discord::status_panel_singleton_store as singleton;
+    use crate::services::tui_o::{cutover::test_override, writer::deliver};
+    use RuntimeHandoffKind::ClaudeTui;
+    const PANEL: u64 = 4_000_000;
+    const LATE_BODY: u64 = 4_500_000;
+    struct SeparatePanel;
+    impl Drop for SeparatePanel {
+        fn drop(&mut self) {
+            crate::services::discord::turn_bridge::single_message_footer::SEPARATE_PANEL_FOR_TESTS
+                .set(false);
+        }
+    }
+    crate::services::discord::turn_bridge::single_message_footer::SEPARATE_PANEL_FOR_TESTS
+        .set(true);
+    let _separate = SeparatePanel;
+    let mut driver = TerminalDeliveryDriver::new(ReplaceBehaviour::Edited, 0);
+    let ui = &mut Arc::get_mut(&mut driver.shared).expect("fresh driver").ui;
+    (ui.status_panel_v2_enabled, ui.two_message_panel_enabled) = (true, true);
+    (
+        driver.inflight.runtime_kind,
+        driver.inflight.status_message_id,
+    ) = (Some(ClaudeTui), Some(PANEL));
+    inflight::save_inflight_state(&driver.inflight).expect("seed the two-message row");
+    let token = driver.shared.token_hash.clone();
+    let channel = DRIVER_CHANNEL_ID;
+    singleton::bind_if_owned(&ProviderKind::Claude, &token, channel, PANEL, None).unwrap();
+    let _mailbox = driver.shared.mailbox(ChannelId::new(channel));
+    let _o = test_override::force_channels(&[(channel, ClaudeTui)]);
+    let _posted = deliver::forget_posted_for_tests(channel);
+
+    let (ctx, state) = driver.parts();
+    let output = run(ctx, state).await;
+    assert!(output.terminal_delivery_committed);
+    run_postlude(&driver, output, false, false).await;
+    let root = crate::services::discord::runtime_store::discord_inflight_root().unwrap();
+    let _ = std::fs::remove_file(inflight::inflight_state_path(
+        &root,
+        &ProviderKind::Claude,
+        channel,
+    ));
+    deliver::note_posted_for_tests(channel, LATE_BODY);
+
+    let panel =
+        || singleton::load(&ProviderKind::Claude, &token, channel).map(|b| b.panel_message_id);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while panel() == Some(PANEL) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let moved = panel().expect("a singleton panel");
+    assert!(
+        moved > LATE_BODY,
+        "panel {moved} stays above O's body {LATE_BODY}"
+    );
+    // Let the follow's window end while this test still holds the runtime root.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 }

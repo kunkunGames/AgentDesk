@@ -369,6 +369,16 @@ pub(crate) fn probe_relay_integrity(
     if !inflight_state_matches_recap_snapshot(&state, snapshot) {
         return base_unknown("inflight state does not match recap session");
     }
+    // O posts this channel's TUI body, so Legacy's delivery frontier is not its evidence.
+    // A read-only probe sends no body, so it leaves a pending adoption undecided.
+    let kind = (state.channel_id == channel_id)
+        .then_some(state.runtime_kind)
+        .flatten();
+    match crate::services::tui_o::cutover::peek_o_owns_tui_output_for_channel(channel_id, kind) {
+        Ok(false) => {}
+        Ok(true) => return base_unknown("O owns this channel's TUI body"),
+        Err(_) => return base_unknown("O output identity held"),
+    }
 
     let Some(output_path) = state
         .output_path
@@ -1992,5 +2002,67 @@ mod tests {
 
         assert!(!inflight_has_active_turn(&ProviderKind::Codex, channel_id));
         assert!(channel_has_active_turn(&ProviderKind::Codex, channel_id).await);
+    }
+
+    /// Legacy's delivery frontier is not evidence for a channel whose TUI body O posts, so the
+    /// probe reports unknown instead of comparing it; unlisted destinations keep the comparison.
+    #[test]
+    fn o_delegated_idle_recap_probe_reports_unknown() {
+        use crate::services::agent_protocol::RuntimeHandoffKind;
+        let _guard = lock_active_turn_env_test();
+        let temp = tempfile::TempDir::new().unwrap();
+        let _env = RootEnvGuard(std::env::var_os("AGENTDESK_ROOT_DIR"));
+        unsafe { std::env::set_var("AGENTDESK_ROOT_DIR", temp.path()) };
+        let channel_id = 8_146_010;
+        let output = temp.path().join("out.jsonl");
+        std::fs::write(&output, "{\"type\":\"result\"}\n").unwrap();
+        let snapshot = snapshot_with_sessions(None, None);
+        let probe_reason = |channel_id: u64, kind: RuntimeHandoffKind| {
+            let mut state = make_inflight(channel_id);
+            state.session_key = Some(snapshot.session_key.clone());
+            state.output_path = Some(output.to_str().unwrap().to_string());
+            state.runtime_kind = Some(kind);
+            super::super::inflight::save_inflight_state(&state).expect("save");
+            let probe = probe_relay_integrity(&snapshot, &ProviderKind::Codex, channel_id, None);
+            assert_eq!(probe.status, RelayIntegrityStatus::Unknown);
+            probe.unknown_reason.unwrap_or_default()
+        };
+        let o_reason = "O owns this channel's TUI body";
+
+        assert_ne!(
+            probe_reason(channel_id, RuntimeHandoffKind::CodexTui),
+            o_reason,
+            "flag off"
+        );
+        let _on = crate::services::tui_o::cutover::test_override::force_channels(&[(
+            channel_id,
+            RuntimeHandoffKind::CodexTui,
+        )]);
+        assert_eq!(
+            probe_reason(channel_id, RuntimeHandoffKind::CodexTui),
+            o_reason
+        );
+        assert_ne!(
+            probe_reason(channel_id + 1, RuntimeHandoffKind::CodexTui),
+            o_reason,
+            "an unlisted destination still compares Legacy's own frontier"
+        );
+        drop(_on);
+        let _pending = crate::services::tui_o::cutover::test_override::force_candidates(&[(
+            channel_id,
+            RuntimeHandoffKind::CodexTui,
+        )]);
+        assert_ne!(
+            probe_reason(channel_id, RuntimeHandoffKind::CodexTui),
+            o_reason
+        );
+        let adoption = crate::services::tui_o::cutover::test_override::with_channels(|boot| {
+            boot.unwrap().candidate(channel_id).unwrap().peek()
+        });
+        let pending = crate::services::tui_o::channel_policy::Adoption::Pending;
+        assert_eq!(
+            adoption, pending,
+            "a read-only probe leaves the adoption undecided"
+        );
     }
 }

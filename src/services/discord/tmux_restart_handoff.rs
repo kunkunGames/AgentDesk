@@ -281,20 +281,40 @@ pub(super) async fn start_restart_handoff_from_state(
     state: super::inflight::InflightTurnState,
     best_response: &str,
 ) -> bool {
-    let stale_text = super::turn_bridge::stale_inflight_message(best_response);
-    match restart_handoff_notice_target(&state) {
+    // O posts this channel's TUI body, so the handoff notice keeps only its marker.
+    // A held destination identity keeps the inflight for retry, like a failed notice.
+    let kind = (state.channel_id == channel_id.get())
+        .then_some(state.runtime_kind)
+        .flatten();
+    let target = restart_handoff_notice_target(&state);
+    let Ok(o_owns_body) =
+        crate::services::tui_o::cutover::peek_o_owns_tui_output_for_channel(channel_id.get(), kind)
+    else {
+        return false;
+    };
+    let stale_text =
+        super::turn_bridge::stale_inflight_message(if o_owns_body { "" } else { best_response });
+    match target {
         RestartHandoffNoticeTarget::Edit(current_msg_id) => {
             let current_msg_id = serenity::MessageId::new(current_msg_id);
             forget_completion_footer_for_restart_handoff(channel_id, current_msg_id);
-            let relay_ok = super::formatting::replace_long_message_raw(
-                http,
-                channel_id,
-                current_msg_id,
-                &stale_text,
-                shared,
-            )
-            .await
-            .is_ok();
+            // Only a notice carrying the saved body claims the channel, as it is sent.
+            let claim = (!o_owns_body && !best_response.trim().is_empty())
+                .then(|| crate::services::tui_o::cutover::BodyClaim::new(channel_id.get(), kind));
+            let replace = || {
+                let text = &stale_text;
+                super::formatting::replace_long_message_raw(
+                    http,
+                    channel_id,
+                    current_msg_id,
+                    text,
+                    shared,
+                )
+            };
+            let relay_ok = matches!(
+                crate::services::tui_o::cutover::claim_then_send(claim, replace).await,
+                Ok(crate::services::tui_o::cutover::BodySend::Sent(Ok(_)))
+            );
             if !relay_ok {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::warn!(
@@ -599,5 +619,146 @@ mod notice_target_tests {
         super::super::footer_view_reconciler::completion_footer_forget_registered_target(
             channel_id,
         );
+    }
+}
+
+#[cfg(test)]
+mod o_cut_tests {
+    use crate::services::agent_protocol::RuntimeHandoffKind;
+    use crate::services::discord::inflight::InflightTurnState;
+    use crate::services::discord::recovery_engine::o_cut_recorder::start;
+    use crate::services::discord::turn_finalizer::tests::with_isolated_runtime_root;
+    use crate::services::provider::ProviderKind;
+    use poise::serenity_prelude::ChannelId;
+
+    const BODY: &str = "ADK-A14B-handoff-body";
+
+    /// A watcher-death handoff on a listed channel whose TUI body O posts edits in only the
+    /// restart marker; flag off or an unlisted destination still carries the saved body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn o_delegated_restart_handoff_keeps_only_the_marker() {
+        let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
+        with_isolated_runtime_root(|| async move {
+            let shared = crate::services::discord::make_shared_data_for_tests();
+            let handoff_contents = |channel: u64| {
+                let shared = shared.clone();
+                async move {
+                    let recorder = start(channel).await;
+                    let mut state = InflightTurnState::new(
+                        ProviderKind::Codex,
+                        channel,
+                        None,
+                        1,
+                        10,
+                        9_425_911,
+                        "restart me".to_string(),
+                        None,
+                        Some(format!("AgentDesk-codex-o-cut-{channel}")),
+                        None,
+                        None,
+                        0,
+                    );
+                    state.runtime_kind = Some(RuntimeHandoffKind::CodexTui);
+                    let handled = super::start_restart_handoff_from_state(
+                        ChannelId::new(channel),
+                        &recorder.http,
+                        &shared,
+                        &ProviderKind::Codex,
+                        state,
+                        BODY,
+                    )
+                    .await;
+                    assert!(handled, "the handoff still completes its lifecycle clear");
+                    recorder.contents()
+                }
+            };
+            let flag_off = handoff_contents(9_425_021).await;
+            assert!(
+                flag_off.iter().any(|content| content.contains(BODY)),
+                "{flag_off:?}"
+            );
+            let _on = crate::services::tui_o::cutover::test_override::force_channels(&[(
+                9_425_022,
+                RuntimeHandoffKind::CodexTui,
+            )]);
+            assert_eq!(
+                handoff_contents(9_425_022).await,
+                vec![super::super::turn_bridge::stale_inflight_message("")],
+                "O owns the body: only the marker is edited in"
+            );
+            let outside = handoff_contents(9_425_023).await;
+            assert!(
+                outside.iter().any(|content| content.contains(BODY)),
+                "a destination outside the list keeps Legacy's body: {outside:?}"
+            );
+        })
+        .await;
+    }
+
+    /// A cleanup that posts no notice leaves a pending adoption; the notice that carries the saved
+    /// body ends it before it is sent and shows that body once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_handoff_notice_with_the_body_ends_a_pending_adoption() {
+        use crate::services::discord::recovery_engine::o_cut_recorder::start_watching;
+        use crate::services::tui_o::channel_policy::{Adoption, BodyCheck};
+        use crate::services::tui_o::cutover::test_override;
+        const CHANNEL: u64 = 9_425_031;
+        let _boot = test_override::force_candidates(&[(CHANNEL, RuntimeHandoffKind::CodexTui)]);
+        let check = BodyCheck::watch(CHANNEL, BODY);
+        with_isolated_runtime_root(|| async move {
+            let shared = crate::services::discord::make_shared_data_for_tests();
+            let handoff = |rebind_origin: bool, current_msg_id: u64| {
+                let (shared, check) = (shared.clone(), check.clone());
+                async move {
+                    let recorder = start_watching(CHANNEL, check, false).await;
+                    let mut state = InflightTurnState::new(
+                        ProviderKind::Codex,
+                        CHANNEL,
+                        None,
+                        1,
+                        10,
+                        current_msg_id,
+                        "restart me".to_string(),
+                        None,
+                        Some(format!("AgentDesk-codex-o-adopt-{CHANNEL}")),
+                        None,
+                        None,
+                        0,
+                    );
+                    state.runtime_kind = Some(RuntimeHandoffKind::CodexTui);
+                    state.rebind_origin = rebind_origin;
+                    let handled = super::start_restart_handoff_from_state(
+                        ChannelId::new(CHANNEL),
+                        &recorder.http,
+                        &shared,
+                        &ProviderKind::Codex,
+                        state,
+                        BODY,
+                    )
+                    .await;
+                    assert!(handled);
+                    recorder.calls()
+                }
+            };
+            for (rebind_origin, current_msg_id) in [(true, 0), (false, 0)] {
+                let calls = handoff(rebind_origin, current_msg_id).await;
+                assert!(calls.is_empty(), "no notice: {calls:?}");
+                check.assert_settled();
+                assert_eq!(
+                    check.adoption(),
+                    Adoption::Pending,
+                    "rebind={rebind_origin}"
+                );
+            }
+            let calls = handoff(false, 9_425_911).await;
+            let shown: Vec<_> = calls
+                .iter()
+                .filter(|call| call.content.as_deref().is_some_and(|c| c.contains(BODY)))
+                .collect();
+            assert_eq!(shown.len(), 1, "{calls:?}");
+            check.assert_settled();
+            assert_eq!(check.adoption(), Adoption::Released);
+        })
+        .await;
     }
 }

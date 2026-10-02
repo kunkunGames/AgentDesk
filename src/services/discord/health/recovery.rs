@@ -6,6 +6,7 @@ use poise::serenity_prelude as serenity;
 use serde::Serialize;
 use serenity::{ChannelId, MessageId};
 
+use crate::services::discord::admin_host_guard::ManagedReset;
 use crate::services::discord::inflight::opt_message_id;
 use crate::services::discord::mailbox_finish::legacy_restitution_refusal;
 use crate::services::discord::mailbox_probe::wait_for_turn_end;
@@ -305,6 +306,9 @@ fn preserve_cancel_can_skip_provider_interrupt_for_idle_tui(
     let Some(tmux_session) = cancel_token_tmux_session(token) else {
         return false;
     };
+    if !discord::host_liveness::local_tmux(&tmux_session, None) {
+        return false;
+    }
     let tmux_ready_for_input = watchdog_decisions::idle_tmux_repair_ready_for_input(
         provider,
         channel_id.get(),
@@ -345,6 +349,21 @@ pub(crate) async fn stop_provider_channel_runtime_with_policy(
 ) -> Option<RuntimeTurnStopResult> {
     let provider = ProviderKind::from_str(provider_name)?;
     let shared = shared_for_provider(registry, &provider, channel_id).await?;
+    let stop = stop_channel_runtime(&shared, &provider, channel_id, reason, cleanup_policy, None);
+    Some(stop.await)
+}
+
+/// A turn stop on `shared`'s channel; a force-kill passes the session its verdict approved
+/// (`Some(None)`: a process turn) so the stop never judges the host again.
+pub(crate) async fn stop_channel_runtime(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    reason: &str,
+    cleanup_policy: discord::TmuxCleanupPolicy,
+    approved: Option<Option<&str>>,
+) -> RuntimeTurnStopResult {
+    let (shared, provider) = (shared.clone(), provider.clone());
     let cleanup_requested = cleanup_policy.should_cleanup_tmux();
     let should_clear_persistent_inflight = cleanup_policy.should_clear_inflight();
     let persistent_inflight_was_present = should_clear_persistent_inflight
@@ -369,7 +388,14 @@ pub(crate) async fn stop_provider_channel_runtime_with_policy(
             skipped_idle_provider_interrupt = true;
             false
         } else if !result.already_stopping || cleanup_requested {
-            discord::turn_bridge::stop_active_turn(&provider, token, cleanup_policy, reason).await
+            discord::turn_bridge::stop_approved_turn(
+                &provider,
+                token,
+                approved,
+                cleanup_policy,
+                reason,
+            )
+            .await
         } else {
             false
         };
@@ -380,7 +406,7 @@ pub(crate) async fn stop_provider_channel_runtime_with_policy(
             } else {
                 false
             };
-            return Some(RuntimeTurnStopResult {
+            return RuntimeTurnStopResult {
                 lifecycle_path: "canonical",
                 had_active_turn: true,
                 queue_depth: snapshot.intervention_queue.len(),
@@ -396,7 +422,7 @@ pub(crate) async fn stop_provider_channel_runtime_with_policy(
                 // canonical exit, which is the only path that never needed a
                 // zombie release in the first place.
                 mailbox_foreground_free: snapshot.cancel_token.is_none(),
-            });
+            };
         }
     }
 
@@ -421,9 +447,14 @@ pub(crate) async fn stop_provider_channel_runtime_with_policy(
             );
             skipped_idle_provider_interrupt = true;
         } else {
-            termination_recorded =
-                discord::turn_bridge::stop_active_turn(&provider, token, cleanup_policy, reason)
-                    .await;
+            termination_recorded = discord::turn_bridge::stop_approved_turn(
+                &provider,
+                token,
+                approved,
+                cleanup_policy,
+                reason,
+            )
+            .await;
         }
     }
     apply_runtime_hard_stop_cleanup(
@@ -484,14 +515,14 @@ pub(crate) async fn stop_provider_channel_runtime_with_policy(
         queue_depth
     };
 
-    Some(RuntimeTurnStopResult {
+    RuntimeTurnStopResult {
         lifecycle_path: "runtime-fallback",
         had_active_turn: finish.removed_token.is_some() || release.released,
         queue_depth,
         persistent_inflight_cleared,
         termination_recorded,
         mailbox_foreground_free,
-    })
+    }
 }
 
 pub async fn force_kill_provider_channel_runtime(
@@ -1049,24 +1080,6 @@ fn revalidate_and_clear_explicit_background_inflight(
     }
 }
 
-pub async fn hard_stop_runtime_turn(
-    registry: Option<&HealthRegistry>,
-    provider_name: Option<&str>,
-    channel_id: Option<u64>,
-    tmux_name: Option<&str>,
-    stop_source: &'static str,
-) -> HardStopRuntimeResult {
-    runtime_turn_cleanup_by_lookup(
-        registry,
-        provider_name,
-        channel_id,
-        tmux_name,
-        stop_source,
-        true,
-    )
-    .await
-}
-
 pub async fn clear_idle_tmux_stale_turn(
     registry: &HealthRegistry,
     provider_name: &str,
@@ -1391,16 +1404,15 @@ async fn runtime_turn_cleanup_by_lookup(
 
 /// Best-effort runtime-side equivalent of `/clear` for an existing Discord channel session.
 /// Used by auto-queue slot recycling so pooled unified-thread slots start the next group fresh
-/// without killing the shared thread itself.
+/// without killing the shared thread itself. `None` when the provider or its runtime is absent;
+/// a session not confirmed on legacy tmux is refused before anything changes.
 pub async fn clear_provider_channel_runtime(
     registry: &HealthRegistry,
     provider_name: &str,
     channel_id: ChannelId,
     session_key: Option<&str>,
-) -> bool {
-    let Some(provider) = ProviderKind::from_str(provider_name) else {
-        return false;
-    };
+) -> Option<ManagedReset> {
+    let provider = ProviderKind::from_str(provider_name)?;
 
     let shared = {
         let providers = registry.providers.lock().await;
@@ -1409,9 +1421,7 @@ pub async fn clear_provider_channel_runtime(
             .find(|entry| entry.name.eq_ignore_ascii_case(provider.as_str()))
             .map(|entry| entry.shared.clone())
     };
-    let Some(shared) = shared else {
-        return false;
-    };
+    let shared = shared?;
 
     let tmux_name = {
         let data = shared.core.lock().await;
@@ -1421,6 +1431,10 @@ pub async fn clear_provider_channel_runtime(
             .map(|channel_name| provider.build_tmux_session_name(channel_name))
             .or_else(|| session_key.and_then(tmux_name_from_session_key))
     };
+    let refusal = discord::admin_host_guard::managed_reset_refusal;
+    if let Some(reason) = refusal(&shared, &provider, channel_id, true, false, session_key).await {
+        return Some(ManagedReset::Refused(reason));
+    }
 
     let cleared = discord::mailbox_clear_channel(&shared, &provider, channel_id).await;
     if let Some(token) = cleared.removed_token {
@@ -1446,13 +1460,13 @@ pub async fn clear_provider_channel_runtime(
     }
 
     #[cfg(unix)]
-    if let Some(name) = tmux_name {
+    if let Some(name) = tmux_name.as_deref() {
         if provider.uses_managed_tmux_backend() {
-            discord::commands::reset_managed_process_session(&name);
+            discord::commands::reset_managed_process_session(name);
         }
     }
 
-    true
+    Some(ManagedReset::Applied(tmux_name))
 }
 
 /// #896: Handle `POST /api/inflight/rebind` — rebind a live tmux session to
@@ -2113,7 +2127,6 @@ async fn maybe_recover_completed_stale_leak(
     let Some(state) = discord::inflight::load_inflight_state(provider, channel_id.get()) else {
         return false;
     };
-
     // Planned restart / rebind flows re-deliver the answer themselves.
     if state.restart_mode.is_some() || state.rebind_origin {
         return false;
@@ -2158,6 +2171,24 @@ async fn maybe_recover_completed_stale_leak(
     // from live Discord state, then seed the ledger before continuing.
     let chunks = discord::formatting::split_message(&delivery_text);
     if chunks.is_empty() {
+        return false;
+    }
+    // O posts this channel's TUI body; the detection above stays, Legacy resends nothing.
+    // A held identity also resends nothing; only a resending pass may end a pending adoption.
+    let kind = (state.channel_id == channel_id.get())
+        .then_some(state.runtime_kind)
+        .flatten();
+    let o_holds = |gate: fn(u64, _) -> Result<bool, _>| {
+        let held = gate(channel_id.get(), kind) != Ok(false);
+        if held {
+            tracing::info!(
+                channel_id = channel_id.get(),
+                "stale-leak recovery skipped: O owns or holds this channel's TUI body"
+            );
+        }
+        held
+    };
+    if o_holds(crate::services::tui_o::cutover::peek_o_owns_tui_output_for_channel) {
         return false;
     }
     let ledger_identity = LeakRecoveryLedgerIdentity::new(provider, &state, start, end, &chunks);
@@ -2271,7 +2302,6 @@ async fn maybe_recover_completed_stale_leak(
         None
     };
 
-    let mut wrote_any_chunk = false;
     if confirmed_chunks == 0 {
         let Some(current_message) = current_message.as_ref() else {
             tracing::warn!(
@@ -2298,7 +2328,15 @@ async fn maybe_recover_completed_stale_leak(
             );
             return false;
         }
-
+    }
+    // Claimed only here, before the first edit or post; a confirm-only pass reads the adoption.
+    if confirmed_chunks < chunks.len()
+        && o_holds(crate::services::tui_o::cutover::o_owns_tui_output_for_channel)
+    {
+        return false;
+    }
+    let mut wrote_any_chunk = false;
+    if confirmed_chunks == 0 {
         // Edit the original placeholder to chunk 0. If Discord commits the edit
         // but the client observes an error/crash, the next pass derives
         // `confirmed_chunks == 1` from the live message and continues with chunk
@@ -6625,6 +6663,184 @@ mod post_cancel_drain_tests {
         assert_eq!(
             shared.dispatch.role_overrides.get(&channel).map(|v| *v),
             Some(alternate)
+        );
+    }
+}
+
+/// Stale-leak recovery on a channel whose TUI body O posts: detection stays, nothing is resent.
+#[cfg(test)]
+mod o_stale_leak_cut_tests {
+    use super::super::HealthRegistry;
+    use super::leak_recovery_ledger::{
+        LeakRecoveryLedgerIdentity, leak_recovery_record_confirmed_chunk,
+        leak_recovery_unrelayed_range, render_leak_recovery_delivery,
+    };
+    use super::maybe_recover_completed_stale_leak;
+    use crate::services::agent_protocol::RuntimeHandoffKind;
+    use crate::services::discord::inflight::InflightTurnState;
+    use crate::services::provider::ProviderKind;
+    use crate::services::tui_o::channel_policy::{Adoption, BodyCheck};
+    use crate::services::tui_o::cutover::test_override;
+    use poise::serenity_prelude::ChannelId;
+
+    const CASE: &str = "ADK_TEST_O_STALE_LEAK_CASE";
+    const CHANNEL: u64 = 9_433_001;
+
+    /// Runs `case` in a child whose HTTP goes through a local listener and counts the connections
+    /// it opened: a Legacy resend must reach Discord's REST API first.
+    fn discord_connections(case: &str) -> usize {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let stdout = root.path().join("stdout");
+        let name = concat!(
+            "services::discord::health::recovery::o_stale_leak_cut_tests::",
+            "o_delegated_stale_leak_recovery_resends_nothing"
+        );
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(CASE, case)
+            .env("AGENTDESK_ROOT_DIR", root.path())
+            .envs(
+                [
+                    "HTTPS_PROXY",
+                    "HTTP_PROXY",
+                    "ALL_PROXY",
+                    "https_proxy",
+                    "http_proxy",
+                ]
+                .map(|key| (key, &proxy)),
+            )
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut connections = 0;
+        let status = loop {
+            while listener.accept().is_ok() {
+                connections += 1;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        while listener.accept().is_ok() {
+            connections += 1;
+        }
+        let stdout = std::fs::read_to_string(stdout).unwrap();
+        assert!(status.success(), "{case}: {stdout}");
+        assert!(stdout.contains("1 passed; 0 failed; 0 ignored"), "{stdout}");
+        connections
+    }
+
+    /// Records the first `confirmed` chunks of the turn's recovery as already delivered.
+    fn seed_ledger(state: &InflightTurnState, v2: bool, confirmed: usize) -> usize {
+        let (start, end) = leak_recovery_unrelayed_range(&state.full_response, 0).unwrap();
+        let text =
+            render_leak_recovery_delivery(&state.full_response, start, v2, &ProviderKind::Claude);
+        let chunks = crate::services::discord::formatting::split_message(&text.unwrap());
+        let identity =
+            LeakRecoveryLedgerIdentity::new(&ProviderKind::Claude, state, start, end, &chunks);
+        for index in 0..confirmed.min(chunks.len()) {
+            leak_recovery_record_confirmed_chunk(&identity, index, 9_433_100 + index as u64)
+                .unwrap();
+        }
+        chunks.len()
+    }
+
+    /// A watcher-owned turn whose answer never reached its placeholder, as the leak detector sees it.
+    async fn recover(case: &str) {
+        let mut state: InflightTurnState = serde_json::from_value(serde_json::json!({
+            "version": 9, "provider": "claude", "channel_id": CHANNEL, "channel_name": "adk-cc",
+            "request_owner_user_id": 7, "user_msg_id": 9_433_010, "current_msg_id": 9_433_011,
+            "current_msg_len": 0, "user_text": "prompt", "source": "text", "session_id": "session",
+            "tmux_session_name": "AgentDesk-claude-adk-cc", "output_path": "/tmp/o-leak.jsonl",
+            "input_fifo_path": null, "last_offset": 0, "full_response": "leaked answer body",
+            "response_sent_offset": 0, "relay_owner_kind": "watcher", "runtime_kind": "claude_tui",
+            "started_at": "2026-01-01 00:00:00", "updated_at": "2026-01-01 00:00:00"
+        }))
+        .unwrap();
+        if case == "pending-resend" {
+            state.full_response = "leaked answer line\n".repeat(200);
+        }
+        // A silent turn resends nothing, so it must leave a pending adoption as it found it.
+        state.silent_turn = case == "pending-silent";
+        crate::services::discord::inflight::save_inflight_state(&state).unwrap();
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let v2 = shared.ui.status_panel_v2_enabled;
+        // A prior pass delivered every chunk (or only the first) but stopped before the offset.
+        match case {
+            "pending-confirmed" => assert_eq!(seed_ledger(&state, v2, usize::MAX), 1),
+            "pending-resend" => assert!(seed_ledger(&state, v2, 1) > 1),
+            _ => {}
+        }
+        shared
+            .http
+            .cached_bot_token
+            .set("Bot o-leak".into())
+            .unwrap();
+        let registry = HealthRegistry::new();
+        registry.register("claude".into(), shared.clone()).await;
+        let owned = match case {
+            "o" => vec![(CHANNEL, RuntimeHandoffKind::ClaudeTui)],
+            _ => Vec::new(),
+        };
+        let pending = case.starts_with("pending");
+        let _owned = if pending {
+            test_override::force_candidates(&[(CHANNEL, RuntimeHandoffKind::ClaudeTui)])
+        } else {
+            test_override::force_channels(&owned)
+        };
+        let check = pending.then(|| BodyCheck::watch(CHANNEL, "leaked answer"));
+        let channel = ChannelId::new(CHANNEL);
+        let recovered =
+            maybe_recover_completed_stale_leak(&registry, &ProviderKind::Claude, &shared, channel);
+        // Only the confirm-only pass succeeds here: it sends nothing and persists the offset.
+        assert_eq!(recovered.await, case == "pending-confirmed", "{case}");
+        let Some(check) = check else {
+            return;
+        };
+        if case == "pending-resend" {
+            // Its continuation POST reached only the parent's counting proxy, no content sink.
+            assert_eq!(check.adoption(), Adoption::Released);
+            return;
+        }
+        check.assert_settled();
+        assert_eq!(check.adoption(), Adoption::Pending, "{case}");
+        // A confirm-only pass settles the turn as a delivery would; the others leave the row alone.
+        let row =
+            crate::services::discord::inflight::load_inflight_state(&ProviderKind::Claude, CHANNEL);
+        let kept = (case != "pending-confirmed").then_some(0);
+        assert_eq!(row.map(|row| row.response_sent_offset), kept, "{case}");
+    }
+
+    #[tokio::test]
+    async fn o_delegated_stale_leak_recovery_resends_nothing() {
+        if let Ok(case) = std::env::var(CASE) {
+            return recover(&case).await;
+        }
+        assert_eq!(discord_connections("o"), 0, "O owns the channel's body");
+        assert!(
+            discord_connections("legacy") > 0,
+            "an unselected channel still tries its Legacy resend"
+        );
+        assert_eq!(discord_connections("pending-silent"), 0);
+        assert!(
+            discord_connections("pending") > 0,
+            "a failed live-message read resends nothing and keeps the adoption pending"
+        );
+        assert_eq!(
+            discord_connections("pending-confirmed"),
+            0,
+            "confirm-only pass"
+        );
+        assert!(
+            discord_connections("pending-resend") > 0,
+            "a pending adoption ends before Legacy tries its continuation resend"
         );
     }
 }

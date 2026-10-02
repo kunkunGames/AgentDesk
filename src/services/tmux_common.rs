@@ -1,3 +1,4 @@
+pub(crate) mod host_marker;
 mod session_markers;
 pub(crate) use session_markers::{
     resolve_tmux_runtime_kind_marker, tmux_session_auth_profile_matches,
@@ -1220,6 +1221,13 @@ pub fn cleanup_session_temp_files(session_name: &str) {
     with_tmux_source_authority(session_name, |_| {
         cleanup_session_temp_files_under_source_authority(session_name)
     });
+}
+
+/// [`cleanup_session_temp_files`] for a session the host guard admitted.
+pub(crate) fn cleanup_cleared_session_temp_files(
+    session: &crate::services::session_host::ClearedHostSession,
+) {
+    cleanup_session_temp_files(session.name());
 }
 
 fn cleanup_session_temp_files_under_source_authority(session_name: &str) {

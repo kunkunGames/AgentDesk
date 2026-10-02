@@ -23,7 +23,9 @@ pub async fn probe_tmux_session_exists(tmux_session_name: &str) -> bool {
     let name = tmux_session_name.to_string();
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio::task::spawn_blocking(move || tmux_session_exists(&name)),
+        tokio::task::spawn_blocking(move || {
+            crate::services::session_host::legacy_collapse::tmux_present_bool(&name)
+        }),
     )
     .await
     .unwrap_or(Ok(true))
@@ -43,44 +45,17 @@ pub fn tmux_session_pane_liveness(
     crate::services::platform::tmux::pane_liveness(tmux_session_name)
 }
 
-/// Test-only forced answers for [`probe_tmux_session_pane_liveness`], keyed by
-/// session name.
-///
-/// #5185: the probe shells out to `tmux has-session` under a two-second
-/// wall-clock bound and maps every failure -- including "the subprocess did not
-/// finish in time" -- to `ProbeError`, which callers must treat as "not dead".
-/// That is right for production and wrong for a test that wants to exercise the
-/// `DeadOrAbsent` branch, because the answer then depends on machine load: on an
-/// idle machine the probe returns in milliseconds, and inside a ~6.9k-test
-/// parallel sweep it can exceed two seconds and flip the branch. Measured:
-/// `session_resume::tests::resume_production_path_clears_stale_binding_and_rebinds_runtime`
-/// failed in a full parallel sweep with `left: RetainedLive, right: Cleared`
-/// and passed when run alone. A test that means "the pane is gone" must say so
-/// rather than race a subprocess for the answer.
-#[cfg(test)]
-static PANE_LIVENESS_OVERRIDES: std::sync::LazyLock<
-    std::sync::Mutex<
-        std::collections::HashMap<String, crate::services::platform::tmux::PaneLiveness>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
 /// Force (or clear, with `None`) the pane-liveness answer for one session name.
+/// Stored as an injected tmux host observation, so typed probes see it too.
 #[cfg(test)]
 pub(crate) fn set_pane_liveness_override_for_tests(
     tmux_session_name: &str,
     liveness: Option<crate::services::platform::tmux::PaneLiveness>,
 ) {
-    let mut overrides = PANE_LIVENESS_OVERRIDES
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    match liveness {
-        Some(value) => {
-            overrides.insert(tmux_session_name.to_string(), value);
-        }
-        None => {
-            overrides.remove(tmux_session_name);
-        }
-    }
+    crate::services::session_host::test_support::inject_liveness(
+        crate::services::session_host::HostSessionRef::tmux(tmux_session_name),
+        liveness.map(Into::into),
+    );
 }
 
 /// RAII form of [`set_pane_liveness_override_for_tests`].
@@ -124,11 +99,14 @@ impl Drop for PaneLivenessOverrideGuard {
 fn pane_liveness_override_for_tests(
     tmux_session_name: &str,
 ) -> Option<crate::services::platform::tmux::PaneLiveness> {
-    PANE_LIVENESS_OVERRIDES
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .get(tmux_session_name)
-        .copied()
+    use crate::services::platform::tmux::PaneLiveness;
+    use crate::services::session_host::{HostLiveness, HostSessionRef, test_support};
+    let injected = test_support::injected_liveness(HostSessionRef::tmux(tmux_session_name))?;
+    Some(match injected {
+        HostLiveness::Live => PaneLiveness::Live,
+        HostLiveness::DeadOrAbsent => PaneLiveness::DeadOrAbsent,
+        HostLiveness::ProbeError => PaneLiveness::ProbeError,
+    })
 }
 
 /// Async adapter for the pre-existing #4489 pane probe. #4794 adopts the
@@ -377,5 +355,34 @@ mod tests {
         assert!(should_recreate_session_after_stdin_error(
             "Process session AgentDesk-claude-123 was stopped"
         ));
+    }
+
+    #[test]
+    fn probe_tmux_session_exists_truth_table() {
+        use crate::services::platform::tmux::SessionPresence;
+        use crate::services::session_host::HostPresence;
+        use crate::services::session_host::legacy_collapse::probe_failed_to_missing;
+        for (presence, exists) in [
+            (SessionPresence::Present, true),
+            (SessionPresence::Missing, false),
+            (SessionPresence::ProbeFailed, false),
+        ] {
+            assert_eq!(
+                probe_failed_to_missing(HostPresence::from(presence)),
+                exists
+            );
+            assert_eq!(presence == SessionPresence::Present, exists);
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        for blank in ["", "  "] {
+            assert!(!runtime.block_on(super::probe_tmux_session_exists(blank)));
+            assert_eq!(
+                runtime.block_on(super::probe_tmux_session_exists(blank)),
+                super::tmux_session_exists(blank)
+            );
+        }
     }
 }

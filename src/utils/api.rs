@@ -23,14 +23,6 @@ pub(crate) fn bad_request(error: impl Display) -> ApiJsonResponse {
     error_response(StatusCode::BAD_REQUEST, error)
 }
 
-pub(crate) fn internal_error(error: impl Display) -> ApiJsonResponse {
-    error_response(StatusCode::INTERNAL_SERVER_ERROR, error)
-}
-
-pub(crate) fn not_found(message: &'static str) -> ApiJsonResponse {
-    error_response(StatusCode::NOT_FOUND, message)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,7 +39,8 @@ mod tests {
 
     #[test]
     fn error_helpers_preserve_simple_error_shape() {
-        let (status, Json(body)) = internal_error("database unavailable");
+        let (status, Json(body)) =
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "database unavailable");
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body, json!({ "error": "database unavailable" }));

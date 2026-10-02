@@ -11,13 +11,13 @@ use std::path::Path as FsPath;
 use super::AppState;
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::server::dto::agents::{
-    AgentDispatchedSessionsResponse, AgentOfficesResponse, AgentSkillsResponse,
-    AgentTimelineResponse, AgentTranscriptsResponse,
+    AgentDispatchedSessionsResponse, AgentSkillsResponse, AgentTimelineResponse,
+    AgentTranscriptsResponse,
 };
 use crate::services::agents::query::{
     AgentQueryLookupError, agent_exists_pg, block_active_card_for_agent_pg, find_diag_session_pg,
-    list_agent_offices_pg_json, list_agent_skills_pg_json, load_agent_dispatched_sessions_pg_json,
-    load_agent_timeline_pg_json, mark_session_disconnected_pg,
+    list_agent_skills_pg_json, load_agent_dispatched_sessions_pg_json, load_agent_timeline_pg_json,
+    mark_session_disconnected_pg,
 };
 use crate::services::agents::turn::{
     AgentTurnLookupError, capture_recent_tmux_output, collect_turn_tool_events, extract_tmux_name,
@@ -238,15 +238,31 @@ pub async fn agent_diag(
         .map(|last| now.signed_duration_since(last).num_seconds().max(0));
 
     let tmux_name = extract_tmux_name(&session.session_key);
-    let tui_prompt_readiness = tui_prompt_readiness_json(
+    // A session the host check refuses is reported as such, never probed by its tmux name.
+    let (provider, channel) = (
         session.provider.as_deref(),
-        tmux_name.as_deref(),
-        session.cwd.as_deref(),
-        session.provider_session_id.as_deref(),
+        session.thread_channel_id.as_deref(),
     );
+    let diag = crate::services::discord::admin_host_guard::row_unsupported;
+    let unsupported = diag(
+        pool,
+        provider,
+        channel,
+        &session.session_key,
+        tmux_name.as_deref(),
+    )
+    .await;
+    let probed_name = tmux_name.as_deref().filter(|_| unsupported.is_none());
+    let tui_prompt_readiness = unsupported.clone().or_else(|| {
+        tui_prompt_readiness_json(
+            session.provider.as_deref(),
+            probed_name,
+            session.cwd.as_deref(),
+            session.provider_session_id.as_deref(),
+        )
+    });
     let inflight = load_inflight_snapshot(session.provider.as_deref(), tmux_name.as_deref());
-    let recent_output = tmux_name
-        .as_deref()
+    let recent_output = probed_name
         .and_then(capture_recent_tmux_output)
         .or_else(|| inflight.as_ref().and_then(inflight_recent_output));
     let events = collect_turn_tool_events(recent_output.as_deref(), inflight.as_ref());
@@ -319,12 +335,14 @@ pub async fn agent_diag(
     let task_notification_kind = inflight
         .as_ref()
         .and_then(|state| state.task_notification_kind.clone());
-    let tmux_relay_adoption = tmux_relay_adoption_json(
-        session.provider.as_deref(),
-        tmux_name.as_deref(),
-        session.thread_channel_id.as_deref(),
-        watcher_snapshot_json.as_ref(),
-    );
+    let tmux_relay_adoption = unsupported.or_else(|| {
+        tmux_relay_adoption_json(
+            session.provider.as_deref(),
+            probed_name,
+            session.thread_channel_id.as_deref(),
+            watcher_snapshot_json.as_ref(),
+        )
+    });
 
     Ok((
         StatusCode::OK,
@@ -631,31 +649,6 @@ fn claude_transcript_turn_state_for_diag(
     Some(crate::services::claude_tui::transcript_tail::observe_transcript_turn_state(&path))
 }
 
-/// GET /api/agents/:id/offices
-pub async fn agent_offices(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    let pool = state.pg_pool_ref().ok_or_else(pg_required_error)?;
-    match agent_exists_pg(pool, &id).await {
-        Ok(true) => {}
-        Ok(false) => return Err(AppError::not_found("agent not found")),
-        Err(e) => {
-            return Err(AppError::internal(format!("query: {e}")).with_code(ErrorCode::Database));
-        }
-    }
-
-    list_agent_offices_pg_json(pool, &id)
-        .await
-        .map(|offices| {
-            (
-                StatusCode::OK,
-                Json(json!(AgentOfficesResponse { offices })),
-            )
-        })
-        .map_err(|e| AppError::internal(format!("query: {e}")).with_code(ErrorCode::Database))
-}
-
 /// GET /api/agents/:id/skills
 pub async fn agent_skills(
     State(state): State<AppState>,
@@ -947,6 +940,14 @@ pub async fn stop_agent_turn(
         }
     };
 
+    // A session the host check refuses, working or idle, is neither stopped nor marked.
+    if let Some(session) = session.as_ref()
+        && let Some(reason) = session.host_unsupported.as_deref()
+    {
+        let (unsupported, key) = ("session_host_not_tmux", &session.session_key);
+        let body = json!({"error": reason, "unsupported": unsupported, "session_key": key});
+        return (StatusCode::CONFLICT, Json(body));
+    }
     let Some(session) = session.filter(|candidate| candidate.is_working) else {
         return (
             StatusCode::CONFLICT,
@@ -1189,3 +1190,7 @@ pub async fn agent_handoff(
         Err(error) => (error.status(), Json(error.body())),
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "agents_host_guard_tests.rs"]
+mod host_guard_tests;
