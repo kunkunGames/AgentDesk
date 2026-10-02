@@ -1,6 +1,6 @@
 """Selection contract for the `high_risk_recovery` path filter (#5232).
 
-`dorny/paths-filter@v3` compiles every pattern into its own
+`dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad` compiles every pattern into its own
 `picomatch(pattern, {dot: true})` matcher and ORs them (`matchers.some(...)`),
 so a leading `!` is not a subtraction but one more POSITIVE matcher for
 "anything that is not this" -- which is what made this lane always true.

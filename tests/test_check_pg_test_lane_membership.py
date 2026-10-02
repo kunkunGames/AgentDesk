@@ -1607,8 +1607,8 @@ class ReusableWorkflowMutations(BypassFixtureCase):
         # step-level `uses:` sits below the job's own key indent, so neither
         # may be read as delegation.
         self.write_sweep(
-            "  sweep:\n    steps:\n      - uses: actions/checkout@v4\n"
-            "      - name: build\n        uses: dtolnay/rust-toolchain@master\n"
+            "  sweep:\n    steps:\n      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+            "      - name: build\n        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067\n"
             "      - run: ./scripts/ci/postgres-service.sh start\n"
             f"      - run: {self.SWEEP}\n"
         )

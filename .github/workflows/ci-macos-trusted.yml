@@ -27,7 +27,7 @@ jobs:
     runs-on: macos-15
     steps:
       # Skip heavy steps on docs-only pushes only when the filter succeeds with run=false.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           filter: blob:none
@@ -42,7 +42,7 @@ jobs:
 
       - name: Install Rust toolchain
         if: steps.rust_filter.outcome != 'success' || steps.rust_filter.outputs.run != 'false'
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.94.1"
           components: clippy
@@ -64,7 +64,7 @@ jobs:
 
       - name: Cache Cargo dependencies
         if: steps.rust_filter.outcome != 'success' || steps.rust_filter.outputs.run != 'false'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # rust-cache derives the final key from OS/arch/toolchain and the
           # dependency-only Cargo.lock/Cargo.toml hash. Keep target artifacts

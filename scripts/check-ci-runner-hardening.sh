@@ -487,7 +487,7 @@ expected_mirror_contract_step = {
   ].join("\n") + "\n",
 }
 expected_mirror_steps = [
-  {"uses" => "actions/checkout@v4"},
+  {"uses" => "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
   expected_mirror_contract_step,
   *expected_shard_mirror_steps,
 ]
@@ -544,7 +544,7 @@ mirror_source = mirror_source&.gsub(
   "expected=<required-check-pin-sha256>",
 )
 mirror_source_sha256 = mirror_source && Digest::SHA256.hexdigest(mirror_source)
-unless mirror_source_sha256 == "86cea9c1d95dc6062fe6edfb3fa8334e491c98f9d7f73f6a45796b9a2b9c12df"
+unless mirror_source_sha256 == "d4be5f21aeec2fa3eb7d1900f34f1aa1af8e95eadeb3fafc8b9e80d2213a5483"
   warn "#{path}: Script checks required-context source bytes changed (scalar tags/styles and exact step surface are pinned); found #{mirror_source_sha256 || '<missing>'}"
   exit 1
 end
@@ -690,7 +690,7 @@ unless execution_contract(script_check_execution, expected_script_check_executio
   exit 1
 end
 evidence_steps = Array(script_checks_job["steps"]).select { |step| step.is_a?(Hash) && step["name"] == "Upload giant-file progress evidence" }
-unless evidence_steps == [{"name" => "Upload giant-file progress evidence", "if" => "always()", "uses" => "actions/upload-artifact@v4", "with" => {"path" => "target/giant-file-progress/evidence.json"}}]
+unless evidence_steps == [{"name" => "Upload giant-file progress evidence", "if" => "always()", "uses" => "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", "with" => {"path" => "target/giant-file-progress/evidence.json"}}]
   warn "#{path}: giant-file progress evidence upload must remain exact and unconditional"
   exit 1
 end
@@ -707,8 +707,8 @@ script_check_shard_jobs.each do |job_id, shard|
     "runs-on" => "ubuntu-latest",
     "timeout-minutes" => "30",
     "steps" => [
-      {"uses" => "actions/checkout@v4", "with" => {"fetch-depth" => "0"}},
-      {"name" => "Setup Python for script checks", "uses" => "actions/setup-python@v5", "with" => {"python-version" => "3.11"}},
+      {"uses" => "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", "with" => {"fetch-depth" => "0"}},
+      {"name" => "Setup Python for script checks", "uses" => "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065", "with" => {"python-version" => "3.11"}},
       {"name" => "Install script-test Python deps", "run" => "python3 -m pip install --disable-pip-version-check pyyaml"},
       {"name" => "Install shellcheck", "run" => "sudo apt-get install -y shellcheck zsh"},
       {"name" => "Run script checks", "shell" => "bash", "run" => "./scripts/ci-script-checks.sh", "env" => expected_shard_step_env},
@@ -783,14 +783,14 @@ end
 script_steps = Array(script_checks_job["steps"])
 setup_specs = {
   "Install Rust toolchain for lib inventory" => {
-    "uses" => "dtolnay/rust-toolchain@master",
+    "uses" => "dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067",
     "toolchain" => "1.94.1",
   },
   "Setup sccache for lib inventory" => {
-    "uses" => "mozilla-actions/sccache-action@v0.0.10",
+    "uses" => "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696",
   },
   "Cache Cargo dependencies for lib inventory" => {
-    "uses" => "Swatinem/rust-cache@v2",
+    "uses" => "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
     "cache-targets" => false,
     "cache-bin" => false,
     "shared-key" => "cargo-dependencies-v2",
@@ -848,7 +848,7 @@ targets = {
     "needs" => "changes",
     "if" => "needs.changes.outputs.rust_compile == 'true' && needs.changes.outputs.cross_os_rust == 'true'",
     "runs_on" => '${{ matrix.os }}',
-    "job_sha256" => "79745b96e7fc4d02c7744ac9141e4da962ea56c603b5926401294c1af8a56cee",
+    "job_sha256" => "dcfbc38100627ad16f6af2dd6c8465a71b82fd105153181820f8180d4d4300b0",
     "cargo_steps" => {
       "cargo check" => {
         "commands" => ["cargo check --workspace --all-targets"],
@@ -863,7 +863,7 @@ targets = {
     "if" => "needs.changes.outputs.rust_compile == 'true' && needs.changes.outputs.cross_os_rust == 'true'",
     "runs_on" => '${{ matrix.os }}',
     # The bounded Windows owner runner; broad runtime remains nightly.
-    "job_sha256" => "c8f9edc04ab62774a5c79006def01569c603c90286b2b903f9be728c0532434d",
+    "job_sha256" => "d496a4fac227332faec900a350715e24e0a2b0d50b756f69b437176ca95fc1f7",
     "cargo_steps" => {
       "Writer namespace exact Windows targets" => {
         "commands" => ["./scripts/ci/run-writer-namespace-windows-targets.sh"],
@@ -879,7 +879,7 @@ targets = {
     "needs" => %w[changes check_fast_cross_os check_fast_cross_os_targets],
     "if" => "always()",
     "runs_on" => "ubuntu-latest",
-    "job_sha256" => "b3f62e36af947ceaede19310676c24f3eb09e33ee2bbbda186df545443bd2390",
+    "job_sha256" => "9ebfc18a9977b9af309ca86de5883e82bd1c428ab8f2dd519a7d082e3da7581c",
     "require_debug_env" => false,
     "cargo_steps" => %w[check_fast_cross_os check_fast_cross_os_targets].to_h do |runner|
       [
@@ -915,7 +915,7 @@ targets = {
     # #5230 re-pins after replacing repeated PostgreSQL skip literals with the
     # shared non-pg-test-filter source; job names, conditions, and timeouts are
     # unchanged, and the exact commands below pin each source/use pair.
-    "job_sha256" => "ee22751e613fae89b25fa9e6c3237388666ceb867eda5a33f0dc1c9e460d452d",
+    "job_sha256" => "cb95ea69fa0102af6cb9b7172b5b99ba5c62775cf5e1ba78d5ac4a5f44006e44",
     "cargo_steps" => {
       "Observe curated lane selections" => {
         "commands" => [
@@ -991,7 +991,7 @@ targets = {
     # source-verified non-PG false positives after the adjudicated sweep.
     # #6104 re-pins after renaming the replay call; its list is now generated
     # from the PG manifest instead of hand-kept.
-    "job_sha256" => "c94384bd806521e5f796bbdd0d9b813841131ce8c4e3c80d5bcde36bbc541bc9",
+    "job_sha256" => "577fb3d97772a92708da995f549e19a9741cb5061f8862dad93eefc25f85086b",
     "cargo_steps" => {
       "Library sweep (selection-set gated)" => {
         "commands" => [
@@ -1009,7 +1009,7 @@ targets = {
     "needs" => nil,
     "if" => nil,
     "runs_on" => "ubuntu-latest",
-    "job_sha256" => "6ea23c9f5dd58b547b88d3c3489df0d0aac31c2c2b0acc3dcff8418d191740e1",
+    "job_sha256" => "b6176cee54e0fafc5420f1efe2ed978555e3060f4200b591edf63ad66c7395c5",
     "job_timeout_minutes" => 30,
     "cargo_steps" => {
       "Verify named relay-authority targets and selection floors" => {
@@ -1040,7 +1040,7 @@ targets = {
     "needs" => nil,
     "if" => nil,
     "runs_on" => "ubuntu-latest",
-    "job_sha256" => "06c4f7b845152711cba75deb7bd02ac019fb863a0a10aef7722e3ec5bc4a7712",
+    "job_sha256" => "ab1325c74f83d8407acbc5e51db9ffdc5e9512fa20888aeea64660f6dd85730a",
     "job_timeout_minutes" => 45,
     "cargo_steps" => {
       "Fetch Cargo dependencies" => {
@@ -1061,7 +1061,7 @@ targets = {
     "needs" => %w[relay_authority_targets relay_authority_mutations],
     "if" => "always()",
     "runs_on" => "ubuntu-latest",
-    "job_sha256" => "188f42334c40446fd80b192f8c23a19310010c25ef3a4d9b70cecc97659053a7",
+    "job_sha256" => "48057a1a770770d5d3489b3f56d5d3998a1117a3b668c6fe44abcdde76cb26b2",
     "job_timeout_minutes" => 10,
     "cargo_steps" => {
       "Pin required-check mirror content (#5321)" => {
@@ -1125,7 +1125,7 @@ targets = {
     "runs_on" => "ubuntu-latest",
     # Pin the accepted-turn regressions and removal of the retired timeout test.
     # All remaining commands and execution settings retain their reviewed values.
-    "job_sha256" => "78a1ac49014cc9ce58aa7aec6d2ae86295b0b5cafec65cccb3bf37b5f8a0bd7f",
+    "job_sha256" => "d34e8bbe8c8014667612594e07d2b2b6c29af58bc351131005e6397964efdc15",
     "cargo_steps" => {
       "Observe curated lane selections" => {
         "commands" => [
@@ -1156,7 +1156,7 @@ proof_owners = [
   "scripts/ci/run-writer-namespace-windows-targets.sh",
   "scripts/exact_rust_test_proof.py",
 ]
-filter_step = Array(jobs.dig("changes", "steps")).find { |step| step.is_a?(Hash) && step["uses"] == "dorny/paths-filter@v3" }
+filter_step = Array(jobs.dig("changes", "steps")).find { |step| step.is_a?(Hash) && step["uses"] == "dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad" }
 path_filters = YAML.safe_load(filter_step&.dig("with", "filters").to_s) || {}
 proof_owners.product(%w[rust_compile cross_os_rust]).each do |owner, filter|
   errors << "exact Rust proof owner #{owner} must select #{filter} exactly once" unless Array(path_filters[filter]).count(owner) == 1
@@ -1318,7 +1318,7 @@ expected_shards.each do |job_id, (shard, name)|
   errors << "#{label} job env must not set script-check selector variables" if (job["env"] || {}).keys.any?(&selector_key)
   steps = Array(job["steps"])
   checkout = steps.first
-  errors << "#{label} must check out full history first" unless checkout.is_a?(Hash) && checkout["uses"] == "actions/checkout@v4" && checkout["with"] == {"fetch-depth" => 0}
+  errors << "#{label} must check out full history first" unless checkout.is_a?(Hash) && checkout["uses"] == "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" && checkout["with"] == {"fetch-depth" => 0}
   runs = steps.select { |step| step.is_a?(Hash) && step["run"].to_s.include?("ci-script-checks.sh") }
   run = runs.first
   unless runs.length == 1 && run["name"] == "Run script checks" && run["run"] == "./scripts/ci-script-checks.sh"
@@ -1334,7 +1334,7 @@ uploads = jobs.flat_map do |job_id, job|
   Array(job["steps"]).select { |step| step.is_a?(Hash) && step["uses"].to_s.start_with?("actions/upload-artifact") }.map { |step| [job_id, step] }
 end
 evidence = uploads.select { |_, step| step["name"] == "Upload giant-file progress evidence" }
-unless evidence == [["scripts", {"name" => "Upload giant-file progress evidence", "if" => "always()", "uses" => "actions/upload-artifact@v4", "with" => {"path" => "target/giant-file-progress/evidence.json"}}]]
+unless evidence == [["scripts", {"name" => "Upload giant-file progress evidence", "if" => "always()", "uses" => "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", "with" => {"path" => "target/giant-file-progress/evidence.json"}}]]
   errors << "giant-file progress evidence upload must remain exact, unconditional and only in the cargo shard job"
 end
 errors << "artifact uploads must stay in the cargo shard job" unless uploads.all? { |job_id, _| job_id == "scripts" }
@@ -1525,7 +1525,7 @@ expected_cache = {
   "shared-key" => "cargo-dependencies-v2",
   "save-if" => "${{ github.ref == 'refs/heads/main' }}",
 }
-cache_steps = Array(job["steps"]).select { |step| step["uses"] == "Swatinem/rust-cache@v2" }
+cache_steps = Array(job["steps"]).select { |step| step["uses"] == "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6" }
 errors << "#{label}: rust-cache must save the shared key from main only" unless cache_steps.map { |step| step["with"] } == [expected_cache]
 commands = main_compile.map { |step| step["run"].strip }
 errors << "#{label}: must build exactly check + lib test binary without running tests" unless commands == ["cargo check --workspace --all-targets", "cargo test --lib --no-run"]
@@ -1911,7 +1911,7 @@ specs.each do |spec|
     "if" => "always()",
     "runs-on" => "ubuntu-latest",
     "steps" => [
-      {"uses" => "actions/checkout@v4"},
+      {"uses" => "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
       pin_step,
       {
         "name" => spec.fetch("step"),

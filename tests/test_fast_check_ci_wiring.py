@@ -19,7 +19,7 @@ REQUIRED_CHECK_MIRROR_SHA256 = (
     "57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d"
 )
 CI_RUNNER_HARDENING_SHA256 = (
-    "0c67a7933577ad27b11c16b16631dcdc4d0c2411fc5088ba5da14be4ebf4921e"
+    "db97c35d7ae81d568ee8c2ee2bd00496d5f7fbc1fdd288602e7b642d179b5bce"
 )
 PR_WORKFLOW = REPO_ROOT / ".github/workflows/ci-pr.yml"
 # Path-filtered required contexts: (mirror job, required name, runner job,
@@ -322,7 +322,7 @@ def comment_out_in_filter(workflow: str, block: str, selector: str) -> str:
 
 
 def glob_matcher(pattern: str) -> re.Pattern[str]:
-    """Reproduce picomatch `{dot: true}` for the shapes dorny/paths-filter@v3 resolves.
+    """Reproduce picomatch `{dot: true}` for the shapes dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad resolves.
 
     Cross-checked against picomatch 2.3.2 over every tracked file and every
     ci-pr.yml filter pattern: identical selection for all 191 non-negated
@@ -390,7 +390,7 @@ def paths_filter_definitions(workflow: str) -> dict[str, list[str]]:
     parsed = yaml.safe_load(workflow)
     steps = parsed["jobs"]["changes"]["steps"]
     filter_step = next(
-        step for step in steps if step.get("uses") == "dorny/paths-filter@v3"
+        step for step in steps if step.get("uses") == "dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad"
     )
     return yaml.safe_load(filter_step["with"]["filters"])
 
@@ -596,7 +596,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertEqual(check["steps"][: len(setup)], targets["steps"][: len(setup)])
         self.assertLess(setup.index(python_step_name), setup.index("Install Rust toolchain"))
         python_step = check["steps"][setup.index(python_step_name)]
-        self.assertEqual(python_step["uses"], "actions/setup-python@v5")
+        self.assertEqual(python_step["uses"], "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065")
         self.assertEqual(python_step["with"]["python-version"], "3.11")
 
         # The two runners together execute exactly the pre-split command set.
@@ -896,13 +896,13 @@ class FastCheckCiWiringTests(unittest.TestCase):
             self.assertEqual(runner["env"]["CARGO_PROFILE_TEST_DEBUG"], "0")
             setup.append([step for step in runner["steps"] if "uses" in step and step.get("id") != "mutation_paths"])
         # The mutation job alone keeps HEAD^1 for its wiring digest; the rest of setup is shared.
-        self.assertEqual(setup[1][0], {"uses": "actions/checkout@v4", "with": {"fetch-depth": 2}})
-        setup[1][0] = {"uses": "actions/checkout@v4"}
+        self.assertEqual(setup[1][0], {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", "with": {"fetch-depth": 2}})
+        setup[1][0] = {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"}
         self.assertEqual(
             setup[0],
             [{key: value for key, value in step.items() if key != "if"} for step in setup[1]],
         )
-        self.assertEqual(setup[0][0], {"uses": "actions/checkout@v4"})
+        self.assertEqual(setup[0][0], {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"})
         self.assertEqual(setup[0][1]["with"]["toolchain"], "1.94.1")
         mutation = jobs["relay_authority_mutations"]
         self.assertEqual(mutation["strategy"], {"fail-fast": False, "matrix": {"shard": [0, 1, 2]}})
@@ -951,10 +951,10 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertNotIn("if", job)
         self.assertNotIn("continue-on-error", job)
         steps = job["steps"]
-        self.assertEqual(steps[0], {"uses": "actions/checkout@v4", "with": {"fetch-depth": 2}})
+        self.assertEqual(steps[0], {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", "with": {"fetch-depth": 2}})
         path_filter = steps[1]
         self.assertEqual(path_filter.get("id"), "mutation_paths")
-        self.assertEqual(path_filter.get("uses"), "dorny/paths-filter@v3")
+        self.assertEqual(path_filter.get("uses"), "dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad")
         self.assertNotIn("if", path_filter)
         self.assertNotIn("continue-on-error", path_filter)
         names = [step.get("name") for step in steps]
@@ -1285,7 +1285,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", job)
         self.assertEqual(job["runs-on"], "ubuntu-latest")
         self.assertEqual(len(job["steps"]), 5)
-        self.assertEqual(job["steps"][0], {"uses": "actions/checkout@v4"})
+        self.assertEqual(job["steps"][0], {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"})
 
         contract, result = job["steps"][1:3]
         self.assertEqual(contract["name"], "Verify Script checks mirror contract (#5321)")
@@ -1314,15 +1314,15 @@ class FastCheckCiWiringTests(unittest.TestCase):
                 1,
             ),
             "checkout provenance": mirror.replace(
-                "      - uses: actions/checkout@v4\n",
-                "      - uses: actions/checkout@v4\n"
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n",
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
                 "        with:\n"
                 "          repository: attacker/green-mirror\n",
                 1,
             ),
             "extra step": mirror.replace(
-                "      - uses: actions/checkout@v4\n",
-                "      - uses: actions/checkout@v4\n"
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n",
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
                 "      - run: printf 'exit 0\\n' > scripts/required-check-mirror.sh\n",
                 1,
             ),
@@ -1643,7 +1643,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
                 self.assertNotIn("continue-on-error", job)
                 self.assertEqual(job["runs-on"], "ubuntu-latest")
                 self.assertEqual(len(job["steps"]), 3)
-                self.assertEqual(job["steps"][0], {"uses": "actions/checkout@v4"})
+                self.assertEqual(job["steps"][0], {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"})
                 pin, result = job["steps"][1:]
                 self.assertEqual(pin["name"], PATH_FILTER_MIRROR_PIN_STEP)
                 self.assertEqual(pin["env"], {"BASH_ENV": "/dev/null"})
@@ -2071,8 +2071,8 @@ class FastCheckCiWiringTests(unittest.TestCase):
         workflow = PR_WORKFLOW.read_text(encoding="utf-8")
         relay_job = job_block(workflow, "relay_authority_targets")
         mutated_relay_job = relay_job.replace(
-            "      - uses: actions/checkout@v4\n\n",
-            "      - uses: actions/checkout@v4\n\n"
+            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n\n",
+            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n\n"
             "      - name: Unregistered forbidden env\n"
             "        env:\n"
             '          CARGO_PROFILE_DEV_DEBUG: "1"\n'
@@ -2332,7 +2332,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
         hosted = job_block(workflow, "macos_hosted")
         header, steps = hosted.split("    steps:\n", 1)
         self.assertNotIn("rust_filter", header)
-        checkout = steps.index("      - uses: actions/checkout@v4\n")
+        checkout = steps.index("      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n")
         filter_step = step_block(hosted, "Decide whether heavy steps are needed")
         self.assertLess(checkout, steps.index(filter_step))
         self.assertIn("fetch-depth: 0", steps[checkout : steps.index(filter_step)])

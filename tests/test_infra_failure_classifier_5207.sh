@@ -65,7 +65,7 @@ PG_JOB="PostgreSQL tests (ubuntu-postgres)"
 
 # --- R1: the outage fingerprint is infrastructure -------------------------
 OUTAGE_LOG="$(write_log outage.log \
-  'Download action repository actions/checkout@v4' \
+  'Download action repository actions/checkout@11d5960a326750d5838078e36cf38b85af677262' \
   'Failed to resolve action download info. Error: Service Unavailable' \
   'Failed to resolve action download info. Error: Service Unavailable')"
 assert_class "action download outage is classified as infrastructure" \
