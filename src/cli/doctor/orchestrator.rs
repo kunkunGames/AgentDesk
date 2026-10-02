@@ -611,7 +611,7 @@ fn check_qwen_auth_hints(configured: bool) -> Check {
         ]);
     }
 
-    let guidance = "Check the API key path in the project .qwen/.env first, then .env. The Qwen CLI does not merge env-files. Check DashScope web console or official documentation for usage/limits instead of hardcoding numbers in doctor.";
+    let guidance = "Check the API key path in the project .qwen/.env first, then .env. The Qwen CLI does not merge env-files.";
     if configured {
         Check::warn(
             "provider_qwen_auth",
