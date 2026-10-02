@@ -55,14 +55,6 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 get(dispatched_sessions::list_dispatched_sessions),
             )
             .route(
-                "/dispatched-sessions/cleanup",
-                delete(dispatched_sessions::cleanup_sessions),
-            )
-            .route(
-                "/dispatched-sessions/gc-threads",
-                delete(dispatched_sessions::gc_thread_sessions),
-            )
-            .route(
                 "/dispatched-sessions/{id}",
                 patch(dispatched_sessions::update_dispatched_session),
             )
