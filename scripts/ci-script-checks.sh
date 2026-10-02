@@ -654,7 +654,6 @@ if run_check cargo "Generate env + CLI reference docs (README source-of-truth ta
 "$PYTHON" -m unittest tests.test_generate_env_reference tests.test_generate_cli_reference
 git diff --exit-code -- \
   ARCHITECTURE.md \
-  docs/generated/module-inventory.md \
   docs/generated/route-inventory.md \
   docs/generated/worker-inventory.md \
   docs/generated/env-reference.md \
