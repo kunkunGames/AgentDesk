@@ -1314,15 +1314,15 @@ class FastCheckCiWiringTests(unittest.TestCase):
                 1,
             ),
             "checkout provenance": mirror.replace(
-                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n",
-                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n",
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n"
                 "        with:\n"
                 "          repository: attacker/green-mirror\n",
                 1,
             ),
             "extra step": mirror.replace(
-                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n",
-                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n",
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n"
                 "      - run: printf 'exit 0\\n' > scripts/required-check-mirror.sh\n",
                 1,
             ),
@@ -2071,8 +2071,8 @@ class FastCheckCiWiringTests(unittest.TestCase):
         workflow = PR_WORKFLOW.read_text(encoding="utf-8")
         relay_job = job_block(workflow, "relay_authority_targets")
         mutated_relay_job = relay_job.replace(
-            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n\n",
-            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n\n"
+            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n\n",
+            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n\n"
             "      - name: Unregistered forbidden env\n"
             "        env:\n"
             '          CARGO_PROFILE_DEV_DEBUG: "1"\n'
@@ -2332,7 +2332,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
         hosted = job_block(workflow, "macos_hosted")
         header, steps = hosted.split("    steps:\n", 1)
         self.assertNotIn("rust_filter", header)
-        checkout = steps.index("      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n")
+        checkout = steps.index("      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n")
         filter_step = step_block(hosted, "Decide whether heavy steps are needed")
         self.assertLess(checkout, steps.index(filter_step))
         self.assertIn("fetch-depth: 0", steps[checkout : steps.index(filter_step)])
