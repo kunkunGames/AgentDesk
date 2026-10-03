@@ -1,6 +1,6 @@
 use axum::{Router, routing::get};
 
-use super::super::{ApiRouter, AppState, analytics, home_metrics, protected_api_domain, receipt};
+use super::super::{ApiRouter, AppState, analytics, home_metrics, protected_api_domain, receipt, stats};
 
 // Category: analytics
 
@@ -21,6 +21,8 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route("/machine-status", get(analytics::machine_status))
             .route("/rate-limits", get(analytics::rate_limits))
             .route("/skills-trend", get(analytics::skills_trend))
+            .route("/stats", get(stats::get_stats))
+            .route("/stats/memento", get(stats::get_memento_stats))
             .route("/home/kpi-trends", get(home_metrics::home_kpi_trends)),
         state,
     )
