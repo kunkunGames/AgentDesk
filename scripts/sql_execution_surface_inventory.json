@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "44fad46e57b0c24258ef4c226dd3a5393409507b",
+  "measured_at_sha": "c16e5a20b805efb9370b9c63d7dff1712ac5bf22",
   "records": [
     {
       "root": "migrations/postgres",
@@ -1458,6 +1458,15 @@
       "api": "agentdesk.db.query",
       "symbol": "query",
       "classification": "STATIC",
+      "fingerprint": "sha256:0d7fdc7a785854dbeb6c76ebd47229ecd569c00ee82da6e42df435dc43ec0e3e"
+    },
+    {
+      "root": "policies",
+      "kind": "POLICY",
+      "path": "policies/kanban-rules.js",
+      "api": "agentdesk.db.query",
+      "symbol": "query",
+      "classification": "STATIC",
       "fingerprint": "sha256:2f27ce137f20ac67d43267ea07c0d894af5aa19f1cbc63175732c9f6b67f9140"
     },
     {
@@ -2242,6 +2251,15 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:14e4c883e0e4fa409c18ac5f3a267fe5c99a2b3f9372a2b331cbd15beb8aebe7"
+    },
+    {
+      "root": "policies",
+      "kind": "POLICY",
+      "path": "policies/timeouts/orphan-dispatch.js",
+      "api": "agentdesk.db.query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:7b033f5d009fab68ae218c2eb8ee0566fccab356547d01839700bbed9e380996"
     },
     {
       "root": "policies",
@@ -21609,6 +21627,15 @@
       "api": "sqlx::query_scalar",
       "symbol": "query_scalar",
       "classification": "STATIC",
+      "fingerprint": "sha256:779767220e6a744f42915f8a3308b855157a682749369e70e2c595d4c25b2348"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/auto_queue/cleanup_tasks.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
       "fingerprint": "sha256:946e3e4699db8edfdcf8214ff18618009d1936ae990b7764724e639fc57b4e34"
     },
     {
@@ -21637,15 +21664,6 @@
       "symbol": "query_scalar",
       "classification": "STATIC",
       "fingerprint": "sha256:c056671228dde2a0fd1fc2b6d5ad0da6219e667f4b638f7f3fa1778c9fd1d7f4"
-    },
-    {
-      "root": "src",
-      "kind": "RUST",
-      "path": "src/services/auto_queue/cleanup_tasks.rs",
-      "api": "sqlx::query_scalar",
-      "symbol": "query_scalar",
-      "classification": "STATIC",
-      "fingerprint": "sha256:c0dd7edac6ce449980f00d22d5fc53be3fc615c55f1f04fcff9eeb8dc188d43b"
     },
     {
       "root": "src",
