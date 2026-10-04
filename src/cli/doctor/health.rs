@@ -243,7 +243,7 @@ pub(crate) fn classify_degraded_reason(raw: &str) -> ClassifiedReason {
             raw: raw.to_string(),
             subsystem: "postgres",
             severity: Severity::Error,
-            fix_safety: FixSafety::NotFixable,
+            fix_safety: FixSafety::ExplicitDbRepairRequired,
             security_exposure: SecurityExposure::OperationalMetadata,
             summary: "database is unavailable".to_string(),
             next_step: "check Postgres/SQLite availability and server logs".to_string(),
@@ -454,7 +454,7 @@ mod health_classification_tests {
                     "raw": "db_unavailable",
                     "subsystem": "postgres",
                     "severity": "error",
-                    "fix_safety": "not_fixable",
+                    "fix_safety": "explicit_db_repair_required",
                     "summary": "database is unavailable",
                     "next_step": "check Postgres/SQLite availability and server logs",
                 }]
