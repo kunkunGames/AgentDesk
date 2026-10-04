@@ -39,8 +39,19 @@ export default function EmojiPickerLibraryPanel({
 
     const syncSelected = () => {
       container.querySelectorAll("button.epr-emoji").forEach((button) => {
-        const isSelected = target !== null && normalize(button.textContent ?? "") === target;
+        const text = normalize(button.textContent ?? "");
+        const isSelected = target !== null && text === target;
         button.setAttribute("aria-pressed", isSelected ? "true" : "false");
+
+        if (isSelected) {
+          button.setAttribute("aria-current", "true");
+        } else {
+          button.removeAttribute("aria-current");
+        }
+
+        if (!button.hasAttribute("aria-label") && text) {
+          button.setAttribute("aria-label", text);
+        }
       });
     };
 
