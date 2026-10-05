@@ -68,7 +68,7 @@ jobs:
       cross_os_rust: ${{ steps.comment_only.outcome == 'success' && steps.comment_only.outputs.comment_only == 'true' && 'false' || steps.filter.outputs.cross_os_rust }}
       win32_build_token: ${{ steps.filter.outputs.win32_build_token }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
         with:
           fetch-depth: 0
 
@@ -740,7 +740,7 @@ jobs:
     if: needs.changes.outputs.dashboard == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -770,7 +770,7 @@ jobs:
       matrix:
         os: [ubuntu-latest]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
@@ -850,10 +850,10 @@ jobs:
         # back to this matrix once issue backlog stabilises.
         os: [windows-latest]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Provision Python 3.11 (tomllib owner for check_test_target_integrity, a2a-C PR-1)
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@v5 # v5
         with:
           python-version: "3.11"
 
@@ -928,10 +928,10 @@ jobs:
       matrix:
         os: [windows-latest]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Provision Python 3.11 (tomllib owner for check_test_target_integrity, a2a-C PR-1)
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@v5 # v5
         with:
           python-version: "3.11"
 
@@ -987,8 +987,8 @@ jobs:
     if: needs.changes.outputs.win32_build_token == 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/checkout@v4 # v4
+      - uses: actions/setup-python@v5 # v5
         with: {python-version: "3.11"}
       - shell: pwsh
         run: git cat-file -e "HEAD:scripts/build_token_win32.py" && git cat-file -e "HEAD:tests/test_build_token_win32_5663.py" && python -m unittest -v tests.test_build_token_win32_5663
@@ -1001,7 +1001,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Mirror fast check result for branch protection
         if: ${{ needs.changes.outputs.relay_contract != 'true' }}
@@ -1034,7 +1034,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Mirror targeted test result for branch protection
         env:
@@ -1053,7 +1053,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       # The required context runs this helper, so pin its bytes before use.
       - name: Pin required-check mirror helper (#5321)
@@ -1101,7 +1101,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Start PostgreSQL service
         run: ./scripts/ci/postgres-service.sh start
@@ -1245,7 +1245,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Start PostgreSQL service
         run: ./scripts/ci/postgres-service.sh start
@@ -1379,7 +1379,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       # The required context runs this helper, so pin its bytes before use.
       - name: Pin required-check mirror helper (#5321)
@@ -1602,7 +1602,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Start PostgreSQL service
         run: ./scripts/ci/postgres-service.sh start
@@ -1670,7 +1670,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Mirror library sweep result across path-filter skips
         env:
@@ -1690,7 +1690,7 @@ jobs:
     if: needs.changes.outputs.rust_or_policy == 'true' || needs.changes.outputs.relay_contract == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
@@ -1733,7 +1733,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       # The required context runs this helper, so pin its bytes before use.
       - name: Pin required-check mirror helper (#5321)
@@ -1769,7 +1769,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Mirror check_fast_cross_os result for branch protection
         shell: bash
@@ -1805,7 +1805,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
       - env: {CHANGED_PATHS_RESULT: '${{ needs.changes.result }}', FILTER_NAME: win32_build_token, FILTER_OUTPUT: '${{ needs.changes.outputs.win32_build_token }}', UPSTREAM_JOB_NAME: win32_build_token, UPSTREAM_RESULT: '${{ needs.win32_build_token.result }}'}
         run: ./scripts/required-check-mirror.sh
 
@@ -1814,7 +1814,7 @@ jobs:
     needs: changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
         with:
           fetch-depth: 0
 
@@ -1839,7 +1839,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Python for script checks
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@v5 # v5
         with:
           python-version: "3.11"
 
@@ -1903,7 +1903,7 @@ jobs:
 
       - name: Upload giant-file progress evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@v4 # v4
         with:
           path: target/giant-file-progress/evidence.json
 
@@ -1941,7 +1941,7 @@ jobs:
 
       - name: Upload maintainability audit artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@v4 # v4
         with:
           name: maintainability-audit
           path: target/maintainability-audit.yaml
@@ -1956,12 +1956,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
         with:
           fetch-depth: 0
 
       - name: Setup Python for script checks
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@v5 # v5
         with:
           python-version: "3.11"
 
@@ -1992,12 +1992,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
         with:
           fetch-depth: 0
 
       - name: Setup Python for script checks
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@v5 # v5
         with:
           python-version: "3.11"
 
@@ -2032,7 +2032,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       # Pin the shared result primitive out-of-band before running structural
       # checks. Intentional helper edits must update this value, the independent
@@ -2105,7 +2105,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
@@ -2171,7 +2171,7 @@ jobs:
         shard: [0, 1, 2]
     steps:
       # Depth 2 keeps HEAD^1, the base side the wiring digest compares against.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
         with:
           fetch-depth: 2
 
@@ -2259,7 +2259,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
 
       - name: Pin required-check mirror content (#5321)
         env:

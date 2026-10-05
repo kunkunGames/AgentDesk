@@ -27,7 +27,7 @@ jobs:
     runs-on: macos-15
     steps:
       # Skip heavy steps on docs-only pushes only when the filter succeeds with run=false.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4 # v4
         with:
           fetch-depth: 0
           filter: blob:none
