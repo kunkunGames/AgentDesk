@@ -1,0 +1,21 @@
+Accessor: add PageUp/PageDown/Home/End keyboard accessibility for sprite spinbutton
+
+What changed:
+- Added `PageUp`, `PageDown`, `Home`, and `End` keyboard events to the sprite spinbutton.
+- Added `aria-controls` to the Next/Previous buttons linking them to the spinbutton.
+- Fixed the Home key logic to set the lower bound to 1.
+- Added unit tests for these keyboard events in `AgentFormModal.test.tsx`.
+
+Why:
+- The standard ARIA behavior for spinbuttons requires handling for `PageUp`, `PageDown`, `Home`, and `End` keys to improve accessibility. Adding `aria-controls` correctly links the controls to the input for screen readers.
+
+WorkFingerprint:
+- Agent: Accessor
+- Category Boundary: dashboard/src/**
+- Primary Files: dashboard/src/components/agent-manager/AgentFormModal.tsx, dashboard/src/components/agent-manager/AgentFormModal.test.tsx
+- Invariant Protected: Visual stability and semantics.
+- Overlap Check: Checked open PRs/branches and found no overlapping work for this specific issue.
+- Verification: ran `./scripts/verify-dashboard.sh` and `npm run test` for the affected files.
+- Skipped Checks: N/A
+- Risk: Low (DOM behavior only, fully tested).
+- Rollback: Revert this commit to rollback.
