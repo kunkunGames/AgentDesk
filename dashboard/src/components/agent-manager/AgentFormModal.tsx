@@ -156,6 +156,7 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   aria-label={tr("다음 스프라이트", "Next Sprite")}
+                  aria-controls="sprite-spinbutton"
                   tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-1 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{
@@ -171,6 +172,7 @@ export default function AgentFormModal({
                   ▲
                 </button>
                 <div
+                  id="sprite-spinbutton"
                   className="w-14 h-14 rounded-xl overflow-hidden bg-th-bg-surface flex items-center justify-center flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{ border: "2px solid var(--th-input-border)" }}
                   role="spinbutton"
@@ -192,6 +194,20 @@ export default function AgentFormModal({
                       e.preventDefault();
                       const next = Math.max(1, (spriteNum || 1) - 1);
                       setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                    } else if (e.key === "PageUp") {
+                      e.preventDefault();
+                      const next = Math.min(MAX_AGENT_SPRITE_NUMBER, Math.max(0, spriteNum || 0) + 10);
+                      setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                    } else if (e.key === "PageDown") {
+                      e.preventDefault();
+                      const next = Math.max(1, (spriteNum || 1) - 10);
+                      setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
+                    } else if (e.key === "Home") {
+                      e.preventDefault();
+                      setValue("sprite_number", 1, { shouldDirty: true, shouldValidate: true });
+                    } else if (e.key === "End") {
+                      e.preventDefault();
+                      setValue("sprite_number", MAX_AGENT_SPRITE_NUMBER, { shouldDirty: true, shouldValidate: true });
                     }
                   }}
                 >
@@ -215,6 +231,7 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   aria-label={tr("이전 스프라이트", "Previous Sprite")}
+                  aria-controls="sprite-spinbutton"
                   tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-1 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{
