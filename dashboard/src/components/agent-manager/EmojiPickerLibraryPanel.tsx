@@ -62,8 +62,8 @@ export default function EmojiPickerLibraryPanel({
         lazyLoadEmojis
         onEmojiClick={handleEmojiClick}
         previewConfig={{ showPreview: false }}
-        searchClearButtonLabel="Clear emoji search"
-        searchPlaceholder="Search emoji"
+        searchClearButtonLabel="Clear icon search"
+        searchPlaceholder="Search icons"
         skinTonesDisabled={false}
         theme={Theme.DARK}
         width={width}

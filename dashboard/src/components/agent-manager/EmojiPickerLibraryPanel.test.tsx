@@ -44,7 +44,7 @@ describe("EmojiPickerLibraryPanel accessibility", () => {
     vi.clearAllMocks();
   });
 
-  it("exposes false for unselected emoji buttons and updates the selected state", async () => {
+  it("exposes false for unselected icon buttons and updates the selected state", async () => {
     const target = await render(
       <EmojiPickerLibraryPanel height={200} onSelect={() => {}} value="😀" width={200} />,
     );
