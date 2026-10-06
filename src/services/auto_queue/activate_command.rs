@@ -1279,6 +1279,9 @@ async fn compute_activate_groups_to_dispatch(
     }
 
     for &group in &active_groups {
+        if groups_to_dispatch.contains(&group) {
+            continue;
+        }
         let has_pending = match crate::db::auto_queue::group_has_pending_entries_pg(
             pool,
             run_id,
@@ -1308,7 +1311,7 @@ async fn compute_activate_groups_to_dispatch(
                 ));
             }
         };
-        if has_pending && !has_dispatched && !groups_to_dispatch.contains(&group) {
+        if has_pending && !has_dispatched {
             groups_to_dispatch.push(group);
         }
     }
