@@ -3589,6 +3589,23 @@ mod tests {
     // harness starts executing routines.
 
     #[test]
+    fn json_count_clamps_bounds() {
+        assert_eq!(super::json_count(&Value::Null), 1);
+        assert_eq!(super::json_count(&serde_json::json!({})), 1);
+        assert_eq!(super::json_count(&serde_json::json!({"count": 0})), 1);
+        assert_eq!(super::json_count(&serde_json::json!({"count": 25})), 25);
+        assert_eq!(super::json_count(&serde_json::json!({"count": 50})), 50);
+        assert_eq!(super::json_count(&serde_json::json!({"count": 51})), 50);
+        assert_eq!(super::json_count(&serde_json::json!({"count": 9999})), 50);
+
+        assert_eq!(super::json_count(&serde_json::json!({"occurrences": 0})), 1);
+        assert_eq!(super::json_count(&serde_json::json!({"occurrences": 12})), 12);
+        assert_eq!(super::json_count(&serde_json::json!({"occurrences": 100})), 50);
+
+        assert_eq!(super::json_count(&serde_json::json!({"count": 10, "occurrences": 20})), 10);
+    }
+
+    #[test]
     fn resume_omitted_next_due_rejects_legacy_schedule_less_rows() {
         assert!(resume_without_next_due_is_invalid(None, None));
         assert!(!resume_without_next_due_is_invalid(Some("@every 1h"), None));
