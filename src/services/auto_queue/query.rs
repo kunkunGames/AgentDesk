@@ -198,11 +198,19 @@ pub(super) async fn slot_requires_thread_reset_before_reuse_pg(
         return Ok(false);
     }
 
+    let has_slot_thread_binding = slot_thread_map_has_bindings_pg(pool, agent_id, slot_index).await?;
+
+    let has_dispatch_thread_history = if has_slot_thread_binding {
+        false // Short-circuit: should_reset_slot_thread_before_reuse uses a logical OR, so if bindings exist, history isn't needed to return true.
+    } else {
+        slot_has_dispatch_thread_history_pg(pool, agent_id, slot_index).await?
+    };
+
     Ok(should_reset_slot_thread_before_reuse(
         newly_assigned,
         reassigned_from_other_group,
-        slot_thread_map_has_bindings_pg(pool, agent_id, slot_index).await?,
-        slot_has_dispatch_thread_history_pg(pool, agent_id, slot_index).await?,
+        has_slot_thread_binding,
+        has_dispatch_thread_history,
     ))
 }
 
