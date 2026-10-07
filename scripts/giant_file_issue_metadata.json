@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "refreshed_at": "2026-09-06T22:50:07Z",
+  "refreshed_at": "2026-10-07T06:53:06Z",
   "ratchets": {
     "closed_deadline_entries": 74,
     "transition_list_entries": 74
@@ -128,7 +128,7 @@
     {
       "number": 5447,
       "state": "open",
-      "title": "Decompose src/services/discord/health/snapshot.rs (prod 1,240 LoC) — giant 트랙 종료 결정(09-04)에 따라 registry 포인터·deadline 정리 후 재판정",
+      "title": "Decompose src/services/discord/health/snapshot.rs (prod 1,240 LoC) \u2014 giant \ud2b8\ub799 \uc885\ub8cc \uacb0\uc815(09-04)\uc5d0 \ub530\ub77c registry \ud3ec\uc778\ud130\u00b7deadline \uc815\ub9ac \ud6c4 \uc7ac\ud310\uc815",
       "owners": [
         "discord-relay"
       ],
