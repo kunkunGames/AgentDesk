@@ -3826,7 +3826,7 @@ fn check_disk_usage() -> Check {
                 CheckGroup::Core,
                 "Disk Usage",
                 format!("{} — unreadable ({e})", path.display()),
-                "runtime root 권한을 확인하세요.",
+                "check runtime root permissions.",
             )
             .with_path(path.display().to_string())
             .with_expected_actual(
