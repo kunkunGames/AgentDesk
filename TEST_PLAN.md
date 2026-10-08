@@ -18,8 +18,8 @@ Every PR must include:
 - Risk and rollback notes
 
 ## Verification Commands
-- **Rust Changes:** `cargo check --all-targets`, `cargo test <narrow-target>`. When executing commands that might terminate the shell session (like `cargo check --all-targets`), wrap them in `bash -c '<command>'` to prevent session loss and preserve environment state.
-- **Dashboard Changes:** `./scripts/verify-dashboard.sh`
+- **Rust Changes:** `cargo check --all-targets`, `cargo test <narrow-target>`. When executing commands that might terminate the shell session (like `cargo check --all-targets`), wrap them in `bash -c '<command>'` to prevent session loss and preserve environment state. If `cargo check --all-targets` fails with internal errors, use `bash -c 'cargo check -p agentdesk --lib'` as a fallback. When running isolated tests, append `-- --exact` (e.g., `bash -c 'cargo test --lib <test_name> -- --exact'`) to avoid timing out on broad matches.
+- **Dashboard Changes:** `./scripts/verify-dashboard.sh`. When running dashboard tests locally, use `cd dashboard && npm run test -- --run`. If `./scripts/verify-dashboard.sh` fails due to known npm audit vulnerabilities, it can be bypassed using `DASHBOARD_AUDIT_WAIVER='<reason>' ./scripts/verify-dashboard.sh`.
 - **Policy Changes:** `npm run test:policies`
 - **Scripts:** `shellcheck`
 - **Generated Docs:** `python3 scripts/generate_inventory_docs.py` (only if the PR explicitly owns generated inventory)
