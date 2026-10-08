@@ -264,7 +264,7 @@ async fn route_intake(pool: &PgPool, ctx: &IntakeRouterContext<'_>) -> IntakeRou
     // requirements; a deferred route cannot grant permission to run elsewhere.
     if let SessionOwnerResolution::LiveLocal { instance_id, .. } = &owner {
         if let Some(blocked) = check_required_target(pool, ctx, instance_id, &requirements).await {
-            return blocked;
+            return apply_observe_mode(ctx.mode, blocked);
         }
     }
 
@@ -429,7 +429,7 @@ async fn route_node_override_without_owner(
         };
 
     if let Some(blocked) = check_required_target(pool, ctx, target, requirements).await {
-        return blocked;
+        return apply_observe_mode(ctx.mode, blocked);
     }
     if target == ctx.leader_instance_id {
         return apply_observe_mode(
@@ -712,7 +712,7 @@ async fn route_to_instance(
     // Live ingress is always attempt 1. Retry-family allocation belongs only
     // to the failed-pre-accept worker recovery path.
     if let Some(blocked) = check_required_target(pool, ctx, target, requirements).await {
-        return blocked;
+        return apply_observe_mode(ctx.mode, blocked);
     }
     let mut payload = build_payload_for_insert(ctx, target, required_labels, agent_id);
     payload.execution_requirements = serde_json::json!(requirements);
