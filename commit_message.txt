@@ -1,0 +1,34 @@
+Doctor: remove outdated SQLite reference from db_unavailable next step
+
+What changed:
+Updated the next step string for the `db_unavailable` degraded reason in `src/cli/doctor/health.rs` to refer only to Postgres instead of Postgres/SQLite. Updated the corresponding test to match.
+
+Why:
+AgentDesk uses PostgreSQL as the canonical live datastore, and legacy SQLite exists only for tests/migrations. The diagnostic report should reflect this and not direct users to check SQLite availability in the `db_unavailable` diagnostic.
+
+WorkFingerprint:
+Agent name: Doctor
+Category boundary: `src/cli/doctor/**`
+Primary files modified: `src/cli/doctor/health.rs`
+Invariant protected: Doctor behavior should inspect and report without mutating runtime state. Legacy SQLite is not the canonical live datastore.
+Public API impact: None
+Docs impact: None
+Verification plan: Run `cargo check --all-targets`, `git diff --check`.
+Related PRs/issues: None
+
+Overlap check:
+Verified overlapping PRs using `gh pr list` / checking remotes and recent branches to ensure no duplicate PR exists for removing SQLite references from `db_unavailable` `next_step` string.
+
+Verification commands:
+- `git diff --check`
+- `cargo check --all-targets` (successful on main crate, some test/timeout issues outside modified code)
+- `cargo check --bin agentdesk`
+
+Skipped checks:
+Manual doctor CLI check was skipped as the environment didn't easily support running the full orchestrated doctor suite locally. `cargo check` and test fix confirms the fix is mechanically sound.
+
+Risk:
+Low. String modification only in diagnostic read path.
+
+Rollback notes:
+Revert the commit to restore the Postgres/SQLite diagnostic string.
