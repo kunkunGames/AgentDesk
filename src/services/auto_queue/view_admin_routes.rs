@@ -179,7 +179,7 @@ pub(super) async fn update_entry_with_pg(
         }
     };
 
-    let mut effective_status = status.clone();
+    let mut effective_status = status;
     if let Some(new_status) = requested_status {
         let update_result = if new_status == crate::db::auto_queue::ENTRY_STATUS_DONE {
             crate::db::auto_queue::reconcile_failed_entry_done_on_pg(
@@ -212,7 +212,7 @@ pub(super) async fn update_entry_with_pg(
                     Json(json!({
                         "error": format!(
                             "entry status transition not allowed: {} -> {}",
-                            status, new_status
+                            effective_status, new_status
                         ),
                     })),
                 ));
