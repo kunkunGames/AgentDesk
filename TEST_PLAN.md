@@ -5,7 +5,7 @@
 - **Strict No-Change Verification:** A "no-change" report MUST have exactly zero changed files. Verify using `gh pr view --json files`. If a PR claims "no change" but modifies files (e.g. migrations, routines), it is unsafe. A no-change result should NOT become a PR unless it explicitly changes a queue-hygiene artifact. If an empty no-change PR is unavoidably created, its body must explicitly list the exact overlapping PR numbers and branches.
 - **Infrastructure CI Failures:** If a CI failure is determined to be an infrastructure issue or runner cancellation (e.g., 'The runner has received a shutdown signal') with no code fix applicable, produce an empty commit no-change report explaining the cancellation.
 - **Stale Branch Cleanup:** Treat low-signal or stale broad branches as queue debt. Explicitly close or recommend closing stale broad branches rather than attempting to salvage them in place.
-- **Clean Workspace (Scratch Files):** When using tools that generate scratch files or creating ad-hoc test scripts (e.g., `test_*.rs`, `test.sh`, `plan.md`, `pr-body.md`), always run a final changed-file audit (e.g. `git status`) before committing to ensure stray artifacts are not accidentally included, preventing repository pollution. Do not commit scratch PR body files such as `pr-body.md`; put PR text directly in the GitHub PR body.
+- **Clean Workspace (Scratch Files):** When using tools that generate scratch files or creating ad-hoc test scripts (e.g., `test_*.rs`, `test.sh`, `plan.md`, `pr-body.md`), always run a final changed-file audit (e.g. `git status`) before committing to ensure stray artifacts are not accidentally included, preventing repository pollution. Do not commit scratch PR body files such as `pr-body.md`; put PR text directly in the GitHub PR body. If the diff contains unrelated files, old merged work, scratch files, or broad stale branch baggage, you must abandon the branch and report that a clean PR is required instead of attempting to salvage the dirty branch.
 
 ## PR Body Requirements
 Every PR must include:
@@ -29,6 +29,7 @@ Every PR must include:
 - Changes must be concrete enough for agents or humans to follow.
 
 ## Agent Execution Plan Guidelines
+- **Actionable Steps Rule:** In execution plans, exclude narrative context, rationale, and reflection. Begin directly with specific, actionable execution steps, and split bundled actions (e.g., creating a branch, making an empty commit, and defining PR content) into separate, granular steps.
 - **Groundedness Rule:** Only use tools, test names, and targets that are explicitly confirmed to exist in the trace. Do not guess test commands; verify them via bash first (e.g., using `grep`) or use standard test commands without specific targets.
 - **Completeness Rule:** Execution plans must explicitly include comprehensive final test runs (e.g., `cargo check --all-targets`, `npm run test:policies`, `./scripts/verify-dashboard.sh`, `python3 scripts/generate_inventory_docs.py`) as defined for the specific agent role, rather than relying solely on `git diff`.
 - **Pre-commit Step:** The pre-commit step description must use the exact mandatory phrasing: 'Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.'
