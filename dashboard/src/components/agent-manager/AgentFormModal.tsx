@@ -8,6 +8,7 @@ import { localeName, useI18n } from "../../i18n";
 import EmojiPicker from "./EmojiPicker";
 import AgentPromptEditor from "./AgentPromptEditor";
 import type { FormData } from "./types";
+import * as Dialog from "@radix-ui/react-dialog";
 import {
   SurfaceActionButton,
   SurfaceCard,
@@ -72,15 +73,6 @@ export default function AgentFormModal({
   const spriteNum = formValues.sprite_number ?? 0;
   const providerCatalog = useProviderCatalog(formValues.cli_provider);
 
-  // ESC 키로 닫기
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [onClose]);
-
   useEffect(() => {
     reset(form);
   }, [form, reset]);
@@ -100,24 +92,22 @@ export default function AgentFormModal({
   });
 
   return (
-    <div
-      ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-hidden px-3 py-4 sm:items-center sm:p-4"
-      style={{
-        background: "var(--th-modal-overlay)",
-        paddingTop: "max(1rem, calc(env(safe-area-inset-top) + 0.75rem))",
-        paddingBottom: "max(1rem, calc(env(safe-area-inset-bottom) + 0.75rem))",
-      }}
-      onClick={(e) => {
-        if (e.target === overlayRef.current) onClose();
-      }}
-    >
-      <form
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="agent-modal-title"
+    <Dialog.Root open={true} onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}>
+      <Dialog.Portal>
+        <div
+          ref={overlayRef}
+          className="fixed inset-0 z-50 flex items-start justify-center overflow-hidden px-3 py-4 sm:items-center sm:p-4"
+          style={{
+            background: "var(--th-modal-overlay)",
+            paddingTop: "max(1rem, calc(env(safe-area-inset-top) + 0.75rem))",
+            paddingBottom: "max(1rem, calc(env(safe-area-inset-bottom) + 0.75rem))",
+          }}
+        >
+          <Dialog.Overlay className="fixed inset-0 z-[-1]" />
+          <Dialog.Content asChild>
+            <form
         onSubmit={handleSave}
-        className="w-full self-start max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-1.5rem)] max-w-[calc(100vw-1.5rem)] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[28px] border p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:my-auto sm:max-h-[90vh] sm:max-w-5xl sm:p-6"
+        className="relative z-50 w-full self-start max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-1.5rem)] max-w-[calc(100vw-1.5rem)] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[28px] border p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:my-auto sm:max-h-[90vh] sm:max-w-5xl sm:p-6"
         style={{
           background:
             "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",
@@ -127,6 +117,12 @@ export default function AgentFormModal({
           touchAction: "pan-y",
         }}
       >
+        <Dialog.Title className="sr-only">
+          {isEdit ? tr("직원 정보 수정", "Edit Agent") : tr("신규 직원 채용", "Hire New Agent")}
+        </Dialog.Title>
+        <Dialog.Description className="sr-only">
+          {isEdit ? tr("직원 정보를 수정합니다.", "Edit agent info.") : tr("신규 직원을 채용합니다.", "Hire a new agent.")}
+        </Dialog.Description>
         {/* Modal header */}
         <div className="flex items-center justify-between mb-5">
           <h3 id="agent-modal-title" className="text-base font-bold" style={{ color: "var(--th-text-heading)" }}>
@@ -156,6 +152,7 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   aria-label={tr("다음 스프라이트", "Next Sprite")}
+                  aria-controls="agent-sprite-spinbutton"
                   tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-1 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{
@@ -171,6 +168,7 @@ export default function AgentFormModal({
                   ▲
                 </button>
                 <div
+                  id="agent-sprite-spinbutton"
                   className="w-14 h-14 rounded-xl overflow-hidden bg-th-bg-surface flex items-center justify-center flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{ border: "2px solid var(--th-input-border)" }}
                   role="spinbutton"
@@ -215,6 +213,7 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   aria-label={tr("이전 스프라이트", "Previous Sprite")}
+                  aria-controls="agent-sprite-spinbutton"
                   tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-1 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{
@@ -445,7 +444,10 @@ export default function AgentFormModal({
             {tr("취소", "Cancel")}
           </SurfaceActionButton>
         </div>
-      </form>
-    </div>
+            </form>
+          </Dialog.Content>
+        </div>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }

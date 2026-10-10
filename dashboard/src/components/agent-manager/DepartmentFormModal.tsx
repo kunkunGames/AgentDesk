@@ -8,6 +8,7 @@ import * as api from "../../api";
 import { DEPT_BLANK, DEPT_COLORS } from "./constants";
 import EmojiPicker from "./EmojiPicker";
 import type { Translator } from "./types";
+import * as Dialog from "@radix-ui/react-dialog";
 import {
   SurfaceActionButton,
   SurfaceNotice,
@@ -102,14 +103,6 @@ export default function DepartmentFormModal({
     const orders = departments.map((d) => d.sort_order).filter((n) => typeof n === "number" && !isNaN(n));
     return Math.max(0, ...orders) + 1;
   })();
-
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [onClose]);
 
   const handleSave = handleSubmit(async (values) => {
     setSaving(true);
@@ -260,32 +253,37 @@ export default function DepartmentFormModal({
   };
 
   return (
-    <div
-      ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-end justify-center p-0 sm:items-center sm:p-4"
-      style={{
-        background: "var(--th-modal-overlay)",
-        paddingTop: "calc(1rem + env(safe-area-inset-top))",
-      }}
-      onClick={(e) => {
-        if (e.target === overlayRef.current) onClose();
-      }}
-    >
-      <form
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="dept-modal-title"
-        className="w-full max-w-2xl max-h-full overflow-y-auto rounded-t-3xl p-5 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:max-h-[85vh] sm:rounded-[28px] sm:p-6"
-        style={{
-          background:
-            "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",
-          borderColor: "color-mix(in srgb, var(--th-border) 72%, transparent)",
-          paddingBottom: "max(1.25rem, calc(1.25rem + env(safe-area-inset-bottom)))",
-        }}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between mb-5">
-          <h3 id="dept-modal-title" className="text-base font-bold flex items-center gap-2" style={{ color: "var(--th-text-heading)" }}>
+    <Dialog.Root open={true} onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}>
+      <Dialog.Portal>
+        <div
+          ref={overlayRef}
+          className="fixed inset-0 z-50 flex items-end justify-center p-0 sm:items-center sm:p-4"
+          style={{
+            background: "var(--th-modal-overlay)",
+            paddingTop: "calc(1rem + env(safe-area-inset-top))",
+          }}
+        >
+          <Dialog.Overlay className="fixed inset-0 z-[-1]" />
+          <Dialog.Content asChild>
+            <form
+              onSubmit={handleSave}
+              className="relative z-50 w-full max-w-2xl max-h-full overflow-y-auto rounded-t-3xl p-5 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:max-h-[85vh] sm:rounded-[28px] sm:p-6"
+              style={{
+                background:
+                  "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",
+                borderColor: "color-mix(in srgb, var(--th-border) 72%, transparent)",
+                paddingBottom: "max(1.25rem, calc(1.25rem + env(safe-area-inset-bottom)))",
+              }}
+            >
+              <Dialog.Title className="sr-only">
+                {isEdit ? tr("부서 정보 수정", "Edit Department") : tr("신규 부서 추가", "Add Department")}
+              </Dialog.Title>
+              <Dialog.Description className="sr-only">
+                {isEdit ? tr("부서 정보를 수정합니다.", "Edit department info.") : tr("신규 부서를 추가합니다.", "Add a new department.")}
+              </Dialog.Description>
+              {/* Header */}
+              <div className="flex items-center justify-between mb-5">
+                <h3 id="dept-modal-title" className="text-base font-bold flex items-center gap-2" style={{ color: "var(--th-text-heading)" }}>
             <span className="text-lg" aria-hidden="true">{form.icon}</span>
             {isEdit ? tr("부서 정보 수정", "Edit Department") : tr("신규 부서 추가", "Add Department")}
           </h3>
@@ -464,55 +462,58 @@ export default function DepartmentFormModal({
           </SurfaceSubsection>
         </div>
 
-        {/* Actions */}
-        <div className="flex items-center gap-2 mt-5 pt-4" style={{ borderTop: "1px solid color-mix(in srgb, var(--th-border) 72%, transparent)" }}>
-          <SurfaceActionButton
-            type="submit"
-            disabled={saving || !form.name.trim()}
-            tone="accent"
-            className="flex-1 text-sm"
-          >
-            {saving
-              ? tr("처리 중...", "Saving...")
-              : isEdit
-                ? tr("변경사항 저장", "Save Changes")
-                : tr("부서 추가", "Add Department")}
-          </SurfaceActionButton>
-          {isEdit &&
-            (confirmDelete ? (
-              <div className="flex items-center gap-1">
+              {/* Actions */}
+              <div className="flex items-center gap-2 mt-5 pt-4" style={{ borderTop: "1px solid color-mix(in srgb, var(--th-border) 72%, transparent)" }}>
                 <SurfaceActionButton
-                  onClick={handleDelete}
-                  disabled={saving}
-                  tone="danger"
+                  type="submit"
+                  disabled={saving || !form.name.trim()}
+                  tone="accent"
+                  className="flex-1 text-sm"
                 >
-                  {tr("삭제 확인", "Confirm")}
+                  {saving
+                    ? tr("처리 중...", "Saving...")
+                    : isEdit
+                      ? tr("변경사항 저장", "Save Changes")
+                      : tr("부서 추가", "Add Department")}
                 </SurfaceActionButton>
+                {isEdit &&
+                  (confirmDelete ? (
+                    <div className="flex items-center gap-1">
+                      <SurfaceActionButton
+                        onClick={handleDelete}
+                        disabled={saving}
+                        tone="danger"
+                      >
+                        {tr("삭제 확인", "Confirm")}
+                      </SurfaceActionButton>
+                      <SurfaceActionButton
+                        onClick={() => setConfirmDelete(false)}
+                        tone="neutral"
+                      >
+                        {tr("취소", "No")}
+                      </SurfaceActionButton>
+                    </div>
+                  ) : (
+                    <SurfaceActionButton
+                      onClick={() => setConfirmDelete(true)}
+                      tone="danger"
+                      className="text-sm"
+                    >
+                      {tr("삭제", "Delete")}
+                    </SurfaceActionButton>
+                  ))}
                 <SurfaceActionButton
-                  onClick={() => setConfirmDelete(false)}
+                  onClick={onClose}
                   tone="neutral"
+                  className="text-sm"
                 >
-                  {tr("취소", "No")}
+                  {tr("취소", "Cancel")}
                 </SurfaceActionButton>
               </div>
-            ) : (
-              <SurfaceActionButton
-                onClick={() => setConfirmDelete(true)}
-                tone="danger"
-                className="text-sm"
-              >
-                {tr("삭제", "Delete")}
-              </SurfaceActionButton>
-            ))}
-          <SurfaceActionButton
-            onClick={onClose}
-            tone="neutral"
-            className="text-sm"
-          >
-            {tr("취소", "Cancel")}
-          </SurfaceActionButton>
+            </form>
+          </Dialog.Content>
         </div>
-      </form>
-    </div>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
