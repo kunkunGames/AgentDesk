@@ -1,0 +1,30 @@
+What changed:
+Migrated `AgentFormModal.tsx` and `DepartmentFormModal.tsx` from custom div overlays to use `@radix-ui/react-dialog`. Both modals now benefit from robust keyboard accessibility (Escape key, Tab-trapping) and screen reader modality (`aria-hidden` outside the portal). Also updated `AgentFormModal.test.tsx` to handle Radix Portals by querying `container.ownerDocument` instead of `container`.
+
+Why:
+The dashboard modals previously used custom `div` overlays and manual `useEffect` hooks for Escape key handling, lacking comprehensive accessibility coverage (focus trapping, screen-reader modality). Migrating to Radix UI Dialog complies with existing AgentDesk accessibility standards, resolving concerns from previous overlapping PRs (#196 and #202).
+
+WorkFingerprint:
+- Agent Name: Accessor
+- Category Boundary: `dashboard/src/**`, dashboard tests
+- Primary Files: `dashboard/src/components/agent-manager/AgentFormModal.tsx`, `dashboard/src/components/agent-manager/DepartmentFormModal.tsx`, `dashboard/src/components/agent-manager/AgentFormModal.test.tsx`
+- Invariant Protected: Layout dimensions stable, pure semantic/functional enhancement.
+- Public API Impact: None
+- Docs Impact: None
+- Verification Plan: `./scripts/verify-dashboard.sh` with waiver for un-related audit finding.
+- Related PRs/Issues: Adopts correct path for PRs #196, #202.
+
+Duplicate/overlap check:
+Executed `git branch -r` and verified no overlapping PR branches targeting modal accessibility exist (stale branches like #196/202 are abandoned/closed).
+
+Verification commands and results:
+- `DASHBOARD_AUDIT_WAIVER='Supply-Lite issue out of scope' ./scripts/verify-dashboard.sh` -> Passed (448 tests passed).
+
+Skipped checks with reasons:
+- `cargo check --all-targets` (Skipped: no Rust files touched).
+
+Risk:
+Low. Replaces custom modal logic with standard well-tested Radix UI Dialogs.
+
+Rollback notes:
+Revert the PR. Ensure to also revert the DOM query fix in `AgentFormModal.test.tsx`.

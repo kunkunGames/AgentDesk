@@ -1,6 +1,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useForm } from "react-hook-form";
+import * as Dialog from "@radix-ui/react-dialog";
 import { z } from "zod";
 import type { Department } from "../../types";
 import { useI18n } from "../../i18n";
@@ -102,14 +103,6 @@ export default function DepartmentFormModal({
     const orders = departments.map((d) => d.sort_order).filter((n) => typeof n === "number" && !isNaN(n));
     return Math.max(0, ...orders) + 1;
   })();
-
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [onClose]);
 
   const handleSave = handleSubmit(async (values) => {
     setSaving(true);
@@ -260,46 +253,50 @@ export default function DepartmentFormModal({
   };
 
   return (
-    <div
-      ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-end justify-center p-0 sm:items-center sm:p-4"
-      style={{
-        background: "var(--th-modal-overlay)",
-        paddingTop: "calc(1rem + env(safe-area-inset-top))",
-      }}
-      onClick={(e) => {
-        if (e.target === overlayRef.current) onClose();
-      }}
-    >
-      <form
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="dept-modal-title"
-        className="w-full max-w-2xl max-h-full overflow-y-auto rounded-t-3xl p-5 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:max-h-[85vh] sm:rounded-[28px] sm:p-6"
-        style={{
-          background:
-            "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",
-          borderColor: "color-mix(in srgb, var(--th-border) 72%, transparent)",
-          paddingBottom: "max(1.25rem, calc(1.25rem + env(safe-area-inset-bottom)))",
-        }}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between mb-5">
-          <h3 id="dept-modal-title" className="text-base font-bold flex items-center gap-2" style={{ color: "var(--th-text-heading)" }}>
-            <span className="text-lg" aria-hidden="true">{form.icon}</span>
-            {isEdit ? tr("부서 정보 수정", "Edit Department") : tr("신규 부서 추가", "Add Department")}
-          </h3>
-          <SurfaceActionButton
-            onClick={onClose}
-            tone="neutral"
-            compact
-            className="h-11 w-11"
-            style={{ padding: 0 }}
-            aria-label={tr("닫기", "Close")}
-          >
-            ✕
-          </SurfaceActionButton>
-        </div>
+    <Dialog.Root open onOpenChange={(open) => !open && onClose()}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-50 bg-black/45 backdrop-blur-sm" />
+        <div
+          ref={overlayRef}
+          className="fixed inset-0 z-50 flex items-end justify-center p-0 sm:items-center sm:p-4"
+          style={{
+            paddingTop: "calc(1rem + env(safe-area-inset-top))",
+          }}
+        >
+          <Dialog.Content asChild>
+            <form
+              onSubmit={handleSave}
+              className="w-full max-w-2xl max-h-full overflow-y-auto rounded-t-3xl p-5 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:max-h-[85vh] sm:rounded-[28px] sm:p-6"
+              style={{
+                background:
+                  "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",
+                borderColor: "color-mix(in srgb, var(--th-border) 72%, transparent)",
+                paddingBottom: "max(1.25rem, calc(1.25rem + env(safe-area-inset-bottom)))",
+                pointerEvents: "auto",
+              }}
+            >
+              <Dialog.Description className="sr-only">
+                {isEdit ? tr("부서 정보 수정 양식", "Form to edit department details") : tr("신규 부서 추가 양식", "Form to add a new department")}
+              </Dialog.Description>
+              {/* Header */}
+              <div className="flex items-center justify-between mb-5">
+                <Dialog.Title className="text-base font-bold flex items-center gap-2" style={{ color: "var(--th-text-heading)" }}>
+                  <span className="text-lg" aria-hidden="true">{form.icon}</span>
+                  {isEdit ? tr("부서 정보 수정", "Edit Department") : tr("신규 부서 추가", "Add Department")}
+                </Dialog.Title>
+                <Dialog.Close asChild>
+                  <SurfaceActionButton
+                    type="button"
+                    tone="neutral"
+                    compact
+                    className="h-11 w-11"
+                    style={{ padding: 0 }}
+                    aria-label={tr("닫기", "Close")}
+                  >
+                    ✕
+                  </SurfaceActionButton>
+                </Dialog.Close>
+              </div>
 
         <div className="space-y-4">
           <SurfaceSubsection
@@ -504,15 +501,20 @@ export default function DepartmentFormModal({
                 {tr("삭제", "Delete")}
               </SurfaceActionButton>
             ))}
-          <SurfaceActionButton
-            onClick={onClose}
-            tone="neutral"
-            className="text-sm"
-          >
-            {tr("취소", "Cancel")}
-          </SurfaceActionButton>
+          <Dialog.Close asChild>
+            <SurfaceActionButton
+              type="button"
+              tone="neutral"
+              className="text-sm"
+            >
+              {tr("취소", "Cancel")}
+            </SurfaceActionButton>
+          </Dialog.Close>
         </div>
-      </form>
-    </div>
+            </form>
+          </Dialog.Content>
+        </div>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
