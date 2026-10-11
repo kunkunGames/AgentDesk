@@ -1,3 +1,4 @@
+import * as Dialog from "@radix-ui/react-dialog";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useEffect, useRef } from "react";
 import { useForm } from "react-hook-form";
@@ -55,7 +56,6 @@ export default function AgentFormModal({
   onClose: () => void;
 }) {
   const { t } = useI18n();
-  const overlayRef = useRef<HTMLDivElement>(null);
   const {
     register,
     handleSubmit,
@@ -71,15 +71,6 @@ export default function AgentFormModal({
   const formValues = watch();
   const spriteNum = formValues.sprite_number ?? 0;
   const providerCatalog = useProviderCatalog(formValues.cli_provider);
-
-  // ESC 키로 닫기
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [onClose]);
 
   useEffect(() => {
     reset(form);
@@ -100,24 +91,23 @@ export default function AgentFormModal({
   });
 
   return (
-    <div
-      ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-hidden px-3 py-4 sm:items-center sm:p-4"
-      style={{
-        background: "var(--th-modal-overlay)",
-        paddingTop: "max(1rem, calc(env(safe-area-inset-top) + 0.75rem))",
-        paddingBottom: "max(1rem, calc(env(safe-area-inset-bottom) + 0.75rem))",
-      }}
-      onClick={(e) => {
-        if (e.target === overlayRef.current) onClose();
-      }}
-    >
+    <Dialog.Root open={true} onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay
+          className="fixed inset-0 z-50 overflow-hidden"
+          style={{ background: "var(--th-modal-overlay)" }}
+        />
+        <Dialog.Content
+          aria-labelledby="agent-modal-title"
+          className="fixed inset-0 z-50 flex items-start justify-center px-3 py-4 sm:items-center sm:p-4 pointer-events-none"
+          style={{
+            paddingTop: "max(1rem, calc(env(safe-area-inset-top) + 0.75rem))",
+            paddingBottom: "max(1rem, calc(env(safe-area-inset-bottom) + 0.75rem))",
+          }}
+        >
       <form
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="agent-modal-title"
         onSubmit={handleSave}
-        className="w-full self-start max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-1.5rem)] max-w-[calc(100vw-1.5rem)] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[28px] border p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:my-auto sm:max-h-[90vh] sm:max-w-5xl sm:p-6"
+        className="w-full self-start max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-1.5rem)] max-w-[calc(100vw-1.5rem)] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[28px] border p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:my-auto sm:max-h-[90vh] sm:max-w-5xl sm:p-6 pointer-events-auto"
         style={{
           background:
             "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",
@@ -129,9 +119,11 @@ export default function AgentFormModal({
       >
         {/* Modal header */}
         <div className="flex items-center justify-between mb-5">
-          <h3 id="agent-modal-title" className="text-base font-bold" style={{ color: "var(--th-text-heading)" }}>
-            {isEdit ? tr("직원 정보 수정", "Edit Agent") : tr("신규 직원 채용", "Hire New Agent")}
-          </h3>
+          <Dialog.Title asChild>
+            <h3 id="agent-modal-title" className="text-base font-bold" style={{ color: "var(--th-text-heading)" }}>
+              {isEdit ? tr("직원 정보 수정", "Edit Agent") : tr("신규 직원 채용", "Hire New Agent")}
+            </h3>
+          </Dialog.Title>
           <SurfaceActionButton onClick={onClose} tone="neutral" compact className="h-11 w-11" style={{ padding: 0 }} aria-label={tr("닫기", "Close")}>
             ✕
           </SurfaceActionButton>
@@ -446,6 +438,8 @@ export default function AgentFormModal({
           </SurfaceActionButton>
         </div>
       </form>
-    </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }

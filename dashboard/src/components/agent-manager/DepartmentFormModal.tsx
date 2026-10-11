@@ -1,3 +1,4 @@
+import * as Dialog from "@radix-ui/react-dialog";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useForm } from "react-hook-form";
@@ -260,22 +261,22 @@ export default function DepartmentFormModal({
   };
 
   return (
-    <div
-      ref={overlayRef}
-      className="fixed inset-0 z-50 flex items-end justify-center p-0 sm:items-center sm:p-4"
-      style={{
-        background: "var(--th-modal-overlay)",
-        paddingTop: "calc(1rem + env(safe-area-inset-top))",
-      }}
-      onClick={(e) => {
-        if (e.target === overlayRef.current) onClose();
-      }}
-    >
+    <Dialog.Root open={true} onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay
+          className="fixed inset-0 z-50 overflow-hidden"
+          style={{ background: "var(--th-modal-overlay)" }}
+        />
+        <Dialog.Content
+          aria-labelledby="dept-modal-title"
+          className="fixed inset-0 z-50 flex items-end justify-center p-0 sm:items-center sm:p-4 pointer-events-none"
+          style={{
+            paddingTop: "calc(1rem + env(safe-area-inset-top))",
+          }}
+        >
       <form
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="dept-modal-title"
-        className="w-full max-w-2xl max-h-full overflow-y-auto rounded-t-3xl p-5 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:max-h-[85vh] sm:rounded-[28px] sm:p-6"
+        onSubmit={handleSave}
+        className="w-full max-w-2xl max-h-full overflow-y-auto rounded-t-3xl p-5 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:max-h-[85vh] sm:rounded-[28px] sm:p-6 pointer-events-auto"
         style={{
           background:
             "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",
@@ -285,10 +286,12 @@ export default function DepartmentFormModal({
       >
         {/* Header */}
         <div className="flex items-center justify-between mb-5">
-          <h3 id="dept-modal-title" className="text-base font-bold flex items-center gap-2" style={{ color: "var(--th-text-heading)" }}>
-            <span className="text-lg" aria-hidden="true">{form.icon}</span>
-            {isEdit ? tr("부서 정보 수정", "Edit Department") : tr("신규 부서 추가", "Add Department")}
-          </h3>
+          <Dialog.Title asChild>
+            <h3 id="dept-modal-title" className="text-base font-bold flex items-center gap-2" style={{ color: "var(--th-text-heading)" }}>
+              <span className="text-lg" aria-hidden="true">{form.icon}</span>
+              {isEdit ? tr("부서 정보 수정", "Edit Department") : tr("신규 부서 추가", "Add Department")}
+            </h3>
+          </Dialog.Title>
           <SurfaceActionButton
             onClick={onClose}
             tone="neutral"
@@ -513,6 +516,8 @@ export default function DepartmentFormModal({
           </SurfaceActionButton>
         </div>
       </form>
-    </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
