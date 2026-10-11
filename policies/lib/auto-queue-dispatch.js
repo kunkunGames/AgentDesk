@@ -124,7 +124,13 @@ function _dispatchableTargets(cfg) {
 function _freePathToDispatchable(from, cfg) {
   var targets = _dispatchableTargets(cfg);
   if (targets.length === 0) return null;
-  if (targets.indexOf(from) >= 0) return [];
+
+  var targetSet = Object.create(null);
+  for (var tIdx = 0; tIdx < targets.length; tIdx++) {
+    targetSet[targets[tIdx]] = true;
+  }
+
+  if (targetSet[from]) return [];
   if (!cfg || !cfg.transitions) return null;
 
   var queue = [from];
@@ -138,7 +144,7 @@ function _freePathToDispatchable(from, cfg) {
       var t = cfg.transitions[i];
       if (t.from !== cur || t.type !== "free" || visited[t.to]) continue;
       parent[t.to] = cur;
-      if (targets.indexOf(t.to) >= 0) {
+      if (targetSet[t.to]) {
         var path = [t.to];
         var p = cur;
         while (p && p !== from) {
