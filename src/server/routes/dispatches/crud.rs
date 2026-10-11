@@ -264,10 +264,12 @@ pub async fn update_dispatch(
                 .get("status")
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
-            let is_review = dispatch
-                .get("dispatch_type")
-                .and_then(|value| value.as_str())
-                == Some("review");
+            let is_review = matches!(
+                dispatch
+                    .get("dispatch_type")
+                    .and_then(|value| value.as_str()),
+                Some("review" | "review-decision")
+            );
             let has_verdict = body
                 .result
                 .as_ref()
