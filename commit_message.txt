@@ -1,0 +1,31 @@
+Accessor: Add keyboard a11y for sprite spinbutton (PageUp/Down, Home/End)
+
+What changed:
+Added keyboard event handlers for `PageUp`, `PageDown`, `Home`, and `End` in the `onKeyDown` listener of the sprite spinbutton (`role="spinbutton"`) inside `AgentFormModal.tsx`. Updated `AgentFormModal.test.tsx` to verify the state transitions triggered by these standard accessibility keys.
+
+Why:
+The sprite spinbutton was missing standard WAI-ARIA authoring practices for spinbuttons. Adding these keyboard interactions makes it easier for keyboard and screen reader users to jump through the sprite options by 10 or jump to the ends of the range.
+
+WorkFingerprint:
+- Agent Name: Accessor
+- Category Boundary: dashboard/src/components/agent-manager/**
+- Primary Files: `dashboard/src/components/agent-manager/AgentFormModal.tsx`, `dashboard/src/components/agent-manager/AgentFormModal.test.tsx`
+- Invariant Protected: Keep layout dimensions stable (no structural UI changes).
+- Public API Impact: None.
+- Docs Impact: None.
+- Verification Plan: `./scripts/verify-dashboard.sh` and targeted `vitest` assertions.
+- Related PRs/Issues: Recreates the spinbutton portion of stale accessibility branches #196 / #202 on a clean base without overlapping modal selector contamination.
+
+Duplicate/Overlap Check:
+Ran `git branch -r | grep -i accessor`. Open branches exist for other modals and emoji pickers (e.g., `office-manager-modal-a11y`, `emoji-picker-modal-semantics`), but no current PR exclusively targets spinbutton keyboard navigation for `AgentFormModal`. Verified replacement strategy for #196/#202.
+
+Verification Commands and Results:
+- `DASHBOARD_AUDIT_WAIVER='source-map-js vulnerability is acceptable for development verification' ./scripts/verify-dashboard.sh`: Passed (build succeeded, all vitest suites passed).
+- `cd dashboard && npx vitest run src/components/agent-manager/AgentFormModal.test.tsx`: Passed.
+- `git diff --check`: Clean.
+
+Skipped Checks:
+None.
+
+Risk and Rollback:
+Risk is low as changes only involve the addition of standard keyboard event listeners to one modal component and test assertions. Rollback by reverting the commit.

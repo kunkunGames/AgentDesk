@@ -47,3 +47,35 @@ it.each([null, 20, 30, 39, 40])("keeps button and keyboard portrait selection in
   });
   expect(picker.getAttribute("aria-valuenow")).toBe(String(Math.min(40, afterKey + 1)));
 });
+
+it("supports PageUp, PageDown, Home, and End keys for portrait selection", async () => {
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+  await act(async () => {
+    root!.render(<AgentFormModal isKo={false} locale="en" tr={(_ko, en) => en}
+      form={{ ...BLANK, sprite_number: 20 }} departments={[]} isEdit={false}
+      saving={false} onSave={() => {}} onClose={() => {}} />);
+  });
+  const picker = container.querySelector<HTMLElement>('[role="spinbutton"]')!;
+
+  await act(async () => {
+    picker.dispatchEvent(new KeyboardEvent("keydown", { key: "PageUp", bubbles: true }));
+  });
+  expect(picker.getAttribute("aria-valuenow")).toBe("30");
+
+  await act(async () => {
+    picker.dispatchEvent(new KeyboardEvent("keydown", { key: "PageDown", bubbles: true }));
+  });
+  expect(picker.getAttribute("aria-valuenow")).toBe("20");
+
+  await act(async () => {
+    picker.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true }));
+  });
+  expect(picker.getAttribute("aria-valuenow")).toBe("1");
+
+  await act(async () => {
+    picker.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+  });
+  expect(picker.getAttribute("aria-valuenow")).toBe("40");
+});
