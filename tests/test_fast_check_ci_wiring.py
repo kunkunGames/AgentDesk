@@ -20,7 +20,7 @@ REQUIRED_CHECK_MIRROR_SHA256 = (
     "57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d"
 )
 CI_RUNNER_HARDENING_SHA256 = (
-    "91a68897455d7215f0d3daf932bd9aaea5851a29adb8d4030927a8013506fc4d"
+    "40b437d9ad1e69ae4b77923a78384ab06fad87ef7fb1c9f39647944fe32fde7f"
 )
 PR_WORKFLOW = REPO_ROOT / ".github/workflows/ci-pr.yml"
 # Job-level condition of every required-context mirror and its source line.
@@ -2600,11 +2600,11 @@ puts Digest::SHA256.hexdigest(JSON.generate(canonical))
             workflows.mkdir(parents=True)
             (root / "scripts").mkdir()
             (workflows / "ci-pr.yml").write_text(pr_workflow, encoding="utf-8")
-            trusted = (REPO_ROOT / ".github/workflows/ci-macos-trusted.yml").read_text(
+            macos_workflow_text = (REPO_ROOT / ".github/workflows/ci-macos-trusted.yml").read_text(
                 encoding="utf-8"
             )
             (workflows / "ci-macos-trusted.yml").write_text(
-                trusted, encoding="utf-8"
+                macos_workflow_text, encoding="utf-8"
             )
             (workflows / "ci-main.yml").write_text(MAIN_WORKFLOW.read_text(encoding="utf-8"), encoding="utf-8")
             for name, content in (extra_workflows or {}).items():
@@ -2633,7 +2633,7 @@ puts Digest::SHA256.hexdigest(JSON.generate(canonical))
 
     def test_hardening_rejects_routing_outside_repository_hosted_runner_policy(self) -> None:
         pr_workflow = PR_WORKFLOW.read_text(encoding="utf-8")
-        trusted = MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8")
+        macos_trusted_text = MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8")
         variants = {
             "scalar": "    runs-on: self-hosted\n",
             "list": "    runs-on: [self-hosted, macOS]\n",
@@ -2730,8 +2730,8 @@ puts Digest::SHA256.hexdigest(JSON.generate(canonical))
         for name, runner in variants.items():
             for path in ("ci-macos-trusted.yml", "extra.yaml"):
                 with self.subTest(runner=name, workflow=path):
-                    mutated = trusted.replace("    runs-on: macos-15\n", runner, 1)
-                    self.assertNotEqual(mutated, trusted)
+                    mutated = macos_trusted_text.replace("    runs-on: macos-15\n", runner, 1)
+                    self.assertNotEqual(mutated, macos_trusted_text)
                     result = self.run_hardening_fixture(
                         pr_workflow, extra_workflows={path: mutated}
                     )

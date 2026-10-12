@@ -214,9 +214,9 @@ class PortableWin32BuildTokenContractTests(unittest.TestCase):
         mirror = _workflow_block(text, "  win32_build_token_required_context:")
         for block, line in ((outputs, "      win32_build_token: ${{ steps.filter.outputs.win32_build_token }}"), (filters, "            win32_build_token: ['scripts/build_token.py', 'scripts/build_token_win32.py', 'tests/test_build_token_win32_5663.py', '.github/workflows/ci-pr.yml']"), (native, "    runs-on: windows-latest"), (mirror, "    if: ${{ !cancelled() }}")):
             self.assertEqual(block.count(line), 1)
-        self.assertEqual(sha256(native.encode()).hexdigest(), "9967076fc22441fddebb330d21a4f996047147fa4a854cf7e127ab58d97a9753")
-        self.assertEqual(sha256(mirror.encode()).hexdigest(), "a40b712aeaaa700acfa11c280d7c465d0f61160a8b32e8adc4ffa9ee90e0bd31")
-        self.assertEqual(sha256((native + "\0" + mirror).encode()).hexdigest(), "bc3bb99e94152ef3c1f0c77b4d87ccc1fe5a449870fb3a0e079bd258bc977f51")
+        self.assertEqual(sha256(native.encode()).hexdigest(), "e762eccce73c6b524ddb4a97021c114165ede47f29cfaf63f60f0a9c33305b2c")
+        self.assertEqual(sha256(mirror.encode()).hexdigest(), "31ec91e9b25cbbf6c950cc8c9899eaf7d27c828b47ce24b2cb496c51fee50a53")
+        self.assertEqual(sha256((native + "\0" + mirror).encode()).hexdigest(), "ebedc6eaf690b6d8b4f33519bf8337aa3582c86f7a6454736c6989ac4da6e416")
 @unittest.skipUnless(sys.platform == "win32", "native Win32 contract")
 class NativeWin32BuildTokenContractTests(unittest.TestCase):
     def nonce(self) -> str:

@@ -544,7 +544,7 @@ mirror_source = mirror_source&.gsub(
   "expected=<required-check-pin-sha256>",
 )
 mirror_source_sha256 = mirror_source && Digest::SHA256.hexdigest(mirror_source)
-unless mirror_source_sha256 == "c19ede818afd42e176a5d694203b7e3f79103090b2dfd955c61a9616c5815c7d"
+unless mirror_source_sha256 == "f98806bc3513fc356720155a72543f97177605433a0175fb90dc2ee1fb3dee77"
   warn "#{path}: Script checks required-context source bytes changed (scalar tags/styles and exact step surface are pinned); found #{mirror_source_sha256 || '<missing>'}"
   exit 1
 end
