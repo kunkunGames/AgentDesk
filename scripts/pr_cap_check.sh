@@ -50,6 +50,11 @@ while IFS= read -r -d '' record; do
     IFS= read -r -d '' old_path && IFS= read -r -d '' new_path \
       || fail 'incomplete numstat rename'
     [[ -n "$old_path" && -n "$new_path" ]] || fail 'empty numstat rename path'
+    file_path="$new_path"
+  fi
+  if [[ "$file_path" =~ ^(.*/)?(plan\.md|pr-body\.md|test_merge_diff\.txt)$ ]]; then
+    printf 'CAP: FAIL (scratch file detected: %s)\n' "$file_path"
+    exit 1
   fi
   files=$((files + 1))
   if [[ "$added" == - && "$deleted" == - ]]; then
