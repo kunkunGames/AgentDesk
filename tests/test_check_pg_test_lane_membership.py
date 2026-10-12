@@ -2283,7 +2283,7 @@ class PgDbCiWiring(unittest.TestCase):
                 with self.subTest(workflow=workflow, job=job_name):
                     steps = shipped["jobs"][job_name]["steps"]
                     installs = [index for index, step in enumerate(steps)
-                                if step.get("uses") == "taiki-e/install-action@v2"
+                                if step.get("uses", "").startswith("taiki-e/install-action@")
                                 and "ripgrep" in step.get("with", {}).get("tool", "").split(",")
                                 and "if" not in step and not step.get("continue-on-error")]
                     preflights = [index for index, step in enumerate(steps)

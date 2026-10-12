@@ -101,6 +101,8 @@ def collect_at(root, revision):
 def admission_problems(root, base_ref, baseline, inner_baseline):
     base = git(root, "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}").strip()
     total_path, inner_path = BASELINE.relative_to(ROOT).as_posix(), INNER_BASELINE.relative_to(ROOT).as_posix()
+    if not git(root, "ls-tree", "--name-only", base, "--", total_path).strip():
+        return []
     admitted = json.loads(git(root, "show", f"{base}:{total_path}"))
     if git(root, "ls-tree", "--name-only", base, "--", inner_path).strip():
         admitted_inner = json.loads(git(root, "show", f"{base}:{inner_path}"))
