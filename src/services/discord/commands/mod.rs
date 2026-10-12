@@ -16,9 +16,11 @@ macro_rules! log_info_event {
     };
 }
 
+#[cfg(all(test, unix))]
+mod cancel_backstop_tests;
 mod command_policy;
 mod config;
-mod control;
+pub(in crate::services::discord) mod control;
 mod diagnostics;
 mod fast_mode;
 mod goals;
@@ -34,6 +36,7 @@ mod restart;
 mod session;
 mod sidecar;
 mod skill;
+pub(in crate::services::discord) mod stop;
 mod text_commands;
 mod tmux_recreate;
 mod tui_passthrough;
@@ -42,6 +45,8 @@ mod voice;
 pub(super) const STOPPING_RESPONSE: &str = "중지하고 있어요...";
 pub(super) const ALREADY_STOPPING_RESPONSE: &str = "이미 중지 중이에요.";
 pub(super) const NO_ACTIVE_TURN_RESPONSE: &str = "중지할 활성 턴이 없어요.";
+pub(super) const HOST_REFUSED_STOP_RESPONSE: &str =
+    "이 세션의 호스트를 확인하지 못해 중지하지 않았어요. 턴은 계속 진행돼요.";
 pub(super) const SESSION_CLEARED_RESPONSE: &str = "세션을 초기화했어요.";
 
 pub(super) fn session_started_response(path: &str) -> String {
@@ -127,7 +132,8 @@ pub(in crate::services::discord) use config::{
 pub(super) use config::{cmd_adduser, cmd_allowall, cmd_allowed, cmd_allowedtools, cmd_removeuser};
 pub(in crate::services::discord) use control::{
     SoftClearNotifyMode, clear_channel_session_state, clear_channel_session_state_with_session_key,
-    reset_channel_provider_state, reset_managed_process_session, reset_provider_session_if_pending,
+    native_clear_admits, reset_channel_provider_state, reset_managed_process_session,
+    reset_provider_session_if_pending,
 };
 pub(super) use control::{cmd_cancel_queued, cmd_clear, cmd_down, cmd_shell, cmd_stop};
 pub(in crate::services::discord) use diagnostics::{

@@ -6,8 +6,11 @@ pub(crate) mod agentdesk_config;
 mod answer_flush_barrier;
 pub(crate) mod bot_role;
 mod busy_followup_retry_store;
+#[cfg(unix)]
+pub(crate) mod herdr_terminate;
 // #3479 item-2: restart-gap message recovery extracted to its catch-up sibling.
 mod catch_up;
+mod codex_adoption_runtime;
 mod commands;
 mod compact_turn_authority;
 mod completion_footer_metadata;
@@ -33,6 +36,7 @@ mod idle_recap_interaction;
 mod idle_relay_drift;
 mod inflight;
 mod inflight_heartbeat_sweeper;
+pub(crate) mod inject_disposition;
 pub(crate) mod internal_api;
 mod jsonl_watcher;
 mod mailbox_finish;
@@ -57,6 +61,7 @@ mod queue_dispatch;
 mod queue_io;
 mod queue_marker;
 mod queue_overflow_dlq;
+mod queue_park_ledger;
 mod queue_reactions;
 // #5191: catch-up recovery dedup identity set (queue + active + reservation).
 mod queued_placeholders_store;
@@ -73,6 +78,13 @@ pub(crate) mod response_sanitizer;
 mod session_banner;
 #[cfg(unix)]
 mod session_relay_sink;
+#[cfg(unix)]
+pub(crate) use session_relay_sink::journal::append_exact_metadata;
+#[cfg(all(test, unix))]
+pub(crate) use session_relay_sink::journal::{
+    exact_duplicate_pg_full_fields_and_legacy_same_key_other_attempt,
+    exact_namespace_pg_old_reader_and_legacy_binding_bytes_unchanged,
+};
 mod sidecar_interaction;
 // #2011 Phase 5.3: standalone JSONL → Discord relay loop on cluster-standby nodes (leader uses tmux_watcher's relay path).
 #[cfg(unix)]
@@ -87,8 +99,13 @@ mod role_map;
 mod role_map_enrichment;
 mod router;
 mod runtime_bootstrap;
+#[cfg(test)]
+pub use runtime_bootstrap::boot_retirement;
 pub(in crate::services::discord) mod semantic_boundaries;
 mod skills_scan;
+mod turn_presence;
+#[cfg(all(test, unix))]
+pub(crate) use turn_presence::lifecycle::Runtime as PresenceRuntime;
 mod turn_teardown_clearance;
 // #1446 stall-deadlock recovery: shared post-clear bookkeeping for the THREAD-GUARD
 // + stall-watchdog cleanup paths so neither leaks `global_active` / cancel tokens.
@@ -125,6 +142,12 @@ mod terminal_ui_obligation;
 #[cfg(unix)]
 mod tmux;
 #[cfg(all(test, unix))]
+pub use tmux::{
+    OOnlyInstallOutcome, OOnlyInstallReason, OOnlyInstallRequest, install_retired_o_watcher,
+};
+#[cfg(unix)]
+pub use tmux::{RetiredOWatcherRestore, restore_retired_o_watchers};
+#[cfg(all(test, unix))]
 pub(crate) fn claim_cross_channel_tmux_watcher_for_high_risk_test(
     requested_channel_id: ChannelId,
     existing_channel_id: ChannelId,
@@ -142,6 +165,7 @@ pub(in crate::services::discord) mod turn_end_wip_warning;
 pub(crate) use tmux::{stamp_spawn_markers, write_spawn_nonce};
 mod tmux_error_detect;
 pub(crate) use tmux_error_detect::{ProviderProseDiagnostic, classify_provider_prose_diagnostic};
+mod live_bridge;
 #[cfg(unix)]
 mod tmux_lifecycle;
 #[cfg(unix)]
@@ -154,12 +178,22 @@ mod tmux_watcher_registry;
 #[rustfmt::skip]
 #[cfg(test)]
 mod tmux_watcher_registry_restore_tests;
+pub(crate) mod input_runtime;
+#[allow(dead_code)]
+mod input_transition;
 #[cfg(test)]
 mod relay_coord_tests;
 pub(crate) mod terminal_delivery_custody;
 mod tui_direct_abort_marker;
 mod tui_direct_pending_start;
 mod tui_prompt_relay;
+#[cfg(all(test, unix))]
+pub(crate) use tmux::commit_codex_watcher_restore_for_tests;
+#[cfg(all(test, unix))]
+pub(crate) use tmux::commit_codex_watcher_restore_to_empty_registry_for_tests;
+#[cfg(all(test, unix))]
+pub(crate) use tui_prompt_relay::run_codex_rehydrate_pass_for_tests;
+pub(crate) mod replay_policy;
 mod tui_task_card;
 mod turn_bridge;
 #[allow(clippy::too_many_arguments)]
@@ -188,6 +222,8 @@ pub(in crate::services::discord) use delivery_lease_cell::{
     DELIVERY_LEASE_DEADLINE_MS, DELIVERY_LEASE_HEARTBEAT_MS, DeliveryLeaseCell,
     DeliveryLeaseHeartbeat, LeaseHolder, LeaseOutcome, LeaseSnapshot, lease_now_ms,
 };
+#[cfg(unix)]
+pub(crate) use recovery_engine::herdr_reader::local_reconnect_health as herdr_reconnect_health;
 #[allow(unused_imports)]
 pub(in crate::services) use relay_coord::TmuxRelayCoord;
 pub(in crate::services::discord) use {
@@ -202,10 +238,13 @@ pub(in crate::services::discord) use catch_up::{
     CatchUpRetryState, catch_up_missed_messages, catch_up_missed_messages_for_retry,
     should_trigger_catch_up_retry, take_catch_up_retry_checkpoint_after_queue_drain,
 };
+#[cfg(test)]
+pub(in crate::services::discord) use mailbox_finish::mailbox_finish_cancelled_turn;
 pub(in crate::services::discord) use mailbox_finish::{
-    mailbox_clear_channel, mailbox_clear_recovery_marker, mailbox_finish_cancelled_turn,
-    mailbox_finish_cancelled_turn_on, mailbox_finish_owned_turn, mailbox_finish_turn,
+    MailboxLookup, mailbox_clear_channel, mailbox_clear_recovery_marker,
+    mailbox_finish_cancelled_turn_on, mailbox_finish_judged_turn, mailbox_finish_turn,
     mailbox_finish_turn_if_matches, mailbox_finish_turn_if_matches_episode_started_before,
+    unavailable_finish_turn_result,
 };
 #[cfg(unix)]
 pub(in crate::services::discord) use mailbox_probe::{
@@ -221,7 +260,8 @@ pub(in crate::services::discord) use recovery_engine as recovery;
 // path (surface freeze, #3294/#3295 pattern).
 pub(crate) use restart_mode::InflightRestartMode;
 pub(crate) use router::{
-    HeadlessTurnStartError, IntakeRequest, TurnKind, execute_intake_turn_core,
+    HeadlessTurnStartError, IntakeExecution, IntakeRequest, TurnKind,
+    checkpoint_waits_for_admission, execute_intake_turn_core,
 };
 #[cfg(unix)]
 pub(crate) use session_relay_sink::run_session_bound_discord_relay_supervisor;
@@ -913,6 +953,7 @@ pub(crate) struct SharedData {
     pub(super) core: Mutex<CoreState>,
     /// Per-channel request lifecycle actor registry.
     mailboxes: ChannelMailboxRegistry,
+    queue_park_ledger: queue_park_ledger::QueueParkLedger,
     /// Serializes `/resume` rebinds with intake session selection for each channel.
     /// Weak entries let inactive channels disappear once the final intake/resume
     /// guard drops; the map is opportunistically pruned on each lookup, so channel
@@ -999,6 +1040,9 @@ pub(crate) struct SharedData {
     /// count for the next in-process pass, independent of live message
     /// checkpoints that may advance while the queued backlog drains.
     pub(super) catch_up_retry_pending: dashmap::DashMap<ChannelId, CatchUpRetryState>,
+    /// Serializes sweeps and retains retries handed to a busy channel.
+    pub(super) catch_up_scan_in_progress:
+        dashmap::DashMap<ChannelId, (bool, Option<CatchUpRetryState>)>,
     /// Per-channel turn start time — used for metrics duration calculation.
     pub(super) turn_start_times: dashmap::DashMap<ChannelId, std::time::Instant>,
     /// Per-channel known speakers collected lazily from incoming messages.
@@ -1249,6 +1293,7 @@ fn make_shared_data_for_tests_with_storage_and_intake_capabilities(
             active_meetings: std::collections::HashMap::new(),
         }),
         mailboxes: ChannelMailboxRegistry::default(),
+        queue_park_ledger: Default::default(),
         session_transition_locks: dashmap::DashMap::new(),
         settings: tokio::sync::RwLock::new(DiscordBotSettings::default()),
         api_timestamps: dashmap::DashMap::new(),
@@ -1279,6 +1324,7 @@ fn make_shared_data_for_tests_with_storage_and_intake_capabilities(
         // preserved — the three members hoisted above the spawn calls are
         // side-effect-free constructors; see run_bot_build_shared_data).
         restart: RestartLifecycle {
+            _home_availability: None,
             recovering_channels: dashmap::DashMap::new(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             intake_worker_lifecycle: Default::default(),
@@ -1319,6 +1365,7 @@ fn make_shared_data_for_tests_with_storage_and_intake_capabilities(
         },
         last_message_ids: dashmap::DashMap::new(),
         catch_up_retry_pending: dashmap::DashMap::new(),
+        catch_up_scan_in_progress: dashmap::DashMap::new(),
         turn_start_times: dashmap::DashMap::new(),
         channel_rosters: dashmap::DashMap::new(),
         http: RuntimeHttpCache {
@@ -1629,29 +1676,6 @@ fn ensure_cancel_token_bound_from_inflight_state(
     true
 }
 
-fn ensure_cancel_token_bound_from_inflight(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    cancel_token: &Arc<CancelToken>,
-    reason: &str,
-) -> bool {
-    if turn_bridge::cancel_token_has_tmux_session(cancel_token) {
-        return true;
-    }
-
-    let Some(state) = inflight::load_inflight_state(provider, channel_id.get()) else {
-        tracing::error!(
-            "cancel token rebind failed: provider={} channel_id={} reason={} error=inflight_not_found",
-            provider.as_str(),
-            channel_id.get(),
-            reason
-        );
-        return false;
-    };
-
-    ensure_cancel_token_bound_from_inflight_state(provider, &state, cancel_token, reason)
-}
-
 async fn mailbox_enqueue_intervention(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -1893,6 +1917,7 @@ async fn apply_queue_exit_feedback(
     channel_id: ChannelId,
     queue_exit_events: &[QueueExitEvent],
 ) {
+    shared.queue_park_ledger.exit(channel_id, queue_exit_events);
     let queue_exit_events: Vec<&QueueExitEvent> = queue_exit_events
         .iter()
         .filter(|event| event.intervention.author_id.get() > 1)
@@ -3474,3 +3499,10 @@ mod queued_placeholder_cluster_characterization_tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) use recovery_engine::{codex_rebind_spawn_for_tests, codex_restart_output_for_tests};
+#[cfg(all(test, unix))]
+pub(crate) use tmux::tmux_output_stream::{
+    codex_native_read_for_tests, codex_source_witness_present_for_tests,
+};

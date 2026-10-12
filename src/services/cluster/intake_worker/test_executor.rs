@@ -4,6 +4,46 @@ use std::cell::RefCell;
 
 thread_local! {
     static RUNS: RefCell<Option<Vec<u64>>> = const { RefCell::new(None) };
+    static FAIL: RefCell<bool> = const { RefCell::new(false) };
+    static CHECKPOINT: RefCell<Option<CheckpointHook>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Checkpoint {
+    /// The claim picked its row and has not confirmed it yet.
+    ClaimSelected,
+    AfterClaim,
+    PreAccept,
+    Spawned,
+    FinalDb,
+    FinalDbDone,
+}
+type CheckpointHook = Box<dyn FnMut(Checkpoint) -> futures::future::BoxFuture<'static, ()>>;
+pub(crate) struct Hook;
+pub(crate) fn hook(callback: CheckpointHook) -> Hook {
+    CHECKPOINT.with(|slot| {
+        assert!(slot.borrow().is_none());
+        *slot.borrow_mut() = Some(callback);
+    });
+    Hook
+}
+impl Drop for Hook {
+    fn drop(&mut self) {
+        CHECKPOINT.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+pub(super) async fn checkpoint(point: Checkpoint) {
+    let pending = CHECKPOINT.with(|slot| slot.borrow_mut().as_mut().map(|hook| hook(point)));
+    if let Some(pending) = pending {
+        pending.await;
+    }
+}
+/// The claim's checkpoint between its SELECT and its confirming UPDATE.
+pub(crate) async fn claim_selected() {
+    checkpoint(Checkpoint::ClaimSelected).await;
+}
+pub(super) fn fail_execution() {
+    FAIL.with(|fail| *fail.borrow_mut() = true);
 }
 
 /// While alive, each executed turn records its channel instead of starting a TUI turn.
@@ -23,6 +63,7 @@ impl Recorder {
 impl Drop for Recorder {
     fn drop(&mut self) {
         RUNS.with(|runs| *runs.borrow_mut() = None);
+        FAIL.with(|fail| *fail.borrow_mut() = false);
     }
 }
 
@@ -33,14 +74,17 @@ pub(crate) async fn execute_intake_turn_core(
     token: &str,
     request: IntakeRequest,
     uploads: crate::services::cluster::attachment_transfer::uploads::PendingUploads,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<crate::services::discord::IntakeExecution, Box<dyn std::error::Error + Send + Sync>> {
     let recorded = RUNS.with(|runs| {
         let mut runs = runs.borrow_mut();
         runs.as_mut()
             .map(|runs| runs.push(request.channel_id.get()))
     });
     if recorded.is_some() {
-        return Ok(());
+        if FAIL.with(|fail| *fail.borrow()) {
+            return Err(std::io::Error::other("C1 executor fixture failure").into());
+        }
+        return Ok(crate::services::discord::IntakeExecution::Executed);
     }
     crate::services::discord::execute_intake_turn_core(http, shared, token, request, uploads).await
 }

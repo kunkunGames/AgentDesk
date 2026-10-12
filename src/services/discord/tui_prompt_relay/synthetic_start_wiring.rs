@@ -77,6 +77,74 @@ pub(super) async fn post_suppressed_injection_note(
     }
 }
 
+pub(super) async fn post_passive_prompt_notice(
+    shared: &Arc<SharedData>,
+    prompt: &ObservedTuiPrompt,
+    channel: ChannelId,
+    decision: &RelayObservedPromptInjectionDecision,
+    observation: task_notification_prompt::TaskPromptObservation,
+) -> Option<task_notification_prompt::TaskPromptObservation> {
+    let status_only = matches!(
+        decision.injected_class,
+        InjectedPromptClass::TaskNotificationEvent
+    );
+    if !status_only && !crate::services::tui_o::turn_mode::transcript_turns(channel.get()) {
+        return Some(observation);
+    }
+    if !status_only {
+        // A confirmed direct turn owns no Legacy lease; release the one its observation recorded.
+        crate::services::tui_prompt_dedupe::clear_external_input_relay_lease_if_generation_matches(
+            &prompt.provider,
+            &prompt.tmux_session_name,
+            channel.get(),
+            prompt.external_input_lease_generation,
+        );
+    }
+    let lease = ExternalInputRelayLease::unassigned(Some(channel.get()));
+    let Some(gate) = task_notification_prompt::resolve_gate(
+        shared,
+        prompt,
+        channel,
+        decision.injected_class,
+        &lease,
+        observation,
+    )
+    .await
+    else {
+        return None;
+    };
+    if status_only || gate.card_anchor.is_some() {
+        return None;
+    }
+    if injected_prompt_suppresses_user_turn_lifecycle(
+        decision.injected_class,
+        decision.slash_command_kind.as_deref(),
+    ) {
+        post_suppressed_injection_note(
+            &gate.notify_http,
+            channel,
+            prompt,
+            decision.injected_class,
+            decision.slash_command_kind.as_deref(),
+        )
+        .await;
+        return None;
+    }
+    let content = match decision.slash_command_kind.as_deref() {
+        Some(kind) => {
+            format_slash_command_control_note(&prompt.tmux_session_name, kind, &prompt.prompt)
+        }
+        None => format_ssh_direct_prompt_notification(
+            &prompt.provider,
+            &prompt.tmux_session_name,
+            &prompt.prompt,
+        ),
+    };
+    let posted = channel.say(&*gate.notify_http, content).await;
+    record_prompt_id_after_post(prompt, posted.as_ref().err());
+    None
+}
+
 /// True only when the POST certainly created no message: rejected before dispatch,
 /// refused by Discord (4xx), or never connected. Timeouts and 5xx stay unknown.
 pub(super) fn discord_post_certainly_unsent(error: &serenity::Error) -> bool {
@@ -111,6 +179,45 @@ pub(super) struct UnannouncedPromptIdGuard<'a>(pub(super) &'a ObservedTuiPrompt)
 impl Drop for UnannouncedPromptIdGuard<'_> {
     fn drop(&mut self) {
         crate::services::tui_prompt_dedupe::withdraw_unannounced_prompt_id(self.0);
+    }
+}
+
+/// Withdraws the native turn the prompt reserved when its relay ends with no row or deferred worker,
+/// so a later steer of that turn is relayed as its own input instead of joining nothing.
+pub(super) struct UnownedNativeTurnGuard<'a>(pub(super) &'a ObservedTuiPrompt);
+
+impl Drop for UnownedNativeTurnGuard<'_> {
+    fn drop(&mut self) {
+        crate::services::tui_prompt_dedupe::withdraw_unowned_native_turn(self.0);
+    }
+}
+
+/// Shows a steering input's text in the channel: the running turn's anchor keeps the answer, so
+/// this records no lease, anchor or turn.
+pub(super) async fn post_steer_echo(
+    shared: &Arc<SharedData>,
+    prompt: &ObservedTuiPrompt,
+    channel_id: ChannelId,
+) {
+    let Some(registry) = shared.health_registry() else {
+        return;
+    };
+    let notify = super::super::bot_role::UtilityBotRole::Notify;
+    let http = match super::super::health::resolve_utility_bot_http(registry.as_ref(), notify).await
+    {
+        Ok(http) => http,
+        Err((status, body)) => {
+            tracing::warn!(channel_id = channel_id.get(), %status, %body, "steer echo: notify bot unavailable");
+            return;
+        }
+    };
+    let content = format_ssh_direct_prompt_notification(
+        &prompt.provider,
+        &prompt.tmux_session_name,
+        &prompt.prompt,
+    );
+    if let Err(error) = channel_id.say(&*http, content).await {
+        tracing::warn!(channel_id = channel_id.get(), %error, "failed to send steer echo");
     }
 }
 
@@ -252,6 +359,11 @@ pub(super) async fn resolve_tui_direct_synthetic_lifecycle_anchor(
         channel_id,
         Some((channel_id, notification_anchor_message_id)),
         false,
+        crate::services::tui_o::n1_observation::Context {
+            provider: &prompt.provider,
+            origin: "tui_direct_synthetic",
+            input_message_id: None,
+        },
     )
     .await;
     let anchor = synthetic_lifecycle_anchor_from_placeholder_result(
@@ -368,6 +480,7 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
     // tail below (a second observer tail would relay the SAME output twice — the
     // original bug). The worker owns the relay-owner handoff.
     let mut deferred_synthetic_start = false;
+    let mut claimed = false;
     if let Some(provider) = ProviderKind::from_str(provider_str) {
         // #3154 — TEMPORAL fix for turn-interleaving. An INLINE claim while the
         // PRIOR turn's tail still drains seeds `turn_start_offset` from the prior
@@ -385,6 +498,10 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
         .await;
         if super::super::tui_direct_pending_start::should_defer_synthetic_turn_start(prior.view) {
             deferred_synthetic_start = true;
+            crate::services::tui_prompt_dedupe::hand_native_turn_to_worker(
+                prompt,
+                anchor_message_id.get(),
+            );
             super::synthetic_start::defer_synthetic_turn_start(
                 shared,
                 &provider,
@@ -417,8 +534,10 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
                     anchor_message_id,
                     &*lease,
                     None,
+                    prompt.native_turn_id.as_deref(),
                 )
                 .await;
+            claimed = claim.claimed;
             if !claim.claimed
                 && source.is_some()
                 && lease.turn_id.as_deref().is_some_and(|id| !id.is_empty())
@@ -427,6 +546,8 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
                 // The provider already accepted this input. Preserve the original
                 // bytes and anchor in the existing bounded claim/restart worker.
                 deferred_synthetic_start = true;
+                let anchor = anchor_message_id.get();
+                crate::services::tui_prompt_dedupe::hand_native_turn_to_worker(prompt, anchor);
                 super::synthetic_start::defer_synthetic_turn_start(
                     shared,
                     &provider,
@@ -470,6 +591,9 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
                 super::super::tui_direct_pending_start::record_claim_marker_if_watcher_owned,
             );
         }
+    }
+    if claimed {
+        crate::services::tui_prompt_dedupe::adopt_native_turn(prompt);
     }
     deferred_synthetic_start
 }

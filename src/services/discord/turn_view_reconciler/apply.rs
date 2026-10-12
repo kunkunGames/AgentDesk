@@ -168,7 +168,9 @@ impl TurnViewReconciler {
         source: &'static str,
     ) -> TurnViewDelivery {
         debug_assert!(
-            TURN_VIEW_REACTIONS.contains(&emoji) || QUEUE_EXIT_FEEDBACK_REACTIONS.contains(&emoji)
+            TURN_VIEW_REACTIONS.contains(&emoji)
+                || QUEUE_EXIT_FEEDBACK_REACTIONS.contains(&emoji)
+                || INJECTION_REACTIONS.contains(&emoji)
         );
         #[cfg(not(test))]
         {
@@ -208,6 +210,32 @@ impl TurnViewReconciler {
         }
         #[cfg(test)]
         {
+            if self.test_http_reactions.load(Ordering::Relaxed) {
+                let http = shared
+                    .serenity_http_or_token_fallback()
+                    .expect("HTTP reaction tests must install a local REST client");
+                let reaction = serenity::ReactionType::Unicode(emoji.to_string());
+                let result = if add {
+                    target
+                        .channel_id
+                        .create_reaction(&http, target.message_id, reaction)
+                        .await
+                } else {
+                    target
+                        .channel_id
+                        .delete_reaction(&http, target.message_id, None, reaction)
+                        .await
+                };
+                return match result {
+                    Ok(()) => TurnViewDelivery::Delivered,
+                    Err(serenity::Error::Http(error)) => {
+                        TurnViewDelivery::from_reaction_error_status(
+                            error.status_code().map(|status| status.as_u16()),
+                        )
+                    }
+                    Err(_) => TurnViewDelivery::Failed,
+                };
+            }
             let _ = (shared, source);
             tokio::task::yield_now().await;
             let delivery = self

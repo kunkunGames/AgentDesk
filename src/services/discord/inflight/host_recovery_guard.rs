@@ -41,6 +41,10 @@ pub(in crate::services::discord) fn marker_witness(marker: HostKindMarker) -> Ho
     }
 }
 
+pub(in crate::services::discord) fn tmux_marker_is_known(name: &str) -> bool {
+    read_host_kind_marker(name) == HostKindMarker::Known(HostKind::Tmux)
+}
+
 /// Adds what the inflight row carries without overwriting what the caller read.
 /// A differing locator reads as unrecognized and a differing tmux name as a name conflict.
 pub(in crate::services::discord) fn with_inflight_row(
@@ -97,6 +101,10 @@ pub(in crate::services::discord) async fn clear_channel_session(
     tmux_name: &str,
     caller: &str,
 ) -> Option<ClearedHostSession> {
+    // A Herdr-configured channel's session is never cleared or killed this way.
+    if crate::services::discord::admin_host_guard::configured_refusal(channel_id).is_some() {
+        return None;
+    }
     let teardown = keyed_teardown(
         pool,
         provider,

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use super::WriterAlarm;
 use super::binding::{BindingEvent, BindingEvents, BindingRecord, BindingTarget};
-use crate::services::tui_o::shadow::capture::file_identity;
+use crate::services::tui_o::shadow::capture::{FileMatch, file_identity, file_match};
 use crate::services::tui_o::shadow::identity::{RecordFact, classify};
 use crate::services::tui_o::shadow::{ShadowProvider, SourceId};
 use crate::services::tui_o::store::InitSource;
@@ -172,7 +172,7 @@ impl ReadVersion {
 
 /// Whether `later` supersedes `pending` as the writer drops it, never to resolve it: a hook on the
 /// pane adopting another session, a later Pending, or a prompt of its own session it outlived.
-pub(super) fn supersedes(pending: &BindingEvent, later: &BindingEvent) -> bool {
+pub(crate) fn supersedes(pending: &BindingEvent, later: &BindingEvent) -> bool {
     #[cfg(test)]
     use crate::services::claude_tui::source_verify::n2b_mutant;
     let same_pane = later.tmux_session == pending.tmux_session;
@@ -210,7 +210,7 @@ pub(super) fn supersedes(pending: &BindingEvent, later: &BindingEvent) -> bool {
 
 /// The sources a binding log names: every bound one in seq order, and those only named as an old
 /// or parent source. A bind still pending refuses the log; a superseded one does not.
-pub(super) fn logged(events: &[BindingEvent]) -> Result<(Vec<&SourceId>, Vec<&SourceId>), Refused> {
+pub(crate) fn logged(events: &[BindingEvent]) -> Result<(Vec<&SourceId>, Vec<&SourceId>), Refused> {
     let (mut bound, mut named, mut pending) = (Vec::new(), Vec::new(), Vec::<&BindingEvent>::new());
     for event in events {
         match &event.record {
@@ -272,6 +272,8 @@ pub fn holds_output<B: BindingEvents>(bindings: &B, channel: u64) -> bool {
 #[derive(Clone, Debug)]
 struct Pinned {
     source: SourceId,
+    /// The file's identity as this read opened it; `source` may keep a dev a reboot renumbered.
+    live: (u64, u64),
     len: u64,
     modified: Option<SystemTime>,
     hash: String,
@@ -283,7 +285,7 @@ impl Pinned {
         let path = self.source.path.display();
         let meta = std::fs::metadata(&self.source.path);
         let meta = meta.map_err(|error| format!("source {path}: {error}"))?;
-        if file_identity(&meta) != (self.source.dev, self.source.ino) {
+        if file_identity(&meta) != self.live {
             return Err(format!("source {path} was replaced"));
         }
         if meta.len() != self.len {
@@ -298,7 +300,7 @@ impl Pinned {
     fn version(&self) -> ReadVersion {
         ReadVersion {
             path: self.source.path.clone(),
-            identity: (self.source.dev, self.source.ino),
+            identity: self.live,
             len: self.len,
             modified: self.modified,
         }
@@ -395,7 +397,8 @@ fn read(source: &SourceId, len: u64, turns: Option<&mut Turns>) -> Result<Pinned
     let io = |error: std::io::Error| Unread::Other(format!("source {path}: {error}"));
     let file = File::open(&source.path).map_err(io)?;
     let meta = file.metadata().map_err(io)?;
-    if file_identity(&meta) != (source.dev, source.ino) {
+    let live = file_identity(&meta);
+    if file_match(source, live) == FileMatch::Other {
         return Err(Unread::Other(format!("source {path} was replaced")));
     }
     if meta.len() != len {
@@ -431,6 +434,7 @@ fn read(source: &SourceId, len: u64, turns: Option<&mut Turns>) -> Result<Pinned
     }
     Ok(Pinned {
         source: source.clone(),
+        live,
         len,
         modified: meta.modified().ok(),
         hash: hex::encode(hasher.finalize()),
@@ -443,6 +447,7 @@ pub struct Snapshot {
     seq: u64,
     tmux: String,
     /// Legacy's cursor on the current source when the pin read it.
+    #[cfg(test)]
     cursor: Option<u64>,
     /// The current source first, then the ones bound before it.
     pinned: Vec<Pinned>,
@@ -544,13 +549,22 @@ pub fn pin_at(
         return Err(open());
     }
     let mut pinned = vec![head];
-    let past = past_of(&bound);
-    let lens = past.iter().map(|source| len_of(&source.path));
-    let lens: Vec<u64> = lens.collect::<Result<_, _>>().map_err(Refused::retry)?;
-    if past.len() > PAST_BUDGET_SOURCES || lens.iter().sum::<u64>() > PAST_BUDGET_BYTES {
-        return Err(Refused::new(Hold::Final, "past sources exceed budget"));
-    }
-    for (source, len) in past.into_iter().zip(lens) {
+    // Only the newest past sources within budget that still exist are pinned; a later bind of any
+    // other has no cursor, so O's rotation holds it as a pending boundary instead of posting it.
+    let mut total = 0;
+    for source in past_of(&bound).into_iter().take(PAST_BUDGET_SOURCES) {
+        let len = match std::fs::metadata(&source.path) {
+            Ok(meta) => meta.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                let detail = format!("source {}: {error}", source.path.display());
+                return Err(Refused::retry(detail));
+            }
+        };
+        total += len;
+        if total > PAST_BUDGET_BYTES {
+            break;
+        }
         match read(source, len, None) {
             Ok(read) => pinned.push(read),
             Err(Unread::Short(detail) | Unread::Other(detail)) => {
@@ -565,6 +579,7 @@ pub fn pin_at(
     Ok(Snapshot {
         seq,
         tmux,
+        #[cfg(test)]
         cursor,
         pinned,
         named: named.into_iter().cloned().collect(),
@@ -642,6 +657,26 @@ impl Snapshot {
         bindings: &B,
         channel: u64,
     ) -> Result<Vec<InitSource>, Refused> {
+        self.recheck_sources(legacy, bindings, channel, false)
+    }
+
+    /// The same source checks after the stall, allowing only a stale running tail.
+    pub fn recheck_past_stall<B: BindingEvents>(
+        &self,
+        legacy: &dyn LegacyView,
+        bindings: &B,
+        channel: u64,
+    ) -> Result<Vec<InitSource>, Refused> {
+        self.recheck_sources(legacy, bindings, channel, true)
+    }
+
+    fn recheck_sources<B: BindingEvents>(
+        &self,
+        legacy: &dyn LegacyView,
+        bindings: &B,
+        channel: u64,
+        past_stall: bool,
+    ) -> Result<Vec<InitSource>, Refused> {
         let events = bindings.binding_events_since(channel, 0);
         let events = events.map_err(|error| Refused::retry(format!("binding log: {error}")))?;
         if events.last().map_or(0, |event| event.seq) != self.seq {
@@ -653,7 +688,7 @@ impl Snapshot {
             .split_first()
             .ok_or(Refused::retry("nothing is pinned"))?;
         current.unchanged().map_err(Refused::retry)?;
-        if legacy.tail_running(&self.tmux) {
+        if !past_stall && legacy.tail_running(&self.tmux) {
             return Err(Refused::retry("a Legacy response tail is running"));
         }
         for pinned in past {
@@ -695,12 +730,8 @@ impl Snapshot {
         })
     }
 
-    /// Whether Legacy is behind O's start: its cursor short of it or a record past its frontier.
-    pub fn behind(&self) -> bool {
-        self.undelivered.is_some() || self.cursor != Some(self.start())
-    }
-
     /// Whether the current source and Legacy's cursor and frontier still read as this pin saw them.
+    #[cfg(test)]
     pub fn unchanged(&self, legacy: &dyn LegacyView, channel: u64) -> bool {
         let Some(current) = self.pinned.first() else {
             return false;

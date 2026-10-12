@@ -1,6 +1,10 @@
 //! Persisted turn and queue recovery shared by Gateway and REST worker runtimes.
 use super::*;
 
+#[cfg(test)]
+#[path = "queued_recovery_s2a_tests.rs"]
+mod s2a_tests;
+
 pub(super) async fn restore_worker_queues(shared: &Arc<SharedData>, provider: &ProviderKind) {
     let Some(http) = shared.serenity_http_or_token_fallback() else {
         tracing::error!(
@@ -28,6 +32,10 @@ pub(super) async fn restore_queued_and_inflight_work(
     // persisted queue item look "already known" and incorrectly drop it.
     let (restored_queues, restored_overrides) = load_pending_queues(provider, &shared.token_hash);
     let restored_dispatch_markers = load_pending_dispatch_markers(provider, &shared.token_hash);
+    // Input-protected channels keep their files for the move or handback; nothing is installed.
+    let protected = |channel: ChannelId| {
+        crate::services::discord::input_runtime::fence::lookup(provider, channel.get()).is_some()
+    };
     let allowed_bot_ids_for_restore: Vec<u64> = {
         let settings = shared.settings.read().await;
         settings.allowed_bot_ids.clone()
@@ -35,6 +43,9 @@ pub(super) async fn restore_queued_and_inflight_work(
     let announce_bot_id_for_restore = super::resolve_announce_bot_user_id(shared).await;
     // P1-1: Restore dispatch_role_overrides from queue snapshots
     for (thread_channel_id, alt_channel_id) in &restored_overrides {
+        if protected(*thread_channel_id) {
+            continue;
+        }
         if !matches!(
             resolve_runtime_channel_binding_status(http, *thread_channel_id).await,
             RuntimeChannelBindingStatus::Owned
@@ -50,6 +61,9 @@ pub(super) async fn restore_queued_and_inflight_work(
         let Some(alt_channel_id) = marker.restored_override else {
             continue;
         };
+        if protected(marker.channel_id) {
+            continue;
+        }
         if !matches!(
             resolve_runtime_channel_binding_status(http, marker.channel_id).await,
             RuntimeChannelBindingStatus::Owned
@@ -75,6 +89,9 @@ pub(super) async fn restore_queued_and_inflight_work(
         let mut skipped_duplicate = 0usize;
         let mut skipped_persist_error = 0usize;
         for (channel_id, items) in restored_queues {
+            if protected(channel_id) {
+                continue;
+            }
             if !matches!(
                 resolve_runtime_channel_binding_status(http, channel_id).await,
                 RuntimeChannelBindingStatus::Owned
@@ -164,6 +181,9 @@ pub(super) async fn restore_queued_and_inflight_work(
         let mut skipped_duplicate = 0usize;
         let mut skipped_persist_error = 0usize;
         for marker in restored_dispatch_markers {
+            if protected(marker.channel_id) {
+                continue;
+            }
             if !matches!(
                 resolve_runtime_channel_binding_status(http, marker.channel_id).await,
                 RuntimeChannelBindingStatus::Owned
@@ -215,8 +235,9 @@ pub(super) async fn restore_queued_and_inflight_work(
     // dedup; the placeholder live-queue filter then sees the final
     // restored queue state before kickoff.
     let mut stale_cards_to_delete: Vec<(ChannelId, MessageId, MessageId)> = Vec::new();
-    let restored_queued_placeholders =
+    let mut restored_queued_placeholders =
         super::queued_placeholders_store::load_queued_placeholders(provider, &shared.token_hash);
+    restored_queued_placeholders.retain(|(channel, _), _| !protected(*channel));
     if !restored_queued_placeholders.is_empty() {
         let live_queue_ids = collect_live_queue_message_ids(shared).await;
         let filter_outcome =
@@ -248,3 +269,165 @@ pub(super) async fn restore_queued_and_inflight_work(
 
     stale_cards_to_delete
 }
+
+#[cfg(test)]
+#[path = "queued_recovery_fence_tests.rs"]
+mod fence_tests;
+
+#[cfg(all(test, unix))]
+use crate::services::cluster::channel_home_port::scoped_restore::{
+    InflightObservation, RestoreContext, RestoreScope, RestoreStatus, RestoreWitness, mutant,
+};
+
+#[cfg(all(test, unix))]
+pub(crate) struct ScopedRestoreLane {
+    channel: u64,
+    serial: Arc<tokio::sync::Mutex<()>>,
+    current: Arc<std::sync::atomic::AtomicU64>,
+    witness: Arc<std::sync::Mutex<RestoreWitness>>,
+}
+#[cfg(all(test, unix))]
+impl ScopedRestoreLane {
+    pub(crate) fn new(channel: u64) -> Arc<Self> {
+        Arc::new(Self {
+            channel,
+            serial: Arc::default(),
+            current: Arc::default(),
+            witness: Arc::default(),
+        })
+    }
+    pub(crate) fn witness(&self) -> RestoreWitness {
+        self.witness.lock().unwrap().clone()
+    }
+    /// The owned task keeps serialization even if its caller abandons the join handle.
+    pub(crate) fn run<F, Fut>(
+        self: &Arc<Self>,
+        scope: RestoreScope,
+        generation: u64,
+        work: F,
+    ) -> tokio::task::JoinHandle<Result<(), String>>
+    where
+        F: FnOnce(ScopedRestoreAttempt) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        let lane = self.clone();
+        tokio::spawn(async move {
+            let guard = lane.serial.clone().lock_owned().await;
+            if scope.channel != lane.channel
+                || generation == 0
+                || generation <= lane.current.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err("restore reservation is stale or foreign".into());
+            }
+            lane.current
+                .store(generation, std::sync::atomic::Ordering::Release);
+            *lane.witness.lock().unwrap() = RestoreWitness {
+                scope: Some(scope.clone()),
+                generation,
+                status: RestoreStatus::Restoring,
+                inflight: None,
+            };
+            let attempt = ScopedRestoreAttempt {
+                lane: lane.clone(),
+                _guard: guard,
+                next: 0,
+                context: RestoreContext {
+                    scope,
+                    generation,
+                    current: lane.current.clone(),
+                },
+            };
+            let result =
+                crate::services::discord::queue_io::with_post_enqueue_idle_queue_kick_suppressed(
+                    work(attempt),
+                )
+                .await;
+            if let Err(reason) = &result {
+                let mut witness = lane.witness.lock().unwrap();
+                if witness.generation == generation && witness.status != RestoreStatus::Restored {
+                    witness.status = RestoreStatus::Blocked(reason.clone().into());
+                }
+            }
+            result
+        })
+    }
+}
+#[cfg(all(test, unix))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallStage {
+    Queue,
+    Inflight,
+    Marker,
+    Placeholder,
+}
+#[cfg(all(test, unix))]
+pub(crate) struct ScopedRestoreAttempt {
+    lane: Arc<ScopedRestoreLane>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    next: usize,
+    pub(crate) context: RestoreContext,
+}
+#[cfg(all(test, unix))]
+impl ScopedRestoreAttempt {
+    pub(crate) fn acknowledge(&mut self, stage: InstallStage) -> Result<(), String> {
+        self.context.check()?;
+        if [
+            InstallStage::Queue,
+            InstallStage::Inflight,
+            InstallStage::Marker,
+            InstallStage::Placeholder,
+        ]
+        .get(self.next)
+            != Some(&stage)
+        {
+            self.block("installation stage out of order");
+            return Err("installation stage out of order".into());
+        }
+        self.next += 1;
+        Ok(())
+    }
+    pub(crate) fn observe(&self, observation: InflightObservation) {
+        let mut witness = self.lane.witness.lock().unwrap();
+        if mutant("retained-restored")
+            && matches!(observation, InflightObservation::Retained { .. })
+        {
+            witness.status = RestoreStatus::Restored;
+        }
+        witness.inflight = Some(observation);
+    }
+    pub(crate) fn block(&self, reason: &str) {
+        self.lane.witness.lock().unwrap().status = RestoreStatus::Blocked(reason.into());
+    }
+    pub(crate) fn finish(&self) -> Result<RestoreWitness, String> {
+        self.context.check()?;
+        let mut witness = self.lane.witness.lock().unwrap();
+        if self.next != 4
+            || witness.inflight.is_none()
+            || !matches!(witness.status, RestoreStatus::Restoring)
+        {
+            witness.status =
+                RestoreStatus::Blocked("installation acknowledgements incomplete".into());
+            return Err("installation acknowledgements incomplete".into());
+        }
+        witness.status = RestoreStatus::Restored;
+        Ok(witness.clone())
+    }
+}
+#[cfg(all(test, unix))]
+impl Drop for ScopedRestoreAttempt {
+    fn drop(&mut self) {
+        let mut witness = self.lane.witness.lock().unwrap();
+        if witness.status == RestoreStatus::Restoring {
+            witness.status =
+                RestoreStatus::Blocked("restore task left installation incomplete".into());
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "scoped_restore_lane_tests.rs"]
+mod scoped_restore_lane_tests;
+
+#[cfg(all(test, unix))]
+#[path = "scoped_inflight_restore_tests.rs"]
+mod scoped_inflight_restore_tests;

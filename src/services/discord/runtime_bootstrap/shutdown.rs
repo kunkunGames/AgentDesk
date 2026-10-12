@@ -7,134 +7,201 @@ use super::*;
 pub(super) fn run_bot_spawn_sigterm_handler(
     shared: &Arc<SharedData>,
     provider_for_shutdown: ProviderKind,
-) {
+) -> tokio::task::JoinHandle<()> {
     let shared_for_signal = shared.clone();
+    let source = SigtermSource::take();
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
-            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
-                sigterm.recv().await;
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!("  [{ts}] 🛑 SIGTERM received — graceful shutdown");
+            let Some(boundaries) = source.wait().await else {
+                return;
+            };
+            // Presence closes before any marking or persistence wait.
+            crate::services::discord::turn_presence::entrypoints::suspend(&shared_for_signal);
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!("  [{ts}] 🛑 SIGTERM received — graceful shutdown");
 
-                // Set global shutdown flag
-                shared_for_signal.restart.legacy_sigterm();
+            // Set global shutdown flag
+            shared_for_signal.restart.legacy_sigterm();
 
-                // ── Critical state persistence (MUST run before any I/O) ──
-                // Save pending queues and last_message_ids FIRST, before any
-                // network calls that might block/timeout and prevent saving.
+            let (after_initial, before_final) = boundaries;
+            persist_sigterm_state_with_boundaries(
+                &shared_for_signal,
+                &provider_for_shutdown,
+                after_initial,
+                before_final,
+            )
+            .await;
 
-                let drain =
-                    mailbox_restart_drain_all(&shared_for_signal, &provider_for_shutdown).await;
-                let queue_count = drain.queued_count;
-                if !drain.persistence_errors.is_empty() {
-                    tracing::error!(
-                        failures = drain.persistence_errors.len(),
-                        "SIGTERM initial drain observed pending-queue persistence failure(s)"
-                    );
-                }
-                if queue_count > 0 {
-                    let ts3 = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!(
-                        "  [{ts3}] 📋 mailbox persisted {queue_count} pending queue item(s)"
-                    );
-                }
+            crate::services::opencode::shutdown_warm_servers();
 
-                // Persist last_message_ids for catch-up polling after restart
-                {
-                    let ids: std::collections::HashMap<u64, u64> = shared_for_signal
-                        .last_message_ids
-                        .iter()
-                        .map(|entry| (entry.key().get(), *entry.value()))
-                        .collect();
-                    if !ids.is_empty() {
-                        runtime_store::save_all_last_message_ids(
-                            provider_for_shutdown.as_str(),
-                            &ids,
-                        );
-                    }
-                }
-
-                // ── Inflight state preservation for silent re-attach ──
-                let inflight_states = inflight::load_inflight_states(&provider_for_shutdown);
-                if !inflight_states.is_empty() {
-                    let ts2 = chrono::Local::now().format("%H:%M:%S");
-                    tracing::info!(
-                        "  [{ts2}] 👁 preserving {} inflight turn(s) for restart recovery",
-                        inflight_states.len()
-                    );
-                    let marked = inflight::mark_all_inflight_states_restart_mode(
-                        &provider_for_shutdown,
-                        crate::services::discord::InflightRestartMode::DrainRestart,
-                    );
-                    tracing::info!(
-                        "  [{ts2}] 🔖 marked {marked} inflight turn(s) as drain_restart"
-                    );
-                }
-
-                // ── Final state snapshot (belt-and-suspenders) ──
-                // During the HTTP placeholder edits above, active turns may have
-                // finished and mutated queues/last_message_ids. Re-save to capture
-                // any changes that occurred after the initial save.
-                {
-                    let drain =
-                        mailbox_restart_drain_all(&shared_for_signal, &provider_for_shutdown).await;
-                    let queue_count = drain.queued_count;
-                    if !drain.persistence_errors.is_empty() {
-                        tracing::error!(
-                            failures = drain.persistence_errors.len(),
-                            "SIGTERM final drain observed pending-queue persistence failure(s)"
-                        );
-                    }
-                    if queue_count > 0 {
-                        let ts4 = chrono::Local::now().format("%H:%M:%S");
-                        tracing::info!(
-                            "  [{ts4}] 📋 mailbox final drain: {queue_count} pending queue item(s)"
-                        );
-                    }
-                }
-                {
-                    let ids: std::collections::HashMap<u64, u64> = shared_for_signal
-                        .last_message_ids
-                        .iter()
-                        .map(|entry| (entry.key().get(), *entry.value()))
-                        .collect();
-                    if !ids.is_empty() {
-                        runtime_store::save_all_last_message_ids(
-                            provider_for_shutdown.as_str(),
-                            &ids,
-                        );
-                    }
-                }
-
-                crate::services::opencode::shutdown_warm_servers();
-
-                // Wait for all providers to finish saving before exiting.
-                // CAS guard: skip if this provider already decremented via deferred restart path.
+            // Wait for all providers to finish saving before exiting.
+            // CAS guard: skip if this provider already decremented via deferred restart path.
+            if shared_for_signal
+                .restart
+                .shutdown_counted
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
                 if shared_for_signal
                     .restart
-                    .shutdown_counted
-                    .compare_exchange(
-                        false,
-                        true,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
+                    .shutdown_remaining
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                    == 1
                 {
-                    if shared_for_signal
-                        .restart
-                        .shutdown_remaining
-                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-                        == 1
-                    {
-                        std::process::exit(0);
-                    }
+                    std::process::exit(0);
                 }
             }
         }
-    });
+        #[cfg(not(unix))]
+        let _ = (source, shared_for_signal, provider_for_shutdown);
+    })
+}
+
+#[cfg(unix)]
+type Boundary = Box<dyn FnOnce() + Send>;
+
+/// Where the handler's signal comes from; a test source never installs the process-wide handler.
+enum SigtermSource {
+    Os,
+    #[cfg(all(test, unix))]
+    Test(SigtermForTest),
+}
+
+#[cfg(all(test, unix))]
+pub(super) struct SigtermForTest {
+    pub(super) signal: tokio::sync::oneshot::Receiver<()>,
+    pub(super) after_initial: Boundary,
+    pub(super) before_final: Boundary,
+}
+
+impl SigtermSource {
+    fn take() -> Self {
+        #[cfg(all(test, unix))]
+        if let Some(test) = SIGTERM_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
+            return Self::Test(test);
+        }
+        Self::Os
+    }
+
+    /// Resolves with the persistence boundaries once the signal arrives; `None` means never.
+    #[cfg(unix)]
+    async fn wait(self) -> Option<(Boundary, Boundary)> {
+        let none = || -> (Boundary, Boundary) { (Box::new(|| {}), Box::new(|| {})) };
+        match self {
+            Self::Os => {
+                use tokio::signal::unix::{SignalKind, signal};
+                let mut sigterm = signal(SignalKind::terminate()).ok()?;
+                sigterm.recv().await;
+                Some(none())
+            }
+            #[cfg(all(test, unix))]
+            Self::Test(test) => {
+                test.signal.await.ok()?;
+                Some((test.after_initial, test.before_final))
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    pub(super) static SIGTERM_FOR_TEST: std::cell::RefCell<Option<SigtermForTest>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Persist both restart snapshots around inflight marking without exiting the process.
+async fn persist_sigterm_state_with_boundaries(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    after_initial: impl FnOnce(),
+    before_final: impl FnOnce(),
+) -> [crate::services::turn_orchestrator::RestartDrainAllResult; 2] {
+    // Save queues and catch-up checkpoints before network I/O can block shutdown.
+
+    let initial_drain = mailbox_restart_drain_all(shared, provider).await;
+    let queue_count = initial_drain.queued_count;
+    if !initial_drain.persistence_errors.is_empty() {
+        tracing::error!(
+            failures = initial_drain.persistence_errors.len(),
+            "SIGTERM initial drain observed pending-queue persistence failure(s)"
+        );
+    }
+    if queue_count > 0 {
+        let ts3 = chrono::Local::now().format("%H:%M:%S");
+        tracing::info!("  [{ts3}] 📋 mailbox persisted {queue_count} pending queue item(s)");
+    }
+
+    // Persist last_message_ids for catch-up polling after restart
+    {
+        let ids: std::collections::HashMap<u64, u64> = shared
+            .last_message_ids
+            .iter()
+            .map(|entry| (entry.key().get(), *entry.value()))
+            .collect();
+        if !ids.is_empty() {
+            runtime_store::save_all_last_message_ids(provider.as_str(), &ids);
+        }
+    }
+
+    after_initial();
+
+    // Preserve inflight state for silent re-attach. A failed or partial pass is reported and the
+    // final drain still runs: an unmarked row is lost to the next boot either way.
+    let ts2 = chrono::Local::now().format("%H:%M:%S");
+    let report = inflight::mark_restart_mode_blocking(
+        provider.clone(),
+        crate::services::discord::InflightRestartMode::DrainRestart,
+    )
+    .await;
+    if report.marked > 0 {
+        tracing::info!(
+            "  [{ts2}] 🔖 marked {} inflight turn(s) as drain_restart",
+            report.marked
+        );
+    }
+    if !report.failed.is_empty() || report.incomplete {
+        tracing::error!(
+            provider = provider.as_str(),
+            failed = ?report.failed,
+            incomplete = report.incomplete,
+            "SIGTERM inflight restart marking left rows unmarked"
+        );
+    }
+
+    before_final();
+
+    // Re-save queues and checkpoints to capture turns finishing during the initial pass.
+    let final_drain_block = {
+        let final_drain = mailbox_restart_drain_all(shared, provider).await;
+        let queue_count = final_drain.queued_count;
+        if !final_drain.persistence_errors.is_empty() {
+            tracing::error!(
+                failures = final_drain.persistence_errors.len(),
+                "SIGTERM final drain observed pending-queue persistence failure(s)"
+            );
+        }
+        if queue_count > 0 {
+            let ts4 = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!("  [{ts4}] 📋 mailbox final drain: {queue_count} pending queue item(s)");
+        }
+        final_drain
+    };
+    {
+        let ids: std::collections::HashMap<u64, u64> = shared
+            .last_message_ids
+            .iter()
+            .map(|entry| (entry.key().get(), *entry.value()))
+            .collect();
+        if !ids.is_empty() {
+            runtime_store::save_all_last_message_ids(provider.as_str(), &ids);
+        }
+    }
+    [initial_drain, final_drain_block]
 }
 
 async fn abort_and_join_task(handle: Option<tokio::task::JoinHandle<()>>) {
@@ -193,7 +260,9 @@ async fn finish_gateway_backend<E, F>(
     }
     // The backend is gone: close O admission, even against a late re-acquisition, before the
     // lease task is aborted and drops the lease.
-    crate::services::tui_o::ownership::gate(provider_for_error.as_str()).close();
+    let gate = crate::services::tui_o::ownership::gate(provider_for_error.as_str());
+    gate.close();
+    crate::services::discord::turn_presence::entrypoints::withdraw_gateway(&gate, "backend_exit");
     drop(gateway_waiter);
     release_catalog_before_diagnostic(model_catalog_refresh_task, diagnostic).await;
     abort_and_join_task(gateway_lease_task).await;
@@ -229,6 +298,10 @@ pub(super) async fn run_bot_run_gateway_backend(
     )
     .await;
 }
+
+#[cfg(test)]
+#[path = "shutdown_input_fence_tests.rs"]
+mod input_fence_tests;
 
 #[cfg(test)]
 mod lifecycle_tests {

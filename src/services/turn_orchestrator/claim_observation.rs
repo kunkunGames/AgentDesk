@@ -155,18 +155,26 @@ impl ChannelMailboxState {
         self.claim_log.record(ids);
     }
 
-    /// Pre-hydrate refusal: active-turn duplicates first, then the claim CAS.
+    /// A busy-turn injection reserving `message` counts as a claim on it.
+    pub(super) fn record_injection_claim(&mut self, message: MessageId) {
+        self.claim_log.record(vec![message]);
+    }
+
+    /// Pre-hydrate refusal: injected input first, then active-turn duplicates, then the claim CAS.
     pub(super) fn enqueue_refusal(
         &self,
         intervention: &Intervention,
         observed: Option<ClaimObservation>,
     ) -> Option<EnqueueRefusalReason> {
-        active_turn_enqueue_refusal(self, intervention).or_else(|| {
-            let sources = &intervention.source_message_ids;
-            observed
-                .filter(|observed| self.claim_log.claimed_since(*observed, sources))
-                .map(|_| EnqueueRefusalReason::ClaimedSinceObservation)
-        })
+        let injected = super::injected_inputs::enqueue_refusal(self, intervention);
+        injected
+            .or_else(|| active_turn_enqueue_refusal(self, intervention))
+            .or_else(|| {
+                let sources = &intervention.source_message_ids;
+                observed
+                    .filter(|observed| self.claim_log.claimed_since(*observed, sources))
+                    .map(|_| EnqueueRefusalReason::ClaimedSinceObservation)
+            })
     }
 }
 
@@ -189,7 +197,19 @@ impl ChannelMailboxHandle {
         persistence: QueuePersistenceContext,
         observed: Option<ClaimObservation>,
     ) -> EnqueueInterventionResult {
+        self.enqueue_observed_with_permit(intervention, persistence, observed, None)
+            .await
+    }
+
+    pub(crate) async fn enqueue_observed_with_permit(
+        &self,
+        intervention: Intervention,
+        persistence: QueuePersistenceContext,
+        observed: Option<ClaimObservation>,
+        input_permit: Option<crate::services::discord::input_runtime::fence::Permit>,
+    ) -> EnqueueInterventionResult {
         self.request(|reply| ChannelMailboxMsg::Enqueue {
+            input_permit,
             intervention,
             persistence,
             observed,

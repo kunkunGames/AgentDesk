@@ -24,8 +24,6 @@ use crate::utils::format::tail_with_ellipsis;
 use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::path::Path;
-#[cfg(unix)]
-use std::process::Command;
 
 // Settlement is shared with restart recovery on every platform; only the
 // pane/source capture entry points inside this module require Unix.
@@ -113,7 +111,16 @@ mod o_recovery_cut_tests;
 #[path = "recovery_engine/restore_inflight.rs"]
 mod restore_inflight;
 pub(crate) use completion_delivery::CapturedReadyDeliveryCommit;
+#[cfg(unix)]
+#[path = "recovery_engine/herdr_admitted_restart.rs"]
+pub(in crate::services::discord) mod herdr_admitted_restart;
+#[cfg(unix)]
+#[path = "recovery_engine/herdr_before_start_restart.rs"]
+mod herdr_before_start_restart;
 // Unix only, like the `tmux::execution_identity` comparison it calls.
+#[cfg(unix)]
+#[path = "recovery_engine/herdr_reader.rs"]
+pub(in crate::services::discord) mod herdr_reader;
 #[cfg(unix)]
 #[path = "recovery_engine/host_reconcile.rs"]
 pub(in crate::services::discord) mod host_reconcile;
@@ -494,9 +501,14 @@ pub enum RebindError {
         tmux_session: String,
         runtime_kind: RuntimeHandoffKind,
     },
+    /// The pane is a Herdr execution no reconcile admitted: refused before any write, or, when
+    /// the admission is withdrawn mid-rebind, with the row written; no watcher is claimed. 409.
+    WatcherWithheld { tmux_session: String },
     /// `tmux_session` not provided and no in-memory session supplies a
     /// channel_name — cannot derive the canonical tmux session name. 400.
     ChannelNameMissing,
+    /// The channel's input gate is not open to new Legacy effects; nothing was written. 409.
+    InputFenced(String),
     /// Unrecoverable internal error (inflight write, lock poisoning, etc.). 500.
     Internal(String),
 }
@@ -542,11 +554,26 @@ impl std::fmt::Display for RebindError {
                 "watcher rebind unavailable for {} tmux session {tmux_session}",
                 runtime_kind.as_str()
             ),
+            Self::WatcherWithheld { tmux_session } => write!(
+                f,
+                "host not admitted: Herdr execution {tmux_session} has no reconcile admission; no watcher was claimed"
+            ),
             Self::ChannelNameMissing => write!(
                 f,
                 "channel name missing — pass tmux_session or pre-register the channel"
             ),
+            Self::InputFenced(reason) => write!(f, "input fence refused rebind: {reason}"),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) use rebind_runtime::codex_rebind_spawn_for_tests;
+#[cfg(test)]
+pub(crate) use restore_persist_outcome::codex_restart_output_for_tests;
+
+#[cfg(all(test, unix))]
+pub(in crate::services::discord) use self::restore_inflight::{
+    install_inflight_scoped, resume_inflight_scoped,
+};

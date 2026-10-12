@@ -1,10 +1,15 @@
 use crate::services::agent_protocol::RuntimeHandoffKind::{ClaudeTui, CodexTui};
 use crate::services::tui_o::channel_policy::{Adoption, BootChannels};
 use crate::services::tui_o::cutover::{self, test_override};
+use crate::services::tui_o::repost::admission::OriginalGate;
+use crate::services::tui_o::repost::runner::{RepostHook, Turned};
+use crate::services::tui_o::store::ledger::PieceRecord;
 use crate::services::tui_o::writer::activation::ActivationFacts;
 use crate::services::tui_o::writer::adoption::{LegacyCursor, LegacyView};
 use crate::services::tui_o::writer::binding::ChannelBindingLog;
-use crate::services::tui_o::writer::host::{Custody, HostIo, HostParts, Readiness, start};
+use crate::services::tui_o::writer::host::{
+    Custody, HostIo, HostParts, Readiness, RepostTurn, start,
+};
 
 use super::*;
 use crate::services::tui_prompt_dedupe::binding_events as p5;
@@ -14,11 +19,23 @@ use chrono::{DateTime, TimeDelta};
 const OTHER: u64 = 8;
 
 #[derive(Clone, Default)]
-struct Raised(Arc<Mutex<Vec<(u64, WriterAlarm)>>>);
+struct Raised(Arc<Mutex<Vec<(u64, WriterAlarm)>>>, Resumes);
+
+/// The host's resume reports, in order: `pending`, `settled` (no longer pending) and `cleared`.
+type Resumes = Arc<Mutex<Vec<(u64, &'static str)>>>;
 
 impl AlarmSink for Raised {
     fn raise(&self, channel: u64, alarm: WriterAlarm) {
         self.0.lock().unwrap().push((channel, alarm));
+    }
+
+    fn resume_pending(&self, channel: u64, pending: bool) {
+        let report = if pending { "pending" } else { "settled" };
+        self.1.lock().unwrap().push((channel, report));
+    }
+
+    fn halt_cleared(&self, channel: u64) {
+        self.1.lock().unwrap().push((channel, "cleared"));
     }
 }
 
@@ -57,6 +74,8 @@ struct TestIo {
     calls: Mutex<Vec<(&'static str, u64)>>,
     facts: Mutex<Result<ActivationFacts, String>>,
     custody: Mutex<Result<Custody, String>>,
+    queued_bodies: std::sync::atomic::AtomicI64,
+    fence_error: Mutex<Option<String>>,
     /// Runs once while the next facts are read.
     on_facts: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The gateway never comes up.
@@ -64,6 +83,25 @@ struct TestIo {
     legacy: Mutex<Option<Arc<dyn LegacyView>>>,
     busy: std::sync::atomic::AtomicBool,
     relaying: std::sync::atomic::AtomicBool,
+    /// Each lease handed to a new writer: when, how many writers still held one, and how many
+    /// piece leases were back by then.
+    leases: Mutex<Vec<(tokio::time::Instant, usize, usize)>>,
+    /// Turns the hosted actors ran of the host's re-post hook.
+    repost_turns: Arc<AtomicUsize>,
+}
+
+/// A re-post hook that only counts its turns; every original still goes.
+pub(super) struct CountedTurn(pub(super) Arc<AtomicUsize>);
+
+impl<W> RepostHook<W> for CountedTurn {
+    fn turn<'a>(&'a mut self, _: &'a mut W) -> Turned<'a, ()> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::ready(()))
+    }
+
+    fn original(&mut self, _: u64, _: PieceRecord) -> Turned<'_, OriginalGate> {
+        Box::pin(std::future::ready(OriginalGate::Send))
+    }
 }
 
 impl TestIo {
@@ -75,11 +113,15 @@ impl TestIo {
             calls: Mutex::default(),
             facts: Mutex::new(Ok(ActivationFacts::default())),
             custody: Mutex::new(Ok(Custody::Free)),
+            queued_bodies: Default::default(),
+            fence_error: Mutex::default(),
             on_facts: Mutex::default(),
             port_down: Default::default(),
             legacy: Mutex::default(),
             busy: Default::default(),
             relaying: Default::default(),
+            leases: Mutex::default(),
+            repost_turns: Arc::default(),
         })
     }
 
@@ -106,8 +148,19 @@ impl HostIo for TestIo {
         }
     }
 
+    fn writer_unavailable(&self, channel: u64) {
+        self.lease.writer_unavailable(channel);
+    }
+
     fn lease(&self) -> Arc<FakeLease> {
         self.calls.lock().unwrap().push(("lease", 0));
+        // This handle and the harness's own are the two that outlive every writer.
+        let writers = Arc::strong_count(&self.lease) - 2;
+        let (at, back) = (
+            tokio::time::Instant::now(),
+            self.lease.released.load(Ordering::SeqCst),
+        );
+        self.leases.lock().unwrap().push((at, writers, back));
         Arc::clone(&self.lease)
     }
 
@@ -133,6 +186,28 @@ impl HostIo for TestIo {
         async move { facts }
     }
 
+    fn intake_fence(
+        &self,
+        channel: u64,
+        provider: ShadowProvider,
+    ) -> impl Future<Output = Result<crate::services::tui_o::writer::host::FencedFacts, String>> + Send
+    {
+        self.calls.lock().unwrap().push(("fence", channel));
+        let error = self.fence_error.lock().unwrap().clone();
+        let queued_bodies = self.queued_bodies.load(Ordering::SeqCst);
+        async move {
+            if let Some(error) = error {
+                return Err(error);
+            }
+            let facts = self.activation_facts(channel, provider).await?;
+            Ok(crate::services::tui_o::writer::host::FencedFacts {
+                hold: crate::db::o_channel_activation::IntakeFence::empty_for_test(),
+                facts,
+                queued_bodies,
+            })
+        }
+    }
+
     fn local_custody(&self, _: u64, _: ShadowProvider) -> Result<Custody, String> {
         self.custody.lock().unwrap().clone()
     }
@@ -149,6 +224,14 @@ impl HostIo for TestIo {
 
     fn relaying(&self, _: u64) -> bool {
         self.relaying.load(Ordering::SeqCst)
+    }
+
+    fn adopted(&self, channel: u64, _: ShadowProvider) {
+        self.calls.lock().unwrap().push(("adopted", channel));
+    }
+
+    fn repost(&self, _: u64, _: &Arc<FakePort>) -> Option<RepostTurn<Self>> {
+        Some(Box::new(CountedTurn(Arc::clone(&self.repost_turns))))
     }
 }
 
@@ -217,7 +300,8 @@ async fn only_a_selected_channel_gets_an_actor_and_it_is_ready_only_while_owned(
     assert_eq!(host(&harness, &io, true, &ready), 1);
     append(&path, &row("m1", "first"));
     polls(3).await;
-    let expected = [("port", 0), ("lease", 0), ("bindings", CHANNEL)];
+    // Bindings are read once per host; a lease is taken for each writer it starts.
+    let expected = [("port", 0), ("bindings", CHANNEL), ("lease", 0)];
     assert_eq!(io.calls(), expected, "the unselected channel gets nothing");
     assert!(
         !ready.is_ready(CHANNEL),
@@ -262,11 +346,22 @@ async fn a_published_flag_alone_does_not_accept_work() {
     assert!(ready.accepts(CHANNEL));
     hosts.iter().for_each(|host| host.abort());
     polls(3).await;
-    assert!(
-        ready.is_ready(CHANNEL),
-        "nothing cleared the flag once its host was gone"
-    );
+    assert!(!ready.is_ready(CHANNEL), "the exited host closes readiness");
     assert!(!ready.accepts(CHANNEL), "an ended actor takes no work");
+}
+
+/// Each actor the host starts gets the host's re-post turn, and runs it every poll.
+#[tokio::test(start_paused = true)]
+async fn f6_every_hosted_actor_runs_the_hosts_repost_turn() {
+    let (harness, _, source) = switched_over(b"");
+    let startup = p5_event(CHANNEL, "claude", p5::BindingTarget::Source(source));
+    p5_log(harness._runtime.path(), CHANNEL, &startup);
+    let _selected = test_override::force_channels(&[(CHANNEL, ClaudeTui)]);
+    let (io, ready) = (TestIo::over(&harness), Arc::new(Readiness::default()));
+    harness.gate.acquired();
+    assert_eq!(host(&harness, &io, true, &ready), 1);
+    polls(3).await;
+    assert!(io.repost_turns.load(Ordering::SeqCst) >= 2);
 }
 
 #[test]
@@ -436,6 +531,43 @@ fn a_channel_binding_log_carries_each_production_event_of_its_channel_and_provid
     assert!(log.binding_events_since(OTHER, 0).is_err());
     let codex = ChannelBindingLog::new(9, ShadowProvider::Claude);
     assert!(codex.binding_events_since(9, 0).is_err());
+
+    let (harness, _, old) = switched_over(b"");
+    let path = old.path.with_file_name("foreign.jsonl");
+    std::fs::write(&path, b"").unwrap();
+    let new = source_id_for("foreign", &path).unwrap();
+    let mut store = harness.channel();
+    store.attach_source(&new).unwrap();
+    store.set_binding_checkpoint(1).unwrap();
+    let foreign = p5::BindingTarget::Source(new);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&p5_event(CHANNEL, "codex", foreign)).unwrap();
+    value["old"] = serde_json::to_value(&old).unwrap();
+    let mut line = serde_json::to_vec(&value).unwrap();
+    line.push(b'\n');
+    p5_log(root.path(), CHANNEL, &line);
+    p5::forget_channel_for_tests(CHANNEL);
+    let mut writer = harness.writer();
+    let mut sources = super::super::rotation::Sources::new(
+        CHANNEL,
+        ShadowProvider::Claude,
+        Arc::new(ChannelBindingLog::new(CHANNEL, ShadowProvider::Claude)),
+    );
+    sources
+        .resume(
+            &mut writer,
+            &mut UnitDeriver::new(CHANNEL, ShadowProvider::Claude),
+            &mut VecDeque::new(),
+        )
+        .unwrap();
+    assert!(writer.store().rotation().unwrap().successors.is_empty());
+    assert!(
+        harness
+            .alarms
+            .taken()
+            .iter()
+            .any(|alarm| matches!(alarm, WriterAlarm::BindingLogUnavailable { .. }))
+    );
     p5::set_test_root(None);
 }
 
@@ -509,6 +641,12 @@ async fn a_new_empty_channel_gets_one_first_init_and_a_ready_actor_that_a_restar
         ready.is_ready(CHANNEL),
         "the actor resumed over the new init"
     );
+    let calls = io.calls();
+    let at = |name| calls.iter().position(|call| call.0 == name).unwrap();
+    assert!(
+        at("facts") < at("adopted") && at("adopted") < at("port"),
+        "a committed first activation is reported before the actor can take work: {calls:?}"
+    );
     append(&path, &row("m1", "first"));
     polls(3).await;
     assert_eq!(harness.port.posts(), ["first"]);
@@ -521,7 +659,7 @@ async fn a_new_empty_channel_gets_one_first_init_and_a_ready_actor_that_a_restar
     append(&path, &row("m2", "second"));
     polls(3).await;
     assert!(
-        !io.calls().contains(&("facts", CHANNEL)),
+        !io.calls().contains(&("facts", CHANNEL)) && !io.calls().contains(&("adopted", CHANNEL)),
         "a restart recovers, it does not activate"
     );
     assert_eq!(
@@ -1077,5 +1215,34 @@ async fn a_resume_the_log_keeps_unchanged_leaves_the_old_source_read_and_a_logge
 mod deferred;
 
 #[cfg(unix)]
+#[path = "resume_tests.rs"]
+mod resume;
+
+#[cfg(unix)]
 #[path = "reclaim_tests.rs"]
 mod reclaim;
+
+#[cfg(test)]
+#[path = "herdr_resume_tests.rs"]
+mod herdr_resume;
+
+#[cfg(unix)]
+#[path = "clear_launch_tests.rs"]
+mod clear_launch;
+
+#[path = "rotation_unsettled_tests.rs"]
+mod rotation_unsettled;
+
+#[path = "host_home_tests.rs"]
+mod home;
+
+#[path = "host_managed_tests.rs"]
+mod managed;
+
+#[cfg(unix)]
+#[path = "host_renumber_tests.rs"]
+mod renumber;
+
+#[cfg(unix)]
+#[path = "readers_host_tests.rs"]
+mod readers_host;

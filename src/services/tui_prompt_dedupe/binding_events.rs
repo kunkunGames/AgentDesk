@@ -29,6 +29,8 @@ mod claude_fold;
 use claude_fold::Waiting;
 pub(crate) use claude_fold::binding_events_judged_since;
 pub(crate) mod codex;
+mod log_record;
+use log_record::{Logged, LoggedRef};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,28 +84,6 @@ pub(crate) struct BindingEvent {
     pub parent_hint: Option<SourceId>,
     pub evidence: BindingEvidence,
     pub committed_at: DateTime<Utc>,
-}
-
-/// A log line: the event plus whether its source passed the Claude source check and when its hook
-/// was published. Both sit beside the event so readers of `BindingEvent` see the same record.
-#[derive(Deserialize)]
-struct Logged {
-    #[serde(flatten)]
-    event: BindingEvent,
-    #[serde(default)]
-    verified: bool,
-    #[serde(default)]
-    published_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Serialize)]
-struct LoggedRef<'a> {
-    #[serde(flatten)]
-    event: &'a BindingEvent,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    verified: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    published_at: Option<DateTime<Utc>>,
 }
 
 /// A binding change whose event could not be persisted; the binding was not published.
@@ -395,6 +375,35 @@ pub(crate) fn subscribe_binding_events(channel_id: u64) -> io::Result<watch::Rec
     Ok(log.notify.subscribe())
 }
 
+#[cfg(all(test, unix))]
+pub(crate) use presence_admission::admit_committed_seq;
+
+#[cfg(all(test, unix))]
+mod presence_admission {
+    use super::*;
+
+    /// Hands off synchronously under the append/apply/committed-seq mutex without writing the log.
+    pub(crate) fn admit_committed_seq<R>(
+        channel_id: u64,
+        expected: u64,
+        hand_off: impl FnOnce() -> R,
+    ) -> io::Result<Option<R>> {
+        let Some(path) = log_path(channel_id)? else {
+            return Ok(None);
+        };
+        let logs = lock_logs();
+        let Some(log) = logs.get(&path) else {
+            return Ok(None);
+        };
+        // A seq restored without its writer, or left after a poisoned one, proves no healthy log.
+        let healthy = log
+            .writer
+            .as_ref()
+            .is_some_and(|writer| !writer.poisoned && !writer.tainted);
+        Ok((healthy && *log.notify.borrow() == expected).then(hand_off))
+    }
+}
+
 /// What a commit left in the log for its proposal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Committed {
@@ -413,6 +422,7 @@ pub(crate) enum Committed {
 /// publish time, or keep it.
 enum Planned {
     Append(BindingEvent, bool, Option<DateTime<Utc>>),
+    CodexAppend(BindingEvent, Box<codex::Ownership>),
     Keep(Committed),
 }
 
@@ -472,6 +482,16 @@ pub(crate) fn record_reclaim(proposal: &Proposal, source: &SourceId) -> io::Resu
 /// Audits a candidate the binding judgment refused; `true` when this judgment was newly logged.
 pub(crate) fn record_rejected(proposal: &Proposal, reason: &str) -> io::Result<bool> {
     commit(proposal, Plan::Rejected(reason)).map(|c| c == Committed::Appended)
+}
+
+/// Reads the existing writer's Pending identity without loading, appending, or publishing a record.
+pub(crate) fn pending_seq(channel_id: u64, tmux_session: &str, session: &str) -> Option<u64> {
+    let path = log_path(channel_id).ok().flatten()?;
+    let logs = lock_logs();
+    let writer = logs.get(&path)?.writer.as_ref()?;
+    let pending = writer.panes.get(tmux_session)?.pending.as_ref()?;
+    let same = matches!(&pending.new, BindingTarget::Pending { payload_session_id: id, .. } if id == session);
+    same.then_some(pending.seq)
 }
 
 /// The pane's current source, when a verified record pinned it.
@@ -538,15 +558,17 @@ fn commit_with(
     let Some(writer) = log.writer.as_mut() else {
         return Ok(Committed::Unchanged);
     };
-    let (record, verified, published_at) = match plan(writer) {
-        Planned::Append(record, verified, published_at) => (record, verified, published_at),
+    let (record, verified, published_at, codex_ownership) = match plan(writer) {
+        Planned::Append(record, verified, published_at) => (record, verified, published_at, None),
+        Planned::CodexAppend(record, ownership) => (record, false, None, Some(ownership)),
         Planned::Keep(committed) => return Ok(committed),
     };
     #[cfg(test)]
     let logged = published_at.filter(|_| !n2b_mutant("live"));
     #[cfg(not(test))]
     let logged = published_at;
-    if let Err(error) = writer.append(&path, &record, verified, logged) {
+    if let Err(error) = writer.append(&path, &record, verified, logged, codex_ownership.as_deref())
+    {
         // A line that could not be cut back off is re-read from disk before the next append.
         if writer.poisoned {
             log.writer = None;
@@ -911,11 +933,13 @@ impl Writer {
         record: &BindingEvent,
         verified: bool,
         published_at: Option<DateTime<Utc>>,
+        codex_ownership: Option<&codex::Ownership>,
     ) -> io::Result<()> {
         let logged = LoggedRef {
             event: record,
             verified,
             published_at,
+            codex_ownership,
         };
         let mut line = serde_json::to_vec(&logged).map_err(io::Error::other)?;
         line.push(b'\n');
@@ -967,6 +991,11 @@ fn fault(step: &str) -> io::Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_root() -> Option<PathBuf> {
+    TEST_ROOT.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
 pub(crate) fn set_test_root(root: Option<&Path>) {
     TEST_ROOT.with(|slot| *slot.borrow_mut() = root.map(Path::to_path_buf));
 }
@@ -981,3 +1010,9 @@ pub(crate) fn forget_channel_for_tests(channel_id: u64) {
 
 #[cfg(test)]
 mod lane_tests;
+
+#[cfg(test)]
+mod codex_claim_tests;
+
+#[cfg(all(test, unix))]
+mod admission_tests;

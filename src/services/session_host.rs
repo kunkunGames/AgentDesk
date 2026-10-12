@@ -4,15 +4,28 @@
 
 mod herdr {
     pub(crate) mod contract;
+    #[cfg(unix)]
+    pub(crate) mod launch_host;
     pub(crate) mod model;
     pub(crate) mod observe;
+    pub(crate) mod pane_probe;
+    pub(crate) mod provenance;
     // Unix-socket only; no Windows transport exists.
     #[cfg(unix)]
     pub(crate) mod transport;
     pub(crate) mod wire;
 }
 mod consumer_guard;
+#[cfg(unix)]
+mod herdr_clear_adapter;
+mod herdr_gate;
 mod herdr_host;
+mod herdr_registry;
+#[cfg(test)]
+pub(crate) mod herdr_socket_rig_tests;
+// The operator terminate path against real Herdr servers its runner starts; ignored otherwise.
+#[cfg(test)]
+pub(crate) mod herdr_terminate_real_tests;
 pub(crate) mod legacy_collapse;
 mod model;
 mod process_host;
@@ -20,10 +33,33 @@ mod resolve;
 mod session_record;
 #[cfg(test)]
 pub(crate) mod test_support;
+// The termination service's Herdr fixture, for the discord relay test that drives it end to end.
+#[cfg(all(test, unix))]
+pub(crate) use herdr_gate::tests::p11 as herdr_termination_rig;
 mod tmux_host;
 mod traits;
 
-pub(crate) use herdr::observe::{RESTORE_RESUME_NOT_OFF, RestoreResume};
+pub(crate) use herdr::contract::ServerWitness;
+// A channel clear's Herdr side, run by the clear command through the native clear helper.
+#[cfg(unix)]
+pub(crate) use herdr_clear_adapter::{
+    ClearSession, HerdrClear, HerdrClearPlan, HerdrClearRefusal, plan_clear,
+    recovery_composer_empty,
+};
+// The unix Herdr turn executor, behind its off-by-default switch, builds targets here.
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use herdr_gate::{
+    HerdrGateRefusal, HerdrPaneView, HerdrTarget, Mutation as HerdrMutation, PaneProvider,
+    PaneReading, TerminationFence,
+};
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use herdr_registry::registry as herdr_endpoints;
+// Dormant: activation constructs it for a configured endpoint.
+#[cfg(unix)]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use herdr::launch_host::SocketHerdrLaunchHost;
+pub(crate) use herdr::observe::{RESTORE_RESUME_NOT_OFF, RestoreResume, RestoreUnverified};
+pub(crate) use herdr::pane_probe::EvidenceGap;
 pub(crate) use model::{
     HostCapabilities, HostError, HostKey, HostKind, HostKindResolution, HostKindSource,
     HostLiveness, HostMutation, HostPresence, HostRefusal, HostSessionRef, HostedRuntimeLocator,

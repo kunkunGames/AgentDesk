@@ -28,7 +28,7 @@ use crate::db::intake_outbox_dispatch_stamp::observe_status;
 use crate::db::intake_outbox_status::IntakeOutboxStatus;
 #[cfg(not(test))]
 use crate::services::discord::execute_intake_turn_core;
-use crate::services::discord::{IntakeRequest, SharedData, TurnKind};
+use crate::services::discord::{IntakeExecution, IntakeRequest, SharedData, TurnKind};
 use crate::services::tui_o::cutover::intake_route::{self, IntakeRoute};
 use poise::serenity_prelude as serenity;
 use serenity::{ChannelId, MessageId, UserId};
@@ -285,7 +285,10 @@ pub(crate) async fn run_intake_worker_tick(
         return Ok(TickOutcome::Cancelled);
     }
 
-    let held = intake_route::held_channels(provider);
+    let mut held = intake_route::held_channels(provider);
+    held.extend(crate::services::discord::input_runtime::fence::held_channels(provider));
+    held.sort_unstable();
+    held.dedup();
     let claimed =
         claim_pending_for_target_except(pool, target_instance_id, provider, claim_owner, &held)
             .await?;
@@ -293,6 +296,9 @@ pub(crate) async fn run_intake_worker_tick(
     let Some(row) = claimed else {
         return Ok(TickOutcome::QueueEmpty);
     };
+
+    #[cfg(test)]
+    test_executor::checkpoint(test_executor::Checkpoint::AfterClaim).await;
 
     // A marker can land while the claim transaction is in flight. Return only
     // this worker's row to pending and stop before payload work or spawning.
@@ -306,11 +312,31 @@ pub(crate) async fn run_intake_worker_tick(
         return Ok(TickOutcome::Cancelled);
     }
 
+    let input_provider = crate::services::provider::ProviderKind::from_str_or_unsupported(provider);
+    let input_channel = row.channel_id.parse::<u64>().ok();
+    let input_permit = match input_channel {
+        Some(channel) => match crate::services::discord::input_runtime::fence::effect::admit(
+            &input_provider,
+            channel,
+        ) {
+            Ok(permit) => permit,
+            Err(_) => {
+                release_cancelled_claim(pool, &row, claim_owner).await?;
+                return Ok(TickOutcome::Held);
+            }
+        },
+        None => None,
+    };
+    crate::services::discord::input_runtime::fence::effect::scope(input_permit, async {
     // Round-2 P0 #2: pre-accept failure (cwd validation, payload
     // conversion) is retryable; post-accept failure is operator-only.
     let request = match intake_request_from_row(&row) {
         Ok(req) => req,
         Err(error) => {
+            if error.starts_with("replay source") {
+                tracing::warn!(row_id = row.id, %error, "worker replay source custody needs reconciliation");
+                return Ok(TickOutcome::Held);
+            }
             let msg = format!("payload conversion: {error}");
             tracing::warn!(
                 row_id = row.id,
@@ -399,10 +425,29 @@ pub(crate) async fn run_intake_worker_tick(
         return Ok(TickOutcome::Held);
     }
 
+    #[cfg(test)]
+    test_executor::checkpoint(test_executor::Checkpoint::PreAccept).await;
+    if input_channel.is_some_and(|channel| {
+        crate::services::discord::input_runtime::fence::lookup(&input_provider, channel)
+            .is_some_and(|gate| gate.mode() != crate::services::discord::input_runtime::fence::Mode::LegacyOpen)
+    }) {
+        release_cancelled_claim(pool, &row, claim_owner).await?;
+        return Ok(TickOutcome::Held);
+    }
+
     // Transition: claimed → accepted. If the sweep beat us to it,
     // ABORT (do not spawn) — Ok(false) means we lost ownership.
     let advanced = mark_accepted(pool, row.id, claim_owner).await?;
     if !advanced {
+        // Still claimed here means the home moved since the last check: the row waits in pending.
+        if return_claimed_to_pending(pool, row.id, claim_owner).await? {
+            tracing::warn!(
+                row_id = row.id,
+                channel_id = row.channel_id,
+                "[intake_worker] channel home refused the accept — returned to pending"
+            );
+            return Ok(TickOutcome::Held);
+        }
         tracing::warn!(
             row_id = row.id,
             channel_id = row.channel_id,
@@ -426,6 +471,8 @@ pub(crate) async fn run_intake_worker_tick(
         return Ok(TickOutcome::Processed);
     }
 
+    #[cfg(test)]
+    test_executor::checkpoint(test_executor::Checkpoint::Spawned).await;
     let result = execute_intake_turn_core(
         &runtime.http,
         &runtime.shared,
@@ -435,8 +482,10 @@ pub(crate) async fn run_intake_worker_tick(
     )
     .await;
 
-    match result {
-        Ok(()) => {
+    #[cfg(test)]
+    test_executor::checkpoint(test_executor::Checkpoint::FinalDb).await;
+    let outcome = match result {
+        Ok(IntakeExecution::Executed) => {
             let advanced = mark_done(pool, row.id, claim_owner).await?;
             if !advanced {
                 classify_mark_done_miss(
@@ -448,6 +497,10 @@ pub(crate) async fn run_intake_worker_tick(
                 .await;
             }
             Ok(TickOutcome::Processed)
+        }
+        Ok(IntakeExecution::Deferred | IntakeExecution::ConsumedProtected) => {
+            tracing::warn!(row_id = row.id, "worker delivery retains its original custody without execution settlement");
+            Ok(TickOutcome::Held)
         }
         Err(error) => {
             let msg = format!("turn execution: {error}");
@@ -468,7 +521,11 @@ pub(crate) async fn run_intake_worker_tick(
             }
             Ok(TickOutcome::Processed)
         }
-    }
+    };
+    #[cfg(test)]
+    test_executor::checkpoint(test_executor::Checkpoint::FinalDbDone).await;
+    outcome
+    }).await
 }
 
 async fn release_cancelled_claim(
@@ -489,7 +546,8 @@ async fn release_cancelled_claim(
 }
 
 /// Returns an O channel's claim to pending unless this node's writer can take it right now, so the
-/// row waits for its gateway instead of running here or failing into a retry.
+/// row waits for its gateway instead of running here or failing into a retry. A delegated row
+/// also waits unless this node holds the home at the row's epoch with intake open.
 async fn hold_off_o_gateway(
     pool: &PgPool,
     row: &IntakeOutboxRow,
@@ -497,7 +555,11 @@ async fn hold_off_o_gateway(
     provider: &str,
     channel_id: ChannelId,
 ) -> Result<bool, sqlx::Error> {
-    let IntakeRoute::Hold(detail) = intake_route::route(provider, channel_id.get()) else {
+    let home = super::channel_home::intake_hold(&row.channel_id, row.home_epoch);
+    let Some(detail) = home.or_else(|| match intake_route::route(provider, channel_id.get()) {
+        IntakeRoute::Hold(detail) => Some(detail),
+        IntakeRoute::Unselected | IntakeRoute::Gateway => None,
+    }) else {
         return Ok(false);
     };
     let released = return_claimed_to_pending(pool, row.id, claim_owner).await?;
@@ -635,7 +697,7 @@ fn intake_request_from_row(row: &IntakeOutboxRow) -> Result<IntakeRequest, Strin
         intake_outbox_id: Some(row.id),
         channel_id: ChannelId::new(channel_id),
         user_msg_id: MessageId::new(user_msg_id),
-        source_message_ids: Vec::new(),
+        source_message_ids: replay_sources_from_row(row, channel_id, user_msg_id)?,
         busy_followup_retry_user_msg_id: MessageId::new(user_msg_id),
         request_owner: UserId::new(request_owner),
         request_owner_name: owner_name,
@@ -654,6 +716,37 @@ fn intake_request_from_row(row: &IntakeOutboxRow) -> Result<IntakeRequest, Strin
         // leaders always persist Some(true/false).
         preserve_on_cancel: row.preserve_on_cancel.unwrap_or(false),
     })
+}
+
+/// Active workers carry every forwarded source; dormant and legacy rows keep the old payload.
+fn replay_sources_from_row(
+    row: &IntakeOutboxRow,
+    channel_id: u64,
+    user_msg_id: u64,
+) -> Result<Vec<MessageId>, String> {
+    if !crate::services::discord::checkpoint_waits_for_admission(ChannelId::new(channel_id)) {
+        return Ok(Vec::new());
+    }
+    let Some(stored) = row.replay_source_message_ids.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut sources = stored
+        .iter()
+        .map(|source| {
+            source
+                .parse::<u64>()
+                .ok()
+                .filter(|source| *source > 0)
+                .map(MessageId::new)
+                .ok_or_else(|| format!("replay source `{source}` is not a Discord message id"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !sources.iter().any(|source| source.get() == user_msg_id) {
+        return Err("replay sources do not contain the representative message".into());
+    }
+    sources.sort_unstable();
+    sources.dedup();
+    Ok(sources)
 }
 
 /// Decode the `intake_outbox.turn_kind` text column into the typed
@@ -684,6 +777,7 @@ mod tests {
             required_labels: serde_json::json!(["unreal"]),
             channel_id: "1234567890".to_string(),
             user_msg_id: "9876543210".to_string(),
+            replay_source_message_ids: None,
             request_owner_id: "555".to_string(),
             request_owner_name: Some("Tester".to_string()),
             user_text: "hello".to_string(),
@@ -705,6 +799,7 @@ mod tests {
             owner_generation: None,
             owner_instance_id: None,
             admission_kind: "forwarded".to_string(),
+            home_epoch: None,
         }
     }
 
@@ -780,7 +875,7 @@ mod tests {
             .expect("worker invokes the executor");
         let result = &tick[result_start..];
         let ok_start = result
-            .find("Ok(()) => {")
+            .find("Ok(IntakeExecution::Executed) => {")
             .expect("executor Ok branch exists");
         let err_start = result
             .find("Err(error) => {")
@@ -949,6 +1044,12 @@ mod tests {
 mod dispatch_stamp_tests;
 
 #[cfg(test)]
+#[path = "intake_worker/home_accept_tests.rs"]
+mod home_accept_tests;
+#[cfg(test)]
+#[path = "intake_worker/home_route_tests.rs"]
+mod home_route_tests;
+#[cfg(test)]
 #[path = "intake_worker/o_route_tests.rs"]
 mod o_route_tests;
 
@@ -959,3 +1060,11 @@ mod drain_tests;
 #[cfg(test)]
 #[path = "intake_worker/test_executor.rs"]
 pub(crate) mod test_executor;
+
+#[cfg(test)]
+#[path = "intake_worker/input_effect_tests.rs"]
+mod input_effect_tests;
+
+#[cfg(test)]
+#[path = "intake_worker/replay_hold_tests.rs"]
+mod replay_hold_tests;

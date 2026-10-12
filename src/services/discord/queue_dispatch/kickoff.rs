@@ -1,7 +1,30 @@
 //! Shared queue dispatch for Gateway and REST runtimes.
 use super::super::*;
 
+#[cfg(test)]
+#[path = "cancel_backstop_race_support_tests.rs"]
+pub(in crate::services::discord) mod cancel_backstop_test_support;
+
 pub(in crate::services::discord) async fn kickoff_idle_queue_channel(
+    deps: &router::IntakeDeps<'_>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+) -> IdleQueueKickoffChannelOutcome {
+    let permit = match input_runtime::fence::lookup(provider, channel_id.get())
+        .map(|gate| gate.admit())
+        .transpose()
+    {
+        Ok(permit) => permit,
+        Err(_) => return IdleQueueKickoffChannelOutcome::default(),
+    };
+    input_runtime::fence::effect::scope(
+        permit,
+        Box::pin(kickoff_admitted_queue_channel(deps, provider, channel_id)),
+    )
+    .await
+}
+
+async fn kickoff_admitted_queue_channel(
     deps: &router::IntakeDeps<'_>,
     provider: &ProviderKind,
     channel_id: ChannelId,
@@ -45,6 +68,9 @@ pub(in crate::services::discord) async fn kickoff_idle_queue_channel(
     if router::hosted_tui_promote_readiness_blocked(shared, provider, channel_id).await {
         return IdleQueueKickoffChannelOutcome::default();
     }
+
+    #[cfg(test)]
+    let _cancel_backstop_race = cancel_backstop_test_support::pause(channel_id).await;
 
     let take_next = idle_queue_take_next_soft_if_ready(shared, provider, channel_id).await;
     if let Some(error) = take_next.persistence_error.as_ref() {
@@ -93,7 +119,8 @@ pub(in crate::services::discord) async fn kickoff_idle_queue_channel(
     {
         router::QueuedAdmissionDisposition::Admitted(admitted) => admitted,
         router::QueuedAdmissionDisposition::Deferred
-        | router::QueuedAdmissionDisposition::RejectedNonPortableAttachment => {
+        | router::QueuedAdmissionDisposition::RejectedNonPortableAttachment
+        | router::QueuedAdmissionDisposition::ConsumedToHold => {
             drop(dispatch_lease);
             return IdleQueueKickoffChannelOutcome::default();
         }
@@ -104,26 +131,29 @@ pub(in crate::services::discord) async fn kickoff_idle_queue_channel(
         }
     };
 
-    let source_message_generations = intervention.source_message_queued_generations();
-    queue_marker::start_and_drain_kickoff_markers(
-        shared,
-        deps.http,
-        channel_id,
-        intervention.message_id,
-        &source_message_generations,
-    )
-    .await;
+    let late_settlement = router::checkpoint_waits_for_admission(channel_id);
+    if !late_settlement {
+        let source_message_generations = intervention.source_message_queued_generations();
+        queue_marker::start_and_drain_kickoff_markers(
+            shared,
+            deps.http,
+            channel_id,
+            intervention.message_id,
+            &source_message_generations,
+        )
+        .await;
 
-    let drained_cards = gateway::drain_merged_queued_placeholders(
-        shared,
-        channel_id,
-        intervention.message_id,
-        &intervention.source_message_ids,
-    )
-    .await;
-    // #5035 (A5): the drain now yields tokens only for gate-released cards.
-    for teardown in drained_cards {
-        let _ = queued_card_gate::teardown_delete(deps.http, shared, teardown).await;
+        let drained_cards = gateway::drain_merged_queued_placeholders(
+            shared,
+            channel_id,
+            intervention.message_id,
+            &intervention.source_message_ids,
+        )
+        .await;
+        // #5035 (A5): the drain now yields tokens only for gate-released cards.
+        for teardown in drained_cards {
+            let _ = queued_card_gate::teardown_delete(deps.http, shared, teardown).await;
+        }
     }
 
     let dispatch_result =
@@ -161,7 +191,22 @@ pub(in crate::services::discord) async fn kickoff_idle_queue_channel(
             drop(dispatch_lease);
             IdleQueueKickoffChannelOutcome { started: false }
         }
-        Ok(()) => {
+        Ok(router::IntakeExecution::Deferred | router::IntakeExecution::ConsumedProtected) => {
+            drop(dispatch_lease);
+            IdleQueueKickoffChannelOutcome { started: false }
+        }
+        Ok(router::IntakeExecution::Executed) => {
+            if late_settlement {
+                queue_dispatch::settle_executed_queued_intake(
+                    shared,
+                    deps.http,
+                    provider,
+                    channel_id,
+                    &intervention,
+                    "idle_kickoff_queue_executed",
+                )
+                .await;
+            }
             mailbox_abandon_unclaimed_dispatch_after_success(
                 shared,
                 provider,
@@ -232,6 +277,13 @@ pub(in crate::services::discord) async fn kickoff_idle_queues_with_deps(
         let outcome = kickoff_idle_queue_channel(deps, provider, channel_id).await;
         if outcome.started {
             started_count += 1;
+        } else if crate::services::tui_o::turn_mode::transcript_turns(channel_id.get()) {
+            // Boot and full reconcile have no later no-start arm; a held direct turn needs one.
+            let reason = "boot kickoff turn-mode no-start";
+            super::super::arm_slow_idle_queue_backstop_if_queue_nonempty(
+                shared, provider, channel_id, reason,
+            )
+            .await;
         }
     }
     started_count

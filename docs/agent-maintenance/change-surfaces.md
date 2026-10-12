@@ -268,10 +268,9 @@ time for diagnostics; neither is a stored approval value.
   `scripts/required-check-mirror.sh`. The required `Script checks` publisher
   compares both the helper digest and the digest of
   `scripts/check-ci-runner-hardening.sh` immediately after checkout; the
-  unconditional required `relay-authority-contract` job repeats the same two
-  comparisons before its own gate run (they sit after its toolchain and
-  relay-contract steps, and any earlier step failure already turns that
-  required job red), and each job then runs only its verified gate copy. The publisher-side copy is intentional and
+  required `relay-authority-contract` publisher repeats the same two
+  comparisons in its first step after checkout, before its own gate run and
+  its two result mirrors, and each job then runs only its verified gate copy. The publisher-side copy is intentional and
   symmetric: it catches a skipped/altered relay job, while the relay copy
   catches a skipped/altered publisher. The helper's
   behavior tests remain useful regressions, but byte identity is primary:
@@ -280,31 +279,43 @@ time for diagnostics; neither is a stored approval value.
 - fixed surfaces: the `Script checks` publisher has exactly checkout,
   contract, and one result-mirror step per shard job (`scripts` runs the
   `cargo` shard, `scripts_guards` and `scripts_contracts` the others); its
-  `name`, `needs: [changes, scripts, scripts_guards, scripts_contracts]`,
-  required job-level `if: always()`, `runs-on`, checkout provenance, and
+  `name`, `needs`, job-level `if`, `runs-on`, checkout provenance, and
   absence of `continue-on-error`,
   `defaults`/`env`/`environment`/`strategy`/`container` are pinned. The
-  publisher's `if: always()` is what runs the fail-closed
-  mirror after an upstream failure, skip, or cancellation. The independent
-  `relay-authority-contract` publisher has no `needs` and must omit job-level
-  `if`; the internal `changes` job and every shard job must also omit
-  job-level `if` so their own work cannot be condition-skipped. Each extra
+  publishers' job-level `if` (wiring table below) is what runs the fail-closed
+  mirror after an upstream failure, skip, or timeout cancellation. When the
+  run is cancelled, a publisher that has not started never starts and a
+  running one is cancelled with the run; its final check conclusion is
+  measured on a PR run, not assumed here. Execution jobs omit job-level `if`
+  so their own work cannot be condition-skipped. Each extra
   shard job runs `./scripts/ci-script-checks.sh` exactly once with the
   `scripts` aggregate's effective execution and its own `SCRIPT_CHECK_SHARD`.
   Its source-byte range is also hashed, so YAML scalar tags and styles remain in
   the comparison; Psych cannot erase an explicit tag such as `!!binary` or
   equate YAML 1.1 spellings such as `yes` and `012` with the intended
   Actions scalars. Plain YAML-boolean-like job IDs fail closed, while quoted
-  `"yes"` remains a valid string job ID. The relay job's semantic hash and
-  explicit step registry pin its absent `needs`/`if`, non-matrix shape, and
-  content-hash backstop. Starting at the two required publishers, the complete
-  recursive `needs` closure is the finite set
-  `{scripts_required_context, relay-authority-contract, scripts,
-  scripts_guards, scripts_contracts, changes}`; every member must exist and
-  omit `continue-on-error`, the Script checks publisher must carry exactly
-  `if: always()`, and the other jobs must
-  omit job-level `if`. Any edge that expands that set is a review-triggering
-  gate failure.
+  `"yes"` remains a valid string job ID. The relay publisher's semantic hash
+  and explicit step registry pin its `needs`, `if`, non-matrix shape, and
+  content-hash backstop. The wiring table below is the single statement of
+  the recursive `needs` closure of the two required publishers and of each
+  member's `needs` and job-level `if`; `tests/test_fast_check_ci_wiring.py`
+  requires it to equal `ci-pr.yml` exactly. Every member must exist and omit
+  `continue-on-error`, and any edge that expands the closure is a
+  review-triggering gate failure.
+
+  <!-- required-publisher-wiring -->
+  | job | needs | job-level `if` |
+  |---|---|---|
+  | `changes` | none | none |
+  | `relay-authority-contract` | `relay_authority_targets`, `relay_authority_mutations` | `${{ !cancelled() }}` |
+  | `relay_authority_mutations` | none | none |
+  | `relay_authority_targets` | none | none |
+  | `scripts` | `changes` | none |
+  | `scripts_contracts` | `changes` | none |
+  | `scripts_guards` | `changes` | none |
+  | `scripts_required_context` | `changes`, `scripts`, `scripts_guards`, `scripts_contracts` | `${{ !cancelled() }}` |
+  <!-- /required-publisher-wiring -->
+
 - aggregate execution: the calculator records shell/working-directory
   candidates, environment scopes, `runs-on`, prior recognized file writes, and
   the selected
@@ -369,9 +380,9 @@ time for diagnostics; neither is a stored approval value.
   pull-request subfilters such as `paths-ignore` are likewise not guaranteed.
   The result mirror detects skipped/failed/cancelled upstream jobs; it cannot
   prove that an upstream success used the intended semantics. Because the
-  publisher runs with `if: always()`, a failure, skip, or cancellation of a
-  single upstream job still reaches the mirror and makes the required context
-  red.
+  publisher runs with `if: ${{ !cancelled() }}`, a failure, skip, or timeout
+  cancellation of a single upstream job in a live run still reaches the mirror
+  and makes the required context red.
   More fundamentally, a single PR that consistently rewrites every guard and
   every pin can pass this in-repository gate system. A cheaper edit in the same
   class: GitHub treats a condition-skipped required check as satisfied, so one
@@ -2064,14 +2075,8 @@ time for diagnostics; neither is a stored approval value.
   The tree is unix-gated: its transcript coordinate is the `(dev, ino)` file
   identity of 4987 §-1.3, and `std::fs::Metadata` exposes no stable Windows
   equivalent.
-- status: **inactive library.** #5071 T4-B1 landed the verdict vocabulary, the
-  row-independent transcript resolution ladder, and the bounded incremental tail
-  reader; #5071 T4-B2a added the canonical obligation framing and the machine
-  that proves the Rust and Python definitions of it agree. There is still no
-  consumer at all — no tick, no task, no health field, no recovery input.
-  Production verdicts are unchanged, and this surface does not count as
-  "4987 S1 active": T4-B2b lands the durable obligation ledger, T4-B2c wires the
-  observation task, and observation starts there.
+- status: active in-band observation and health composition. The external
+  input is retired; composition retains the absent-input `Unknown` behavior.
 - invariants: obligation production is independent of the inflight row
   (4987 §-1.5 I14), and no verdict authorizes a destructive action or a
   redelivery (4987 §7.1 I15, S7 stays NO-GO). `TransportUnknown` is neither
@@ -2080,23 +2085,10 @@ time for diagnostics; neither is a stored approval value.
   success→commit crash window looks like a loss and is not one (4987 §-1.3b).
   `ReachabilityVerdict != Reachable` denies GREEN whatever the structural
   signals say (4987 §4.1); the converse does not hold.
-- companion edits: changing the obligation rule REQUIRES changing
-  `scripts/relay_watchdog.py` (`assistant_blocks_from_lines` /
-  `is_harness_control_assistant_record`) and the golden fixture corpus in the
-  same PR. 4987 §2.4: two implementations of "assistant text block" are two
-  oracles, and one of them is then always wrong. Since #5071 T4-B2a that is
-  enforced rather than requested: both halves are compared byte for byte against
-  the golden corpus in `tests/fixtures/relay_obligation/` — Python by
-  `scripts/check_reachability_canonical_equivalence.py`, Rust by
-  `services::discord::health::reachability::obligation::tests` — over the
-  canonical `(generation, start, end, identity, reason)` schema plus its
-  `next_offset` trailer. The trailer is inside the compared bytes because every
-  framing rule is a cursor rule; measured on this corpus, omitting it lets the
-  "a partial line advances the cursor" mutation survive every case. The corpus
-  is a THIRD PARTY to both, so a change applied identically to the two
-  implementations still turns it red. Editing either framing rule means running
-  `just reachability-mutation-runner`, which applies each declared one-sided
-  mutation and requires it to die.
+- companion edits: changing the obligation rule requires reviewing the golden
+  fixture corpus in `tests/fixtures/relay_obligation/` and running
+  `just reachability-mutation-runner`. Rust framing and cursor rules remain
+  pinned by `services::discord::health::reachability::obligation::tests`.
 - non_guarantees: `scripts/check_reachability_row_independence.py` (run by
   `scripts/ci-script-checks.sh`) enforces I14 as a source **lint, not a type
   proof** — `InflightTurnState` is `pub(in crate::services::discord)`, so the

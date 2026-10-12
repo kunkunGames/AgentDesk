@@ -144,6 +144,8 @@ use crate::services::discord::router::{TurnKind, admit_queued_intake};
 use crate::services::provider::ProviderKind;
 use crate::services::turn_orchestrator::{Intervention, InterventionMode};
 
+mod replay_hold;
+
 struct ScopedIntakeTestEnv {
     _lock: std::sync::MutexGuard<'static, ()>,
     _root: tempfile::TempDir,
@@ -733,6 +735,7 @@ async fn queued_foreign_owner_forwards_without_local_body_pg() {
         QueuedAdmissionDisposition::Admitted(admitted) => admitted,
         QueuedAdmissionDisposition::Deferred
         | QueuedAdmissionDisposition::RejectedNonPortableAttachment
+        | QueuedAdmissionDisposition::ConsumedToHold
         | QueuedAdmissionDisposition::RejectedRestore => {
             panic!("live foreign owner should forward")
         }
@@ -968,6 +971,7 @@ async fn dispatched_open_route_never_uses_stale_local_recovery_pg() {
         channel_id: &channel,
         policy_channel_id: &channel,
         user_msg_id: "4350452",
+        replay_source_message_ids: None,
         request_owner_id: &request_owner_id,
         request_owner_name: Some(&submission.request.request_owner_name),
         user_text: &submission.request.user_text,
@@ -981,6 +985,8 @@ async fn dispatched_open_route_never_uses_stale_local_recovery_pg() {
         wait_for_completion: false,
         preserve_on_cancel: false,
         node_override_instance_id: None,
+        owner_authority:
+            crate::services::cluster::intake_routing_config::OwnerAuthorityChannelOptIn::NotOptedIn,
         has_nonportable_uploads: false,
         attachment_refs: &[],
     };

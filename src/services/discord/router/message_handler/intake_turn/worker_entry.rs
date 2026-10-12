@@ -44,24 +44,18 @@ pub(crate) struct IntakeRequest {
     pub preserve_on_cancel: bool,
 }
 
-/// Worker-callable entry point for executing an intake turn. Phase 2-pre.3
-/// of intake-node-routing: this is the public surface a worker node will
-/// invoke after claiming an `intake_outbox` row from its target queue. Pass
-/// the runtime primitives the worker has (`Arc<Http>`, `Arc<SharedData>`,
-/// bot token) plus the deserialized message payload; the function constructs
-/// `IntakeDeps` with `cache: None` and `ctx_for_chained_dispatch: None`
-/// (workers have no live gateway shard) and delegates to the existing
-/// intake body.
-///
-/// Leader producers use `router::intake_dispatch`; a claimed worker bypasses
-/// admission so it cannot recursively create another outbox row.
+/// Claimed workers check canonical admission without routing another delivery row.
+/// Only their execution outcome may settle the original delivery.
 pub(crate) async fn execute_intake_turn_core(
     http: &Arc<serenity::http::Http>,
     shared: &Arc<SharedData>,
     token: &str,
     request: IntakeRequest,
     uploads: crate::services::cluster::attachment_transfer::uploads::PendingUploads,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<IntakeExecution, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(stopped) = worker_replay_admission(shared, &request).await {
+        return Ok(stopped);
+    }
     super::handle_text_message(
         &IntakeDeps {
             http,
@@ -79,4 +73,317 @@ pub(crate) async fn execute_intake_turn_core(
         None,
     )
     .await
+}
+
+/// A claimed delivery keeps its existing durable payload when canonical admission cannot start it.
+async fn worker_replay_admission(
+    shared: &Arc<SharedData>,
+    request: &IntakeRequest,
+) -> Option<IntakeExecution> {
+    use crate::services::discord::router::intake_dispatch::replay_admission::{
+        self as admission, ReplayAdmissionContext, ReplayPreflight,
+    };
+    let channel = request.channel_id.get().to_string();
+    if request.intake_outbox_id.is_none() || admission::dormant_start(&channel).is_some() {
+        return None;
+    }
+    let Some(pool) = shared.pg_pool.as_ref() else {
+        return Some(IntakeExecution::Deferred);
+    };
+    let input = admission::discord_input(
+        shared.provider.as_str(),
+        request.channel_id.get(),
+        request.user_msg_id.get(),
+        request.source_message_ids.iter().map(|source| source.get()),
+        &request.user_text,
+    );
+    let instance =
+        crate::services::cluster::node_registry::resolve_self_instance_id_without_config();
+    let ctx = ReplayAdmissionContext::production(pool, &instance, admission::incarnation())
+        .for_channel(&channel);
+    match admission::preflight_source(&ctx, &input).await {
+        ReplayPreflight::Admit(_) | ReplayPreflight::LegacyUnprotected => None,
+        ReplayPreflight::ConsumeProtected(_) => Some(IntakeExecution::ConsumedProtected),
+        ReplayPreflight::Defer(_) => Some(IntakeExecution::Deferred),
+    }
+}
+
+/// How long an exact retry waits for the stale turn to release its channel before it gives up.
+const EXACT_RETRY_CLAIM_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Starts a protected request's exact retry on the intake start path once the stale turn released
+/// the channel. Only that start can take the permit; anything short of its begin leaves it held.
+pub(crate) async fn start_exact_retry(
+    http: &Arc<serenity::http::Http>,
+    shared: &Arc<SharedData>,
+    channel_id: ChannelId,
+    retry: crate::services::discord::replay_policy::ExactRetry,
+) -> crate::services::discord::replay_policy::ExactHandoff {
+    use crate::services::discord::replay_policy::{ExactHandoff, hand_over};
+    let deadline = tokio::time::Instant::now() + EXACT_RETRY_CLAIM_WAIT;
+    while crate::services::discord::mailbox_snapshot(shared, channel_id)
+        .await
+        .cancel_token
+        .is_some()
+    {
+        if tokio::time::Instant::now() >= deadline {
+            return ExactHandoff::Refused;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let request = IntakeRequest {
+        intake_outbox_id: None,
+        channel_id,
+        user_msg_id: retry.user_message_id,
+        source_message_ids: retry.sources,
+        busy_followup_retry_user_msg_id: retry.user_message_id,
+        request_owner: retry.request_owner,
+        request_owner_name: String::new(),
+        user_text: retry.text,
+        reply_to_user_message: true,
+        defer_watcher_resume: false,
+        wait_for_completion: false,
+        merge_consecutive: false,
+        reply_context: retry.reply_context,
+        has_reply_boundary: false,
+        dm_hint: None,
+        turn_kind: TurnKind::Foreground,
+        preserve_on_cancel: false,
+    };
+    let token = shared
+        .http
+        .cached_bot_token
+        .get()
+        .cloned()
+        .unwrap_or_default();
+    let start = execute_intake_turn_core(http, shared, &token, request, Vec::new());
+    let (result, handoff) = hand_over(retry.permit, start).await;
+    if let Err(error) = result {
+        tracing::warn!(channel_id = channel_id.get(), %error, "exact retry start failed");
+    }
+    handoff
+}
+
+#[cfg(all(test, unix))]
+mod input_effect_tests {
+    use super::*;
+    use crate::services::discord::input_runtime::fence::{self, effect};
+    use futures::FutureExt;
+
+    #[tokio::test]
+    async fn c1b_worker_actual_intake_holds_provider_and_bridge_through_cleanup() {
+        if !crate::services::discord::admin_host_guard::tests::api_child(concat!(
+            "services::discord::router::message_handler::intake_turn::worker_entry::input_effect_tests::",
+            "c1b_worker_actual_intake_holds_provider_and_bridge_through_cleanup"
+        )) {
+            return;
+        }
+        actual_intake_lifetime(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn c1b_worker_actual_role_override_onto_a_foreign_gate_is_refused_at_root() {
+        if !crate::services::discord::admin_host_guard::tests::api_child(concat!(
+            "services::discord::router::message_handler::intake_turn::worker_entry::input_effect_tests::",
+            "c1b_worker_actual_role_override_onto_a_foreign_gate_is_refused_at_root"
+        )) {
+            return;
+        }
+        actual_intake_lifetime(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn c1b_worker_actual_redirect_admits_protected_destination_from_off_root() {
+        if !crate::services::discord::admin_host_guard::tests::api_child(concat!(
+            "services::discord::router::message_handler::intake_turn::worker_entry::input_effect_tests::",
+            "c1b_worker_actual_redirect_admits_protected_destination_from_off_root"
+        )) {
+            return;
+        }
+        actual_intake_lifetime(false, true).await;
+    }
+
+    async fn actual_intake_lifetime(override_provider: bool, redirect: bool) {
+        let _root = crate::config::TestRuntimeRootGuard::new();
+        let boot = serde_json::from_value(serde_json::json!({"server": {}, "agents": []})).unwrap();
+        crate::services::tui_o::channel_policy::install(&boot).unwrap();
+        let channel = ChannelId::new(6_325_527);
+        let original = if redirect {
+            ChannelId::new(6_325_535)
+        } else {
+            channel
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let dispatch_workspace = workspace.path().display().to_string();
+        let api = crate::services::discord::admin_host_guard::tests::Recorder::start_with(Arc::new(
+            move |_, path| {
+                if redirect && path == "/api/internal/card-thread" {
+                    Some(serde_json::json!({
+                        "active_thread_id": channel.to_string(),
+                        "dispatch_type": "implementation",
+                        "dispatch_context": serde_json::json!({"worktree_path": dispatch_workspace}).to_string()
+                    }))
+                } else if redirect && path.ends_with(&format!("/channels/{channel}")) {
+                    Some(serde_json::json!({"id": channel.to_string(), "type": 0, "name": "input-test", "position": 0}))
+                } else { None }
+            },
+        )).await;
+        crate::services::discord::internal_api::init(api.port, None);
+        let mut shared = crate::services::discord::make_shared_data_for_tests();
+        Arc::get_mut(&mut shared).unwrap().api_port = api.port;
+        crate::services::discord::host_defer_gate::tests::map_channel(&shared, channel, "").await;
+        if redirect {
+            crate::services::discord::host_defer_gate::tests::map_channel(&shared, original, "")
+                .await;
+            let mut core = shared.core.lock().await;
+            let session = core.sessions.get_mut(&original).unwrap();
+            session.channel_name = None;
+            session.current_path = Some(workspace.path().display().to_string());
+            session.session_id = Some("input-effect-existing".into());
+            assert!(fence::lookup(&shared.provider, original.get()).is_none());
+        }
+        {
+            let mut core = shared.core.lock().await;
+            let session = core.sessions.get_mut(&channel).unwrap();
+            session.channel_name = None;
+            session.current_path = Some(workspace.path().display().to_string());
+            session.session_id = Some("input-effect-existing".into());
+        }
+        let final_provider = if override_provider {
+            let role_channel = ChannelId::new(6_325_530);
+            let path = crate::services::discord::runtime_store::role_map_path().unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &path,
+                serde_json::json!({
+                    "byChannelId": {role_channel.get().to_string(): {
+                        "roleId": "input-effect-codex", "promptFile": "", "provider": "codex"
+                    }}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            shared.dispatch.role_overrides.insert(channel, role_channel);
+            assert!(fence::lookup(&shared.provider, channel.get()).is_none());
+            ProviderKind::Codex
+        } else {
+            shared.provider.clone()
+        };
+        let gate = fence::Gate::protect(final_provider.clone(), channel.get()).unwrap();
+        let _health = fence::test_health::Clear::new(&gate);
+        let (entered, provider_entered) = tokio::sync::oneshot::channel();
+        let (release_provider, release) = std::sync::mpsc::channel();
+        *super::super::super::provider_dispatch::INPUT_EFFECT_PROBE
+            .lock()
+            .unwrap() = Some(super::super::super::provider_dispatch::InputEffectProbe {
+            channel: channel.get(),
+            entered,
+            release,
+            terminal_before_release: true,
+        });
+        let (captured, bridge_captured) = tokio::sync::oneshot::channel();
+        let (release_bridge, resume) = tokio::sync::oneshot::channel();
+        *crate::services::discord::turn_bridge::resume_pin_tests::BRIDGE_CAPTURE_PROBE
+            .lock()
+            .unwrap() = Some((channel, captured, resume));
+        let (completed, bridge_completed) = tokio::sync::oneshot::channel();
+        *crate::services::discord::turn_bridge::resume_pin_tests::BRIDGE_COMPLETION_PROBE
+            .lock()
+            .unwrap() = Some((channel, completed));
+        let request = IntakeRequest {
+            intake_outbox_id: None,
+            channel_id: original,
+            user_msg_id: MessageId::new(6_325_528),
+            source_message_ids: vec![MessageId::new(6_325_529)],
+            busy_followup_retry_user_msg_id: MessageId::new(6_325_528),
+            request_owner: UserId::new(7),
+            request_owner_name: "owner".into(),
+            user_text: if redirect {
+                "DISPATCH:input-effect-local - input effect".into()
+            } else {
+                "input effect".into()
+            },
+            reply_to_user_message: false,
+            defer_watcher_resume: false,
+            wait_for_completion: false,
+            merge_consecutive: false,
+            reply_context: None,
+            has_reply_boundary: false,
+            dm_hint: Some(false),
+            turn_kind: TurnKind::Foreground,
+            preserve_on_cancel: false,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            execute_intake_turn_core(&api.http, &shared, "", request, Vec::new()),
+        )
+        .await
+        .unwrap();
+        if override_provider {
+            // The root writer meets the other provider's protection (X13-C channel-wide lookup);
+            // E2 never protects a channel whose writer differs from its root runtime.
+            assert!(result.unwrap_err().to_string().contains("refused"));
+            assert!(
+                crate::services::discord::inflight::load_inflight_state(
+                    &final_provider,
+                    channel.get()
+                )
+                .is_none()
+            );
+            assert!(gate.close().unwrap().drain().now_or_never().is_some());
+            shared.mailboxes.remove_fixture_for_test(channel);
+            return;
+        }
+        result.unwrap();
+        let provider = tokio::time::timeout(std::time::Duration::from_secs(10), provider_entered)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), bridge_captured)
+            .await
+            .unwrap()
+            .unwrap();
+        let row =
+            crate::services::discord::inflight::load_inflight_state(&final_provider, channel.get())
+                .unwrap();
+        assert_eq!(row.source_message_ids, vec![6_325_529]);
+        let closing = gate.close().unwrap();
+        let held = closing.drain().now_or_never().is_none();
+        release_bridge.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), bridge_completed)
+            .await
+            .unwrap()
+            .unwrap();
+        let provider_holds_after_bridge = closing.drain().now_or_never().is_none();
+        release_provider.send(()).unwrap();
+        assert!(
+            provider_holds_after_bridge,
+            "provider still owns an effect after bridge cleanup and drop"
+        );
+        assert!(
+            held,
+            "intake return does not end provider or bridge effects"
+        );
+        assert_eq!(
+            provider,
+            (true, true),
+            "actual intake provider has named worker capability"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(20), closing.drain())
+            .await
+            .unwrap();
+        assert!(
+            crate::services::discord::inflight::load_inflight_state(&final_provider, channel.get())
+                .is_none()
+        );
+        let mailbox = shared.mailbox_peek(channel).unwrap().snapshot().await;
+        assert!(mailbox.cancel_token.is_none());
+        assert!(mailbox.active_user_message_id.is_none());
+        assert!(effect::current().is_none());
+        assert!(!crate::services::discord::live_bridge::is_live(
+            &final_provider,
+            channel.get()
+        ));
+        shared.mailboxes.remove_fixture_for_test(channel);
+    }
 }

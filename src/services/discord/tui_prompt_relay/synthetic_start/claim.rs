@@ -10,6 +10,7 @@ pub(super) struct SyntheticClaimIdentity<'a> {
     pub(super) anchor_message_id: MessageId,
     pub(super) lease: &'a ExternalInputRelayLease,
     pub(super) register_deferred_start: bool,
+    pub(super) native_turn: Option<&'a str>,
 }
 
 pub(super) struct SyntheticClaimPreparation<'a> {
@@ -38,6 +39,7 @@ pub(in crate::services::discord::tui_prompt_relay) async fn claim_tui_direct_syn
         anchor_message_id,
         lease,
         None,
+        None,
     )
     .await
     .0
@@ -54,7 +56,14 @@ pub(in crate::services::discord::tui_prompt_relay) async fn claim_tui_direct_syn
     anchor_message_id: MessageId,
     lease: &ExternalInputRelayLease,
     captured_source: Option<&(String, u64)>,
+    native_turn: Option<&str>,
 ) -> (TuiDirectSyntheticTurnClaim, Option<(String, u64)>) {
+    if crate::services::tui_o::turn_mode::transcript_turns(channel_id.get()) {
+        return (
+            TuiDirectSyntheticTurnClaim::new(lease.relay_owner, false, 0),
+            None,
+        );
+    }
     let binding =
         crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux_session_name);
     let binding =
@@ -81,6 +90,23 @@ pub(in crate::services::discord::tui_prompt_relay) async fn claim_tui_direct_syn
         );
     #[cfg(not(unix))]
     let committed_relay_offset: Option<u64> = None;
+    // A Codex input whose native turn the rollout already holds starts at that turn's record.
+    let native_source = native_turn
+        .filter(|_| provider == &ProviderKind::Codex)
+        .zip(output_path.as_deref())
+        .and_then(|(turn, path)| {
+            match super::super::idle_transcript_scan::resolve_codex_turn_prompt_end(
+                path,
+                turn,
+                prompt_text,
+            ) {
+                Ok(super::super::idle_transcript_scan::CodexTurnPrompt::Found(end)) => {
+                    Some((path.to_str()?.to_string(), end))
+                }
+                _ => None,
+            }
+        });
+    let captured_source = native_source.as_ref().or(captured_source);
     let start_offset = match captured_source {
         Some((path, offset)) => {
             if output_path.as_deref() != Some(Path::new(path))
@@ -112,7 +138,8 @@ pub(in crate::services::discord::tui_prompt_relay) async fn claim_tui_direct_syn
             "#3358 synthetic inflight offset-authority handover: carried committed relay frontier forward"
         );
     }
-    // The supervisor keeps its producer alive without a watcher; the sink needs both.
+    // The supervisor keeps its producer alive without a watcher; the sink also needs a
+    // watcher reading this output (a Codex TUI watcher on the relay jsonl never sees the rollout).
     let live_producer_present =
         crate::services::cluster::relay_producer_registry::global_relay_producer_registry()
             .get_live_producer(tmux_session_name)
@@ -125,10 +152,11 @@ pub(in crate::services::discord::tui_prompt_relay) async fn claim_tui_direct_syn
         ),
         session_bound_discord_delivery_enabled(),
         live_producer_present,
-        shared
-            .tmux_watchers
-            .tmux_session_live_for_relay(tmux_session_name)
-            == Some(true),
+        tui_direct_watcher_covers_output(
+            &shared.tmux_watchers,
+            tmux_session_name,
+            output_path.as_deref(),
+        ),
     );
     let relay_owner_kind = match relay_owner {
         ExternalInputRelayOwner::TmuxWatcher => RelayOwnerKind::Watcher,
@@ -150,6 +178,7 @@ pub(in crate::services::discord::tui_prompt_relay) async fn claim_tui_direct_syn
             anchor_message_id,
             lease,
             register_deferred_start: DEFERRED,
+            native_turn,
         },
         output_path,
         start_offset,
@@ -158,6 +187,28 @@ pub(in crate::services::discord::tui_prompt_relay) async fn claim_tui_direct_syn
     })
     .await;
     (claim, source)
+}
+
+/// Whether the live tmux watcher reads `output_path` itself, path aliases included. The
+/// session-bound sink only hears what that watcher reads, so another file starves it.
+pub(in crate::services::discord::tui_prompt_relay) fn tui_direct_watcher_covers_output(
+    watchers: &super::super::super::TmuxWatcherRegistry,
+    tmux_session_name: &str,
+    output_path: Option<&Path>,
+) -> bool {
+    if watchers.tmux_session_live_for_relay(tmux_session_name) != Some(true) {
+        return false;
+    }
+    // No output path, or the same uncanonicalizable string, counts as covered, as in
+    // `tui_direct_watcher_can_own_output`.
+    let Some(output_path) = output_path else {
+        return true;
+    };
+    let canonical =
+        |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    watchers
+        .watcher_output_path(tmux_session_name)
+        .is_some_and(|watcher_path| canonical(Path::new(&watcher_path)) == canonical(output_path))
 }
 
 impl TuiDirectSyntheticTurnClaim {
@@ -258,4 +309,87 @@ pub(in crate::services::discord) async fn claim_tui_direct_synthetic_turn_for_te
     )
     .await
     .claimed
+}
+
+#[cfg(test)]
+mod n1a_tests {
+    use super::*;
+
+    #[test]
+    fn n1a_synthetic_claim_has_no_row_or_lease_until_unconfirmed() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            root.path(),
+        );
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let shared = crate::services::discord::make_shared_data_for_tests();
+                for (i, provider) in [ProviderKind::Claude, ProviderKind::Codex]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let channel = ChannelId::new(63250201 + i as u64);
+                    let mut lease = ExternalInputRelayLease::unassigned(Some(channel.get()));
+                    lease.turn_id = Some("n1a-claim-fixture".into());
+                    lease.relay_owner = ExternalInputRelayOwner::TmuxWatcher;
+                    let confirmed =
+                        crate::services::tui_o::turn_mode::TestConfirmation::new(channel.get());
+                    let (claim, _) = claim_tui_direct_synthetic_turn_inner::<true>(
+                        &shared,
+                        &provider,
+                        channel,
+                        "n1a-isolated-claim",
+                        "human prompt",
+                        MessageId::new(7),
+                        &lease,
+                        None,
+                        None,
+                    )
+                    .await;
+                    assert!(
+                        super::super::super::super::inflight::load_inflight_state(
+                            &provider,
+                            channel.get()
+                        )
+                        .is_none(),
+                        "confirmed synthetic producer must leave row absent"
+                    );
+                    assert!(
+                        super::super::super::super::mailbox_snapshot(&shared, channel)
+                            .await
+                            .cancel_token
+                            .is_none()
+                    );
+                    assert!(!claim.claimed);
+                    drop(confirmed);
+                    let (claim, _) = claim_tui_direct_synthetic_turn_inner::<true>(
+                        &shared,
+                        &provider,
+                        channel,
+                        "n1a-isolated-claim",
+                        "human prompt",
+                        MessageId::new(7),
+                        &lease,
+                        None,
+                        None,
+                    )
+                    .await;
+                    assert!(claim.claimed, "Legacy claim remains available");
+                    assert!(
+                        super::super::super::super::inflight::load_inflight_state(
+                            &provider,
+                            channel.get()
+                        )
+                        .is_some()
+                    );
+                }
+            });
+    }
 }

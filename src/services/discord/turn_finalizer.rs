@@ -273,6 +273,9 @@ pub(in crate::services::discord) enum TerminalEvent {
     /// Normal completion — bridge or watcher relayed (or intentionally
     /// suppressed) terminal output and the turn is done.
     Complete,
+    /// Physical hosted execution ended; settle its captured mailbox without provider output.
+    #[cfg(unix)]
+    HostTerminated,
     /// `/!stop`, reaction, watchdog. `mark_completion_cleanup()` is skipped
     /// (the cancel is a real mid-stream stop) but `cancelled.store(true)`
     /// still fires.
@@ -292,10 +295,23 @@ pub(in crate::services::discord) enum TerminalEvent {
 /// #3646 OBSERVATION-ONLY: stable wire string for the `finalizer_ledger_owner`
 /// event's `terminal_event` field (avoids leaking `GateTimeout`'s inner struct
 /// into the payload via `Debug`).
+impl TerminalEvent {
+    pub(in crate::services::discord) fn is_mute_settlement(&self) -> bool {
+        match self {
+            Self::OperatorRelease(_) => true,
+            #[cfg(unix)]
+            Self::HostTerminated => true,
+            _ => false,
+        }
+    }
+}
+
 fn terminal_event_kind_str(event: &TerminalEvent) -> &'static str {
     match event {
         TerminalEvent::OperatorRelease(_) => "operator_lease_release",
         TerminalEvent::Complete => "complete",
+        #[cfg(unix)]
+        TerminalEvent::HostTerminated => "host_terminated",
         TerminalEvent::Cancel => "cancel",
         TerminalEvent::GateTimeout { .. } => "gate_timeout",
         TerminalEvent::RelayMiss => "relay_miss",
@@ -684,10 +700,15 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
                         event,
                         ctx,
                         evidence,
+                        input_permit,
                         shared,
                         ack,
                     } => {
                         cached_shared = Some(Arc::downgrade(&shared));
+                        // Move the serial actor state, not its authority, through worker cleanup.
+                        let mut owned_ledger = std::mem::take(&mut ledger);
+                        let mut owned_pending = std::mem::take(&mut pending_admission);
+                        let work = async move {
                         // #3866: the actor is a single, never-respawned task that
                         // owns finalize for the whole process. The crate unwinds
                         // (not `panic = "abort"`), so without this guard ONE panic
@@ -700,8 +721,8 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
                         // does not hang, and the loop survives to finalize the next
                         // turn.
                         let outcome = match AssertUnwindSafe(handle_terminal(
-                            &mut ledger,
-                            &mut pending_admission,
+                            &mut owned_ledger,
+                            &mut owned_pending,
                             key,
                             provider,
                             event,
@@ -722,6 +743,12 @@ async fn actor_loop(mut rx: mpsc::UnboundedReceiver<FinalizeMsg>) {
                                 FinalizeOutcome::AlreadyFinalized
                             }
                         };
+                            (owned_ledger, owned_pending, outcome)
+                        };
+                        let (next_ledger, next_pending, outcome) =
+                            super::input_runtime::fence::effect::run(input_permit, work).await;
+                        ledger = next_ledger;
+                        pending_admission = next_pending;
                         let _ = ack.send(outcome);
                     }
                     // #3041 §2-§3 P1-0 (DORMANT, UNREACHABLE today). Routing these
@@ -878,6 +905,13 @@ mod test_panic_hook {
             panic!("injected do_finalize side-effect panic after phase flip (#3866 test)");
         }
     }
+}
+
+/// Arms this thread's next `do_finalize` to panic, so a caller outside the finalizer can drive a
+/// terminal that is acknowledged `AlreadyFinalized` with its token still held.
+#[cfg(test)]
+pub(in crate::services::discord) fn arm_finalize_panic_once_for_test() {
+    test_panic_hook::arm_in_finalize_once();
 }
 
 #[cfg(test)]

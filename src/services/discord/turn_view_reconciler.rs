@@ -27,10 +27,14 @@ mod queue_repair;
 mod reaction_set;
 mod resolution;
 mod store;
-pub(in crate::services::discord) use orphan_sweep::sweep_orphan_tui_anchor_reactions;
+pub(in crate::services::discord) use orphan_sweep::{
+    pending_anchor_presence, sweep_orphan_tui_anchor_reactions,
+};
 
 const TURN_VIEW_REACTIONS: [char; 7] = ['📬', '➕', '🔄', '⏳', '✅', '⚠', '🛑'];
 const QUEUE_EXIT_FEEDBACK_REACTIONS: [char; 3] = ['🚫', '⌛', '⏏'];
+/// Marks on a message a busy turn's pane took or may have taken; never tracked as turn view state.
+const INJECTION_REACTIONS: [char; 2] = ['📥', '❓'];
 const PERSISTED_STATE_VERSION: u32 = 1;
 const LEGACY_QUEUED_HOURGLASS_STATE_VERSION: u32 = 2;
 const QUEUED_MARKER_ONLY_STATE_VERSION: u32 = 3;
@@ -351,6 +355,8 @@ pub(in crate::services::discord) struct TurnViewReconciler {
     // Bounded in-memory only. A restart loses this guard, and durable queue
     // replay remains the source of truth for messages still queued on disk.
     recently_finalized: std::sync::Mutex<RecentlyFinalizedTargets>,
+    #[cfg(test)]
+    test_http_reactions: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     ops: Arc<std::sync::Mutex<Vec<TestReactionOp>>>,
     #[cfg(test)]
@@ -870,6 +876,11 @@ pub(in crate::services::discord) struct TestReactionOp {
 
 #[cfg(test)]
 impl TurnViewReconciler {
+    /// Opt only this reconciler into real REST requests against a test HTTP client.
+    pub(in crate::services::discord) fn enable_test_http_reactions(&self) {
+        self.test_http_reactions.store(true, Ordering::Relaxed);
+    }
+
     pub(in crate::services::discord) fn ops(&self) -> Vec<TestReactionOp> {
         self.ops.lock().expect("turn view test op lock").clone()
     }
@@ -898,3 +909,14 @@ impl TurnViewReconciler {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn http_reaction_opt_in_is_instance_local_and_defaults_off() {
+    let enabled = TurnViewReconciler::default();
+    let untouched = TurnViewReconciler::default();
+    assert!(!enabled.test_http_reactions.load(Ordering::Relaxed));
+    enabled.enable_test_http_reactions();
+    assert!(enabled.test_http_reactions.load(Ordering::Relaxed));
+    assert!(!untouched.test_http_reactions.load(Ordering::Relaxed));
+}

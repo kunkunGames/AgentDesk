@@ -234,6 +234,32 @@ impl SharedData {
         );
     }
 
+    pub(in crate::services::discord) async fn insert_queued_placeholder_on_worker_locked(
+        &self,
+        channel_id: ChannelId,
+        user_msg_id: MessageId,
+        placeholder_msg_id: MessageId,
+    ) {
+        if super::input_runtime::fence::lookup(&self.provider, channel_id.get()).is_none() {
+            return self.insert_queued_placeholder_locked(
+                channel_id,
+                user_msg_id,
+                placeholder_msg_id,
+            );
+        }
+        self.queued
+            .queued_placeholders
+            .insert((channel_id, user_msg_id), placeholder_msg_id);
+        super::queued_placeholders_store::persist_map_on_worker(
+            &self.queued.queued_placeholders,
+            &self.provider,
+            &self.token_hash,
+            channel_id,
+            false,
+        )
+        .await;
+    }
+
     /// Write-through remove for the `queued_placeholders` mapping. Returns
     /// the removed placeholder message id, if any, under the per-channel
     /// persistence mutex.
@@ -244,7 +270,32 @@ impl SharedData {
     ) -> Option<MessageId> {
         let persist_lock = self.queued_placeholders_persist_lock(channel_id);
         let _persist_guard = persist_lock.lock().await;
-        self.remove_queued_placeholder_locked(channel_id, user_msg_id)
+        self.remove_queued_placeholder_on_worker_locked(channel_id, user_msg_id)
+            .await
+    }
+
+    pub(in crate::services::discord) async fn remove_queued_placeholder_on_worker_locked(
+        &self,
+        channel_id: ChannelId,
+        user_msg_id: MessageId,
+    ) -> Option<MessageId> {
+        if super::input_runtime::fence::lookup(&self.provider, channel_id.get()).is_none() {
+            return self.remove_queued_placeholder_locked(channel_id, user_msg_id);
+        }
+        let removed = self
+            .queued
+            .queued_placeholders
+            .remove(&(channel_id, user_msg_id))
+            .map(|(_, msg_id)| msg_id);
+        super::queued_placeholders_store::persist_map_on_worker(
+            &self.queued.queued_placeholders,
+            &self.provider,
+            &self.token_hash,
+            channel_id,
+            false,
+        )
+        .await;
+        removed
     }
 
     /// Remove variant that assumes the caller already holds the per-channel
@@ -302,12 +353,14 @@ impl SharedData {
                 .queue_exit_placeholder_clears
                 .insert((channel_id, card.user_msg_id), card.placeholder_msg_id);
         }
-        super::queued_placeholders_store::persist_queue_exit_placeholder_clears_channel_from_map(
+        super::queued_placeholders_store::persist_map_on_worker(
             &self.queued.queue_exit_placeholder_clears,
             &self.provider,
             &self.token_hash,
             channel_id,
-        );
+            true,
+        )
+        .await;
     }
 
     /// Enqueues a single deferred placeholder-clear when an inline
@@ -325,12 +378,14 @@ impl SharedData {
         self.queued
             .queue_exit_placeholder_clears
             .insert((channel_id, user_msg_id), placeholder_msg_id);
-        super::queued_placeholders_store::persist_queue_exit_placeholder_clears_channel_from_map(
+        super::queued_placeholders_store::persist_map_on_worker(
             &self.queued.queue_exit_placeholder_clears,
             &self.provider,
             &self.token_hash,
             channel_id,
-        );
+            true,
+        )
+        .await;
     }
 
     pub(in crate::services::discord) async fn remove_pending_queue_exit_placeholder_clears(
@@ -355,12 +410,14 @@ impl SharedData {
                 self.queued.queue_exit_placeholder_clears.remove(&key);
             }
         }
-        super::queued_placeholders_store::persist_queue_exit_placeholder_clears_channel_from_map(
+        super::queued_placeholders_store::persist_map_on_worker(
             &self.queued.queue_exit_placeholder_clears,
             &self.provider,
             &self.token_hash,
             channel_id,
-        );
+            true,
+        )
+        .await;
     }
 
     pub(in crate::services::discord) fn pending_queue_exit_placeholder_clears(
@@ -596,6 +653,9 @@ pub(in crate::services::discord) fn clear_codex_goals_reset_pending_for_channel(
 /// plain atomic would silently fork the process-global counter per provider
 /// and break the deferred-restart / shutdown barrier arithmetic.
 pub(in crate::services) struct RestartLifecycle {
+    /// Keeps delegation judgement alive for background runtimes after their boot future returns.
+    pub(in crate::services) _home_availability:
+        Option<crate::services::cluster::home_availability::Registration>,
     /// Per-channel restart-resume marker: Instant when recovery started, for
     /// stale-recovery timeout.
     pub(in crate::services) recovering_channels: dashmap::DashMap<ChannelId, std::time::Instant>,
@@ -619,10 +679,9 @@ pub(in crate::services) struct RestartLifecycle {
     pub(in crate::services) reconcile_done: Arc<std::sync::atomic::AtomicBool>,
     /// Number of queued deferred idle-queue kickoffs waiting to run.
     pub(in crate::services) deferred_hook_backlog: std::sync::atomic::AtomicUsize,
-    /// Per-channel deferred idle-queue kickoff guard: one drain task active
-    /// per channel, removed when its backlog guard drops.
+    /// One deferred drain task per channel, retained until pending arm requests are evaluated.
     pub(in crate::services) deferred_hook_channels:
-        dashmap::DashMap<ChannelId, Arc<tokio::sync::Notify>>,
+        dashmap::DashMap<ChannelId, Arc<super::queue_io::BackstopSlot>>,
     /// When this provider started reconcile/recovery for the current boot.
     pub(in crate::services) recovery_started_at: std::time::Instant,
     /// Captured reconcile/recovery duration for the current boot in milliseconds.

@@ -8,7 +8,7 @@ use serde::Serialize;
 mod relay_probe;
 
 use super::liveness_authority::CaptureCoordinateObservation;
-use super::mailbox::MailboxHealthSnapshot;
+use super::mailbox::{MailboxHealthSnapshot, QueueParkHealthObservations as ParkObservations};
 use super::provider_probe::{self, ProviderHealthSnapshot};
 // #5071 T4-B6: `health::reachability` is `#[cfg(unix)]` (see the `mod` decl in
 // `health.rs`), so the composition wiring built on it — this import,
@@ -230,8 +230,15 @@ pub struct DiscordHealthSnapshot {
     /// `routes::health_api::public_health_json`. How to read it — count the
     /// entries, never test emptiness — is in `relay_probe`'s module doc.
     expired_relay_ledgers: Vec<String>,
+    /// Providers whose latest restart-marking pass left rows unmarked; beside `degraded_reasons`,
+    /// never inside it, because marking runs during every deploy.
+    restart_marking_short_passes: Vec<discord::inflight::ShortPass>,
     providers: Vec<ProviderHealthSnapshot>,
     mailboxes: Vec<MailboxHealthSnapshot>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    queue_park_observation_failures: Vec<super::mailbox::QueueParkObservationFailureSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript_turns: Option<super::transcript_turn::TranscriptTurnsHealth>,
 }
 
 impl DiscordHealthSnapshot {
@@ -809,6 +816,7 @@ pub(super) async fn build_health_snapshot_with_options(
     let mut watcher_count = 0usize;
     let mut recovery_duration = 0.0f64;
     let mut mailbox_entries = Vec::new();
+    let mut failures = Vec::new();
     let mut provider_active_turns = 0usize;
     // Read the authority switch once per snapshot. Structural polarity is a
     // no-op, so the public build skips channel observation entirely (#5736).
@@ -835,6 +843,7 @@ pub(super) async fn build_health_snapshot_with_options(
         watcher_count += provider_probe.watcher_count;
         recovery_duration = recovery_duration.max(provider_probe.recovery_duration);
         let provider_kind = ProviderKind::from_str(&entry.name);
+        let park = ParkObservations::observe(entry, include_mailbox_details, &mut failures).await;
         let observed_mailboxes = observe_channels
             .then_some(&provider_probe.mailbox_snapshots)
             .into_iter()
@@ -1002,6 +1011,7 @@ pub(super) async fn build_health_snapshot_with_options(
                     channel_id: channel.get(),
                     has_cancel_token: mailbox_has_cancel_token,
                     queue_depth,
+                    queue_park: park.project(channel),
                     recovery_started: snapshot.recovery_started_at.is_some(),
                     active_request_owner: snapshot.active_request_owner.map(|id| id.get()),
                     active_user_message_id: mailbox_active_user_msg_id,
@@ -1065,7 +1075,13 @@ pub(super) async fn build_health_snapshot_with_options(
         status = status.worsen(HealthStatus::Degraded);
         degraded_reasons.push(reason);
     }
-    for reason in crate::services::tui_o::alarm::health_reasons() {
+    let (transcript_reasons, transcript_turns) =
+        super::transcript_turn::project_retired(&providers, include_mailbox_details).await;
+    for reason in crate::services::tui_o::alarm::health_reasons()
+        .into_iter()
+        .chain(super::super::input_runtime::health_reasons())
+        .chain(transcript_reasons)
+    {
         status = status.worsen(HealthStatus::Degraded);
         degraded_reasons.push(reason);
     }
@@ -1084,8 +1100,11 @@ pub(super) async fn build_health_snapshot_with_options(
         bot_token_reload_scopes: bot_token_reload_scopes(),
         degraded_reasons,
         expired_relay_ledgers,
+        restart_marking_short_passes: discord::inflight::short_passes(),
         providers: provider_entries,
         mailboxes: mailbox_entries,
+        queue_park_observation_failures: failures,
+        transcript_turns,
     }
 }
 
@@ -1486,6 +1505,54 @@ mod tests {
                     .expect("the O channel's verdict stays published");
                 assert!(!owned_entry.reachability.governs_health_polarity);
                 assert_ne!(owned_entry.reachability.verdict, "reachable");
+            });
+    }
+
+    /// A LedgerOpen-shaped channel (O owns its output, input is retired to the ledger, nothing
+    /// is left behind) raises no reason naming it on either build.
+    #[cfg(unix)]
+    #[test]
+    fn a_ledger_open_channel_raises_no_legacy_reason() {
+        use crate::services::discord::health::legacy_supervision::RetiredForTest;
+        use crate::services::tui_o::cutover::{boot_ownership, test_override};
+
+        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("temp runtime root");
+        unsafe { std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.path().to_str().unwrap()) };
+        let _env_guard = EnvGuard;
+        let _source_guard = set_relay_verdict_source_for_tests(RelayVerdictSource::Composite);
+        let owned = NEXT_ABSENT_MAILBOX_CHANNEL.fetch_add(1, Ordering::Relaxed);
+        let _boot = test_override::force_candidates(&[(owned, RuntimeHandoffKind::ClaudeTui)]);
+        for (channel, _, candidate) in boot_ownership() {
+            if channel == owned {
+                assert!(candidate.expect("selected channel").confirm_store());
+            }
+        }
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(async {
+                let registry = HealthRegistry::new();
+                let shared = crate::services::discord::make_shared_data_for_tests();
+                let provider = ProviderKind::Claude.as_str();
+                registry
+                    .register(provider.to_string(), shared.clone())
+                    .await;
+                shared.mailboxes.handle(ChannelId::new(owned));
+                let _retired = RetiredForTest::new(provider, owned);
+
+                let detail = build_health_snapshot(&registry).await;
+                let public = build_public_health_snapshot(&registry).await;
+                for reasons in [&detail.degraded_reasons, &public.degraded_reasons] {
+                    let names_owned = |r: &String| r.contains(&owned.to_string());
+                    assert!(!reasons.iter().any(names_owned), "{reasons:?}");
+                }
+                let json = serde_json::to_value(detail).expect("serialize detail snapshot");
+                let entry = &json["transcript_turns"]["channels"][0];
+                assert_eq!(entry["channel_id"], owned);
+                assert_eq!(entry["residue"], serde_json::json!({}));
             });
     }
 

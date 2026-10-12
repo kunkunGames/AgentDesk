@@ -4,8 +4,17 @@
 # spaces, exactly as printed in the violation's `command:` field). Add an
 # entry ONLY for lanes that legitimately select zero tests on some platform
 # (e.g. an entire suite behind #[cfg(target_os = "...")]) and document the
-# reason in a `#` comment directly above the entry.
+# reason directly above each entry, with no blank line in between:
 #
-# target-mismatch violations (wrong --lib/--bin/--test pairing) can NOT be
-# allowlisted — check_test_target_integrity.py ignores allowlist entries for
-# that kind in code. Fix the command instead.
+#   # optional notes go above the reason line
+#   # reason: <why, with at least one letter or digit>
+#   cargo test ...
+#
+# The `# reason:` marker is lowercase and must be the last comment line before
+# the entry; each entry needs its own. A <why> left as the placeholder is
+# rejected.
+# Duplicate entries and entries matching no extracted command are rejected.
+#
+# Only zero-match and empty-target findings are excused. Wrong target pairing,
+# unknown modules/targets and inventory failures cannot be allowlisted.
+# Fix those commands or source inventories instead.

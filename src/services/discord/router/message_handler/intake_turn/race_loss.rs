@@ -19,6 +19,29 @@ fn race_loss_persistence_failure(
     .into())
 }
 
+fn input_refusal(reason: Option<crate::services::turn_orchestrator::EnqueueRefusalReason>) -> bool {
+    use crate::services::turn_orchestrator::EnqueueRefusalReason as R;
+    matches!(
+        reason,
+        Some(R::InputModeFenced(_) | R::InputPersistence | R::LockTimeout | R::ActorUnreachable)
+    )
+}
+
+fn race_loss_input_failure(
+    channel: ChannelId,
+    reason: Option<crate::services::turn_orchestrator::EnqueueRefusalReason>,
+) -> Result<(), Error> {
+    if !input_refusal(reason) {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "queued intake refused for channel {}: {}",
+        channel.get(),
+        reason.unwrap().as_str()
+    ))
+    .into())
+}
+
 async fn enqueue_race_loss_requeued_intervention(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -36,6 +59,9 @@ async fn enqueue_race_loss_requeued_intervention(
         ),
     )
     .await;
+    if input_refusal(outcome.refusal_reason) {
+        return outcome;
+    }
     if outcome.persistence_error.is_some() {
         let cleared = crate::services::discord::mailbox_clear_pending_dispatch_reservation(
             shared,
@@ -192,6 +218,18 @@ pub(super) async fn handle_race_loss_enqueue(
         return race_loss_persistence_failure(channel_id, Some(persistence_error));
     }
 
+    if input_refusal(enqueue_outcome.refusal_reason) {
+        mailbox_reaction::clear_rejected_attempt_pending(
+            shared,
+            http,
+            channel_id,
+            user_msg_id,
+            turn_start_attempt,
+        )
+        .await;
+        return race_loss_input_failure(channel_id, enqueue_outcome.refusal_reason);
+    }
+
     // Enqueue rejected (dedup/duplicate): skip the placeholder POST and
     // mapping insert (a fresh card would orphan) and the `📬` reaction (the
     // prior live enqueue owns it). Only the matching start attempt clears
@@ -261,6 +299,11 @@ pub(super) async fn handle_race_loss_enqueue(
             // QUEUED — its "📬" card is a trailing notice that must wait
             // behind any in-flight multi-chunk answer flush.
             true,
+            crate::services::tui_o::n1_observation::Context {
+                provider: provider.as_str(),
+                origin: "discord_race",
+                input_message_id: Some(user_msg_id.get()),
+            },
         )
         .await;
 
@@ -378,7 +421,9 @@ pub(super) async fn handle_race_loss_enqueue(
             }
             return Ok(());
         }
-        shared.insert_queued_placeholder_locked(channel_id, user_msg_id, placeholder_msg_id);
+        shared
+            .insert_queued_placeholder_on_worker_locked(channel_id, user_msg_id, placeholder_msg_id)
+            .await;
         // Hand the still-held guard to the `ensure_queued` PATCH branch so
         // ownership check + insert + PATCH run under one held lock guard.
         Some(persist_guard)
@@ -515,7 +560,9 @@ pub(super) async fn handle_race_loss_enqueue(
                         placeholder_msg_id,
                     );
                     if still_owned_under_lock {
-                        shared.remove_queued_placeholder_locked(channel_id, user_msg_id);
+                        shared
+                            .remove_queued_placeholder_on_worker_locked(channel_id, user_msg_id)
+                            .await;
                     }
                     drop(persist_guard);
                     if still_owned_under_lock {

@@ -1,6 +1,9 @@
 server:
   port: 8791
   host: "0.0.0.0"
+  # Peers outside loopback, Tailscale (100.64.0.0/10) and private LAN ranges:
+  # off = no filter, log = warn only (default), enforce = 403.
+  # peer_filter: log
 
 cluster:
   # Roles: hub = Hub, runner = Runner, auto = Automatic.
@@ -60,6 +63,9 @@ cluster:
   # online, and takes it when this node is offline (failover is unchanged).
   # gateway_preferred_instance_id: "example-main-node"
   # gateway_yield_grace_secs: 90
+  # An idle gateway lease session is ended by PostgreSQL after this many seconds,
+  # so a holder that lost its network path cannot keep the lease. 0 disables it.
+  # gateway_lease_idle_expiry_secs: 300
 
 discord:
   guild_id: "YOUR_GUILD_ID"
@@ -453,6 +459,8 @@ prompt_manifest_retention:
 #   stale_paused_alert_secs: 0
 #   stale_paused_alert_ttl_secs: 86400
 #   failure_pause_auto_resume_secs: 0
+#   startup_grace_secs: 120
+#   max_consecutive_failures: 3
 
 # 자동/수동 escalation 대상 설정입니다. 기본값은 mode=pm, owner_user_id/pm_channel_id 없음,
 # schedule은 pm_hours=00:00-08:00, timezone=Asia/Seoul로 해석됩니다. user/scheduled 라우팅 때 설정하세요.

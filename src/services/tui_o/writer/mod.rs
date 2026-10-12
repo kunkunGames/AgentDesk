@@ -5,11 +5,15 @@ pub mod activation;
 pub mod actor;
 pub mod adoption;
 pub mod binding;
+pub mod codex_adoption;
 pub mod confirm;
 mod deferred;
 pub mod deliver;
 pub mod host;
+pub mod input_facts;
+pub(crate) mod owed;
 pub mod pieces;
+pub mod resume;
 pub mod rotation;
 pub mod round_trip;
 pub mod switch;
@@ -26,6 +30,12 @@ use crate::services::tui_o::shadow::SourceId;
 #[serde(default)]
 pub struct WriterConfig {
     pub enabled: bool,
+}
+
+/// Reader policy selected explicitly by an engine caller; the default keeps FDs open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReaderConfig {
+    pub dormant: bool,
 }
 
 /// A message as Discord returned it.
@@ -71,6 +81,8 @@ pub trait DeliveryLease: Send + Sync {
     type Held: Send + 'static;
     /// `None` when another holder has it; the piece waits and is never posted without it.
     fn try_acquire(&self, channel: u64, serial: u64) -> Option<Self::Held>;
+    /// The channel's writer stopped for good; its verified episodes become Unknown, not settled.
+    fn writer_unavailable(&self, _channel: u64) {}
 }
 
 /// Raised from the first occurrence; A1-5 routes these to health and the operator channel.
@@ -114,6 +126,12 @@ pub enum WriterAlarm {
     },
     /// Capture waits until delivered segments are collected; nothing is dropped.
     SpoolFull,
+    /// Ready or Prepared work has waited more than five minutes; this only reports the wait.
+    WaitingTooLong {
+        incident: String,
+        ready: usize,
+        prepared: Option<u64>,
+    },
     /// The binding log skipped a seq; the channel stops before applying anything past it.
     BindingGap {
         expected: u64,
@@ -143,6 +161,12 @@ pub enum WriterAlarm {
     RetiredSourceGrew {
         source: SourceId,
     },
+    CleanupRetired {
+        source: SourceId,
+        offset: u64,
+        modified: std::time::SystemTime,
+        age: std::time::Duration,
+    },
     /// The full spool refuses an old source's tail, its successor waits behind that tail, and an
     /// announced unit keeps GC off; nothing can move, so the channel stops for an operator.
     RotationStalled {
@@ -154,8 +178,19 @@ pub enum WriterAlarm {
 
 pub trait AlarmSink: Send + Sync {
     fn raise(&self, channel: u64, alarm: WriterAlarm);
+    /// No overdue work remains; a later overdue wait is a new incident.
+    fn waiting_cleared(&self, _channel: u64) {}
+    fn reconcile_reader_count(&self, _channel: u64, _count: usize) {}
+    /// Whether the host will start the halted writer again after a wait.
+    fn resume_pending(&self, _channel: u64, _pending: bool) {}
+    /// The halt ended: a recovered writer is about to start in its place.
+    fn halt_cleared(&self, _channel: u64) {}
 }
+
+mod historical_hops;
+mod past_bind;
+mod renumbered;
 
 #[cfg(test)]
 #[path = "writer_tests.rs"]
-mod tests;
+pub(crate) mod tests;

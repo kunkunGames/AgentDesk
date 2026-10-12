@@ -209,3 +209,135 @@ Other channels stay on Legacy throughout. Check that their delivery is unchanged
 - Deploying an external binary (`AGENTDESK_DEPLOY_BINARY`) while the source switch is `true`, or
   rolling back to a build whose manifest does not record `o_tui_writer` as `true`. The deploy
   script refuses both.
+
+## 7. Recover a piece Discord refused
+
+A POST refused with 400, 403 or 404 blocks the channel's O output with a `Blocked` alarm. A restart
+alone keeps it blocked. After the cause is fixed, one explicit approval lets the next writer send
+the original piece once, then the output that followed. Run these on the O home, in order:
+
+1. Note the channel and serial from the `Blocked` log.
+2. `agentdesk o status --channel <CHANNEL_ID>` lists every refused piece with its latest attempt
+   and approval (`absent`, `unconsumed` or `consumed by serial <n> <outcome>`). It writes nothing,
+   but it holds the ledger lock while it reads, so do not run it during a restart.
+3. Fix the cause of the refusal, for example the channel permission. Do not send a test POST.
+4. `agentdesk o resume --channel <CHANNEL_ID> --rejected-serial <SERIAL> --reason "<what was
+   fixed>"`. `--operator` defaults to `operator`. Only the latest refused attempt of a piece, with
+   no POST in flight, can be approved. The approval sends nothing and does not check the cause.
+5. Wait for the command to exit, then run the managed restart. The new writer sends the original
+   piece, which gets a new serial, and continues with later output. Check the new serial's result.
+
+`o resume` exits with:
+
+| Exit | Meaning | Next step |
+|---|---|---|
+| 0 | This command wrote the approval and it is durable | Managed restart |
+| 1 | No runtime root, or no `o_store` under it; nothing was written | Run it on the O home |
+| 3 | The serial already had an approval, possibly from a command that ran at the same time; the first one stands, with its state | Nothing more to record |
+| 4 | The store refused the request or the ledger check: not the latest 400/403/404 attempt, a POST in flight, blank input, a ledger violation or an unfinished tail; nothing was written | Run `o status`; an unfinished ledger tail is recovered by the next writer start |
+| 5 | The ledger is locked by a writer or another operator; nothing was written | Retry once the other command or the restart is done |
+| 6 | Any other error, such as store damage, a missing channel ledger or an I/O error, with the rollback floor confirmed absent, so this command appended no approval | Fix the cause the message names and retry |
+| 7 | Any other error while the floor exists or cannot be checked, so the command cannot tell whether an approval is durable. It does not mean the append was reached | Run `o status`, then the same command again |
+
+- A writer that starts while the ledger is locked holds the channel; the next managed restart
+  recovers it.
+- If the retry is refused again, its new serial needs a new approval. A retry whose result is
+  uncertain is recorded and alarmed as any other POST, and the output continues.
+- A piece Discord refuses with 400 again has no exit in this build: its payload cannot be changed
+  or discarded. Escalate it as a separate fix.
+- The first approval creates `<runtime_root>/o_store/operator_resume.floor`. From then on the deploy
+  script refuses a source or a rollback target that does not record `o_ledger_operator_resume` as
+  `true`. Fix forward instead, and never delete approval lines from the ledger to get past it.
+
+An enabled re-post turn reports retained uncertain backlog with
+`[tui_o] re-post backlog retained`: `channel`, `count`, and `pieces` contain the serial, unit key,
+piece index and reason, without the payload. The sidecar marks each serial before the log is
+emitted; repeated turns, sidecar reopening and later activations do not repeat that report.
+These pieces do not enter the shared re-post budget and are not automatically re-posted.
+`[tui_o] re-post backlog report failed` blocks that re-post turn until the sidecar can be reopened
+and the report recorded. A missing log line is not proof of an empty backlog: a serial may already
+be marked reported, or the reporting step may have failed.
+
+## 8. Roll back after re-post activation
+
+An older binary that cannot read the `not_sent` ledger tag stops the channel writer with ledger
+damage if it encounters that tag. Turning re-post OFF does not end an existing request or prevent
+its terminal ledger append: a request waiting after HTTP 429 can append `not_sent` after OFF.
+Follow these steps in order before selecting that older binary:
+
+1. Confirm effective OFF.
+   Establish the complete list of channels that have ever had re-post enabled, including channels
+   no longer selected for activation. Confirm the effective re-post switch is OFF on every target
+   node, using its validated live value rather than a default or a file edit alone. Keep it OFF on
+   all nodes through the rollback decision.
+2. Wait for in-flight requests and writer quiescence.
+   Wait for existing requests to end and their terminal ledger appends to complete, then confirm
+   the affected writer tasks have ended and joined with no ledger writes still possible. An HTTP
+   in-flight count of zero alone does not prove writer quiescence. Keep the writers quiescent from
+   the ledger inspection through the decision; do not restart them between those steps.
+3. Inspect all activated channel ledgers.
+   Read every ledger in the complete activation list at
+   `<runtime_root>/o_store/<CHANNEL_ID>/ledger.jsonl`, using the runtime root that holds that channel.
+   Run this check for each ledger and retain every result:
+
+   ```sh
+   rg -n '"type"[[:space:]]*:[[:space:]]*"not_sent"' '<runtime_root>/o_store/<CHANNEL_ID>/ledger.jsonl'
+   ```
+
+   Exit 0 means the tag is present; exit 1 means it is absent in that file; exit 2 or higher means
+   the read failed. One tag-free file is not evidence for the other activated channels. Confirm
+   each ledger was read completely and that every channel in the activation list was checked.
+4. Decide whether the older binary may run.
+   REFUSE the older binary if any ledger contains `not_sent`, any ledger cannot be read completely,
+   or the full activation list cannot be established. Only complete, successful reads with zero
+   `not_sent` tags across all activated ledgers allow this reader compatibility check to pass.
+   The existing O writer rollback restrictions in §6 and operator-resume floor in §7 still apply.
+   OFF does not remove existing tags. Do not delete or automatically convert `not_sent` records,
+   or infer conversions from old Prepared/NotFound records. Keep a binary that supports the tag
+   until a separately verified compatible recovery procedure is available.
+
+This is a manual rollback procedure. A re-post rollback preflight in `scripts/deploy-release.sh`
+is follow-up work and is not implemented here.
+
+## 9. Resolve an unseen resume boundary
+
+An in-session resume can bind a transcript the O writer has never seen. If that source has no
+stored cursor or rotation link and no verified parent, its boundary is `Pending { candidates: [0] }`
+and the writer raises `BoundaryPending`. The candidate `0` is not an approved delivery start.
+While Pending, the source spools both history and new output but posts neither; its spool is
+ineligible for GC. The alarm appears in `/api/health` as `tui_o:boundary_pending:<channel>` and
+raises health to at least degraded. It reports withheld output, not proof of loss or duplication.
+
+Run the following procedure on the O home:
+
+1. Identify the channel and resumed source from the `BoundaryPending` alarm. Inspect the transcript
+   and establish the first record that should be delivered after resume. Keep its exact byte start
+   or unique record UUID, excluding the historical prefix while retaining all new owed output.
+2. Record that start using the source's spool key or transcript path:
+
+   ```sh
+   agentdesk o boundary resolve --channel <CHANNEL_ID> --source '<KEY_OR_PATH>' --from '<BYTE_OFFSET_OR_UUID>' --operator '<NAME>'
+   ```
+
+   `--operator` defaults to `operator`. A `--from` that parses as an unsigned integer is a byte
+   offset; otherwise it is a UUID. The source selector must match exactly one stored source,
+   whose boundary must be Pending and whose file identity must still match. A numeric `--from`
+   validates a line-start byte offset, not the existence of a complete record: newline-aligned
+   EOF, offset 0 in an empty file, and the start of an incomplete trailing line can pass. UUID
+   lookup requires exactly one matching complete JSON line. An already recorded resolution is
+   refused with an instruction to restart the writer (`src/cli/o.rs:48–83`,
+   `src/services/tui_o/store/rotation.rs:220–285`).
+   Neither check proves the resume boundary; leave the source Pending unless the first owed
+   position can be established.
+3. Wait for the command to succeed, then use the managed restart path. The command only appends
+   and fsyncs `BoundaryResolved`; it sends no output and applies at the next writer start. That
+   start changes Pending to `Owed { from }` and replays the retained spool. Confirm that the
+   historical range `[0, from)` is not posted and the owed output at or after `from` is delivered.
+
+Automatic resume byte boundaries and automatic re-evaluation of existing resume Pending states
+are not provided. Hook publication time, elapsed time and current EOF do not prove the resume
+position. Reopening automatic boundary work requires a provider signal proving the exact resume
+byte position or a separately verified boundary contract.
+
+See the [TUI O resume contract](relay-state-contract.md#appendix-tui-o-unseen-resume-boundary)
+for current-main code coordinates, acceptance-test assertions and the health follow-up.

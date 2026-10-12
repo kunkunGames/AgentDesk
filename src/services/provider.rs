@@ -7,11 +7,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 pub(crate) mod cancel_token_claude_interrupt;
 pub(crate) mod cancel_token_cleanup;
+mod cancel_token_codex_owed;
 mod cancel_watchdog;
 pub(crate) mod channel_rules;
+pub(crate) mod herdr_before_start;
 mod output_reader;
 mod registry;
 pub(crate) mod session_probe;
+pub(crate) use output_reader::herdr_provider_terminal_only;
 pub use output_reader::{fold_read_output_result, poll_output_file_until_result};
 #[cfg(test)]
 pub(crate) mod read_fault;
@@ -712,11 +715,20 @@ pub struct CancelToken {
     /// Wrapper prompt handoff completed before its JSONL user envelope appeared.
     /// The stop path must treat this window as submitted, not as prior-turn idle.
     claude_interrupt_submit_pending: AtomicBool,
+    /// Herdr-only input observation and user-stop intent; absent on all existing paths.
+    herdr_interrupt:
+        Mutex<Option<std::sync::Arc<cancel_token_claude_interrupt::HerdrInterruptState>>>,
+    /// The protected request attempt this turn's executor started; absent on every legacy turn.
+    replay_attempt: std::sync::OnceLock<
+        std::sync::Arc<crate::services::discord::replay_policy::live::LiveAttempt>,
+    >,
     /// Lifecycle-aware restart/handoff mode for inflight preservation.
     pub restart_mode: AtomicU8,
     /// Independent destructive claims prevent a PID-only cleanup from suppressing tmux cleanup.
     pub(crate) pid_kill_claim: AtomicU8,
     pub(crate) name_kill_claim: AtomicU8,
+    /// The exact Codex episode record owed delivery checks; unset on every current path.
+    codex_owed: std::sync::OnceLock<std::sync::Arc<cancel_token_codex_owed::Record>>,
 }
 
 impl CancelToken {
@@ -747,14 +759,31 @@ impl CancelToken {
                 .fetch_add(1, Ordering::Relaxed),
             turn_nonce,
             claude_interrupt_submit_pending: AtomicBool::new(false),
+            herdr_interrupt: Mutex::new(None),
+            replay_attempt: std::sync::OnceLock::new(),
             restart_mode: AtomicU8::new(0),
             pid_kill_claim: AtomicU8::new(0),
             name_kill_claim: AtomicU8::new(0),
+            codex_owed: std::sync::OnceLock::new(),
         }
     }
 
     pub fn turn_nonce(&self) -> Option<&str> {
         self.turn_nonce.as_deref()
+    }
+
+    pub(crate) fn replay_attempt(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::services::discord::replay_policy::live::LiveAttempt>> {
+        self.replay_attempt.get()
+    }
+
+    /// Binds the attempt whose start permit this turn's executor spent; at most once per token.
+    pub(crate) fn attach_replay_attempt(
+        &self,
+        live: std::sync::Arc<crate::services::discord::replay_policy::live::LiveAttempt>,
+    ) -> bool {
+        self.replay_attempt.set(live).is_ok()
     }
 
     pub fn mark_completion_cleanup(&self) {
@@ -931,6 +960,7 @@ impl CancelToken {
             e.into_inner()
         });
         self.set_cancel_source_locked(source);
+        let _record = self.codex_owed_publication();
         self.cancelled.store(true, Ordering::Release);
     }
 
@@ -940,6 +970,7 @@ impl CancelToken {
             e.into_inner()
         });
         self.set_cancel_source_if_absent_locked(source);
+        let _record = self.codex_owed_publication();
         self.cancelled.store(true, Ordering::Release);
     }
 

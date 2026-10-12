@@ -3,10 +3,8 @@ use poise::serenity_prelude as serenity;
 use super::super::formatting::{send_long_message_ctx, truncate_str};
 use super::super::outbound::confirmation::send_command_confirmation_message;
 use super::super::router::{IntakeDeps, IntakeOrigin, dispatch_skill_intake};
-use super::super::{
-    Context, Error, auto_restore_session, check_auth, mailbox_cancel_active_turn,
-    mailbox_has_active_turn,
-};
+use super::super::turn_bridge::CommandStop;
+use super::super::{Context, Error, auto_restore_session, check_auth, mailbox_has_active_turn};
 use crate::services::provider::ProviderKind;
 
 // Keep provider-specific skill wording in one helper so /skill, /cc, !skill,
@@ -182,34 +180,45 @@ async fn run_skill_slash_command(
             if !super::enforce_slash_command_policy(&ctx, "/stop").await? {
                 return Ok(());
             }
-            let channel_id = ctx.channel_id();
-            let result = mailbox_cancel_active_turn(&ctx.data().shared, channel_id).await;
-            match result.token {
-                Some(token) => {
-                    if result.already_stopping {
-                        ctx.say(super::ALREADY_STOPPING_RESPONSE).await?;
-                        return Ok(());
+            let permit = crate::services::cluster::channel_home::admit_command(
+                &ctx.channel_id().get().to_string(),
+                ctx.data().provider.as_str(),
+            )?;
+            return crate::services::cluster::channel_home::command_scope(permit, async {
+                let (shared, provider) = (&ctx.data().shared, &ctx.data().provider);
+                let begin = super::super::turn_bridge::begin_user_stop;
+                let reason = format!("{invoked_as} stop");
+                match begin(shared, provider, ctx.channel_id(), false, &reason).await {
+                    CommandStop::Session(stop) => {
+                        ctx.say(super::STOPPING_RESPONSE).await?;
+                        stop.interrupt(&format!("{invoked_as} stop")).await;
                     }
-                    ctx.say(super::STOPPING_RESPONSE).await?;
-                    super::super::turn_bridge::stop_active_turn(
-                        &ctx.data().provider,
-                        &token,
-                        super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
-                        &format!("{invoked_as} stop"),
-                    )
-                    .await;
-                    log_info_event!(
-                        "discord_cancel_signal_sent",
-                        channel_id = ctx.channel_id().get(),
-                        provider = ctx.data().provider.as_str(),
-                        status = "sent",
-                    );
+                    CommandStop::Stop(stop) => {
+                        ctx.say(super::STOPPING_RESPONSE).await?;
+                        let policy = super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession;
+                        stop.stop(policy, &format!("{invoked_as} stop")).await;
+                        log_info_event!(
+                            "discord_cancel_signal_sent",
+                            channel_id = ctx.channel_id().get(),
+                            provider = ctx.data().provider.as_str(),
+                            status = "sent",
+                        );
+                    }
+                    other => {
+                        let response = match other {
+                            // The turn stays with its provider; nothing was cancelled.
+                            #[cfg(unix)]
+                            CommandStop::Herdr(stop) => stop.reply(),
+                            CommandStop::AlreadyStopping => super::ALREADY_STOPPING_RESPONSE,
+                            CommandStop::HostRefused => super::HOST_REFUSED_STOP_RESPONSE,
+                            _ => super::NO_ACTIVE_TURN_RESPONSE,
+                        };
+                        ctx.say(response).await?;
+                    }
                 }
-                None => {
-                    ctx.say(super::NO_ACTIVE_TURN_RESPONSE).await?;
-                }
-            }
-            return Ok(());
+                Ok(())
+            })
+            .await;
         }
         "pwd" => {
             let current_path = {

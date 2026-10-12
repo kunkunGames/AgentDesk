@@ -1,21 +1,34 @@
 //! One channel's delivery. For each piece: take the delivery lease, then under the ownership gate
-//! fsync `Prepared` and start the POST, record the result, and settle unclear ones.
+//! (a delegated channel's home gate) fsync `Prepared` and start the POST, record the result, and
+//! settle unclear ones.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::task::Poll;
 use std::time::Duration;
 
-use tokio::sync::oneshot;
+use futures::FutureExt;
+use tokio::sync::{oneshot, watch};
 
 use super::confirm::{self, Verdict};
 use super::pieces::{Derived, PieceWork};
-use super::{AlarmSink, DeliveryLease, DiscordPort, PostOutcome, WriterAlarm};
+use super::{AlarmSink, DeliveryLease, DiscordPort, PostOutcome, SeenMessage, WriterAlarm};
+use crate::services::cluster::channel_home;
 use crate::services::tui_o::ownership::OwnershipGate;
+use crate::services::tui_o::repost::admission::OriginalGate;
+use crate::services::tui_o::repost::dispatch::{DispatchPermit, RepostWriter};
+use crate::services::tui_o::repost::runner::{RepostHook, TurnWriter};
+use crate::services::tui_o::repost::send::{DispatchReport, WireOutcome};
+use crate::services::tui_o::shadow::SourceId;
 use crate::services::tui_o::store::ChannelStore;
-use crate::services::tui_o::store::ledger::{LedgerEntry, LedgerState, PieceOutcome};
+use crate::services::tui_o::store::ledger::{
+    LedgerEntry, LedgerState, PieceDisposition, PieceOutcome, PieceRecord, Unsent,
+};
+use crate::services::tui_prompt_dedupe::codex_verified::provenance::admission::EpisodePermissionRecord;
+use crate::services::tui_prompt_dedupe::codex_verified::provenance::dormant::OwedOrigin;
 
 /// A POST still unanswered by then is treated as uncertain and settled from history.
 pub const POST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -30,7 +43,12 @@ pub enum Step {
     NoGateway,
     /// The channel stays stopped until an operator acts; its alarm is raised.
     Stopped,
+    /// The exact episode permit refused the piece before its `Prepared`; it stays owed.
+    Withheld,
 }
+
+/// Verified owed work's exact permit, checked under the gate before `Prepared` is appended.
+pub(crate) type Admission<'a> = (&'a EpisodePermissionRecord, &'a OwedOrigin);
 
 /// Highest message id O posted per channel in this process; Legacy keeps its live panel below it.
 static LAST_POSTED: LazyLock<Mutex<HashMap<u64, u64>>> = LazyLock::new(Mutex::default);
@@ -79,6 +97,73 @@ fn note_posted(channel: u64, msg_id: u64) {
     *last = (*last).max(msg_id);
 }
 
+type Counts = Mutex<BTreeMap<u64, Arc<AtomicUsize>>>;
+
+/// POSTs started per Herdr-configured channel in this process and not ended yet. A channel's
+/// writers share one count, so a POST that outlives its writer still counts. Tests keep one per thread.
+#[cfg(not(test))]
+static IN_FLIGHT: Counts = Mutex::new(BTreeMap::new());
+#[cfg(test)]
+thread_local! {
+    static IN_FLIGHT: Counts = const { Mutex::new(BTreeMap::new()) };
+}
+
+fn with_in_flight<R>(use_counts: impl FnOnce(&mut BTreeMap<u64, Arc<AtomicUsize>>) -> R) -> R {
+    let locked =
+        |counts: &Counts| use_counts(&mut counts.lock().unwrap_or_else(PoisonError::into_inner));
+    #[cfg(not(test))]
+    return locked(&IN_FLIGHT);
+    #[cfg(test)]
+    IN_FLIGHT.with(locked)
+}
+
+/// The POSTs of `channel` started and not ended in this process; `None` until a writer of the
+/// channel counted them.
+pub fn posts_in_flight(channel: u64) -> Option<usize> {
+    with_in_flight(|counts| {
+        counts
+            .get(&channel)
+            .map(|count| count.load(Ordering::SeqCst))
+    })
+}
+
+/// Counts one POST from before its request exists until the request is dropped, ended or aborted.
+struct Running(Arc<AtomicUsize>);
+
+type RepostCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+
+fn source_delivery_allowed(channel: u64, sources: impl IntoIterator<Item = SourceId>) -> bool {
+    crate::services::tui_prompt_dedupe::codex_verified_channel_delivery_allowed(channel)
+        && sources.into_iter().all(|source| {
+            crate::services::tui_prompt_dedupe::codex_verified_o_source_allowed(channel, &source)
+        })
+}
+
+impl Running {
+    fn start(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A delegated channel posts only through its registered home gate, which also ends a lapsed hold;
+/// any other channel through the writer's gate. A channel whose delegation is unavailable posts none.
+fn admit<T>(gate: &OwnershipGate, channel: u64, hand_off: impl FnOnce(u64) -> T) -> Option<T> {
+    if crate::services::cluster::home_availability::refusal(channel).is_some() {
+        return None;
+    }
+    match channel_home::registered_channel(channel) {
+        Some(home) => home.admit_post(hand_off),
+        None => gate.admit(hand_off),
+    }
+}
+
 type Request = Pin<Box<dyn Future<Output = PostOutcome> + Send>>;
 
 /// A POST admitted under the gate: finished on its first poll, or still running.
@@ -88,8 +173,21 @@ enum Started {
 }
 
 enum Refusal {
-    Store(String),
+    /// The `Prepared` append failed, so no POST was created for it.
+    Store {
+        detail: String,
+        unsent: Option<Box<Unsent>>,
+    },
     Violation(String),
+    Withheld(&'static str),
+}
+
+/// A writer's first stop, the store I/O error behind it, and a prepared piece it never posted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StopCause {
+    pub alarm: WriterAlarm,
+    pub io: Option<std::io::ErrorKind>,
+    pub unsent: Option<Unsent>,
 }
 
 /// Rides in the POST task so the delivery lease is released only once that task can no longer
@@ -114,12 +212,30 @@ pub struct ChannelWriter<P, L, A> {
     port: Arc<P>,
     lease: L,
     alarms: A,
-    stopped: bool,
+    stopped: Option<StopCause>,
     paused: bool,
+    /// The channel's shared POST count; only a Herdr-configured channel keeps one.
+    posts: Option<Arc<AtomicUsize>>,
+    /// The channel's re-post turn, run from the same actor turn as its posts.
+    repost: Option<Box<dyn RepostHook<Self>>>,
+    repost_live: RepostLive,
+    repost_switch: Mutex<Option<RepostCheck>>,
+    repost_stops: Vec<watch::Receiver<bool>>,
+}
+
+/// Whether a re-post request may still leave: re-post on and the writer neither stopped nor gone.
+#[derive(Default)]
+struct RepostLive(Arc<AtomicBool>);
+
+impl Drop for RepostLive {
+    /// A request still running after its writer was dropped never sends again.
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
-    /// A recovered ledger with a violation or a refused POST stops the channel before any POST.
+    /// A violation or an unapproved latest refusal stops the recovered channel before any POST.
     pub fn new(
         store: ChannelStore,
         gate: Arc<OwnershipGate>,
@@ -128,7 +244,12 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
         alarms: A,
     ) -> Self {
         let channel = store.init().channel;
-        let (stopped, paused) = (false, false);
+        let (stopped, paused) = (None, false);
+        let herdr = crate::config::session_hosts::herdr_endpoint(channel).is_some();
+        let shared = |counts: &mut BTreeMap<_, Arc<AtomicUsize>>| {
+            Arc::clone(counts.entry(channel).or_default())
+        };
+        let posts = herdr.then(|| with_in_flight(shared));
         let mut writer = Self {
             channel,
             store,
@@ -138,20 +259,71 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
             alarms,
             stopped,
             paused,
+            posts,
+            repost: None,
+            repost_live: RepostLive::default(),
+            repost_switch: Mutex::new(None),
+            repost_stops: Vec::new(),
         };
         let ledger = writer.store.ledger();
         seed_last_posted(channel, ledger);
-        let refused =
-            (0..ledger.next_serial()).find_map(|serial| match ledger.piece(serial)?.outcome {
-                Some(PieceOutcome::Rejected(status)) => Some(status),
-                _ => None,
-            });
+        let refused = ledger.blocked();
         if let Some(detail) = ledger.violation().map(str::to_string) {
             writer.stop(WriterAlarm::LedgerViolation { detail });
-        } else if let Some(status) = refused {
+        } else if let Some((serial, status)) = refused {
+            tracing::warn!(
+                channel,
+                serial,
+                status,
+                "[tui_o] latest rejected piece needs operator approval"
+            );
             writer.stop(WriterAlarm::Blocked { status });
         }
         writer
+    }
+
+    /// Gives the writer its re-post turn, if its host has one.
+    pub(crate) fn with_repost(mut self, hook: Option<Box<dyn RepostHook<Self>>>) -> Self {
+        self.repost = hook;
+        self
+    }
+
+    pub(crate) fn with_repost_stop(mut self, stop: watch::Receiver<bool>) -> Self {
+        self.repost_stops.push(stop);
+        self
+    }
+
+    /// Outstanding ordinary pieces pin retired cursors; re-post turns have nothing owed.
+    pub(crate) fn delivery_allowed(&self, owing: bool) -> bool {
+        source_delivery_allowed(
+            self.channel,
+            self.store
+                .cursors()
+                .filter(|cursor| !cursor.retired || owing)
+                .map(|cursor| cursor.source.clone()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn repost_posts_counter(&mut self) -> Arc<AtomicUsize> {
+        let channel = self.channel;
+        self.posts
+            .get_or_insert_with(|| {
+                with_in_flight(|counts| Arc::clone(counts.entry(channel).or_default()))
+            })
+            .clone()
+    }
+
+    /// One re-post turn, after this poll's owed pieces; nothing without a turn or once stopped.
+    pub(crate) async fn repost_turn(&mut self) {
+        if self.is_stopped() {
+            return;
+        }
+        let Some(mut hook) = self.repost.take() else {
+            return;
+        };
+        hook.turn(self).await;
+        self.repost = Some(hook);
     }
 
     pub fn store(&mut self) -> &mut ChannelStore {
@@ -163,17 +335,40 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
     }
 
     pub fn is_stopped(&self) -> bool {
-        self.stopped
+        self.stopped.is_some()
+    }
+
+    pub fn stop_cause(&self) -> Option<&StopCause> {
+        self.stopped.as_ref()
     }
 
     pub fn alarm(&self, alarm: WriterAlarm) {
         self.alarms.raise(self.channel, alarm);
     }
 
+    pub fn waiting_cleared(&self) {
+        self.alarms.waiting_cleared(self.channel);
+    }
+
+    pub fn reconcile_reader_count(&self, count: usize) {
+        self.alarms.reconcile_reader_count(self.channel, count);
+    }
+
     /// Stops the channel once; only the first stop raises its alarm.
     pub fn stop(&mut self, alarm: WriterAlarm) -> Step {
-        if !self.stopped {
-            self.stopped = true;
+        self.stop_with(alarm, None)
+    }
+
+    /// The store's I/O error is read now, as the error that caused the first stop is just behind it.
+    fn stop_with(&mut self, alarm: WriterAlarm, unsent: Option<Unsent>) -> Step {
+        self.repost_live.0.store(false, Ordering::SeqCst);
+        if self.stopped.is_none() {
+            let (kept, io) = (alarm.clone(), self.store.io_failure());
+            self.stopped = Some(StopCause {
+                alarm: kept,
+                io,
+                unsent,
+            });
             self.alarms.raise(self.channel, alarm);
         }
         Step::Stopped
@@ -202,7 +397,16 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
     }
 
     pub async fn deliver(&mut self, item: &Derived) -> Step {
-        if self.stopped {
+        self.deliver_admitted(item, None).await
+    }
+
+    /// As [`Self::deliver`]; a piece with an admission posts only while its exact permit holds.
+    pub(crate) async fn deliver_admitted(
+        &mut self,
+        item: &Derived,
+        admission: Option<Admission<'_>>,
+    ) -> Step {
+        if self.is_stopped() {
             return Step::Stopped;
         }
         if let Err(step) = self.settle_open().await {
@@ -222,54 +426,127 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
                 self.record(LedgerEntry::Excluded { unit_key, reason })
                     .map_or_else(|step| step, |()| Step::Done)
             }
-            Derived::Piece(piece) => self.deliver_piece(piece).await,
+            Derived::Piece(piece) => self.deliver_piece(piece, admission).await,
         }
     }
 
-    async fn deliver_piece(&mut self, piece: &PieceWork) -> Step {
+    async fn deliver_piece(&mut self, piece: &PieceWork, admission: Option<Admission<'_>>) -> Step {
         let ledger = self.store.ledger();
         if ledger.excluded(&piece.unit_key).is_some() {
             return Step::Done;
         }
-        let earlier = ledger.latest_piece(&piece.unit_key, piece.index);
-        if let Some(outcome) = earlier.map(|(_, earlier)| earlier.outcome.clone()) {
-            return match outcome {
-                Some(PieceOutcome::Rejected(status)) => self.stop(WriterAlarm::Blocked { status }),
-                Some(_) => Step::Done,
-                None => self.stop(WriterAlarm::LedgerViolation {
+        let (piece, approved) = match ledger.disposition(&piece.unit_key, piece.index) {
+            PieceDisposition::Blocked { serial, status } => {
+                tracing::warn!(channel = self.channel, serial, status, unit_key = ?piece.unit_key,
+                    "[tui_o] latest rejected piece needs operator approval");
+                return self.stop(WriterAlarm::Blocked { status });
+            }
+            PieceDisposition::Settled => return Step::Done,
+            PieceDisposition::Open { .. } => {
+                return self.stop(WriterAlarm::LedgerViolation {
                     detail: "open piece after settling".into(),
-                }),
-            };
-        }
+                });
+            }
+            PieceDisposition::Authorized { rejected_serial } => {
+                let Some(original) = ledger.piece(rejected_serial) else {
+                    return self.stop(WriterAlarm::LedgerViolation {
+                        detail: "approved piece missing".into(),
+                    });
+                };
+                if original.payload != piece.payload {
+                    tracing::warn!(channel = self.channel, rejected_serial, unit_key = ?piece.unit_key,
+                        "[tui_o] rederived payload differs; sending ledger payload");
+                }
+                (
+                    PieceWork {
+                        unit_key: original.unit_key.clone(),
+                        index: original.piece_index,
+                        payload: original.payload.clone(),
+                    },
+                    Some(rejected_serial),
+                )
+            }
+            PieceDisposition::Fresh => (piece.clone(), None),
+        };
         let (serial, anchor_id) = (ledger.next_serial(), ledger.anchor());
+        if approved.is_none()
+            && let Some(mut hook) = self.repost.take()
+        {
+            let record = PieceRecord {
+                unit_key: piece.unit_key.clone(),
+                piece_index: piece.index,
+                payload: piece.payload.clone(),
+                anchor_id,
+                epoch: 0,
+                prepared_at: chrono::Utc::now(),
+                outcome: None,
+            };
+            let gate = hook.original(serial, record).await;
+            self.repost = Some(hook);
+            match gate {
+                OriginalGate::Send => {}
+                // Re-post owns an admitted piece's sends; its original is never sent again.
+                OriginalGate::Admitted => return Step::Done,
+                // Unknown admission holds the piece and retries it on a later poll.
+                OriginalGate::Unknown => return Step::LeaseBusy,
+            }
+        }
         let Some(held) = self.lease.try_acquire(self.channel, serial) else {
             return Step::LeaseBusy;
         };
         let (gate, port, channel) = (Arc::clone(&self.gate), Arc::clone(&self.port), self.channel);
+        let mut posts = self.posts.clone();
         let store = &mut self.store;
         // The first poll of the request runs under the gate, so no request starts after a
         // transition; the rest runs outside the lock.
         let admitted = poll_fn(|cx| {
-            Poll::Ready(gate.admit(|epoch| {
-                let prepared = LedgerEntry::Prepared {
-                    serial,
-                    unit_key: piece.unit_key.clone(),
-                    piece_index: piece.index,
-                    payload: piece.payload.clone(),
-                    anchor_id,
-                    epoch,
+            Poll::Ready(admit(&gate, channel, |epoch| {
+                // The exact permit is checked first and its lock held through the first poll.
+                let mut start = || {
+                    let prepared = || LedgerEntry::Prepared {
+                        serial,
+                        unit_key: piece.unit_key.clone(),
+                        piece_index: piece.index,
+                        payload: piece.payload.clone(),
+                        anchor_id,
+                        epoch,
+                    };
+                    // Returning here comes before `port.post`, so this piece's POST was never created.
+                    store
+                        .append_ledger(prepared())
+                        .map_err(|error| Refusal::Store {
+                            detail: format!("{error:?}"),
+                            unsent: Unsent::new(prepared()).map(Box::new),
+                        })?;
+                    if let Some(detail) = store.ledger().violation() {
+                        return Err(Refusal::Violation(detail.to_string()));
+                    }
+                    if let Some(rejected_serial) = approved {
+                        tracing::info!(channel, rejected_serial, serial, unit_key = ?piece.unit_key,
+                        "[tui_o] operator approval consumed by Prepared");
+                    }
+                    let running = posts.take().map(Running::start);
+                    let post = port.post(channel, piece.payload.clone());
+                    // `map` forwards each poll to the request; the count ends when it is ready or dropped.
+                    let mut request: Request = match running {
+                        Some(running) => Box::pin(post.map(move |outcome| {
+                            drop(running);
+                            outcome
+                        })),
+                        None => Box::pin(post),
+                    };
+                    Ok(match request.as_mut().poll(cx) {
+                        Poll::Ready(outcome) => Started::Done(outcome),
+                        Poll::Pending => Started::Running(request),
+                    })
                 };
-                store
-                    .append_ledger(prepared)
-                    .map_err(|error| Refusal::Store(format!("{error:?}")))?;
-                if let Some(detail) = store.ledger().violation() {
-                    return Err(Refusal::Violation(detail.to_string()));
+                match admission {
+                    None => start(),
+                    Some((record, origin)) => {
+                        let started = record.admit(origin, start);
+                        started.unwrap_or_else(|reason| Err(Refusal::Withheld(reason)))
+                    }
                 }
-                let mut request: Request = Box::pin(port.post(channel, piece.payload.clone()));
-                Ok(match request.as_mut().poll(cx) {
-                    Poll::Ready(outcome) => Started::Done(outcome),
-                    Poll::Pending => Started::Running(request),
-                })
             }))
         })
         .await;
@@ -280,9 +557,16 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
                 }
                 return Step::NoGateway;
             }
-            Some(Err(Refusal::Store(detail))) => return self.stop(WriterAlarm::Halted { detail }),
+            Some(Err(Refusal::Store { detail, unsent })) => {
+                return self.stop_with(WriterAlarm::Halted { detail }, unsent.map(|u| *u));
+            }
             Some(Err(Refusal::Violation(detail))) => {
                 return self.stop(WriterAlarm::LedgerViolation { detail });
+            }
+            Some(Err(Refusal::Withheld(reason))) => {
+                tracing::info!(channel, reason, unit_key = ?piece.unit_key,
+                    "[tui_o] verified piece withheld before Prepared");
+                return Step::Withheld;
             }
             Some(Ok(started)) => started,
         };
@@ -331,6 +615,12 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
                 }
             }
             PostOutcome::Refused(status) => {
+                tracing::warn!(
+                    channel = self.channel,
+                    serial,
+                    status,
+                    "[tui_o] POST rejected; this serial needs a new operator approval"
+                );
                 if let Err(step) = self.record(LedgerEntry::Rejected { serial, status }) {
                     return step;
                 }
@@ -398,5 +688,148 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
             self.alarms.raise(self.channel, alarm);
         }
         Ok(())
+    }
+}
+
+impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> RepostWriter for ChannelWriter<P, L, A> {
+    type Lease = L::Held;
+
+    async fn settle_open(&mut self) -> bool {
+        ChannelWriter::settle_open(self).await.is_ok() && self.store.ledger().unresolved().is_none()
+    }
+
+    /// Rechecks the actor's channel and retained-source policy at the final grant boundary.
+    fn guard(&self) -> Result<(), String> {
+        if let Some(cause) = &self.stopped {
+            return Err(format!("writer stopped: {:?}", cause.alarm));
+        }
+        if !self.repost_live.0.load(Ordering::SeqCst) {
+            return Err("re-post is off".into());
+        }
+        if !self.live()() {
+            return Err("re-post authority withdrawn".into());
+        }
+        Ok(())
+    }
+
+    fn try_lease(&self) -> Option<L::Held> {
+        let serial = self.store.ledger().next_serial();
+        self.lease.try_acquire(self.channel, serial)
+    }
+
+    fn gate(&self) -> Arc<OwnershipGate> {
+        Arc::clone(&self.gate)
+    }
+
+    fn live(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let live = Arc::clone(&self.repost_live.0);
+        let effective = self
+            .repost_switch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let stops = self.repost_stops.clone();
+        let channel = self.channel;
+        let sources: Arc<[SourceId]> = self
+            .store
+            .cursors()
+            .filter(|cursor| !cursor.retired)
+            .map(|cursor| cursor.source.clone())
+            .collect();
+        Arc::new(move || {
+            live.load(Ordering::SeqCst)
+                && effective.as_ref().is_some_and(|enabled| enabled())
+                && stops.iter().all(|stop| !*stop.borrow())
+                && channel_home::registered_channel(channel).is_none()
+                && crate::services::cluster::home_availability::refusal(channel).is_none()
+                && source_delivery_allowed(channel, sources.iter().cloned())
+        })
+    }
+
+    fn start_request(&self) -> Box<dyn Send> {
+        Box::new(
+            self.posts
+                .as_ref()
+                .map(|posts| Running::start(Arc::clone(posts))),
+        )
+    }
+
+    fn prepare(&mut self, epoch: u64, permit: &DispatchPermit) -> Result<(), String> {
+        let ledger = self.store.ledger();
+        let (serial, anchor_id) = (ledger.next_serial(), ledger.anchor());
+        let prepared = || LedgerEntry::Prepared {
+            serial,
+            unit_key: permit.key().unit().clone(),
+            piece_index: permit.key().piece_index(),
+            payload: permit.payload().to_owned(),
+            anchor_id,
+            epoch,
+        };
+        // As for an original: a failed append created no request, and recovery may drop it.
+        if let Err(error) = self.store.append_ledger(prepared()) {
+            let detail = format!("{error:?}");
+            let alarm = WriterAlarm::Halted {
+                detail: detail.clone(),
+            };
+            self.stop_with(alarm, Unsent::new(prepared()));
+            return Err(detail);
+        }
+        if let Some(detail) = self.store.ledger().violation().map(str::to_string) {
+            self.stop(WriterAlarm::LedgerViolation {
+                detail: detail.clone(),
+            });
+            return Err(detail);
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, report: &DispatchReport) -> impl Future<Output = ()> + Send {
+        let outcome = match &report.outcome {
+            WireOutcome::Created(created) => PostOutcome::Created(SeenMessage {
+                id: created.id,
+                author_id: created.author_id,
+                content: created.content.clone(),
+            }),
+            WireOutcome::Refused(status) => PostOutcome::Refused(*status),
+            other => PostOutcome::Uncertain(format!("{other:?}")),
+        };
+        async move {
+            // The re-post's Prepared is the open one; it settles like any other piece.
+            let Some((serial, open)) = self.store.ledger().unresolved() else {
+                return;
+            };
+            if matches!(
+                report.outcome,
+                WireOutcome::Unsent(_) | WireOutcome::Throttled
+            ) && report.counted == 0
+                && report.wire == report.throttled
+            {
+                let _ = self.record(LedgerEntry::NotSent { serial });
+                return;
+            }
+            let payload = open.payload.clone();
+            self.record_outcome(serial, &payload, outcome).await;
+        }
+    }
+}
+
+impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> TurnWriter for ChannelWriter<P, L, A> {
+    fn bind_switch(&self, effective: RepostCheck) {
+        *self
+            .repost_switch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(effective);
+    }
+    fn channel(&self) -> u64 {
+        self.channel
+    }
+
+    fn ledger(&mut self) -> &LedgerState {
+        self.store.ledger()
+    }
+
+    fn set_live(&self, live: bool) {
+        let live = live && self.stopped.is_none();
+        self.repost_live.0.store(live, Ordering::SeqCst);
     }
 }

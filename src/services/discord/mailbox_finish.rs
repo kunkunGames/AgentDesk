@@ -1,17 +1,20 @@
 use poise::serenity_prelude as serenity;
 use serenity::ChannelId;
 
-use crate::services::provider::ProviderKind;
+use std::sync::Arc;
+
+use crate::services::provider::{CancelToken, ProviderKind};
 use crate::services::turn_orchestrator::registry_purge::{MailboxRefusal, retry_while_closed};
 use crate::services::turn_orchestrator::{
     ChannelMailboxHandle, ClearChannelResult, FinishTurnResult, HydratePendingQueueResult,
+    TokenFinish,
 };
 
 use super::{
     SharedData, apply_queue_exit_feedback, queue_persistence_context, turn_completion_events,
 };
 
-fn unavailable_finish_turn_result() -> FinishTurnResult {
+pub(in crate::services::discord) fn unavailable_finish_turn_result() -> FinishTurnResult {
     FinishTurnResult {
         removed_token: None,
         has_pending: false,
@@ -39,30 +42,45 @@ pub(in crate::services::discord) async fn mailbox_clear_recovery_marker(
     handle.recovery_done().mark_done();
 }
 
-/// Recovery-only non-creating finish. Runtime selection must resolve an
-/// instance-local mailbox; a process-global mirror is not runtime identity.
-pub(in crate::services::discord) async fn mailbox_finish_owned_turn(
+/// Where a judged finish finds the channel's actor.
+pub(in crate::services::discord) enum MailboxLookup {
+    Create,
+    /// Recovery's non-creating lookup: an instance-local actor, never the process-global mirror.
+    Peek,
+}
+
+/// Finishes the channel's turn only while `expected` still keys it: the judged token, or `None`
+/// for a judged empty slot. Only a finish that ran marks recovery done and announces completion.
+pub(in crate::services::discord) async fn mailbox_finish_judged_turn(
     shared: &SharedData,
     provider: &ProviderKind,
     channel_id: ChannelId,
-) -> FinishTurnResult {
-    let Some(handle) = shared.mailbox_peek(channel_id) else {
-        return unavailable_finish_turn_result();
+    expected: Option<&Arc<CancelToken>>,
+    lookup: MailboxLookup,
+) -> TokenFinish {
+    let handle = match lookup {
+        MailboxLookup::Create => shared.mailbox(channel_id),
+        // No actor is registered in this instance; an entry is removed only on an idle or closed
+        // verdict or a dead actor's fallback. A successor admitted after this read is not seen.
+        MailboxLookup::Peek => match shared.mailbox_peek(channel_id) {
+            Some(handle) => handle,
+            None => return TokenFinish::NoMailbox,
+        },
     };
-    let result = handle
-        .finish_turn(queue_persistence_context(shared, provider, channel_id))
-        .await;
-    if !result.mailbox_online {
-        return result;
+    let persistence = queue_persistence_context(shared, provider, channel_id);
+    let finish = handle.finish_turn_if_token(expected.cloned(), persistence);
+    let finish = finish.await;
+    if let TokenFinish::Finished(result) | TokenFinish::NoActiveTurn(result) = &finish {
+        apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
+        handle.recovery_done().mark_done();
+        turn_completion_events::publish_mailbox_release_completion_event(
+            shared, channel_id, None, result,
+        );
     }
-    apply_queue_exit_feedback(shared, channel_id, &result.queue_exit_events).await;
-    handle.recovery_done().mark_done();
-    turn_completion_events::publish_mailbox_release_completion_event(
-        shared, channel_id, None, &result,
-    );
-    result
+    finish
 }
 
+#[cfg(test)]
 pub(in crate::services::discord) async fn mailbox_finish_cancelled_turn(
     shared: &SharedData,
     channel_id: ChannelId,
@@ -364,6 +382,16 @@ pub(super) fn legacy_restitution_refusal(refusal: MailboxRefusal) -> HydratePend
             persistence_error: Some("mailbox still purge-closed after retries".to_string()),
             ..Default::default()
         },
+        MailboxRefusal::InputFenced(reason) => {
+            tracing::warn!(
+                ?reason,
+                "input fence refused queue restitution; source retained"
+            );
+            HydratePendingQueueResult {
+                persistence_error: Some(format!("input fence: {reason:?}")),
+                ..Default::default()
+            }
+        }
         MailboxRefusal::Unreachable => HydratePendingQueueResult::default(),
     }
 }
@@ -380,5 +408,17 @@ mod relay_state_contract_refs {
         let _ = |snapshot: &crate::services::turn_orchestrator::ChannelMailboxSnapshot| {
             let _ = &snapshot.active_turn_nonce;
         };
+    }
+}
+
+#[cfg(test)]
+mod input_fence_contract_tests {
+    #[test]
+    fn input_fence_restitution_is_observable_failure() {
+        use crate::services::discord::input_runtime::fence::{Failure, Mode};
+        let result = super::legacy_restitution_refusal(super::MailboxRefusal::InputFenced(
+            Failure::Mode(Mode::Held),
+        ));
+        assert!(result.persistence_error.unwrap().contains("Held"));
     }
 }

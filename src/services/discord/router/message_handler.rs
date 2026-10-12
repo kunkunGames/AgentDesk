@@ -42,6 +42,7 @@ use url::Url;
 mod attachments;
 mod busy_retry;
 mod control;
+mod foreign_row;
 mod goal_lifecycle;
 mod headless_turn;
 mod intake_turn;
@@ -57,6 +58,8 @@ mod voice_announcement_scope;
 mod watchdog;
 
 use self::goal_lifecycle::*;
+#[cfg(test)]
+pub(in crate::services::discord) use self::provider_dispatch::producer_error_test_support::producer_error_frame;
 use self::provider_isolation::*;
 use self::tui_followup::*;
 pub(in crate::services::discord) use self::turn_lifecycle::mailbox_try_start_turn_with_terminal_marker_cleanup;
@@ -260,7 +263,7 @@ pub(in crate::services::discord) use self::headless_turn::{
     start_voice_headless_turn,
 };
 pub(in crate::services::discord) use self::intake_turn::IntakeDeps;
-pub(crate) use self::intake_turn::{IntakeRequest, execute_intake_turn_core};
+pub(crate) use self::intake_turn::{IntakeRequest, execute_intake_turn_core, start_exact_retry};
 // #4270 — pre-teardown hosted-TUI readiness probe + live-dispatch defer for the
 // queued-turn promote entrypoints (idle kickoff in discord/mod.rs, live
 // dispatch in gateway.rs).
@@ -277,7 +280,7 @@ pub(super) async fn finish_admitted_local(
     queued_drain: bool,
     preloaded_uploads: crate::services::cluster::attachment_transfer::uploads::PendingUploads,
     voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
-) -> Result<(), Error> {
+) -> Result<IntakeExecution, Error> {
     intake_turn::handle_text_message(
         deps,
         preserve_on_cancel,

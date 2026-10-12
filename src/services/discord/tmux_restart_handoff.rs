@@ -16,6 +16,8 @@ async fn load_dispatch_type_for_restart_handoff(
     shared: &SharedData,
     dispatch_id: &str,
 ) -> Option<String> {
+    #[cfg(test)]
+    retirement_await_tests::checkpoint("dispatch_lookup").await;
     let pool = shared.pg_pool.as_ref()?;
     sqlx::query("SELECT dispatch_type FROM task_dispatches WHERE id = $1")
         .bind(dispatch_id)
@@ -281,6 +283,10 @@ pub(super) async fn start_restart_handoff_from_state(
     state: super::inflight::InflightTurnState,
     best_response: &str,
 ) -> bool {
+    let handoff_started = std::time::Instant::now();
+    let Ok(_recovery) = super::live_bridge::try_recovery(provider_kind, state.channel_id) else {
+        return false;
+    };
     // O posts this channel's TUI body, so the handoff notice keeps only its marker.
     // A held destination identity keeps the inflight for retry, like a failed notice.
     let kind = (state.channel_id == channel_id.get())
@@ -360,17 +366,39 @@ pub(super) async fn start_restart_handoff_from_state(
                 "tmux session died mid-turn (watcher death recovery) — session={}",
                 state.tmux_session_name.as_deref().unwrap_or("<unknown>")
             );
-            super::turn_bridge::fail_dispatch_with_retry(
-                shared.api_port,
-                Some(dispatch_id),
-                &failure_text,
-            )
-            .await;
+            if super::health::legacy_supervision::legacy_retired(
+                provider_kind.as_str(),
+                channel_id.get(),
+                "watcher_death_dispatch_after_lookup",
+            ) {
+                return false;
+            }
+            #[cfg(test)]
+            let record_only = retirement_await_tests::record_dispatch_failure();
+            #[cfg(not(test))]
+            let record_only = false;
+            if !record_only {
+                super::turn_bridge::fail_dispatch_with_retry(
+                    shared.api_port,
+                    Some(dispatch_id),
+                    &failure_text,
+                )
+                .await;
+            }
         }
     }
 
+    #[cfg(test)]
+    retirement_await_tests::checkpoint("core_lock").await;
     let seeded_channel_name = {
         let mut data = shared.core.lock().await;
+        if super::health::legacy_supervision::legacy_retired(
+            provider_kind.as_str(),
+            channel_id.get(),
+            "watcher_death_metadata_after_lock",
+        ) {
+            return false;
+        }
         seed_restart_handoff_session_metadata(&mut data.sessions, channel_id, &state)
     };
     if seeded_channel_name {
@@ -387,8 +415,75 @@ pub(super) async fn start_restart_handoff_from_state(
         channel_id.get()
     );
 
-    super::inflight::clear_inflight_state(provider_kind, channel_id.get());
-    true
+    if !_recovery.is_guarded() {
+        super::inflight::clear_inflight_state(provider_kind, channel_id.get());
+        release_relinquished_turn_mailbox(shared, provider_kind, &state, handoff_started).await;
+        return true;
+    }
+    let outcome = match super::inflight::clear_inflight_state_for_snapshot(provider_kind, &state) {
+        super::inflight::GuardedClearOutcome::RebindOriginSkipped => {
+            super::inflight::clear_rebind_origin_inflight_state_if_matches_identity(
+                provider_kind,
+                state.channel_id,
+                &super::inflight::InflightTurnIdentity::from_state(&state),
+                state.turn_nonce.as_deref(),
+            )
+        }
+        outcome => outcome,
+    };
+    if matches!(
+        outcome,
+        super::inflight::GuardedClearOutcome::Cleared
+            | super::inflight::GuardedClearOutcome::Missing
+    ) {
+        release_relinquished_turn_mailbox(shared, provider_kind, &state, handoff_started).await;
+    }
+    !matches!(
+        outcome,
+        super::inflight::GuardedClearOutcome::UserMsgMismatch
+    )
+}
+
+/// Releases the dead turn's mailbox token when its bridge had already handed the relay away,
+/// since no bridge remains to finish it; the episode guard spares any other turn's token.
+async fn release_relinquished_turn_mailbox(
+    shared: &Arc<SharedData>,
+    provider_kind: &ProviderKind,
+    state: &super::inflight::InflightTurnState,
+    handoff_started: std::time::Instant,
+) {
+    if state.effective_relay_owner_kind() == super::inflight::RelayOwnerKind::None
+        || state.channel_id == 0
+        || state.user_msg_id == 0
+    {
+        return;
+    }
+    let channel = ChannelId::new(state.channel_id);
+    let finish = super::mailbox_finish::mailbox_finish_turn_if_matches_episode_started_before(
+        shared,
+        provider_kind,
+        channel,
+        serenity::MessageId::new(state.user_msg_id),
+        state.turn_nonce.clone(),
+        handoff_started,
+    )
+    .await;
+    let Some(removed) = finish.removed_token else {
+        return;
+    };
+    removed.mark_completion_cleanup();
+    removed
+        .cancelled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    super::saturating_decrement_global_active(shared);
+    if finish.has_pending {
+        super::queue_io::schedule_deferred_idle_queue_kickoff(
+            shared.clone(),
+            provider_kind.clone(),
+            channel,
+            "watcher_death_mailbox_release",
+        );
+    }
 }
 
 pub(super) async fn resume_aborted_restart_turn(
@@ -407,6 +502,13 @@ pub(super) async fn resume_aborted_restart_turn(
         );
         return false;
     };
+    if super::health::legacy_supervision::legacy_retired(
+        provider_kind.as_str(),
+        channel_id.get(),
+        "watcher_death_handoff",
+    ) {
+        return false;
+    }
     let Some(state) = super::inflight::load_inflight_state(&provider_kind, channel_id.get()) else {
         let ts = chrono::Local::now().format("%H:%M:%S");
         // #3014: there is no persisted inflight turn to hand off, but the pane
@@ -420,6 +522,8 @@ pub(super) async fn resume_aborted_restart_turn(
         // (no live pane ⇒ not "busy", no active turn ⇒ kickable), and the
         // dispatch path spawns a fresh session for the queued item.
         let snapshot = super::mailbox_snapshot(shared.as_ref(), channel_id).await;
+        #[cfg(test)]
+        retirement_await_tests::checkpoint("rowless_snapshot").await;
         let has_queued_backlog = !snapshot.intervention_queue.is_empty();
         // codex review P2: only auto-drain when the mailbox is IDLE. The
         // watcher death handler runs asynchronously, so by the time it fires a
@@ -439,6 +543,13 @@ pub(super) async fn resume_aborted_restart_turn(
             && snapshot.active_request_owner.is_none()
             && snapshot.active_user_message_id.is_none();
         if has_queued_backlog && mailbox_idle {
+            if super::health::legacy_supervision::legacy_retired(
+                provider_kind.as_str(),
+                channel_id.get(),
+                "watcher_death_backlog_after_snapshot",
+            ) {
+                return false;
+            }
             tracing::info!(
                 "  [{ts}] ↻ watcher death recovery: idle mailbox for channel {} (provider {}) with queued backlog — scheduling idle-queue kickoff (#3014)",
                 channel_id.get(),
@@ -727,6 +838,13 @@ mod o_cut_tests {
                     );
                     state.runtime_kind = Some(RuntimeHandoffKind::CodexTui);
                     state.rebind_origin = rebind_origin;
+                    state.turn_nonce = Some("handoff-adoption".into());
+                    crate::services::discord::inflight::save_inflight_state(&state).unwrap();
+                    let state = crate::services::discord::inflight::load_inflight_state(
+                        &ProviderKind::Codex,
+                        CHANNEL,
+                    )
+                    .unwrap();
                     let handled = super::start_restart_handoff_from_state(
                         ChannelId::new(CHANNEL),
                         &recorder.http,
@@ -737,6 +855,14 @@ mod o_cut_tests {
                     )
                     .await;
                     assert!(handled);
+                    assert!(
+                        crate::services::discord::inflight::load_inflight_state(
+                            &ProviderKind::Codex,
+                            CHANNEL,
+                        )
+                        .is_none(),
+                        "completed handoff must clear its exact row, rebind={rebind_origin}"
+                    );
                     recorder.calls()
                 }
             };
@@ -762,3 +888,97 @@ mod o_cut_tests {
         .await;
     }
 }
+
+#[cfg(test)]
+#[path = "tmux_restart_handoff_mailbox_tests.rs"]
+mod mailbox_tests;
+
+#[cfg(test)]
+mod retired_channel_tests {
+    use poise::serenity_prelude::ChannelId;
+
+    use crate::config::TestEnvVarGuard;
+    use crate::services::discord::health::legacy_supervision::RetiredForTest;
+    use crate::services::discord::health::legacy_supervision::test_support::{
+        MockDiscord, fingerprint, seed_backfill_row,
+    };
+    use crate::services::discord::inflight::InflightTurnState;
+    use crate::services::provider::ProviderKind;
+
+    /// Watcher death on a retired channel hands nothing off: the row is not loaded or
+    /// cleared and Discord sees no notice, while a Legacy channel still hands off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retired_channel_skips_watcher_death_handoff() {
+        let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _env =
+            TestEnvVarGuard::set_path_after_shared_test_env_lock("AGENTDESK_ROOT_DIR", temp.path());
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let discord = MockDiscord::start().await;
+        let (retired, legacy) = (6_325_412_001u64, 6_325_412_002u64);
+        let session = |channel: u64| format!("AgentDesk-codex-n4a-handoff-{channel}");
+        let row = |channel: u64| {
+            InflightTurnState::new(
+                ProviderKind::Codex,
+                channel,
+                None,
+                1,
+                channel * 10,
+                channel * 10 + 1,
+                "restart me".into(),
+                None,
+                Some(session(channel)),
+                None,
+                None,
+                0,
+            )
+        };
+        // The retired row lacks its finalizer id, so any writing load would rewrite it.
+        let rows = [seed_backfill_row(&row(retired)), {
+            crate::services::discord::inflight::save_inflight_state(&row(legacy)).unwrap();
+            let root = crate::services::discord::runtime_store::discord_inflight_root().unwrap();
+            crate::services::discord::inflight::inflight_state_path(
+                &root,
+                &ProviderKind::Codex,
+                legacy,
+            )
+        }];
+        let _retired = RetiredForTest::new("codex", retired);
+        let before = fingerprint(&rows[0]);
+
+        let handled = super::resume_aborted_restart_turn(
+            ChannelId::new(retired),
+            &discord.http,
+            &shared,
+            &session(retired),
+            "",
+        )
+        .await;
+        assert!(!handled);
+        assert!(before.is_some() && fingerprint(&rows[0]) == before);
+        assert!(discord.calls_for(retired).is_empty());
+
+        let handled = super::resume_aborted_restart_turn(
+            ChannelId::new(legacy),
+            &discord.http,
+            &shared,
+            &session(legacy),
+            "",
+        )
+        .await;
+        assert!(handled);
+        assert!(
+            fingerprint(&rows[1]).is_none(),
+            "legacy handoff clears its row"
+        );
+        assert!(
+            !discord.calls_for(legacy).is_empty(),
+            "legacy handoff posts its notice"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "tmux_restart_handoff_retirement_await_tests.rs"]
+mod retirement_await_tests;

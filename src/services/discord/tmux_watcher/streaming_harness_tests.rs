@@ -24,7 +24,31 @@ mod o_delegated_watcher_tests;
 #[path = "post_stream_exit_host_tests.rs"]
 mod post_stream_exit_host_tests;
 
+#[cfg(test)]
+#[path = "judged_stop_harness_tests.rs"]
+mod judged_stop_harness_tests;
+
+#[cfg(test)]
+#[path = "herdr_entry_host_tests.rs"]
+mod herdr_entry_host_tests;
+
+#[path = "n1a_turn_mode_tests.rs"]
+mod n1a_turn_mode_tests;
+
+#[path = "o_seed_install_tests.rs"]
+mod o_seed_install_tests;
+
+#[path = "retired_host_tick_tests.rs"]
+mod retired_host_tick_tests;
+
+#[path = "retired_o_boundary_tests.rs"]
+mod retired_o_boundary_tests;
+
+#[path = "o_capsule_origin_tests.rs"]
+mod o_capsule_origin_tests;
+
 const CHILD: &str = "ADK_STREAMING_HARNESS_CHILD";
+pub(super) const STATUS_PANEL_V2: &str = "ADK_STREAMING_HARNESS_STATUS_PANEL_V2";
 const CLAUDE: ProviderKind = ProviderKind::Claude;
 static LOG: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
@@ -99,11 +123,11 @@ pub(super) fn isolated_in(submodule: &str, test: &str, envs: &[(&str, &str)]) ->
             crate::services::tui_o::cutover::test_override::CHANNELS_ENV,
             "[]",
         )
+        .env("AGENTDESK_STATUS_INTERVAL_SECS", "0")
         .envs(envs.iter().copied())
         .env(CHILD, "1")
         .env("AGENTDESK_ROOT_DIR", root.path())
         .env("PATH", root.path())
-        .env("AGENTDESK_STATUS_INTERVAL_SECS", "0")
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -315,8 +339,12 @@ impl Harness {
                 .build(),
         );
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut shared = crate::services::discord::make_shared_data_for_tests_with_storage(pool);
+        // A child that sets this runs the separate status-panel-v2 path.
+        let ui = &mut Arc::get_mut(&mut shared).expect("fresh runtime").ui;
+        ui.status_panel_v2_enabled = std::env::var_os(STATUS_PANEL_V2).is_some();
         let harness = Self {
-            shared: crate::services::discord::make_shared_data_for_tests_with_storage(pool),
+            shared,
             channel,
             tmux,
             path,
@@ -380,6 +408,11 @@ impl Harness {
     /// Registers and starts a watcher at `offset`; a running one is cancelled first,
     /// which hands its turn over through cancellation custody.
     pub(super) fn spawn(&mut self, offset: u64) {
+        self.spawn_restoring(offset, None);
+    }
+
+    /// [`Harness::spawn`] seeded with `restored`, as a restart restores a watcher from its row.
+    pub(super) fn spawn_restoring(&mut self, offset: u64, restored: Option<RestoredWatcherTurn>) {
         self.cancel();
         let cancel = Arc::new(AtomicBool::new(false));
         let resume = Arc::new(Mutex::new(None));
@@ -415,7 +448,7 @@ impl Harness {
             epoch,
             delivered,
             beat.clone(),
-            None,
+            restored,
         ));
         self.watcher = Some(Controls {
             cancel,
@@ -446,7 +479,7 @@ impl Harness {
     /// Cancels the running watcher, if any.
     pub(super) fn cancel(&self) {
         if let Some(watcher) = self.watcher.as_ref() {
-            watcher.cancel.store(true, Ordering::Release);
+            cancel_for_test(&watcher.cancel, Ordering::Release);
         }
     }
 
@@ -612,4 +645,8 @@ impl Harness {
         }
         observed
     }
+}
+
+pub(in crate::services::discord) fn cancel_for_test(cancel: &Arc<AtomicBool>, ordering: Ordering) {
+    cancel.store(true, ordering);
 }

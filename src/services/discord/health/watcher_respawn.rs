@@ -49,10 +49,24 @@ use poise::serenity_prelude::ChannelId;
 
 use super::HealthRegistry;
 use super::snapshot::WatcherStateSnapshot;
+use crate::services::discord::input_runtime::fence::{BootTarget, boot_skip};
 use crate::services::discord::{self as discord, SharedData};
 use crate::services::provider::ProviderKind;
 
+mod absence_state;
+#[cfg(all(test, unix))]
+mod claude_original_tests;
+use absence_state::{WatcherAbsenceKey, WatcherAbsenceState, respawn_backoff_secs};
 mod idle_relay_absence;
+mod live_bridge_guard;
+#[cfg(unix)]
+mod o_only_retry;
+pub(super) use live_bridge_guard::complete_force_clean_watcher_recovery;
+pub(in crate::services::discord) use live_bridge_guard::retry_pending_watcher_respawn;
+#[cfg(unix)]
+pub(in crate::services::discord) use o_only_retry::{
+    record_retired_o_install_outcome, retired_o_install_due,
+};
 
 use idle_relay_absence::observe_routable_unwatched_tui_sessions;
 
@@ -79,50 +93,6 @@ const WATCHER_RESPAWN_MAX_ATTEMPTS: u32 = 8;
 const WATCHER_RESPAWN_BACKOFF_BASE_SECS: u64 = 30;
 const WATCHER_RESPAWN_BACKOFF_CEILING_SECS: u64 = 960;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct WatcherAbsenceKey {
-    provider: String,
-    channel_id: u64,
-}
-
-#[derive(Clone, Debug)]
-struct WatcherAbsenceState {
-    first_seen_unix_secs: i64,
-    last_seen_unix_secs: i64,
-    escalated: bool,
-    /// #5957: one-shot latch for the routable-but-unwatched WARN. Separate from
-    /// `escalated` because the two ladders arm from different authorities — this
-    /// one from the surviving registry entry, `escalated` from a health snapshot
-    /// that does not exist for an idle channel.
-    idle_relay_announced: bool,
-    minimum_initial_offset: Option<u64>,
-    failed_attempts: u32,
-    next_attempt_unix_secs: i64,
-    retirement_logged: bool,
-}
-
-impl WatcherAbsenceState {
-    fn newly_absent(now_unix_secs: i64) -> Self {
-        Self {
-            first_seen_unix_secs: now_unix_secs,
-            last_seen_unix_secs: now_unix_secs,
-            escalated: false,
-            idle_relay_announced: false,
-            minimum_initial_offset: None,
-            failed_attempts: 0,
-            next_attempt_unix_secs: now_unix_secs,
-            retirement_logged: false,
-        }
-    }
-}
-
-/// Delay before the next respawn attempt after `failed_attempts` consecutive
-/// failures.
-fn respawn_backoff_secs(failed_attempts: u32) -> u64 {
-    let doublings = failed_attempts.saturating_sub(1).min(5);
-    (WATCHER_RESPAWN_BACKOFF_BASE_SECS << doublings).min(WATCHER_RESPAWN_BACKOFF_CEILING_SECS)
-}
-
 static WATCHER_ABSENCE: LazyLock<dashmap::DashMap<WatcherAbsenceKey, WatcherAbsenceState>> =
     LazyLock::new(dashmap::DashMap::new);
 
@@ -133,7 +103,8 @@ static WATCHER_ABSENCE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::c
 
 /// Take it before any other test lock, the shared env lock included, so lock order stays acyclic.
 #[cfg(test)]
-pub(super) async fn lock_watcher_absence_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+pub(in crate::services::discord) async fn lock_watcher_absence_for_test()
+-> tokio::sync::MutexGuard<'static, ()> {
     WATCHER_ABSENCE_TEST_LOCK.lock().await
 }
 
@@ -212,7 +183,8 @@ fn is_agentdesk_tmux_session(tmux_session: Option<&str>) -> bool {
 /// armed by `observe_watcher_absence_for_unwatched_work` instead (#5957). It is
 /// kept (and tested) as the entry point a future destructive cleanup would have
 /// to call to stay wired to the dead-man switch.
-pub(super) async fn complete_force_clean_watcher_recovery(
+
+async fn complete_force_clean_watcher_recovery_admitted(
     registry: &HealthRegistry,
     provider: &ProviderKind,
     shared: &Arc<SharedData>,
@@ -344,6 +316,13 @@ pub(super) async fn observe_watcher_absence_for_unwatched_work(
     for (channel_id, shared) in
         unwatched_relay_work_candidates(provider, runtimes, watcher_derived).await
     {
+        if super::legacy_supervision::is_retired(provider.as_str(), channel_id.get()) {
+            continue;
+        }
+        // Like boot, absence observation leaves a protected channel to its move or handback.
+        if boot_skip(BootTarget::Channel(provider, channel_id.get())) {
+            continue;
+        }
         let Some(snapshot) = registry
             .snapshot_watcher_state_for_shared(provider, shared, channel_id.get())
             .await
@@ -515,6 +494,12 @@ pub(super) async fn respawn_watcher_after_force_clean(
     minimum_initial_offset: Option<u64>,
     expected_episode: Option<&discord::inflight::InflightEpisodePin>,
 ) -> bool {
+    #[cfg(test)]
+    discord::inflight::o_seed_observation::record_event(
+        provider,
+        channel_id.get(),
+        "legacy_rebind_enter",
+    );
     let ts = chrono::Local::now().format("%H:%M:%S");
     match registry
         .rebind_inflight_after_force_clean(
@@ -582,6 +567,12 @@ pub(super) fn detect_and_escalate_watcher_absence(
     watcher_present: bool,
     now_unix_secs: i64,
 ) -> bool {
+    if super::legacy_supervision::is_retired(provider.as_str(), channel_id.get()) {
+        return false;
+    }
+    if discord::live_bridge::is_live(provider, channel_id.get()) {
+        return false;
+    }
     let should_have_watcher = snapshot.tmux_session_alive == Some(true)
         && is_agentdesk_tmux_session(snapshot.tmux_session.as_deref())
         && watcher_ownership_expected(snapshot);
@@ -723,7 +714,8 @@ fn pending_absent_channels(provider: &ProviderKind) -> Vec<ChannelId> {
 /// retrying. We still drive the channel-aware respawn on `None`, because
 /// `rebind_inflight` re-resolves the channel's true owning runtime regardless of
 /// which runtime (if any) we could snapshot from.
-async fn retry_pending_watcher_respawn(
+
+async fn retry_pending_watcher_respawn_admitted(
     registry: &HealthRegistry,
     provider: &ProviderKind,
     runtimes: &[Arc<SharedData>],
@@ -742,9 +734,15 @@ async fn retry_pending_watcher_respawn(
     if !respawn_attempt_due(provider, channel_id, now_unix_secs) {
         return false;
     }
+    #[cfg(all(test, unix))]
+    claude_original_tests::respawn_gap::pause(channel_id).await;
     // No owner: snapshot from any runtime to read the provider+channel-global
     // inflight/tmux liveness. A `None` snapshot does NOT clear the absence — it
     // is "not yet resolvable", and the channel-aware respawn below still runs.
+    #[cfg(test)]
+    if let Some(mut counts) = RESPAWN_TEST_COUNTS.get_mut(&channel_id.get()) {
+        counts[0] += 1;
+    }
     let snapshot_runtime = runtimes.first().cloned();
     let snapshot = match snapshot_runtime.as_ref() {
         Some(snapshot_runtime) => {
@@ -800,9 +798,14 @@ async fn retry_pending_watcher_respawn(
     // `WatcherReattach` arm clears the canonical row and re-mints a synthetic
     // one; pinned, the same arm adopts it, and a row that changed underneath us
     // fails the rebind instead of being overwritten.
-    let expected_episode = discord::inflight::load_inflight_state(provider, channel_id.get())
-        .as_ref()
-        .map(discord::inflight::InflightEpisodePin::from_state);
+    // The read can backfill an old-format row, so an admitted retry runs it on the input worker.
+    let expected_episode = live_bridge_guard::row_io({
+        let (provider, channel_id) = (provider.clone(), channel_id.get());
+        move || discord::inflight::load_inflight_state(&provider, channel_id)
+    })
+    .await
+    .as_ref()
+    .map(discord::inflight::InflightEpisodePin::from_state);
     if let Some(pin) = expected_episode.as_ref() {
         reclaim_watcherless_session_bound_relay(registry, provider, channel_id, pin).await;
     }
@@ -844,6 +847,16 @@ pub(in crate::services::discord) async fn reclaim_watcherless_session_bound_rela
     channel_id: ChannelId,
     pin: &discord::inflight::InflightEpisodePin,
 ) {
+    #[cfg(test)]
+    discord::inflight::o_seed_observation::record_event(
+        provider,
+        channel_id.get(),
+        "legacy_reclaim_enter",
+    );
+    #[cfg(test)]
+    if let Some(mut counts) = RESPAWN_TEST_COUNTS.get_mut(&channel_id.get()) {
+        counts[1] += 1;
+    }
     let shared = match registry
         .shared_for_provider_on_channel(provider, channel_id)
         .await
@@ -854,12 +867,15 @@ pub(in crate::services::discord) async fn reclaim_watcherless_session_bound_rela
             None => return,
         },
     };
-    let outcome = discord::inflight::reclaim_watcherless_session_bound_relay_owner(
-        &shared,
-        provider,
-        channel_id.get(),
-        pin,
-    );
+    let outcome = live_bridge_guard::row_io({
+        let (provider, channel_id, pin) = (provider.clone(), channel_id.get(), pin.clone());
+        move || {
+            discord::inflight::reclaim_watcherless_session_bound_relay_owner(
+                &shared, &provider, channel_id, &pin,
+            )
+        }
+    })
+    .await;
     if outcome == discord::inflight::OrphanRelayReclaimOutcome::Downgraded {
         tracing::warn!(
             channel_id = channel_id.get(),
@@ -915,23 +931,15 @@ fn record_failed_respawn_attempt(
 }
 
 pub(super) fn gc_watcher_absence_state(now_unix_secs: i64) {
-    WATCHER_ABSENCE.retain(|_, state| {
-        saturating_age_secs(state.last_seen_unix_secs, now_unix_secs)
-            <= WATCHER_ABSENCE_STATE_TTL_SECS
+    WATCHER_ABSENCE.retain(|key, state| {
+        super::legacy_supervision::is_retired(&key.provider, key.channel_id)
+            || saturating_age_secs(state.last_seen_unix_secs, now_unix_secs)
+                <= WATCHER_ABSENCE_STATE_TTL_SECS
     });
 }
 
 fn saturating_age_secs(anchor_unix_secs: i64, now_unix_secs: i64) -> u64 {
     now_unix_secs.saturating_sub(anchor_unix_secs).max(0) as u64
-}
-
-impl WatcherAbsenceKey {
-    fn new(provider: &ProviderKind, channel_id: ChannelId) -> Self {
-        Self {
-            provider: provider.as_str().to_string(),
-            channel_id: channel_id.get(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -954,7 +962,7 @@ mod tests {
     };
     use super::*;
 
-    fn snapshot(
+    pub(super) fn snapshot(
         channel_id: u64,
         tmux_session: Option<&str>,
         tmux_alive: Option<bool>,
@@ -1030,6 +1038,63 @@ mod tests {
                 unpaired_active_token_reconfirmed: false,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn live_original_defers_deadman_until_its_execution_ends() {
+        let _absence = lock_watcher_absence_for_test().await;
+        let _root = crate::config::TestRuntimeRootGuard::new();
+        let channel = ChannelId::new(655_214_001);
+        let provider = ProviderKind::Codex;
+        let shared = discord::make_shared_data_for_tests();
+        let token = std::sync::Arc::new(CancelToken::new());
+        let state = discord::inflight::InflightTurnState::new(
+            provider.clone(),
+            channel.get(),
+            None,
+            7,
+            9001,
+            9002,
+            "original".into(),
+            None,
+            None,
+            None,
+            None,
+            0,
+        );
+        let original =
+            discord::live_bridge::register_or_requeue(&shared, &provider, &state, &token)
+                .await
+                .unwrap();
+        let snapshot = snapshot(
+            channel.get(),
+            Some("AgentDesk-codex-deadman-fixture"),
+            Some(true),
+            true,
+            Some(9001),
+        );
+        assert!(!detect_and_escalate_watcher_absence(
+            &provider, channel, &snapshot, false, 0
+        ));
+        assert!(!detect_and_escalate_watcher_absence(
+            &provider,
+            channel,
+            &snapshot,
+            false,
+            WATCHER_ABSENCE_DEADMAN_SECS as i64
+        ));
+        drop(original);
+        assert!(!detect_and_escalate_watcher_absence(
+            &provider, channel, &snapshot, false, 0
+        ));
+        assert!(detect_and_escalate_watcher_absence(
+            &provider,
+            channel,
+            &snapshot,
+            false,
+            WATCHER_ABSENCE_DEADMAN_SECS as i64
+        ));
+        clear_watcher_absence(&provider, channel);
     }
 
     #[test]
@@ -1969,7 +2034,7 @@ mod tests {
     #[test]
     fn retry_respawn_call_site_pins_the_inflight_episode() {
         let body = include_str!("watcher_respawn.rs")
-            .split_once("async fn retry_pending_watcher_respawn(")
+            .split_once("async fn retry_pending_watcher_respawn_admitted(")
             .expect("single-channel retry")
             .1;
         // Bounded to the argument list: an unbounded slice runs to EOF and this
@@ -2461,4 +2526,93 @@ mod tests {
              waits a whole extra tick"
         );
     }
+
+    /// Like boot, both absence observers leave an input-protected channel to its move or
+    /// handback: neither arms it for respawn while its tmux is live and work is owed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn absence_observers_leave_an_input_protected_channel_unarmed() {
+        use crate::services::discord::input_runtime::fence::{Gate, test_health};
+        let _absence = lock_watcher_absence_for_test().await;
+        let provider = ProviderKind::Codex;
+        let (protected, routable) = (ChannelId::new(6_325_579_001), ChannelId::new(6_325_579_002));
+        clear_watcher_absence(&provider, protected);
+        clear_watcher_absence(&provider, routable);
+        let _tmux = FakeTmux::answering_alive(true);
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        engage_mailbox_bound_to_tmux(&shared, protected, 6_325_579_101, "AgentDesk-codex-c2b2a")
+            .await;
+        let gates = [protected, routable].map(|channel| {
+            let gate = Gate::protect(provider.clone(), channel.get()).unwrap();
+            test_health::Clear::new(&gate)
+        });
+        let registry = HealthRegistry::new();
+        let now = chrono::Utc::now().timestamp();
+        let none = std::collections::HashSet::new();
+        let runtimes = [shared];
+        let absent =
+            observe_watcher_absence_for_unwatched_work(&registry, &provider, &runtimes, &none, now);
+        assert_eq!(absent.await, 0);
+        assert!(!observe_routable_unwatched_session(
+            &provider,
+            &candidate(routable),
+            now
+        ));
+        let pending = pending_absent_channels(&provider);
+        assert!(!pending.contains(&protected) && !pending.contains(&routable));
+        drop(gates);
+    }
+}
+
+#[cfg(test)]
+static RESPAWN_TEST_COUNTS: LazyLock<dashmap::DashMap<u64, [usize; 2]>> =
+    LazyLock::new(dashmap::DashMap::new);
+
+#[cfg(all(test, unix))]
+pub(in crate::services::discord) fn n4d2_absence(
+    provider: &ProviderKind,
+    channel: ChannelId,
+) -> Option<(i64, u32, i64, Option<discord::tmux::OOnlyInstallReason>)> {
+    WATCHER_ABSENCE
+        .get(&WatcherAbsenceKey::new(provider, channel))
+        .map(|state| {
+            (
+                state.first_seen_unix_secs,
+                state.failed_attempts,
+                state.next_attempt_unix_secs,
+                state.o_install_reason,
+            )
+        })
+}
+
+#[cfg(all(test, unix))]
+pub(in crate::services::discord) fn n4d2_arm_absence(
+    provider: &ProviderKind,
+    channel: ChannelId,
+    now: i64,
+) {
+    WATCHER_ABSENCE
+        .entry(WatcherAbsenceKey::new(provider, channel))
+        .or_insert_with(|| WatcherAbsenceState::newly_absent(now));
+}
+
+#[cfg(test)]
+pub(in crate::services::discord) fn seed_live_bridge_respawn_test(channel: ChannelId) {
+    WATCHER_ABSENCE.insert(
+        WatcherAbsenceKey::new(&ProviderKind::Codex, channel),
+        WatcherAbsenceState::newly_absent(0),
+    );
+    RESPAWN_TEST_COUNTS.insert(channel.get(), [0, 0]);
+}
+
+#[cfg(test)]
+pub(in crate::services::discord) fn live_bridge_respawn_test_counts(
+    channel: ChannelId,
+) -> [usize; 3] {
+    let counts = *RESPAWN_TEST_COUNTS.get(&channel.get()).unwrap();
+    let attempts = WATCHER_ABSENCE
+        .get(&WatcherAbsenceKey::new(&ProviderKind::Codex, channel))
+        .map(|state| state.failed_attempts as usize)
+        .unwrap_or(0);
+    [counts[0], counts[1], attempts]
 }

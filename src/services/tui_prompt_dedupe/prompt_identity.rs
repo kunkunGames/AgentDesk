@@ -1,5 +1,5 @@
 //! Claude `prompt_id` as the relayed-entry ledger's second key, known before the row's
-//! uuid. Only hooks record it (forks rewrite row ids); it suppresses once announced.
+//! uuid. Only hooks record it (forks rewrite row ids); once announced it suppresses rows.
 
 use super::*;
 
@@ -84,7 +84,7 @@ pub(super) fn check_relayed_prompt_id(
 }
 
 /// Holds a published hook's `prompt_id` unannounced so a row read before the POST
-/// result can mark it ambiguous; a present id keeps its first record.
+/// result can mark it ambiguous; a present id keeps its first record unchanged.
 pub(super) fn record_observed_hook_prompt_id(
     provider: &str,
     tmux_session_name: &str,
@@ -98,13 +98,7 @@ pub(super) fn record_observed_hook_prompt_id(
         .relayed_prompt_ids_by_tmux
         .entry(PromptKey::new(provider, tmux_session_name))
         .or_default();
-    if let Some(entry) = queue
-        .iter_mut()
-        .find(|seen| seen.value.prompt_id == prompt_id)
-    {
-        if !same_text(&entry.value.prompt, prompt) {
-            entry.value.ambiguous = true;
-        }
+    if queue.iter().any(|seen| seen.value.prompt_id == prompt_id) {
         return;
     }
     queue.push_back(TimedValue {
@@ -162,7 +156,7 @@ fn settle_hook_prompt_id(prompt: &ObservedTuiPrompt, announced: bool) {
     }
 }
 
-/// Test-only: backdates every content, uuid and prompt-id record for one key.
+/// Ages the content, uuid and prompt-id records while preserving other keys' ages.
 #[cfg(test)]
 pub(crate) fn age_observed_prompt_records_for_tests(
     provider: &str,
@@ -171,6 +165,7 @@ pub(crate) fn age_observed_prompt_records_for_tests(
 ) {
     let key = PromptKey::new(provider, tmux_session_name);
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    state.aged_stamp_for_tests(by);
     for entry in state
         .recent_observed_by_tmux
         .entry(key.clone())

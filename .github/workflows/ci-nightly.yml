@@ -100,6 +100,16 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # Rollback rehearsal executes the runbook's literal rg command.
+      - name: Install ripgrep
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep
+
+      - name: Require ripgrep
+        shell: bash
+        run: rg --version
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
@@ -162,6 +172,16 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # Rollback rehearsal executes the runbook's literal rg command.
+      - name: Install ripgrep
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep
+
+      - name: Require ripgrep
+        shell: bash
+        run: rg --version
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
@@ -206,6 +226,7 @@ jobs:
   postgres_full:
     name: PostgreSQL full tests
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
       RUST_BACKTRACE: 1
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
@@ -225,6 +246,16 @@ jobs:
       - name: Start PostgreSQL service
         run: ./scripts/ci/postgres-service.sh start
 
+      # Rollback rehearsal executes the runbook's literal rg command.
+      - name: Install ripgrep
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep
+
+      - name: Require ripgrep
+        shell: bash
+        run: rg --version
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
@@ -242,12 +273,17 @@ jobs:
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # 30 minutes is the old 15 + 15 arithmetic budget, not measured runtime: selected lib tests grow 385 -> 636 and PG-connected tests 276 -> 422 under `--test-threads=1`.
+      - name: Ensure swap for the lib test build
+        uses: ./.github/actions/ensure-swap
+
+      # The measured build plus serial PG suite takes just over 30 minutes;
+      # leave 15 minutes of headroom and keep the later E2E within the job budget.
+
       # `--lib` like `just test-postgres`: the PG filter selects nothing elsewhere, and building
       # all targets at once got the runner killed for memory (exit 143, #4245). e2e runs below.
       - name: cargo test (PostgreSQL bootstrap and routes)
         id: pg_cargo_test
-        timeout-minutes: 30
+        timeout-minutes: 45
         shell: bash
         env:
           PG_DIAG_ENABLED: ${{ github.event_name == 'workflow_dispatch' && inputs.resource_diagnostics == true }}
@@ -358,6 +394,9 @@ jobs:
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Ensure swap for the lib test build
+        uses: ./.github/actions/ensure-swap
+
       - name: Rust multinode invariants
         timeout-minutes: 15
         run: "cargo test --lib multinode_regression:: -- --nocapture --test-threads=1"
@@ -409,6 +448,9 @@ jobs:
           cache-bin: false
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Ensure swap for the lib test build
+        uses: ./.github/actions/ensure-swap
 
       - name: High-risk recovery lane
         run: "cargo test --lib high_risk_recovery:: -- --test-threads=1"
@@ -565,6 +607,9 @@ jobs:
           cache-bin: false
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Ensure swap for the lib test build
+        uses: ./.github/actions/ensure-swap
 
       - name: Fetch Cargo dependencies
         env:

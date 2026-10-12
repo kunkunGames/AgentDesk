@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::Mutex;
@@ -5,10 +7,14 @@ use std::sync::Mutex;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::services::session_host::herdr::contract::HerdrTransportError;
+use crate::services::session_host::herdr::contract::{
+    HerdrTransportError, ServerWitness, Witnessed,
+};
 use crate::services::session_host::herdr::model::{
     ExecutionState, HerdrReadSource, HerdrReply, HerdrResult, PaneState,
 };
+use crate::services::session_host::herdr::observe::RestoreUnverified;
+use crate::services::session_host::herdr::provenance::StartIdentity;
 
 const PANE: &str = "w1-1";
 
@@ -27,43 +33,55 @@ type Step = (HerdrRequest, Scripted);
 struct FakeTransport {
     script: Mutex<VecDeque<Step>>,
     calls: Mutex<Vec<HerdrCall>>,
-    /// Moves to a new connection on every call, like a reconnecting transport.
-    reconnects: bool,
-    generation: AtomicU64,
-    /// E7 readings in order; once empty, Off on the current connection.
+    /// The server each call's connection reaches, in order; once empty, `serving()`.
+    reached: Mutex<VecDeque<Witnessed>>,
+    /// E7 readings in order; once empty, Off naming `serving()`.
     restore: Mutex<VecDeque<RestoreResume>>,
 }
 
-impl HerdrTransport for FakeTransport {
-    fn call(&self, call: &HerdrCall) -> (contract::HerdrOutcome, u64) {
-        self.calls.lock().unwrap().push(call.clone());
-        let generation = if self.reconnects {
-            self.generation.fetch_add(1, Ordering::SeqCst) + 1
-        } else {
-            self.generation.load(Ordering::SeqCst)
-        };
-        (self.reply(call), generation)
-    }
-
-    fn call_on(&self, call: &HerdrCall, generation: u64) -> (contract::HerdrOutcome, u64) {
-        let current = self.generation.load(Ordering::SeqCst);
-        if generation != current {
-            let error = HerdrTransportError::NotSent(format!("connection {current}"));
-            return (Err(error), current);
-        }
-        self.calls.lock().unwrap().push(call.clone());
-        (self.reply(call), current)
+/// The server a fake connection reaches unless a test scripts another.
+fn serving() -> ServerWitness {
+    ServerWitness {
+        socket: "/tmp/h.sock".into(),
+        pid: 4,
+        start: StartIdentity::Darwin {
+            seconds: 1_000,
+            micros: 0,
+        },
     }
 }
 
-fn scripted_restore(transport: &FakeTransport) -> RestoreResume {
+impl HerdrTransport for FakeTransport {
+    fn call(&self, call: &HerdrCall) -> (contract::HerdrOutcome, Witnessed) {
+        self.calls.lock().unwrap().push(call.clone());
+        (self.reply(call), self.reach())
+    }
+
+    fn call_with_witness(
+        &self,
+        call: &HerdrCall,
+        expected: &ServerWitness,
+    ) -> contract::HerdrOutcome {
+        let reached = self.reach();
+        if reached.as_ref() != Ok(expected) {
+            return Err(HerdrTransportError::NotSent(format!("{reached:?}")));
+        }
+        self.calls.lock().unwrap().push(call.clone());
+        self.reply(call)
+    }
+}
+
+fn scripted_restore(transport: &FakeTransport, _endpoint: &HerdrEndpoint) -> RestoreResume {
     let next = transport.restore.lock().unwrap().pop_front();
-    next.unwrap_or(RestoreResume::Off {
-        generation: transport.generation.load(Ordering::SeqCst),
-    })
+    next.unwrap_or(RestoreResume::Off { witness: serving() })
 }
 
 impl FakeTransport {
+    fn reach(&self) -> Witnessed {
+        let next = self.reached.lock().unwrap().pop_front();
+        next.unwrap_or_else(|| Ok(serving()))
+    }
+
     fn reply(&self, call: &HerdrCall) -> contract::HerdrOutcome {
         let next = self.script.lock().unwrap().pop_front();
         let (expected, reply) = next.expect("fake transport called more often than scripted");
@@ -80,19 +98,19 @@ impl FakeTransport {
     }
 }
 
-fn fake(script: Vec<Step>, reconnects: bool) -> HerdrHost<FakeTransport> {
+fn fake(script: Vec<Step>, reached: Vec<Witnessed>) -> HerdrHost<FakeTransport> {
     let endpoint = HerdrEndpoint::new("mac-mini", "pilot", Path::new("/tmp/h.sock"), "adk")
         .expect("valid endpoint");
     let transport = FakeTransport {
         script: Mutex::new(script.into()),
-        reconnects,
+        reached: Mutex::new(reached.into()),
         ..FakeTransport::default()
     };
     HerdrHost::new(endpoint, transport).with_restore_reader(scripted_restore)
 }
 
 fn host(script: Vec<Step>) -> HerdrHost<FakeTransport> {
-    fake(script, false)
+    fake(script, Vec::new())
 }
 
 fn calls(host: &HerdrHost<FakeTransport>) -> Vec<HerdrCall> {
@@ -230,21 +248,38 @@ fn herdr_liveness_needs_a_root_shell_pid() {
 }
 
 #[test]
-fn herdr_process_info_from_another_connection_is_not_liveness() {
-    let herdr = fake(
+fn herdr_process_info_from_another_server_is_not_liveness() {
+    let restarted = ServerWitness {
+        start: StartIdentity::Darwin {
+            seconds: 1_001,
+            micros: 0,
+        },
+        ..serving()
+    };
+    for reached in [
+        vec![Ok(serving()), Ok(restarted)],
+        vec![Ok(serving()), Err(RestoreUnverified::ProcessUnreadable)],
         vec![
-            (snapshot_call(), snapshot(22, &[PANE])),
-            (process_call(), process_info(PANE, json!(4242))),
+            Err(RestoreUnverified::NoPeer),
+            Err(RestoreUnverified::NoPeer),
         ],
-        true,
-    );
-    let observation = herdr.observe(pane());
-    assert_eq!(
-        (observation.execution, observation.shell_pid),
-        (ExecutionState::Unknown, None),
-        "a pid read after a reconnect must not join the earlier snapshot"
-    );
-    assert_eq!(observation.liveness(), HostLiveness::ProbeError);
+    ] {
+        let herdr = fake(
+            vec![
+                (snapshot_call(), snapshot(22, &[PANE])),
+                (process_call(), process_info(PANE, json!(4242))),
+            ],
+            reached.clone(),
+        );
+        let observation = herdr.observe(pane());
+        assert_eq!(observation.presence(), HostPresence::Present);
+        assert_eq!(
+            (observation.execution, observation.shell_pid),
+            (ExecutionState::Unknown, None),
+            "a pid from another or unnamed server must not join the snapshot: {reached:?}"
+        );
+        assert_eq!(observation.liveness(), HostLiveness::ProbeError);
+    }
 }
 
 #[test]
@@ -430,39 +465,106 @@ fn herdr_send_text_keeps_ambiguous_outcomes_indeterminate() {
     }
 }
 
+fn keys_call(keys: &[&str]) -> HerdrRequest {
+    HerdrRequest::PaneSendKeys {
+        pane_id: PANE.into(),
+        keys: keys.iter().map(|key| key.to_string()).collect(),
+    }
+}
+
+// Executor keys reach Herdr under its names in one request, a paste is bracketed and a line
+// carries its Enter; an unknown key, a bad text or a non-Herdr ref sends nothing at all.
 #[test]
-fn herdr_keys_and_non_herdr_refs_make_no_transport_call() {
-    let herdr = host(Vec::new());
-    let unsupported = |op| {
-        Ok(HostMutation::Refused(HostRefusal::Unsupported {
-            kind: HostKind::Herdr,
-            op,
-        }))
-    };
-    assert_eq!(herdr.send_keys(pane(), &["C-c"]), unsupported("send_keys"));
-    assert_eq!(herdr.interrupt(pane()), unsupported("interrupt"));
+fn herdr_keys_map_whole_or_send_nothing() {
+    let executor_keys = ["Enter", "Escape", "C-u", "C-e", "Left", "Right", "BSpace"];
+    let herdr_names = [
+        "enter",
+        "esc",
+        "ctrl+u",
+        "ctrl+e",
+        "left",
+        "right",
+        "backspace",
+    ];
+    let herdr = host(vec![
+        (keys_call(&herdr_names), ok()),
+        (keys_call(&["ctrl+c"]), ok()),
+        (keys_call(&["esc"]), Scripted::Error("invalid_key")),
+        (send_call("\x1b[200~한글\n둘째\x1b[201~"), ok()),
+        (
+            HerdrRequest::PaneSendInput {
+                pane_id: PANE.into(),
+                text: "/clear".into(),
+                keys: vec!["enter".into()],
+            },
+            ok(),
+        ),
+    ]);
+    assert_eq!(
+        herdr.send_keys(pane(), &executor_keys),
+        Ok(HostMutation::Confirmed)
+    );
+    assert_eq!(herdr.interrupt(pane()), Ok(HostMutation::Confirmed));
+    assert!(matches!(
+        herdr.send_keys(pane(), &["Escape"]),
+        Ok(HostMutation::Indeterminate(_))
+    ));
+    assert_eq!(
+        herdr.send_paste(pane(), "한글\n둘째"),
+        Ok(HostMutation::Confirmed)
+    );
+    assert_eq!(
+        herdr.send_line(pane(), "/clear"),
+        Ok(HostMutation::Confirmed)
+    );
+    assert_eq!(calls(&herdr).len(), 5);
+
+    let silent = host(Vec::new());
+    let unsupported = Ok(HostMutation::Refused(HostRefusal::Unsupported {
+        kind: HostKind::Herdr,
+        op: "send_keys",
+    }));
+    for keys in [&["Enter", "C-z"][..], &["enter"], &[]] {
+        assert_eq!(silent.send_keys(pane(), keys), unsupported, "{keys:?}");
+    }
+    let end = format!("a{PASTE_END}b");
+    for refused in [
+        silent.send_paste(pane(), &end),
+        silent.send_line(pane(), "/clear\n"),
+        silent.send_line(pane(), ""),
+    ] {
+        assert!(
+            matches!(
+                refused,
+                Ok(HostMutation::Refused(HostRefusal::Precondition(_)))
+            ),
+            "{refused:?}"
+        );
+    }
     for wrong in [
         HostSessionRef::tmux(PANE),
         HostSessionRef::process(PANE),
         HostSessionRef::herdr_pane(" "),
     ] {
-        assert_eq!(herdr.presence(wrong), HostPresence::ProbeFailed);
-        assert_eq!(herdr.liveness(wrong), HostLiveness::ProbeError);
-        assert!(herdr.send_text(wrong, "x").is_err());
-        assert!(herdr.execution_pid(wrong).is_err());
+        assert_eq!(silent.presence(wrong), HostPresence::ProbeFailed);
+        assert_eq!(silent.liveness(wrong), HostLiveness::ProbeError);
+        assert!(silent.send_text(wrong, "x").is_err());
+        assert!(silent.send_keys(wrong, &["Enter"]).is_err());
+        assert!(silent.send_paste(wrong, "x").is_err());
+        assert!(silent.execution_pid(wrong).is_err());
     }
-    assert!(calls(&herdr).is_empty());
-    let caps = herdr.capabilities();
-    assert!(caps.send_text && caps.capture_screen && !caps.send_keys && !caps.interrupt);
+    assert!(calls(&silent).is_empty());
 }
 
-/// Text, Enter, draft clear (C-e, C-u) and cancel (Escape, interrupt) as the executor sends them.
+/// Text, Enter, draft clear (C-e, C-u), cancel (Escape, interrupt), paste and a command line.
 fn every_input(herdr: &HerdrHost<FakeTransport>) -> Vec<Result<HostMutation, HostError>> {
     let mut outcomes = vec![herdr.send_text(pane(), "x")];
     for keys in [&["Enter"][..], &["C-e", "C-u"], &["Escape"]] {
         outcomes.push(herdr.send_keys(pane(), keys));
     }
     outcomes.push(herdr.interrupt(pane()));
+    outcomes.push(herdr.send_paste(pane(), "x"));
+    outcomes.push(herdr.send_line(pane(), "/clear"));
     outcomes
 }
 
@@ -491,22 +593,28 @@ fn herdr_production_restore_reader_refuses_every_input_before_any_call() {
 }
 
 #[test]
-fn herdr_input_needs_a_fresh_off_reading_on_the_connection_that_carries_it() {
+fn herdr_input_needs_a_fresh_off_reading_naming_the_server_that_gets_it() {
     let with_readings = |readings: Vec<RestoreResume>| {
         let herdr = host(vec![(send_call("x"), ok())]);
         *herdr.transport.restore.lock().unwrap() = readings.into();
         herdr
     };
-    for reading in [RestoreResume::On, RestoreResume::Unverified] {
-        let herdr = with_readings(vec![reading; 5]);
+    for reading in [
+        RestoreResume::On,
+        RestoreResume::Unverified(RestoreUnverified::NoPeer),
+    ] {
+        let herdr = with_readings(vec![reading.clone(); 8]);
         for outcome in every_input(&herdr) {
             assert_eq!(outcome, restore_refused(), "{reading:?}");
         }
         assert!(calls(&herdr).is_empty(), "{reading:?}");
     }
 
-    let off = RestoreResume::Off { generation: 0 };
-    let herdr = with_readings(vec![off, RestoreResume::Unverified]);
+    let off = RestoreResume::Off { witness: serving() };
+    let herdr = with_readings(vec![
+        off.clone(),
+        RestoreResume::Unverified(RestoreUnverified::NoPeer),
+    ]);
     assert_eq!(herdr.send_text(pane(), "x"), Ok(HostMutation::Confirmed));
     assert_eq!(
         herdr.send_text(pane(), "x"),
@@ -515,11 +623,15 @@ fn herdr_input_needs_a_fresh_off_reading_on_the_connection_that_carries_it() {
     );
     assert_eq!(calls(&herdr).len(), 1);
 
+    let replaced = ServerWitness {
+        pid: 5,
+        ..serving()
+    };
     let herdr = with_readings(vec![off]);
-    herdr.transport.generation.store(1, Ordering::SeqCst);
+    *herdr.transport.reached.lock().unwrap() = vec![Ok(replaced)].into();
     assert!(
         matches!(herdr.send_text(pane(), "x"), Err(HostError::Transport(_))),
-        "a reading from before a reconnect admits nothing"
+        "a reading of the replaced server admits nothing on the new one"
     );
     assert!(calls(&herdr).is_empty());
 }
@@ -737,17 +849,241 @@ fn production_text(text: &str) -> (String, Vec<(String, Option<String>)>) {
     (out, test_mods)
 }
 
+type ExternalModules = Vec<(String, Option<String>)>;
+
+/// Top-level paths are exact; nested declarations also protect uncertain production layouts.
+fn external_module_declarations(text: &str) -> (ExternalModules, ExternalModules) {
+    static PATH_ATTR: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"^\s*path\s*=\s*"([^"]+)"\s*$"#).unwrap());
+    let chars: Vec<char> = text.chars().collect();
+    let (mut modules, mut nested, mut path, mut depth, mut i) =
+        (Vec::new(), Vec::new(), None, 0usize, 0);
+    while i < chars.len() {
+        if let Some(end) = literal_end(&chars, i) {
+            i = end;
+        } else if chars[i..].starts_with(&['#', '[']) {
+            let (mut k, mut brackets) = (i + 2, 1usize);
+            while k < chars.len() && brackets > 0 {
+                if let Some(end) = literal_end(&chars, k) {
+                    k = end;
+                    continue;
+                }
+                match chars[k] {
+                    '[' => brackets += 1,
+                    ']' => brackets -= 1,
+                    _ => {}
+                }
+                k += 1;
+            }
+            if brackets == 0 {
+                let attribute: String = chars[i + 2..k - 1].iter().collect();
+                if let Some(found) = PATH_ATTR.captures(&attribute) {
+                    path = Some(found[1].to_string());
+                }
+            }
+            i = k;
+        } else if chars[i].is_ascii_alphabetic() || chars[i] == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            if word == "mod" {
+                while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                    i += 1;
+                }
+                let start = i;
+                while chars
+                    .get(i)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                {
+                    i += 1;
+                }
+                let name: String = chars[start..i].iter().collect();
+                while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                    i += 1;
+                }
+                if !name.is_empty() && chars.get(i) == Some(&';') {
+                    if depth == 0 {
+                        modules.push((name, path.take()));
+                    } else {
+                        nested.push((name, path.take()));
+                    }
+                }
+                path = None;
+            } else if matches!(
+                word.as_str(),
+                "fn" | "struct"
+                    | "enum"
+                    | "use"
+                    | "impl"
+                    | "trait"
+                    | "type"
+                    | "const"
+                    | "static"
+                    | "extern"
+            ) {
+                path = None;
+            }
+        } else {
+            match chars[i] {
+                '{' => {
+                    depth += 1;
+                    path = None;
+                }
+                '(' | '[' => depth += 1,
+                '}' | ')' | ']' => depth = depth.saturating_sub(1),
+                ';' => path = None,
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    (modules, nested)
+}
+
+fn external_modules(text: &str) -> ExternalModules {
+    external_module_declarations(text).0
+}
+
+fn module_files(path: &Path, modules: ExternalModules) -> Vec<std::path::PathBuf> {
+    let base = match path.file_stem().and_then(|stem| stem.to_str()) {
+        Some("mod" | "lib" | "main") => path.parent().unwrap().to_path_buf(),
+        _ => path.with_extension(""),
+    };
+    modules
+        .into_iter()
+        .flat_map(|(name, file)| match file {
+            Some(file) => vec![path.parent().unwrap().join(file)],
+            None => vec![
+                base.join(format!("{name}.rs")),
+                base.join(name).join("mod.rs"),
+            ],
+        })
+        .map(|path| {
+            let mut normalized = std::path::PathBuf::new();
+            for component in path.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    component => normalized.push(component.as_os_str()),
+                }
+            }
+            normalized
+        })
+        .collect()
+}
+
+/// Test ancestry cannot hide a child also reached by an ungated production parent.
+fn test_only_files(files: &BTreeMap<std::path::PathBuf, String>) -> BTreeSet<std::path::PathBuf> {
+    let mut candidates = BTreeSet::new();
+    let mut production = BTreeMap::new();
+    for (path, text) in files {
+        let (prod, tests) = production_text(text);
+        candidates.extend(module_files(path, tests));
+        production.insert(path.clone(), module_files(path, external_modules(&prod)));
+    }
+    let mut queue: Vec<_> = candidates.iter().cloned().collect();
+    while let Some(path) = queue.pop() {
+        if let Some(text) = files.get(&path) {
+            for child in module_files(&path, external_modules(text)) {
+                if candidates.insert(child.clone()) {
+                    queue.push(child);
+                }
+            }
+        }
+    }
+    for (path, text) in files {
+        let (prod, _) = production_text(text);
+        let nested = external_module_declarations(&prod).1;
+        for (name, file) in nested {
+            // An inline module's directory may be overridden; never hide a possible child.
+            production.get_mut(path).unwrap().extend(
+                candidates
+                    .iter()
+                    .filter(|child| {
+                        if let Some(file) = &file {
+                            let file = Path::new(file);
+                            child.file_name() == file.file_name()
+                        } else {
+                            child.file_stem().is_some_and(|stem| stem == name.as_str())
+                                || (child.file_name().is_some_and(|file| file == "mod.rs")
+                                    && child
+                                        .parent()
+                                        .and_then(Path::file_name)
+                                        .is_some_and(|stem| stem == name.as_str()))
+                        }
+                    })
+                    .cloned(),
+            );
+        }
+    }
+    let mut live: BTreeSet<_> = files
+        .keys()
+        .filter(|path| !candidates.contains(*path))
+        .cloned()
+        .collect();
+    let mut queue: Vec<_> = live.iter().cloned().collect();
+    while let Some(path) = queue.pop() {
+        for child in production.get(&path).into_iter().flatten() {
+            if live.insert(child.clone()) {
+                queue.push(child.clone());
+            }
+        }
+    }
+    candidates.retain(|path| !live.contains(path));
+    candidates
+}
+
 /// Production text of every non-test `src/**/*.rs`, keyed by repo-relative path.
 fn production_sources() -> BTreeMap<String, String> {
     let (probe, _) = production_text(
         "fn a() { b(\"}\"); }\n#[cfg(test)]\nmod t { const S: &str = \"{\"; }\nfn c() {}",
     );
     assert!(probe.contains("fn a()") && probe.contains("fn c()") && !probe.contains("mod t"));
+    let mut modules: BTreeMap<_, _> = [
+        (
+            "src/root.rs",
+            "#[cfg(test)]\n#[path = \"fixtures/root.rs\"]\nmod tests;",
+        ),
+        ("src/fixtures/root.rs", "mod nested;"),
+        (
+            "src/fixtures/root/nested.rs",
+            "#[path = \"../../shared.rs\"]\nmod shared;",
+        ),
+        ("src/shared.rs", "mod leaf;"),
+        ("src/shared/leaf.rs", "fn marker_reader() {}"),
+    ]
+    .into_iter()
+    .map(|(path, text)| (std::path::PathBuf::from(path), text.to_string()))
+    .collect();
+    let test_files = test_only_files(&modules);
+    assert_eq!(
+        test_files
+            .iter()
+            .filter(|path| modules.contains_key(*path))
+            .count(),
+        4
+    );
+    modules
+        .get_mut(Path::new("src/root.rs"))
+        .unwrap()
+        .push_str("\n#[path = \"shared.rs\"]\nmod live;");
+    let test_files = test_only_files(&modules);
+    assert!(!test_files.contains(Path::new("src/shared.rs")));
+    assert!(!test_files.contains(Path::new("src/shared/leaf.rs")));
+    assert!(test_files.contains(Path::new("src/fixtures/root/nested.rs")));
+    modules.insert("src/root.rs".into(), "#[cfg(test)]\n#[path = \"fixtures/root.rs\"]\nmod tests; mod inline { #[path = \"../../shared.rs\"] mod live; }".into());
+    let test_files = test_only_files(&modules);
+    assert!(!test_files.contains(Path::new("src/shared.rs")));
+    assert!(!test_files.contains(Path::new("src/shared/leaf.rs")));
+    assert!(external_modules("/* mod fake; */ const S: &str = \"mod fake;\"; mod inline { mod fake; } macro_call!(mod fake;);").is_empty());
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut stack = vec![root.join("src")];
     let mut files = BTreeMap::new();
-    let mut test_files = BTreeSet::new();
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry
@@ -763,25 +1099,12 @@ fn production_sources() -> BTreeMap<String, String> {
             let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
                 panic!("source scan: unreadable {}: {error}", path.display())
             });
-            let (prod, test_mods) = production_text(&text);
-            let stem = path.file_stem().unwrap().to_string_lossy().to_string();
-            let base = match stem.as_str() {
-                "mod" | "lib" | "main" => path.parent().unwrap().to_path_buf(),
-                _ => path.with_extension(""),
-            };
-            for (name, file) in test_mods {
-                if let Some(file) = file {
-                    test_files.insert(path.parent().unwrap().join(file));
-                    continue;
-                }
-                test_files.insert(base.join(format!("{name}.rs")));
-                test_files.insert(base.join(name).join("mod.rs"));
-            }
-            files.insert(path, (text.len(), prod));
+            files.insert(path, text);
         }
     }
+    let test_files = test_only_files(&files);
     let (mut total, mut kept, mut sources) = (0, 0, BTreeMap::new());
-    for (path, (len, prod)) in files {
+    for (path, text) in files {
         if test_files.contains(&path) {
             continue;
         }
@@ -790,7 +1113,8 @@ fn production_sources() -> BTreeMap<String, String> {
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        (total, kept) = (total + len, kept + prod.len());
+        let (prod, _) = production_text(&text);
+        (total, kept) = (total + text.len(), kept + prod.len());
         sources.insert(relative, prod);
     }
     assert!(
@@ -1337,18 +1661,27 @@ fn item_uses_by_file(
     uses
 }
 
-/// Files outside `owners` reaching the `Herdr` variant through `HostKind` or one of
-/// its aliases: a variant or glob import, or a path to the variant.
-fn herdr_variant_violations(sources: &BTreeMap<String, String>, owners: &[&str]) -> Vec<String> {
+/// Files outside `owners` reaching a guarded variant through its enum or an alias,
+/// including variant imports and globs.
+fn guarded_variant_violations(
+    sources: &BTreeMap<String, String>,
+    enum_name: &str,
+    variant_name: &str,
+    owners: &[&str],
+) -> Vec<String> {
     let mut violations = Vec::new();
     let files = scan_files(sources, &mut violations);
-    let kinds = bindings(&files, "HostKind");
-    let variant = regex::Regex::new(r"\b(\w+)\s*::\s*Herdr\b").unwrap();
+    let kinds = bindings(&files, enum_name);
+    let variant = regex::Regex::new(&format!(
+        r"\b(\w+)\s*::\s*{}\b",
+        regex::escape(variant_name)
+    ))
+    .unwrap();
     for (relative, file) in files.iter().filter(|(r, _)| !owners.contains(&r.as_str())) {
-        // Whether `path[k]`, reached through `path[..k]`, may name HostKind or an alias of it;
+        // Whether `path[k]`, reached through `path[..k]`, may name the enum or an alias of it;
         // a qualifier that globs the alias's module, or names no scanned module, counts.
         let kind_at = |path: &[String], k: usize| {
-            path[k] == "HostKind"
+            path[k] == enum_name
                 || kinds.iter().any(|(name, at)| {
                     let module = &files[at].module;
                     *name == path[k]
@@ -1363,12 +1696,12 @@ fn herdr_variant_violations(sources: &BTreeMap<String, String>, owners: &[&str])
             (0..leaf.path.len()).any(|k| {
                 kind_at(&leaf.path, k)
                     && match leaf.path.get(k + 1) {
-                        Some(next) => next == "Herdr",
+                        Some(next) => next == variant_name,
                         None => leaf.binds.is_none(),
                     }
             })
         });
-        let pathed = file.code.contains("Herdr")
+        let pathed = file.code.contains(variant_name)
             && variant.captures_iter(&file.code).any(|found| {
                 let name = found.get(1).unwrap();
                 let mut path = qualifier(&file.code, name.start());
@@ -1376,10 +1709,14 @@ fn herdr_variant_violations(sources: &BTreeMap<String, String>, owners: &[&str])
                 kind_at(&path, path.len() - 1)
             });
         if imported || pathed {
-            violations.push(format!("{relative}: HostKind::Herdr import"));
+            violations.push(format!("{relative}: {enum_name}::{variant_name} import"));
         }
     }
     violations
+}
+
+fn herdr_variant_violations(sources: &BTreeMap<String, String>, owners: &[&str]) -> Vec<String> {
+    guarded_variant_violations(sources, "HostKind", "Herdr", owners)
 }
 
 const GUARD_ADAPTER: &str = "src/services/discord/inflight/host_recovery_guard.rs";
@@ -1387,20 +1724,33 @@ const SESSION_RECORD: &str = "src/services/session_host/session_record.rs";
 /// The timeouts policy repair facade: the one production caller of the target guard.
 const POLICY_REPAIR: &str = "src/engine/ops/timeouts_ops/host_repair.rs";
 
-// Dormant guard: no production code reaches a Herdr host. Owners may only name
-// Herdr items, never construct or route to one; everything else may not name them.
+// Dormant guard: only the boot registry builds a Herdr host. Owners may name Herdr
+// items but never construct one; everything else may not name them.
 #[test]
 fn herdr_items_have_no_production_caller() {
+    const ESCAPE_DELIVERY: &str =
+        "src/services/discord/turn_bridge/tmux_runtime/codex_stop_delivery.rs";
     const OWNERS: &[(&str, usize)] = &[
         ("src/services/session_host.rs", 0),
+        // Dormant Escape uses the registered target; no host is constructed or stop path wired.
+        (ESCAPE_DELIVERY, 1),
         ("src/services/session_host/herdr_host.rs", 5),
         ("src/services/session_host/herdr/model.rs", 1),
         ("src/services/session_host/herdr/contract.rs", 0),
         ("src/services/session_host/herdr/observe.rs", 0),
         ("src/services/session_host/herdr/transport.rs", 0),
         ("src/services/session_host/herdr/wire.rs", 0),
+        ("src/services/session_host/herdr/provenance.rs", 0),
+        // Dormant socket launch host: builds its own transports; nothing constructs it.
+        ("src/services/session_host/herdr/launch_host.rs", 0),
         ("src/services/session_host/model.rs", 3),
         ("src/services/session_host/resolve.rs", 2),
+        // The input gate (its own `.host_kind` check) and the boot registry, the one place a
+        // Herdr host is built.
+        (INPUT_GATE, 1),
+        (REGISTRY, 0),
+        // Claude input: a Herdr target exists only through the registry and its gate.
+        ("src/services/claude_tui/host_input.rs", 4),
         ("src/services/session_host/consumer_guard.rs", 2),
         ("src/services/session_host/legacy_collapse.rs", 1),
         ("src/services/session_host/tmux_host.rs", 0),
@@ -1416,8 +1766,15 @@ fn herdr_items_have_no_production_caller() {
         (RECONCILE, 1),
         // Dormant source attach: takes the caller's reader, never constructs or routes to a host.
         ("src/services/discord/tui_prompt_relay/herdr_source.rs", 0),
+        // Switched-on Claude Herdr turn: reads the stored pane through its gate, never a host.
+        (
+            "src/services/discord/router/message_handler/provider_dispatch.rs",
+            0,
+        ),
         // Watcher host snapshot: reads the marker beside the admission map and row, never a host.
         (WATCH_HOST, 1),
+        // Restart reader and reconnect pass: read the stored pane through its gate, never a host.
+        ("src/services/discord/recovery_engine/herdr_reader.rs", 0),
     ];
     const NEEDLES: &[&str] = &[
         "HerdrHost",
@@ -1434,7 +1791,10 @@ fn herdr_items_have_no_production_caller() {
         "HerdrHost::<",
         "HerdrSocketTransport::new(",
         "HerdrSocketTransport::<",
+        "SocketHerdrLaunchHost::new(",
     ];
+    const LAUNCH_HOST: &str = "src/services/session_host/herdr/launch_host.rs";
+    const REGISTRY: &str = "src/services/session_host/herdr_registry.rs";
     // Only the inflight binding CAS copies a locator and only the Claude launch writes a
     // (tmux) `.host_kind` marker. Termination holds a locator only as a target.
     const LOCATOR: &str = "src/services/discord/inflight/host_locator.rs";
@@ -1452,6 +1812,7 @@ fn herdr_items_have_no_production_caller() {
     const CLAUDE_TURN_GATE: &str = "src/services/claude/host_gate.rs";
     const RECONCILE: &str = "src/services/discord/recovery_engine/host_reconcile.rs";
     const WATCH_HOST: &str = "src/services/discord/watchers/lifecycle/watch_host.rs";
+    const INPUT_GATE: &str = "src/services/session_host/herdr_gate.rs";
     const READERS: &[(&str, &[&str])] = &[
         (
             "PersistedHostLocator",
@@ -1471,6 +1832,7 @@ fn herdr_items_have_no_production_caller() {
             "HostKindMarker",
             &[
                 MARKER,
+                CLAUDE_LAUNCH, // Guarded relaunch reads the marker only to keep a live session's evidence.
                 GUARD_ADAPTER,
                 CLEANUP_GATE,
                 RESOLVE,
@@ -1478,12 +1840,15 @@ fn herdr_items_have_no_production_caller() {
                 CLAUDE_TURN_GATE,
                 RECONCILE,
                 WATCH_HOST,
+                INPUT_GATE,
+                ESCAPE_DELIVERY, // Dormant executor's marker read; test-only caller until settlement activation.
             ],
         ),
         (
             "read_host_kind_marker",
             &[
                 MARKER,
+                CLAUDE_LAUNCH, // Guarded relaunch reads the marker only to keep a live session's evidence.
                 CLEANUP_GATE,
                 RESOLVE,
                 GUARD_ADAPTER,
@@ -1491,6 +1856,8 @@ fn herdr_items_have_no_production_caller() {
                 CLAUDE_TURN_GATE,
                 RECONCILE,
                 WATCH_HOST,
+                INPUT_GATE,
+                ESCAPE_DELIVERY, // Dormant executor's marker read; test-only caller until settlement activation.
             ],
         ),
         (
@@ -1504,6 +1871,8 @@ fn herdr_items_have_no_production_caller() {
                 CLAUDE_TURN_GATE,
                 RECONCILE,
                 WATCH_HOST,
+                INPUT_GATE,
+                ESCAPE_DELIVERY, // Dormant executor's marker read; test-only caller until settlement activation.
             ],
         ),
         ("record_tmux_host_marker", &[MARKER, CLAUDE_LAUNCH]),
@@ -1524,7 +1893,17 @@ fn herdr_items_have_no_production_caller() {
             Some(_) => Vec::new(),
             None => NEEDLES.iter().filter(|n| prod.contains(**n)).collect(),
         };
-        let activated = ACTIVATIONS.iter().filter(|n| prod.contains(**n));
+        let activated = ACTIVATIONS
+            .iter()
+            .filter(|n| prod.contains(**n))
+            .filter(|n| {
+                // The launch host owns its transports; the host itself must stay unconstructed.
+                !(relative == LAUNCH_HOST && n.starts_with("HerdrSocketTransport::new("))
+                    // The boot registry builds each local endpoint's transport, host and launch host.
+                    && !(relative == REGISTRY
+                        && ["HerdrHost::new(", "HerdrSocketTransport::new(", "SocketHerdrLaunchHost::new("]
+                            .contains(n))
+            });
         violations.extend(
             named
                 .into_iter()
@@ -1950,6 +2329,8 @@ fn name_only_teardown_calls_stay_on_the_reviewed_list() {
     const OWNED: &str = "owned by another piece";
     const MISSING: &str = "a Missing row path keeps it name-only";
     const ENTRY: &str = "forwarded by the guarded entry";
+    const NATIVE: &str = "behind the native clear's keyed clearance or managed-reset refusal";
+    const LEDGER: &str = "behind the ledger clear's managed-reset refusal and keyed clearance";
     const CALLS: &[(&str, Listed)] = &[
         (
             "record_termination_for_tmux",
@@ -2005,14 +2386,29 @@ fn name_only_teardown_calls_stay_on_the_reviewed_list() {
                     BEFORE_WRITER,
                 ),
                 ("src/services/discord/tmux_reaper.rs", 2, MISSING),
-                ("src/services/discord/commands/control.rs", 1, MISSING),
+                (
+                    "src/services/discord/commands/control/managed_reset.rs",
+                    1,
+                    MISSING,
+                ),
                 ("src/services/turn_lifecycle.rs", 1, MISSING),
             ],
         ),
         (
             "reset_managed_process_session",
             &[
-                ("src/services/discord/commands/control.rs", 2, MISSING),
+                ("src/services/discord/commands/control.rs", 1, MISSING),
+                (
+                    "src/services/discord/commands/control/provider_reset.rs",
+                    1,
+                    MISSING,
+                ),
+                ("src/services/discord/commands/control/native.rs", 1, NATIVE),
+                (
+                    "src/services/discord/commands/control/input_clear.rs",
+                    1,
+                    LEDGER,
+                ),
                 ("src/services/discord/commands/mod.rs", 0, ENTRY),
                 ("src/services/discord/health/recovery.rs", 1, MISSING),
                 ("src/services/discord/admin_host_guard.rs", 1, MISSING),
@@ -2594,4 +2990,261 @@ fn claude_warm_followup_reaches_tmux_only_through_the_executor() {
         violations.is_empty(),
         "warm follow-up bypasses the executor: {violations:?}"
     );
+}
+
+const CLOSE_GATE: &str = "src/services/session_host/herdr_gate.rs";
+const CLOSE_MODEL: &str = "src/services/session_host/herdr/model.rs";
+const CLOSE_OWNER: &str = "src/services/termination_audit/host_terminate.rs";
+
+fn close_owner_violations(sources: &BTreeMap<String, String>) -> Vec<String> {
+    let mut violations = guarded_variant_violations(
+        sources,
+        "HerdrRequest",
+        "PaneClose",
+        &[CLOSE_GATE, CLOSE_OWNER],
+    );
+    violations.extend(guarded_variant_violations(
+        sources,
+        "Mutation",
+        "Terminate",
+        &[CLOSE_GATE],
+    ));
+    violations.extend(guarded_item_violations(
+        sources,
+        &[
+            (
+                "terminate_herdr_once",
+                &[("src/services/discord/herdr_terminate.rs", 1)],
+            ),
+            ("pin_terminate", &[(CLOSE_OWNER, 1)]),
+            ("pin_terminate_fenced", &[(CLOSE_OWNER, 1)]),
+            ("send_close_pinned", &[(CLOSE_OWNER, 1)]),
+            (
+                "call_with_witness",
+                &[
+                    (CLOSE_GATE, 2),
+                    ("src/services/session_host/herdr/launch_host.rs", 2),
+                    ("src/services/session_host/herdr_host.rs", 1),
+                    ("src/services/session_host/herdr_registry.rs", 1),
+                ],
+            ),
+        ],
+    ));
+    for (path, source) in sources {
+        for forbidden in [
+            "server.stop",
+            "workspace.close",
+            "tab.close",
+            "group.close",
+            "worktree_group.close",
+        ] {
+            if source.contains(&format!("\"{forbidden}\"")) {
+                violations.push(format!("{path}: destructive wire {forbidden}"));
+            }
+        }
+        if path != CLOSE_MODEL && source.contains("\"pane.close\"") {
+            violations.push(format!("{path}: raw pane.close"));
+        }
+        for variant in [
+            "ServerStop",
+            "WorkspaceClose",
+            "TabClose",
+            "GroupClose",
+            "WorktreeGroupClose",
+        ] {
+            if !word_uses(&code_tokens(source), variant).is_empty() {
+                violations.push(format!("{path}: destructive variant {variant}"));
+            }
+        }
+    }
+    violations
+}
+
+#[test]
+fn m0_close_variant_closed_world() {
+    let sources = production_sources();
+    assert!(
+        close_owner_violations(&sources).is_empty(),
+        "{:?}",
+        close_owner_violations(&sources)
+    );
+    let gate = code_tokens(&sources[CLOSE_GATE]);
+    let files = scan_files(&sources, &mut Vec::new());
+    let uses = item_uses_by_file(&files, "PaneClose", &bindings(&files, "PaneClose"));
+    assert_eq!(uses[CLOSE_GATE].0, 3);
+    assert_eq!(uses[CLOSE_MODEL].0, 1, "only the variant declaration");
+    let calls = item_uses_by_file(
+        &files,
+        "call_with_witness",
+        &bindings(&files, "call_with_witness"),
+    );
+    assert_eq!(calls.values().map(|(count, _)| count).sum::<usize>(), 6);
+    assert_eq!(
+        word_uses(&gate, "PaneClose").len(),
+        3,
+        "constructor and two request checks"
+    );
+    let leaf = &gate[fn_body(&gate, "fn send_close_pinned(")];
+    assert_eq!(word_uses(leaf, "call_with_witness").len(), 1);
+    assert!(leaf.contains("let request = HerdrRequest::PaneClose"));
+    let owner =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(CLOSE_OWNER)).unwrap();
+    let owner = code_tokens(&owner);
+    let body = &owner[fn_body(&owner, "fn terminate_herdr_once(")];
+    assert_eq!(word_uses(body, "pin_terminate").len(), 1);
+    assert_eq!(word_uses(body, "send_close_pinned").len(), 1);
+    for forbidden in [
+        "interrupt",
+        "kill_session",
+        "kill",
+        "retire_pg",
+        "record_termination",
+        "clear_legacy_session",
+        "terminate_hosted_session",
+        "submit_terminal",
+    ] {
+        assert!(
+            word_uses(body, forbidden).is_empty(),
+            "owner escaped to {forbidden}"
+        );
+    }
+    let model = &sources[CLOSE_MODEL];
+    let requests = model
+        .split("pub(crate) enum HerdrRequest {")
+        .nth(1)
+        .unwrap()
+        .split("impl HerdrRequest")
+        .next()
+        .unwrap();
+    let names: Vec<_> = regex::Regex::new(r#"serde\(rename = "([^"]+)"\)"#)
+        .unwrap()
+        .captures_iter(requests)
+        .map(|c| c[1].to_string())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "ping",
+            "session.snapshot",
+            "pane.get",
+            "pane.process_info",
+            "pane.read",
+            "pane.close",
+            "pane.send_text",
+            "pane.send_keys",
+            "pane.send_input",
+            "workspace.create"
+        ]
+    );
+}
+
+#[test]
+fn m0_close_variant_alias_fixture() {
+    let outsider = "src/services/termination_audit.rs";
+    for source in [
+        "fn f() { let _ = HerdrRequest::PaneClose { pane_id: String::new() }; }",
+        "use crate::services::session_host::herdr::model::HerdrRequest as R; fn f() { let _ = R::PaneClose { pane_id: String::new() }; }",
+        "use crate::services::session_host::herdr::model::HerdrRequest::*; fn f() { let _ = PaneClose { pane_id: String::new() }; }",
+        "pub use crate::services::session_host::herdr::model::HerdrRequest::PaneClose as End;",
+        "use crate::services::session_host::herdr::model::HerdrRequest as R; use R::*;",
+        "type R = crate::services::session_host::herdr::model::HerdrRequest; fn f() { let _ = R::PaneClose { pane_id: String::new() }; }",
+        "fn f() { let close = terminate_herdr_once; use_fn(close); }",
+        "fn f(t: HerdrTarget) { t.pin_terminate().ok(); t.send_close_pinned(); }",
+        "fn f() { let f = HerdrTarget::send_close_pinned; }",
+        "fn f(t: Transport) { t.call_with_witness(request, witness); }",
+        "use crate::services::termination_audit::host_terminate::terminate_herdr_once as close; fn f() { close(); }",
+        "fn f() { raw(\"workspace.close\"); }",
+        "fn f() { raw(\"pane.close\"); }",
+        "use crate::services::session_host::HerdrMutation; fn f() { let _ = HerdrMutation::Terminate; }",
+    ] {
+        let mut sources = BTreeMap::from([(outsider.into(), source.into())]);
+        sources.insert(
+            "src/services/session_host.rs".into(),
+            "pub use herdr_gate::Mutation as HerdrMutation;".into(),
+        );
+        assert!(
+            !close_owner_violations(&sources).is_empty(),
+            "missed {source}"
+        );
+    }
+    let sources = BTreeMap::from([
+        (CLOSE_OWNER.into(), "pub use crate::services::session_host::herdr::model::HerdrRequest as R;".into()),
+        (outsider.into(), "use crate::services::termination_audit::host_terminate::*; fn f() { let _ = R::PaneClose { pane_id: String::new() }; }".into()),
+    ]);
+    assert!(
+        !close_owner_violations(&sources).is_empty(),
+        "reexport + glob"
+    );
+}
+
+const TERMINATE_SERVICE: &str = "src/services/discord/herdr_terminate.rs";
+const TERMINATE_ROUTE: &str = "src/server/routes/herdr_terminate.rs";
+const HERDR_CLI: &str = "src/cli/herdr.rs";
+
+/// The operator terminate chain's production names, each reached from its one caller only.
+fn terminate_entry_violations(sources: &BTreeMap<String, String>) -> Vec<String> {
+    let mut violations = guarded_item_violations(
+        sources,
+        &[
+            ("terminate_registered_herdr", &[(TERMINATE_ROUTE, 1)]),
+            ("terminate_explicit_herdr", &[(TERMINATE_SERVICE, 1)]),
+            ("host_terminated", &[(TERMINATE_SERVICE, 1)]),
+            ("retire_pg", &[(HERDR_CLI, 1), (TERMINATE_SERVICE, 1)]),
+            (
+                "post_json_local_at",
+                &[(HERDR_CLI, 1), ("src/cli/client.rs", 0)],
+            ),
+        ],
+    );
+    // The variant is built by the service; the finalizer files only match on it.
+    violations.extend(guarded_variant_violations(
+        sources,
+        "TerminalEvent",
+        "HostTerminated",
+        &[
+            TERMINATE_SERVICE,
+            "src/services/discord/turn_finalizer.rs",
+            "src/services/discord/turn_finalizer/cleanup.rs",
+        ],
+    ));
+    // Each link of the chain is still made, exactly once: a lost call fails as an extra one does.
+    let files = scan_files(sources, &mut Vec::new());
+    let required: [(&str, &str); 4] = [
+        ("terminate_registered_herdr", TERMINATE_ROUTE),
+        ("terminate_explicit_herdr", TERMINATE_SERVICE),
+        ("host_terminated", TERMINATE_SERVICE),
+        ("post_json_local_at", HERDR_CLI),
+    ];
+    for (needle, owner) in required {
+        let uses = item_uses_by_file(&files, needle, &bindings(&files, needle));
+        let used = uses.get(owner).map_or(0, |(used, _)| *used);
+        if used != 1 {
+            violations.push(format!("{owner}: {needle} used x{used}, not exactly once"));
+        }
+    }
+    let built = regex::Regex::new(r"\bTerminalEvent\s*::\s*HostTerminated\b").unwrap();
+    let built = files
+        .get(TERMINATE_SERVICE)
+        .map_or(0, |file| built.find_iter(&file.code).count());
+    if built != 1 {
+        violations.push(format!(
+            "{TERMINATE_SERVICE}: HostTerminated built x{built}, not exactly once"
+        ));
+    }
+    violations
+}
+
+#[test]
+fn act_terminate_entry_census() {
+    // The finalizer's terminated-host tests are gated `cfg(all(test, unix))`; that is test code.
+    let sources: BTreeMap<String, String> = production_sources()
+        .into_iter()
+        .map(|(path, text)| {
+            let text = text.replace("#[cfg(all(test, unix))]", "#[cfg(test)]");
+            (path, production_text(&text).0)
+        })
+        .collect();
+    let violations = terminate_entry_violations(&sources);
+    assert!(violations.is_empty(), "{violations:?}");
+    assert!(close_owner_violations(&sources).is_empty());
 }

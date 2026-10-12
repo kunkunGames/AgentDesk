@@ -25,10 +25,6 @@ env:
   SCCACHE_GHA_RW_MODE: READ_WRITE
   POSTGRES_SERVICE_IMAGE: ${{ vars.AGENTDESK_POSTGRES_SERVICE_IMAGE }}
 
-permissions:
-  contents: read
-  actions: write
-
 jobs:
   full_non_pg:
     # The whole non-PG library, adjudicated exactly as the PR `library_sweep`;
@@ -50,18 +46,28 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4
 
       - name: Start PostgreSQL service
         run: ./scripts/ci/postgres-service.sh start
 
+      # Rollback rehearsal executes the runbook's literal rg command.
+      - name: Install ripgrep
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep
+
+      - name: Require ripgrep
+        shell: bash
+        run: rg --version
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.1"
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # Cache only cargo registry/git. `target/` is intentionally NOT cached
       # because sccache (GHA-backed) already caches compiled rustc output and
@@ -70,12 +76,15 @@ jobs:
       # Rust hit-rate collapsed from 99.80% → 0.00% over a few hours of
       # merges). See PR description and docs/ci/sccache-setup.md §4.2.
       - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
           cache-bin: false
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Ensure swap for the lib test build
+        uses: ./.github/actions/ensure-swap
 
       - name: Library sweep (selection-set gated)
         timeout-minutes: 45
@@ -86,7 +95,7 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: |
           source scripts/ci/non-pg-test-filter.sh
-          python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 2 "${NON_PG_SKIP_ARGS[@]}" -- env -u AGENTDESK_ROOT_DIR cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}"
+          python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 4 "${NON_PG_SKIP_ARGS[@]}" -- env -u AGENTDESK_ROOT_DIR cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}"
           run_non_pg_filter_replay
 
       - name: Stop PostgreSQL service
@@ -103,25 +112,27 @@ jobs:
     name: Main lint and non-lib tests (ubuntu-latest)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.1"
           components: clippy, rustfmt
 
       - name: Install just
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@v2
         with:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # See `full_non_pg` for rationale.
       - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
           cache-bin: false
@@ -129,7 +140,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@v4
         with:
           node-version: "22"
 
@@ -139,8 +150,24 @@ jobs:
       - name: just fmt-check
         run: just fmt-check
 
+      # Workspace clippy can exhaust hosted-runner memory; swap pages it instead of killing the runner.
+      - name: Ensure swap for clippy
+        uses: ./.github/actions/ensure-swap
+
       - name: just lint
-        run: just lint
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p target/clippy-observation
+          cargo clippy --workspace --all-targets --all-features --message-format=json -- -W clippy::all | tee target/clippy-observation/diagnostics.jsonl
+          python3 scripts/check_clippy_warning_count.py --input target/clippy-observation/diagnostics.jsonl --output target/clippy-observation/report.json --baseline scripts/clippy_warning_baseline.json --base-ref HEAD^1
+
+      - name: Upload Clippy observation
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-observation-${{ github.sha }}
+          path: target/clippy-observation/
+          if-no-files-found: error
 
       # The library sweep covers the lib side of the `--all-targets` filters; this
       # runs their non-lib side and the ClaudeBinary compile-fail doctests.
@@ -185,33 +212,46 @@ jobs:
       PGPASSWORD: postgres
       AGENTDESK_REQUIRE_PG: "1"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4
 
       - name: Start PostgreSQL service
         run: ./scripts/ci/postgres-service.sh start
 
+      # Rollback rehearsal executes the runbook's literal rg command.
+      - name: Install ripgrep
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep
+
+      - name: Require ripgrep
+        shell: bash
+        run: rg --version
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.1"
 
       - name: Install just
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        uses: taiki-e/install-action@v2
         with:
           tool: just@1.51.0
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # See ci-main.yml `full_non_pg` for rationale: `target/` excluded so the
       # GHA cache quota is not starved out from under sccache.
       - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
           cache-bin: false
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Ensure swap for the lib test build
+        uses: ./.github/actions/ensure-swap
 
       - name: PostgreSQL lane resource diagnostics
         if: ${{ inputs.resource_diagnostics == true }}
@@ -230,8 +270,9 @@ jobs:
           resource_sample > "$RUNNER_TEMP/pg-resource-samples.log" 2>&1 &
 
       - name: just test-postgres-shard
-        # Same budget as ci-pr.yml; main hit 30 min at 25–27 min typical runtime.
-        timeout-minutes: 40
+        # Same budget as ci-pr.yml; shard 1 runs the rest of the PG selection and
+        # reached 39–41 min on 2026-10-11, so 40 min cut healthy runs.
+        timeout-minutes: 60
         run: just test-postgres-shard
         env:
           # #4245: see Full tests lane — keep test debuginfo off so the build
@@ -270,27 +311,30 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4
 
       - name: Start PostgreSQL service
         run: ./scripts/ci/postgres-service.sh start
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.1"
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       # See ci-main.yml `full_non_pg` for rationale.
       - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
           cache-bin: false
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Ensure swap for the lib test build
+        uses: ./.github/actions/ensure-swap
 
       - name: High-risk recovery lane
         run: "cargo test --lib high_risk_recovery:: -- --test-threads=1"
@@ -318,30 +362,33 @@ jobs:
     name: Main script checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       # --verify-lib-inventory invokes `cargo test --lib -- --list`; keep the
       # main-push aggregate job on the pinned Rust toolchain and shared cache.
       - name: Install Rust toolchain for lib inventory
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.1"
 
       - name: Setup sccache for lib inventory
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Cache Cargo dependencies for lib inventory
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
           cache-bin: false
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Ensure swap for the lib test build
+        uses: ./.github/actions/ensure-swap
+
       - name: Setup Python for script checks
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -366,13 +413,13 @@ jobs:
           SCRIPT_CHECK_SHARD: cargo
       - name: Upload giant-file progress evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@v4
         with:
           path: target/giant-file-progress/evidence.json
 
       - name: Upload maintainability audit artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@v4
         with:
           name: maintainability-audit-main
           path: target/maintainability-audit.yaml
@@ -383,12 +430,12 @@ jobs:
     name: Main script checks (guards)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Setup Python for script checks
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -411,12 +458,12 @@ jobs:
     name: Main script checks (contracts)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Setup Python for script checks
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -448,23 +495,23 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@v4
 
       - name: Provision Python 3.11
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94.1"
 
       - name: Setup sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
           cache-bin: false

@@ -19,7 +19,8 @@ gated funnels. This gate keeps that cut honest on every intermediate head:
       read as Posted evidence. The `O_TUI_WRITER` token itself may appear only
       in the O_TUI_WRITER_FILES.
   (d) A claim is the `claim_then_send` helper, which claims just before the
-      send it runs; its closure is the transport call alone. `claim_at_post`
+      send it runs; its closure is the transport call alone. `claim_then_send_held`
+      also hands back the claimed send for a body sent in more steps. `claim_at_post`
       wraps a task-response transport so each chunk post claims that way. A
       raw claim (a claiming gate fn, or under tui_o any `.claim(` call or
       `::claim` path) may appear only in the RAW_CLAIM_SITES functions, each
@@ -71,15 +72,15 @@ PRIMITIVES: dict[str, str] = {
     "send_outbound_message": r"\bsend_outbound_message\s*\(",
     "edit_outbound_message": r"\bedit_outbound_message\s*\(",
 }
-_OWNS = r"o_owns_tui_output(?:_for_channel_tmux|_for_channel|_for_tmux_session|_with)?"
-_RAW_CLAIM = rf"\b{_OWNS}\b|\bcandidate\s*\.\s*claim\s*\("
+_OWNS = r"o_owns_tui_output(?:_for_channel_tmux|_for_channel|_for_tmux_session|_with)?(?:_reserving)?"
+_RAW_CLAIM = rf"\b{_OWNS}\b|\bcandidate\s*\.\s*claim(?:_body)?\s*\("
 RAW_CLAIM_RE = re.compile(_RAW_CLAIM)
-# `Candidate::claim` is visible only under tui_o, so there every `.claim(` call and every
-# `::claim` path counts, whatever the receiver or chain, and whether called or taken as a value.
+# `Candidate::claim` and `claim_body` are visible only under tui_o, so there every such call
+# and path counts, whatever the receiver or chain, and whether called or taken as a value.
 TUI_O_ROOT = "src/services/tui_o/"
-TUI_O_RAW_CLAIM_RE = re.compile(rf"{_RAW_CLAIM}|\.\s*claim\s*\(|::\s*claim\b")
+TUI_O_RAW_CLAIM_RE = re.compile(rf"{_RAW_CLAIM}|\.\s*claim(?:_body)?\s*\(|::\s*claim(?:_body)?\b")
 GATE_RES = {
-    "claim": re.compile(rf"{_RAW_CLAIM}|\bclaim_then_(?:direct_)?send\b|\bclaim_at_post\b"),
+    "claim": re.compile(rf"{_RAW_CLAIM}|\bclaim_then_(?:direct_)?send(?:_held)?\b|\bclaim_at_post\b"),
     "peek": re.compile(rf"\b(?:peek_{_OWNS}|bridge_o_body_peek_decision)\b"),
 }
 FLAG_RE = re.compile(r"\bO_TUI_WRITER\b")
@@ -120,7 +121,9 @@ EXPECTED_PRIMITIVES: dict[str, dict[str, int]] = {
     "abandon_request_store.rs": {"edit_outbound_message": 1},
     "admin_host_guard.rs": {".say": 1},
     "commands/config.rs": {".say": 12, "send_long_message*": 1},
-    "commands/control.rs": {".say": 15, "send_long_message*": 1},
+    "commands/control.rs": {".say": 14, "send_long_message*": 1},
+    "commands/control/home_fence.rs": {".say": 1},
+    "commands/control/input_clear.rs": {".say": 1},
     "commands/diagnostics/mod.rs": {".say": 9, "send_long_message*": 7},
     "commands/fast_mode.rs": {".say": 2},
     "commands/goals.rs": {".say": 2},
@@ -162,7 +165,9 @@ EXPECTED_PRIMITIVES: dict[str, dict[str, int]] = {
     "placeholder_controller.rs": {".edit_message": 1},
     "placeholder_controller/queued_card_gate.rs": {"edit_channel_message*": 1},
     "placeholder_sweeper.rs": {"edit_outbound_message": 1},
+    "queue_io/turn_admission.rs": {"send_channel_message*": 1},
     "recovery_engine/completion_delivery.rs": {"relay_recovered_body_to_placeholder": 3},
+    "recovery_engine/herdr_before_start_restart.rs": {"replace_message_with_outcome": 1},
     "recovery_engine/restore_inflight.rs": {"relay_recovered_terminal_text_to_placeholder": 2},
     "recovery_engine/terminal_text_idempotency.rs": {"replace_long_message*": 2, "send_long_message*": 2},
     "recovery_engine/two_message_panel.rs": {"send_channel_message*": 1},
@@ -170,10 +175,12 @@ EXPECTED_PRIMITIVES: dict[str, dict[str, int]] = {
     "recovery_paths/restart.rs": {"relay_recovered_body_to_placeholder": 1},
     "router/intake_dispatch/notice.rs": {"send_channel_message*": 1},
     "router/intake_gate.rs": {".say": 3},
+    "router/intake_gate/busy_inject.rs": {".say": 1},
     "router/message_handler/attachments.rs": {".say": 4},
     "router/message_handler/control.rs": {".say": 1},
     "router/message_handler/goal_lifecycle.rs": {".say": 1},
     "router/message_handler/intake_turn.rs": {".say": 2},
+    "router/message_handler/intake_turn/host_refusal.rs": {".say": 1},
     "router/message_handler/pre_admission_control.rs": {".say": 1},
     "router/message_handler/tui_followup.rs": {"edit_channel_message*": 1},
     "session_relay_sink.rs": {"replace_long_message*": 1, "replace_message_with_outcome": 1},
@@ -194,13 +201,16 @@ EXPECTED_PRIMITIVES: dict[str, dict[str, int]] = {
     "tmux_watcher/streaming_status_tick/existing_panel_update.rs": {"edit_channel_message*": 1},
     "tmux_watcher/task_response_authority.rs": {"send_task_response_chunks_with_card_repair": 1},
     "tmux_watcher/terminal_abort_exits.rs": {"edit_channel_message*": 1, "send_channel_message*": 1},
-    "tmux_watcher/terminal_direct_fallback.rs": {"replace_long_message*": 1, "send_long_message*": 2},
+    "tmux_watcher/terminal_direct_fallback.rs": {"send_long_message*": 1},
+    "tmux_watcher/terminal_direct_fallback_edit.rs": {"replace_long_message*": 1, "send_long_message*": 1},
     "tmux_watcher/terminal_long_chunks.rs": {"deliver_turn_output*": 1, "send_long_message*": 1},
     "tmux_watcher/terminal_send.rs": {"deliver_turn_output*": 1},
     "tmux_watcher/two_message_panel.rs": {"send_channel_message*": 1},
     "tui_prompt_relay.rs": {".say": 2},
     "tui_prompt_relay/bridge_gateway.rs": {"edit_outbound_message": 1, "replace_long_message*": 1, "send_long_message*": 1, "send_outbound_message": 1},
-    "tui_prompt_relay/synthetic_start_wiring.rs": {".say": 1},
+    "tui_prompt_relay/synthetic_start_wiring.rs": {".say": 3},
+    "turn_bridge/before_start_stop.rs": {"replace_message_with_outcome": 1},
+    "turn_bridge/bridge_entry_persist.rs": {"TurnGateway::send_message": 1},
     "turn_bridge/completion_postlude/o_panel_below.rs": {"TurnGateway::send_message": 1, "send_channel_message*": 1},
     "turn_bridge/current_message_anchor.rs": {"TurnGateway::edit_message": 1, "TurnGateway::send_message": 1},
     "turn_bridge/headless_delivery.rs": {"edit_channel_message*": 1, "send_long_message*": 1},
@@ -219,6 +229,7 @@ EXPECTED_PRIMITIVES: dict[str, dict[str, int]] = {
     "turn_bridge/terminal_outcome_delivery/foreign_terminal_handoff.rs": {"TurnGateway::send_message": 1},
     "turn_bridge/terminal_outcome_delivery/recovery_retry.rs": {".edit_message": 1},
     "turn_bridge/two_message_panel.rs": {".send_message": 2},
+    "turn_presence/supervisor.rs": {".say": 1},
     "voice_barge_in/final_result_playback.rs": {"send_channel_message*": 1},
     "voice_barge_in/progress_playback.rs": {"send_channel_message*": 1},
     "voice_barge_in/routing.rs": {"send_channel_message*": 1},
@@ -230,6 +241,8 @@ CENSUS: dict[str, tuple[str, ...]] = {
     "admin_host_guard.rs": ("CMD", "KEEP_NONBODY"),
     "commands/config.rs": ("CMD", "KEEP_NONBODY"),
     "commands/control.rs": ("CMD", "KEEP_NONBODY"),
+    "commands/control/home_fence.rs": ("CMD", "KEEP_NONBODY"),
+    "commands/control/input_clear.rs": ("CMD", "KEEP_NONBODY"),
     "commands/diagnostics/mod.rs": ("CMD", "KEEP_NONBODY"),
     "commands/fast_mode.rs": ("CMD", "KEEP_NONBODY"),
     "commands/goals.rs": ("CMD", "KEEP_NONBODY"),
@@ -271,7 +284,11 @@ CENSUS: dict[str, tuple[str, ...]] = {
     "placeholder_controller.rs": ("1-B-panel", "KEEP_NONBODY"),
     "placeholder_controller/queued_card_gate.rs": ("1-B-panel", "KEEP_NONBODY"),
     "placeholder_sweeper.rs": ("1-D-notice", "KEEP_NONBODY"),
+    # Control Notice via the reference helper; no O body authority or original/body text.
+    "queue_io/turn_admission.rs": ("INPUT-FENCE-notice", "KEEP_NONBODY"),
     "recovery_engine/completion_delivery.rs": ("W30,W31", "CUT_D"),
+    # Dormant restart stop notice on the turn's own message, sent only when O peek is Ok(false).
+    "recovery_engine/herdr_before_start_restart.rs": ("1-D-notice", "KEEP_NONBODY"),
     "recovery_engine/restore_inflight.rs": ("1-D-notice", "KEEP_NONBODY"),
     "recovery_engine/terminal_text_idempotency.rs": ("W32", "COV:W32"),
     "recovery_engine/two_message_panel.rs": ("1-D-panel", "KEEP_NONBODY"),
@@ -279,10 +296,13 @@ CENSUS: dict[str, tuple[str, ...]] = {
     "recovery_paths/restart.rs": ("W35", "CUT_D", "recovery_engine/terminal_text_idempotency.rs"),
     "router/intake_dispatch/notice.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/intake_gate.rs": ("INTAKE", "KEEP_NONBODY"),
+    # Injection notices (unconfirmed paste, unknown handback); no body text.
+    "router/intake_gate/busy_inject.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/message_handler/attachments.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/message_handler/control.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/message_handler/goal_lifecycle.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/message_handler/intake_turn.rs": ("INTAKE", "KEEP_NONBODY"),
+    "router/message_handler/intake_turn/host_refusal.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/message_handler/pre_admission_control.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/message_handler/tui_followup.rs": ("W26", "KEEP_NONBODY"),
     "session_relay_sink.rs": ("W20", "CUT_D"),
@@ -304,12 +324,15 @@ CENSUS: dict[str, tuple[str, ...]] = {
     "tmux_watcher/task_response_authority.rs": ("W01g", "CUT_D"),
     "tmux_watcher/terminal_abort_exits.rs": ("1-A-notice", "KEEP_NONBODY"),
     "tmux_watcher/terminal_direct_fallback.rs": ("W01a-c", "COV:W01"),
+    "tmux_watcher/terminal_direct_fallback_edit.rs": ("W01a-c", "COV:W01"),
     "tmux_watcher/terminal_long_chunks.rs": ("W01e-f", "COV:W01"),
     "tmux_watcher/terminal_send.rs": ("W01d", "COV:W01"),
     "tmux_watcher/two_message_panel.rs": ("1-A-panel", "KEEP_NONBODY"),
     "tui_prompt_relay.rs": ("W24", "KEEP_NONBODY"),
     "tui_prompt_relay/bridge_gateway.rs": ("W23", "COV:W10"),
     "tui_prompt_relay/synthetic_start_wiring.rs": ("W24", "KEEP_NONBODY"),
+    "turn_bridge/before_start_stop.rs": ("1-D-notice", "KEEP_NONBODY"),
+    "turn_bridge/bridge_entry_persist.rs": ("1-D-notice", "KEEP_NONBODY"),
     "turn_bridge/completion_postlude/o_panel_below.rs": ("1-B-panel", "KEEP_NONBODY"),
     "turn_bridge/current_message_anchor.rs": ("W15", "KEEP_NONBODY"),
     "turn_bridge/headless_delivery.rs": ("W17", "KEEP_36"),
@@ -332,6 +355,7 @@ CENSUS: dict[str, tuple[str, ...]] = {
     "turn_bridge/terminal_outcome_delivery/foreign_terminal_handoff.rs": ("W13", "CUT_D"),
     "turn_bridge/terminal_outcome_delivery/recovery_retry.rs": ("W18", "KEEP_NONBODY"),
     "turn_bridge/two_message_panel.rs": ("1-B-panel", "KEEP_NONBODY"),
+    "turn_presence/supervisor.rs": ("1-D-notice", "KEEP_NONBODY"),
     "voice_barge_in/final_result_playback.rs": ("1-E", "KEEP_36"),
     "voice_barge_in/progress_playback.rs": ("1-E", "KEEP_36"),
     "voice_barge_in/routing.rs": ("1-E", "KEEP_36"),
@@ -340,6 +364,7 @@ CENSUS: dict[str, tuple[str, ...]] = {
 # Each file's cutover gates as `enclosing fn:kind`, in source order.
 # claim: a body is sent here (`claim_then_send`, or a RAW_CLAIM_SITES claim). peek: only read.
 EXPECTED_GATES: dict[str, tuple[str, ...]] = {
+    "src/services/discord/commands/control/native.rs": ("select:peek",),
     "src/services/discord/footer_view_reconciler/mod.rs": (
         "edit_body_message:claim",
     ),
@@ -360,6 +385,8 @@ EXPECTED_GATES: dict[str, tuple[str, ...]] = {
         "o_owns_recovery_body:peek",
         "relay_recovered_body_to_placeholder:claim",
     ),
+    "src/services/discord/recovery_engine/herdr_admitted_restart.rs": ("o_owns:peek",),
+    "src/services/discord/recovery_engine/herdr_before_start_restart.rs": ("o_owns:peek",),
     "src/services/discord/recovery_engine/terminal_text_idempotency.rs": (
         "relay_no_anchor_terminal_text:claim",
         "relay_no_anchor_terminal_text:claim",
@@ -396,6 +423,8 @@ EXPECTED_GATES: dict[str, tuple[str, ...]] = {
     ),
     "src/services/discord/tmux_watcher/o_delegated_arm.rs": (
         "o_took_channel:peek",
+        # After card await, consumption requires an explicit Ok(true) ownership peek.
+        "under_current_authority:peek",
     ),
     "src/services/discord/tmux_watcher/streaming_status_tick.rs": (
         "update_streaming_status_tick:peek",
@@ -407,12 +436,15 @@ EXPECTED_GATES: dict[str, tuple[str, ...]] = {
     ),
     "src/services/discord/tmux_watcher/terminal_direct_fallback.rs": (
         "apply_watcher_direct_fallback_send:claim",
-        "apply_watcher_direct_fallback_send:claim",
+    ),
+    "src/services/discord/tmux_watcher/terminal_direct_fallback_edit.rs": (
+        "replace_or_post_after_edit_failure:claim",
     ),
     "src/services/discord/tmux_watcher/terminal_long_chunks.rs": (
         "apply_watcher_long_chunks_legacy:claim",
     ),
     "src/services/discord/tui_prompt_relay/claude_idle_bridge.rs": ("idle_tail_tool_opens:peek",),
+    "src/services/discord/turn_bridge/before_start_stop.rs": ("consume:peek",),
     "src/services/discord/turn_bridge/completion_postlude/o_panel_below.rs": (
         "follow:peek",
     ),
@@ -461,17 +493,18 @@ EXPECTED_GATES: dict[str, tuple[str, ...]] = {
     "src/services/tui_o/cutover/channel_gate.rs": (
         "claim:claim",
         "claim:claim",
+        "claim_then_send:claim",
         "decide_with_snapshot:claim",
     ),
 }
 # Functions where a raw claim may stand outside `claim_then_send`, keyed by file.
 RAW_CLAIM_SITES: dict[str, tuple[str, ...]] = {
     # The helper's own claim, and the adoption transition it reaches.
-    "src/services/tui_o/cutover/channel_gate.rs": ("claim", "claim_then_send", "decide_with_snapshot"),
+    "src/services/tui_o/cutover/channel_gate.rs": ("claim", "claim_then_send_held", "decide_with_snapshot"),
     # Re-exports; a placement releases a pending adoption by design, with no body.
     "src/services/tui_o/cutover.rs": ("<module>", "claim_for_placement"),
     # The writer host's once-per-channel actor slot, not an adoption.
-    "src/services/tui_o/writer/host.rs": ("start",),
+    "src/services/tui_o/writer/host.rs": ("start_managed",),
     # Claimed right before the first unconfirmed chunk's edit or post, across a resumable loop.
     "src/services/discord/health/recovery.rs": ("maybe_recover_completed_stale_leak",),
 }

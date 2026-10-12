@@ -12,8 +12,10 @@ use serde_json::{Value, json};
 use super::AppState;
 use super::agents_turn_target::{AgentTurnTarget, resolve_agent_turn_target};
 use crate::services::discord::health::{
-    HumanInputDelivery, HumanInputError, HumanInputRequest, deliver_human_input,
+    HealthRegistry, HumanInputDelivery, HumanInputError, HumanInputRequest, deliver_human_input,
+    preflight_human_input,
 };
+use crate::services::imsg_reply;
 
 const MAX_ORIGIN_ID_LEN: usize = 256;
 const MAX_SOURCE_LEN: usize = 64;
@@ -33,6 +35,47 @@ struct DeliverTurnInputBody {
 }
 
 type RouteResponse = (StatusCode, Json<Value>);
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(super) struct DeliveryProbe {
+    pub calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub entered: Option<std::sync::Arc<tokio::sync::Notify>>,
+    pub release: Option<std::sync::Arc<tokio::sync::Notify>>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static ADMISSION_ENABLED_FOR_TEST: bool;
+    pub(super) static DELIVERY_PROBE_FOR_TEST: DeliveryProbe;
+}
+
+fn admission_enabled() -> bool {
+    #[cfg(test)]
+    if let Ok(enabled) = ADMISSION_ENABLED_FOR_TEST.try_with(|enabled| *enabled) {
+        return enabled;
+    }
+    imsg_reply::is_enabled()
+}
+
+async fn observed_delivery(
+    registry: &HealthRegistry,
+    request: HumanInputRequest,
+) -> Result<HumanInputDelivery, HumanInputError> {
+    #[cfg(test)]
+    if let Ok(probe) = DELIVERY_PROBE_FOR_TEST.try_with(Clone::clone) {
+        probe
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(entered) = probe.entered {
+            entered.notify_one();
+        }
+        if let Some(release) = probe.release {
+            release.notified().await;
+        }
+    }
+    deliver_human_input(registry, request).await
+}
 
 fn failure(status: StatusCode, error: &str) -> RouteResponse {
     (status, Json(json!({"ok": false, "error": error})))
@@ -77,7 +120,15 @@ pub async fn deliver_turn_input(
     if source.len() > MAX_SOURCE_LEN {
         return bad_request("source_too_long");
     }
-    let origin_id = non_empty(body.origin_id);
+    let obligations_enabled = imsg_reply::enabled_for_source(admission_enabled(), &source);
+    let origin_id = if obligations_enabled {
+        body.origin_id.filter(|origin| !origin.trim().is_empty())
+    } else {
+        non_empty(body.origin_id)
+    };
+    if obligations_enabled && origin_id.is_none() {
+        return bad_request("origin_id_required");
+    }
     if origin_id
         .as_ref()
         .is_some_and(|origin| origin.len() > MAX_ORIGIN_ID_LEN)
@@ -124,7 +175,34 @@ pub async fn deliver_turn_input(
         }})),
         channel_name_hint,
     };
-    delivery_response(channel_id, deliver_human_input(registry, request).await)
+    if let (true, Some(origin_id)) = (obligations_enabled, origin_id.as_deref()) {
+        let input = imsg_reply::AdmissionInput {
+            origin_id,
+            agent_id: &id,
+            channel_id,
+            author_id,
+            source: &source,
+            text,
+        };
+        let provider = request.provider.clone();
+        imsg_reply::deliver_once(
+            pool,
+            &input,
+            || {
+                preflight_human_input(
+                    registry,
+                    poise::serenity_prelude::ChannelId::new(channel_id),
+                    &provider,
+                    author_id,
+                )
+            },
+            || observed_delivery(registry, request),
+            |result| delivery_response(channel_id, result),
+        )
+        .await
+    } else {
+        delivery_response(channel_id, observed_delivery(registry, request).await)
+    }
 }
 
 fn delivery_response(
@@ -132,21 +210,39 @@ fn delivery_response(
     result: Result<HumanInputDelivery, HumanInputError>,
 ) -> RouteResponse {
     let channel = channel_id.to_string();
-    let ok = |delivery: &str, turn_id: String, reason: Option<String>| {
-        (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "delivery": delivery,
-                "turn_id": turn_id,
-                "channel_id": channel,
-                "reason": reason,
-            })),
-        )
+    // `inject_veto` and `detail` are omitted when unset; with injection off only the base fields remain.
+    let ok = |delivery: &str, turn_id: Option<String>, reason: Option<&str>, extra: Value| {
+        let mut body = json!({
+            "ok": true,
+            "delivery": delivery,
+            "turn_id": turn_id,
+            "channel_id": channel,
+            "reason": reason,
+        });
+        if let (Some(body), Value::Object(extra)) = (body.as_object_mut(), extra) {
+            body.extend(extra);
+        }
+        (StatusCode::OK, Json(body))
     };
     match result {
-        Ok(HumanInputDelivery::Started { turn_id }) => ok("started", turn_id, None),
-        Ok(HumanInputDelivery::Queued { turn_id, reason }) => ok("queued", turn_id, Some(reason)),
+        Ok(HumanInputDelivery::Started { turn_id }) => {
+            ok("started", Some(turn_id), None, json!({}))
+        }
+        Ok(HumanInputDelivery::Queued {
+            turn_id,
+            reason,
+            inject_veto,
+        }) => {
+            let extra = inject_veto.map_or_else(|| json!({}), |veto| json!({"inject_veto": veto}));
+            ok("queued", Some(turn_id), Some(&reason), extra)
+        }
+        Ok(HumanInputDelivery::Injected { turn_id }) => ok("injected", turn_id, None, json!({})),
+        Ok(HumanInputDelivery::Unconfirmed { turn_id, detail }) => ok(
+            "unconfirmed",
+            turn_id,
+            Some("inject_unconfirmed"),
+            json!({"detail": detail}),
+        ),
         Err(HumanInputError::AuthorNotAllowed) => {
             failure(StatusCode::FORBIDDEN, "author_not_allowed")
         }
@@ -192,6 +288,34 @@ mod tests {
         assert_eq!(body.0["error"], "invalid_target");
     }
 
+    #[test]
+    fn each_delivery_carries_only_its_documented_fields() {
+        use super::HumanInputDelivery::{Injected, Queued, Started, Unconfirmed};
+        let queued = |veto: Option<&str>| Queued {
+            turn_id: "discord:7:9".into(),
+            reason: "external_turn_active".into(),
+            inject_veto: veto.map(str::to_string),
+        };
+        #[rustfmt::skip]
+        let cases = [
+            (Started { turn_id: "discord:7:9".into() }, json!({"delivery": "started", "turn_id": "discord:7:9", "reason": null})),
+            (queued(None), json!({"delivery": "queued", "turn_id": "discord:7:9", "reason": "external_turn_active"})),
+            (queued(Some("not_busy")), json!({"delivery": "queued", "turn_id": "discord:7:9", "reason": "external_turn_active", "inject_veto": "not_busy"})),
+            (Injected { turn_id: None }, json!({"delivery": "injected", "turn_id": null, "reason": null})),
+            (Unconfirmed { turn_id: Some("discord:7:5".into()), detail: "not_observed".into() },
+                json!({"delivery": "unconfirmed", "turn_id": "discord:7:5", "reason": "inject_unconfirmed", "detail": "not_observed"})),
+        ];
+        for (delivery, fields) in cases {
+            let (status, body) = super::delivery_response(7, Ok(delivery));
+            let mut expected = json!({"ok": true, "channel_id": "7"});
+            expected
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            assert_eq!((status, body.0), (StatusCode::OK, expected));
+        }
+    }
+
     pub(super) fn router(
         pg_pool: Option<sqlx::PgPool>,
         health_registry: Option<Arc<HealthRegistry>>,
@@ -213,9 +337,24 @@ mod tests {
     }
 
     pub(super) async fn deliver(app: &Router, agent: &str, body: &str) -> (StatusCode, Value) {
+        post(app, &format!("/agents/{agent}/turn/deliver"), body).await
+    }
+
+    pub(super) async fn get(app: &Router, uri: &str) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.expect("body");
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    pub(super) async fn post(app: &Router, uri: &str, body: &str) -> (StatusCode, Value) {
         let request = Request::builder()
             .method(Method::POST)
-            .uri(format!("/agents/{agent}/turn/deliver"))
+            .uri(uri)
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .expect("request");
@@ -265,55 +404,4 @@ mod tests {
 }
 
 #[cfg(test)]
-mod pg_tests {
-    use std::sync::Arc;
-
-    use axum::http::StatusCode;
-    use serde_json::{Value, json};
-
-    use super::tests::{deliver, router};
-    use crate::db::auto_queue::test_support::TestPostgresDb;
-    use crate::services::discord::health::{HealthRegistry, register_bot_auth_for_tests};
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn target_and_author_gates_run_at_the_route_boundary_pg() {
-        let pg_db = TestPostgresDb::create().await;
-        let pool = pg_db.connect_and_migrate().await;
-        let (cc, cdx) = (6_245_101_u64, 6_245_102_u64);
-        let (cc_id, cdx_id) = (cc.to_string(), cdx.to_string());
-        let seed = crate::db::agents::insert_agent_channels_for_tests;
-        seed(&pool, "deliver-agent", Some(&cc_id), Some(&cdx_id)).await;
-        seed(&pool, "unbound-agent", None, None).await;
-        let registry = Arc::new(HealthRegistry::new());
-        register_bot_auth_for_tests(&registry, "claude", cc, Some(100), vec![200], false).await;
-        // A second bot that opens itself to everyone must not widen who may inject.
-        register_bot_auth_for_tests(&registry, "codex", cdx, None, vec![200], true).await;
-        let app = router(Some(pool), Some(registry));
-        let with = |extra: Value| {
-            let mut payload = json!({"text": "status?", "author_discord_user_id": "200"});
-            payload
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            payload.to_string()
-        };
-        #[rustfmt::skip]
-        let cases = [
-            ("missing-agent", with(json!({})), StatusCode::NOT_FOUND, "agent not found"),
-            ("unbound-agent", with(json!({})), StatusCode::CONFLICT, "agent primary provider is not configured"),
-            ("deliver-agent", with(json!({"channel_id": "999"})), StatusCode::FORBIDDEN, "channel override 999 is not allowed for agent deliver-agent"),
-            ("deliver-agent", with(json!({"provider": "nope"})), StatusCode::BAD_REQUEST, "unsupported provider override: nope"),
-            ("deliver-agent", with(json!({"author_discord_user_id": "300"})), StatusCode::FORBIDDEN, "author_not_allowed"),
-            ("deliver-agent", with(json!({"provider": "codex"})), StatusCode::FORBIDDEN, "author_not_allowed"),
-            ("deliver-agent", with(json!({})), StatusCode::SERVICE_UNAVAILABLE, "runtime_unavailable"),
-        ];
-        for (agent, payload, status, error) in cases {
-            let (actual, response) = deliver(&app, agent, &payload).await;
-            assert_eq!(
-                (actual, response["error"].as_str()),
-                (status, Some(error)),
-                "{agent} {payload}"
-            );
-        }
-    }
-}
+mod pg_tests;

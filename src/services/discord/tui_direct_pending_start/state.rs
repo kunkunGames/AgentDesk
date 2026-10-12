@@ -1,3 +1,7 @@
+#[allow(dead_code)]
+#[path = "turn_retirement.rs"]
+pub(in crate::services::discord) mod turn_retirement;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -88,6 +92,9 @@ pub(in crate::services::discord) struct TuiDirectPendingStart {
     /// Older deferred records still resolve the post-drain cursor at claim time.
     #[serde(default)]
     pub captured_source: Option<(String, u64)>,
+    /// Codex native turn the deferred input opened, so the worker's claim starts at its record.
+    #[serde(default)]
+    pub native_turn_id: Option<String>,
 }
 
 impl TuiDirectPendingStart {

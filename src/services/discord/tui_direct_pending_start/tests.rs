@@ -249,6 +249,7 @@ fn record_roundtrips_through_json() {
         state: PendingStartState::Waiting,
         attempt_count: 0,
         captured_source: None,
+        native_turn_id: None,
     };
     let json = serde_json::to_string(&record).unwrap();
     let back: TuiDirectPendingStart = serde_json::from_str(&json).unwrap();
@@ -317,6 +318,7 @@ fn record(provider: &str, channel_id: u64, anchor: u64) -> TuiDirectPendingStart
         state: PendingStartState::Waiting,
         attempt_count: 0,
         captured_source: None,
+        native_turn_id: None,
     }
 }
 
@@ -1992,7 +1994,7 @@ fn stale_foreign_demote_racing_fresh_claim_does_not_clear_fresh_row() {
                 channel,
             );
         assert!(
-            !submit_stale_foreign_inflight_cancel(&shared, &provider, channel, &stale_probe).await,
+            !submit_stale_foreign_inflight_cancel(&shared, &provider, channel, &stale_probe, ForeignRecoverySource::PendingStart).await,
             "identity mismatch is a no-op; the fresh turn must remain live"
         );
         let current = super::super::inflight::load_inflight_state(&provider, channel_id)
@@ -3606,4 +3608,5 @@ fn anchor_slot_rig_teardown_preserves_absent_root() {
 }
 
 mod headless_row_tests;
+mod input_effect_tests;
 mod retire_tests;

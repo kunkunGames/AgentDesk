@@ -1,7 +1,10 @@
 use serde_json::Value;
 use std::collections::HashSet;
 
-use crate::services::agent_protocol::StreamMessage;
+use crate::services::agent_protocol::{
+    NativeTerminalKind, StreamMessage, codex_payload_turn_id, same_codex_turn,
+};
+use crate::services::provider::ReadOutputResult;
 
 use super::{RelaySuppressionSender, RolloutFinalizePath};
 use std::path::Path;
@@ -110,6 +113,20 @@ pub(super) struct RolloutParseState {
     pub(super) last_emitted_text_ended_with_newline: Option<bool>,
     /// Byte offset in `final_text` where the most recent message text begins.
     pub(super) last_message_start: usize,
+    /// The first `task_started` read and its turn id: the turn this reader follows.
+    pub(super) started_turn: Option<Option<String>>,
+    /// That turn's own `turn_aborted` record was read.
+    pub(super) turn_aborted_seen: bool,
+    /// That turn's own `task_complete` was read; `turn_complete_seen` also counts any other turn's.
+    pub(super) own_turn_complete_seen: bool,
+    /// The fallback body of that turn's own `task_complete`; a Herdr turn ends only on this one.
+    pub(super) own_task_complete_fallback_text: Option<String>,
+    /// Another turn's terminal before the start or another start before a terminal: no Herdr kind.
+    pub(super) mixed_turn: bool,
+    /// The most recent `task_started` turn id: the turn a user record read now belongs to.
+    pub(super) latest_turn: Option<String>,
+    /// A direct input's tail seeded `started_turn` with its native turn before reading.
+    pub(super) native_seeded: bool,
 }
 
 impl RolloutParseState {
@@ -228,11 +245,12 @@ pub(super) fn observe_rollout_user_prompt(json: &Value, state: &mut RolloutParse
         );
         return;
     }
-    let observation = crate::services::tui_prompt_dedupe::observe_prompt_by_tmux_with_entry_id_at(
-        "codex",
+    // The record belongs to the turn the latest `task_started` opened; a steer names it.
+    let observation = crate::services::tui_prompt_dedupe::observe_codex_prompt_in_turn_at(
         &tmux_session_name,
         &prompt,
         entry_id.as_deref(),
+        state.latest_turn.as_deref(),
         chrono::Utc::now(),
     );
     tracing::debug!(
@@ -263,7 +281,16 @@ fn response_item_messages(json: &Value, state: &mut RolloutParseState) -> Vec<St
     let Some(payload) = json.get("payload") else {
         return Vec::new();
     };
-    match payload.get("type").and_then(Value::as_str).unwrap_or("") {
+    let kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    // Assistant text, a tool record or reasoning before this turn's start is a previous turn's tail.
+    let content = match kind {
+        "message" => payload.get("role").and_then(Value::as_str) == Some("assistant"),
+        "function_call" | "custom_tool_call" | "tool_search_call" | "reasoning" => true,
+        "function_call_output" | "custom_tool_call_output" | "tool_search_output" => true,
+        _ => false,
+    };
+    state.mixed_turn |= content && state.started_turn.is_none();
+    match kind {
         "message" => response_message_items(payload, state),
         "function_call" | "custom_tool_call" | "tool_search_call" => {
             match payload.get("call_id").and_then(Value::as_str) {
@@ -424,14 +451,48 @@ fn event_msg_message(json: &Value, state: &mut RolloutParseState) -> Option<Stre
             }
             None
         }
+        "task_started" => {
+            let turn = codex_payload_turn_id(payload).map(str::to_owned);
+            if state.started_turn.is_none() {
+                state.started_turn = Some(turn.clone());
+            } else if herdr_terminal_kind(state).is_none() {
+                // The next turn's head before this turn's terminal.
+                state.mixed_turn |= !started_turn_named_by(state, payload);
+            }
+            if turn.is_some() {
+                state.latest_turn = turn;
+            }
+            state.lifecycle_activity = true;
+            None
+        }
+        "turn_aborted" => {
+            // An abort ends this reader's turn only when it and the started turn name the same turn.
+            state.turn_aborted_seen |= started_turn_named_by(state, payload);
+            state.mixed_turn |= state.started_turn.is_none();
+            state.lifecycle_activity = true;
+            None
+        }
+        // A reader seeded with its native turn takes no other turn's completion or its text.
+        "task_complete" if state.native_seeded && !started_turn_named_by(state, payload) => {
+            state.lifecycle_activity = true;
+            None
+        }
         "task_complete" => {
             state.turn_complete_seen = true;
+            // A previous turn's tail after this turn's input boundary but before its start.
+            state.mixed_turn |= state.started_turn.is_none();
+            let own = started_turn_named_by(state, payload);
+            state.own_turn_complete_seen |= own;
+            let text = payload
+                .get("last_agent_message")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned);
+            if own && state.own_task_complete_fallback_text.is_none() {
+                state.own_task_complete_fallback_text = text.clone();
+            }
             if state.task_complete_fallback_text.is_none() {
-                state.task_complete_fallback_text = payload
-                    .get("last_agent_message")
-                    .and_then(Value::as_str)
-                    .filter(|text| !text.is_empty())
-                    .map(str::to_owned);
+                state.task_complete_fallback_text = text;
             }
             None
         }
@@ -440,6 +501,200 @@ fn event_msg_message(json: &Value, state: &mut RolloutParseState) -> Option<Stre
             None
         }
     }
+}
+
+fn started_turn_named_by(state: &RolloutParseState, payload: &Value) -> bool {
+    let started = state.started_turn.as_ref().and_then(Option::as_deref);
+    same_codex_turn(started, codex_payload_turn_id(payload))
+}
+
+/// A Herdr turn's reply takes the fallback body only from its own `task_complete`.
+pub(super) fn promote_own_task_complete_fallback_text(state: &mut RolloutParseState) {
+    state.task_complete_fallback_text = state.own_task_complete_fallback_text.take();
+    super::promote_task_complete_fallback_text(state);
+}
+
+/// A Herdr turn's provider terminal: its own abort, else its own completion with no tool left open.
+pub(super) fn herdr_terminal_kind(state: &RolloutParseState) -> Option<NativeTerminalKind> {
+    if state.mixed_turn {
+        return None;
+    }
+    if state.turn_aborted_seen {
+        return Some(NativeTerminalKind::Aborted);
+    }
+    (state.own_turn_complete_seen && !state.has_pending_tool_call())
+        .then_some(NativeTerminalKind::Completed)
+}
+
+/// A seeded native turn ended: its own abort or completion with no tool open, or a newer turn.
+fn native_turn_ended(state: &RolloutParseState) -> bool {
+    herdr_terminal_kind(state).is_some()
+        || state.latest_turn.as_deref() != state.started_turn.as_ref().and_then(Option::as_deref)
+}
+
+/// One EOF of a direct input's tail in its native turn: once that turn ended, the reply ends at the
+/// last accepted record through the ordinary `emit_done` guards; otherwise the legacy judgement runs.
+pub(super) fn native_turn_eof(
+    sender: &RelaySuppressionSender<'_>,
+    state: &mut RolloutParseState,
+    rollout_path: &Path,
+    terminal_range: (u64, Option<&str>, bool),
+    accept: &RecordAcceptance<'_>,
+) -> Option<ReadOutputResult> {
+    accept.own_turn?;
+    if !native_turn_ended(state) {
+        return None;
+    }
+    let offset = terminal_range.0.saturating_add(state.bytes_read);
+    // An abort or a newer turn closes the turn as a completion would.
+    state.turn_complete_seen = true;
+    super::promote_task_complete_fallback_text(state);
+    let path = if state.saw_assistant_text {
+        RolloutFinalizePath::Envelope
+    } else {
+        RolloutFinalizePath::Heuristic
+    };
+    emit_done(sender, state, path, rollout_path, offset, terminal_range);
+    Some(ReadOutputResult::Completed { offset })
+}
+
+/// One EOF of a Herdr turn's tail under settlement: `None` keeps the legacy judgement, `Some(None)`
+/// reads on, `Some(Some(_))` ends on the provider's record or, for a dead pane, unconfirmed.
+pub(super) fn herdr_eof(
+    sender: &RelaySuppressionSender<'_>,
+    (state, partial_line): (&mut RolloutParseState, &mut Vec<u8>),
+    rollout_path: &Path,
+    turn: (u64, Option<&str>),
+    accept: &RecordAcceptance<'_>,
+    is_alive: &mut dyn FnMut() -> bool,
+) -> Option<Option<ReadOutputResult>> {
+    let actor = accept.token?;
+    let logical = crate::services::provider::herdr_provider_terminal_only(Some(actor))?;
+    if let Some(kind) = herdr_terminal_kind(state) {
+        let terminal = HerdrTerminal {
+            kind,
+            actor,
+            logical,
+        };
+        let offset = emit_herdr_terminal(sender, state, terminal, rollout_path, turn);
+        return Some(Some(ReadOutputResult::Completed { offset }));
+    }
+    // The turn's own start is read and nothing ended it: a stop that met it unbound runs now.
+    let progress = turn.0.saturating_add(state.bytes_read);
+    if let Some(Some(turn_id)) = state.started_turn.as_ref()
+        && !state.mixed_turn
+        && let Some(herdr) = actor.herdr_interrupt_state()
+    {
+        herdr.own_start_observed(progress, turn_id);
+    }
+    if super::try_process_complete_partial_line(partial_line, sender, state, accept) {
+        return Some(None);
+    }
+    // No drain, deadline or idle wait ends a Herdr turn.
+    if !is_alive() {
+        let offset = turn.0.saturating_add(state.bytes_read);
+        return Some(Some(ReadOutputResult::SessionDied { offset }));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    Some(None)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NextRecord {
+    Accept,
+    StopBefore,
+}
+
+/// The one judgement every complete record passes before the tail accepts it; each stop rule is
+/// one predicate in `accept_next_record`, so neither the record loop nor the EOF flush changes.
+pub(super) struct RecordAcceptance<'a> {
+    token: Option<&'a std::sync::Arc<crate::services::provider::CancelToken>>,
+    /// The Codex native turn a direct input's tail answers.
+    own_turn: Option<&'a str>,
+}
+
+impl<'a> RecordAcceptance<'a> {
+    pub(super) fn new(
+        token: Option<&'a std::sync::Arc<crate::services::provider::CancelToken>>,
+    ) -> Self {
+        Self {
+            token,
+            own_turn: None,
+        }
+    }
+
+    /// The tail starts inside `own_turn` after its prompt, so that turn is seeded as started.
+    pub(super) fn with_own_turn(
+        mut self,
+        own_turn: Option<&'a str>,
+        state: &mut RolloutParseState,
+    ) -> Self {
+        if let Some(turn) = own_turn {
+            state.started_turn = Some(Some(turn.to_owned()));
+            state.latest_turn = Some(turn.to_owned());
+            state.native_seeded = true;
+        }
+        self.own_turn = own_turn;
+        self
+    }
+
+    pub(super) fn accept_next_record(&self, state: &RolloutParseState) -> NextRecord {
+        // A direct input's turn ends at its own terminal or once another turn has started.
+        if self.own_turn.is_some() && native_turn_ended(state) {
+            return NextRecord::StopBefore;
+        }
+        // A Herdr turn's reply stops at its terminal record; later lines are another turn's.
+        let token = self.token.map(std::sync::Arc::as_ref);
+        if crate::services::provider::herdr_provider_terminal_only(token).is_some()
+            && herdr_terminal_kind(state).is_some()
+        {
+            return NextRecord::StopBefore;
+        }
+        NextRecord::Accept
+    }
+}
+
+/// The provider terminal a Herdr read ended on and the token that read it.
+struct HerdrTerminal<'a> {
+    kind: NativeTerminalKind,
+    actor: &'a std::sync::Arc<crate::services::provider::CancelToken>,
+    logical: String,
+}
+
+/// Sends a Herdr turn's provider terminal ending at its record, completion and abort alike, as a
+/// typed frame naming the reader's own descriptor; only bridge admission turns it into a Done.
+fn emit_herdr_terminal(
+    sender: &RelaySuppressionSender<'_>,
+    state: &mut RolloutParseState,
+    terminal: HerdrTerminal<'_>,
+    rollout_path: &Path,
+    (source_start, turn_nonce): (u64, Option<&str>),
+) -> u64 {
+    let complete_record_end = source_start.saturating_add(state.bytes_read);
+    if terminal.kind == NativeTerminalKind::Completed {
+        promote_own_task_complete_fallback_text(state);
+    }
+    let (source_file_dev, source_file_ino) =
+        crate::services::provider::cancel_token_claude_interrupt::opened_file_identity(
+            state.harvest.source_file.as_ref(),
+        );
+    sender.send(StreamMessage::CodexTuiTerminalDone {
+        result: state.final_text.clone(),
+        session_id: state.session_id.clone(),
+        rollout_path: rollout_path.display().to_string(),
+        tmux_session_name: terminal.logical,
+        turn_nonce: turn_nonce.unwrap_or_default().to_owned(),
+        source_start,
+        complete_record_end,
+        captured_source: Some(crate::services::agent_protocol::CapturedTuiTerminalSource {
+            generation_mtime_ns: 0,
+            source_file_dev,
+            source_file_ino,
+            actor: std::sync::Arc::downgrade(terminal.actor),
+        }),
+        kind: terminal.kind,
+    });
+    complete_record_end
 }
 
 fn maybe_observe_synthetic_composer_ready(state: &mut RolloutParseState) {
@@ -580,6 +835,7 @@ pub(super) fn emit_done(
             source_start,
             complete_record_end,
             captured_source: None,
+            kind: NativeTerminalKind::Completed,
         });
     } else {
         sender.send(StreamMessage::Done {
@@ -588,3 +844,8 @@ pub(super) fn emit_done(
         });
     }
 }
+
+mod herdr_replay;
+
+#[cfg(all(test, unix))]
+mod herdr_terminal_tests;

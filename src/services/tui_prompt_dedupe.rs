@@ -6,7 +6,11 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(test))]
+use std::time::Instant;
+#[cfg(test)]
+pub(crate) use test_clock::Instant;
 use tokio::sync::broadcast;
 
 use crate::services::agent_protocol::RuntimeHandoffKind;
@@ -114,6 +118,13 @@ pub struct ObservedTuiPrompt {
     /// Hook-submitted Claude `prompt_id`, held unannounced until the relay's
     /// announcement POST result settles it.
     pub(crate) hook_prompt_id: Option<String>,
+    /// A transcript row's `prompt_id` that was still unannounced when the scanner published the
+    /// row; only looked up again before the relay announces, never settled by it.
+    pub(crate) row_prompt_id: Option<String>,
+    /// Codex native turn this input opened, when its hook or record named one.
+    pub(crate) native_turn_id: Option<String>,
+    /// A steering input that joined its running native turn: its text is shown, nothing is owned.
+    pub(crate) steer_echo: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,6 +269,29 @@ struct TuiPromptDedupeState {
     // Hook `prompt_id` -> its text, so the idle scanner's later row (`promptId`,
     // fresh uuid) is suppressed as the same input once the hook was announced.
     relayed_prompt_ids_by_tmux: HashMap<PromptKey, VecDeque<TimedValue<RelayedPromptId>>>,
+    // Latest Codex native turn an observed input opened; a later input naming it steers that turn.
+    native_turn_by_tmux: HashMap<PromptKey, TimedValue<NativeTurnSlot>>,
+    // Nonces pasted into a running Codex turn; the first observation naming a native turn settles each.
+    injected_steer_by_tmux: HashMap<PromptKey, VecDeque<TimedValue<InjectedSteer>>>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeTurnSlot {
+    turn: String,
+    /// The opening observation's generation: only its relay may withdraw the slot.
+    observed_by: u64,
+    owner: NativeTurnOwner,
+}
+
+/// Who answers an open native turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeTurnOwner {
+    /// The observing relay, until it adopts, hands over or withdraws the turn.
+    Relay,
+    /// The deferred start worker of this anchor message: its claim keeps the turn, its exit drops it.
+    Worker(u64),
+    /// A row or a Discord turn.
+    Answer,
 }
 
 #[derive(Clone, Debug)]
@@ -288,6 +322,8 @@ impl PromptKey {
 }
 
 mod extract;
+mod injected_steer;
+pub(crate) mod native_clear;
 mod observation;
 mod prompt_identity;
 mod runtime_binding;
@@ -296,15 +332,21 @@ mod shadow_peek;
 mod state;
 
 pub(crate) use session_rotation::*;
-pub(crate) use shadow_peek::peek_tmux_runtime_binding;
+#[cfg(test)]
+pub(crate) use shadow_peek::hold_binding_peek_lock_for_tests;
+pub(crate) use shadow_peek::{
+    BindingPeekBusy, peek_tmux_runtime_binding, try_peek_tmux_runtime_binding,
+};
 
 pub use extract::*;
 use extract::{
     is_discord_relayed_user_prompt, is_user_prefixed_subagent_notification_machine_event,
-    normalize_line_endings, normalize_provider, record_relayed_entry_id,
-    relayed_entry_id_already_seen, take_matching_pending_prompt,
+    native_turn_is_open, normalize_line_endings, normalize_provider, open_native_turn,
+    record_relayed_entry_id, relayed_entry_id_already_seen, take_matching_pending_prompt,
     take_or_record_recent_observed_prompt,
 };
+use injected_steer::{Claim, InjectedSteer, claim_injected_steer};
+pub(crate) use injected_steer::{register_injected_steer, withdraw_injected_steer};
 use observation::clear_ssh_direct_observation_pending;
 pub use observation::*;
 #[cfg(test)]
@@ -317,4 +359,100 @@ use prompt_identity::{PromptIdMatch, check_relayed_prompt_id, record_observed_ho
 pub use runtime_binding::*;
 
 #[cfg(test)]
+mod injected_steer_tests;
+#[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod test_clock {
+    use super::*;
+    use std::ops::{Add, AddAssign, Sub, SubAssign};
+
+    // The shared state and Tokio workers must observe the same test clock.
+    static OFFSET: Mutex<Duration> = Mutex::new(Duration::ZERO);
+
+    fn offset() -> std::sync::MutexGuard<'static, Duration> {
+        OFFSET.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    pub(crate) struct Instant(std::time::Instant);
+
+    impl Instant {
+        pub(crate) fn now() -> Self {
+            Self(std::time::Instant::now() + *offset())
+        }
+
+        pub(crate) fn reset() {
+            *offset() = Duration::ZERO;
+        }
+
+        pub(crate) fn elapsed(self) -> Duration {
+            Self::now().duration_since(self)
+        }
+
+        pub(crate) fn duration_since(self, earlier: Self) -> Duration {
+            self.0.duration_since(earlier.0)
+        }
+    }
+
+    impl Add<Duration> for Instant {
+        type Output = Self;
+        fn add(self, by: Duration) -> Self {
+            Self(self.0 + by)
+        }
+    }
+    impl AddAssign<Duration> for Instant {
+        fn add_assign(&mut self, by: Duration) {
+            self.0 += by;
+        }
+    }
+    impl Sub<Duration> for Instant {
+        type Output = Self;
+        fn sub(self, by: Duration) -> Self {
+            Self(self.0 - by)
+        }
+    }
+    impl SubAssign<Duration> for Instant {
+        fn sub_assign(&mut self, by: Duration) {
+            self.0 -= by;
+        }
+    }
+
+    impl TuiPromptDedupeState {
+        // Move the clock and existing stamps forward together, preserving their ages.
+        pub(super) fn aged_stamp_for_tests(&mut self, age: Duration) -> Instant {
+            let recorded = Instant::now();
+            macro_rules! shift {
+                ($($field:ident),*) => { $(
+                    for entry in self.$field.values_mut() { entry.recorded_at += age; }
+                )* };
+            }
+            macro_rules! shift_queues {
+                ($($field:ident),*) => { $(
+                    for queue in self.$field.values_mut() {
+                        for entry in queue { entry.recorded_at += age; }
+                    }
+                )* };
+            }
+            shift!(
+                tmux_by_provider_session,
+                channel_by_tmux,
+                runtime_by_tmux,
+                prompt_anchor_by_tmux,
+                ssh_direct_observation_by_tmux,
+                external_input_relay_lease_by_tmux,
+                deferred_anchor_completion_by_tmux
+            );
+            shift_queues!(
+                pending_by_tmux,
+                recent_observed_by_tmux,
+                relayed_entry_ids_by_tmux,
+                relayed_prompt_ids_by_tmux,
+                injected_steer_by_tmux
+            );
+            *offset() += age;
+            recorded
+        }
+    }
+}

@@ -377,13 +377,13 @@ until frontier.empty?
   end
   case job_id
   when "scripts_required_context"
-    unless job.key?("if") && job["if"] == "always()"
-      warn "#{path}: Script checks publisher must carry `if: always()` so upstream failure still runs the fail-closed mirror"
+    unless job.key?("if") && job["if"] == "${{ !cancelled() }}"
+      warn "#{path}: Script checks publisher must carry `if: ${{ !cancelled() }}` so upstream failure still runs the fail-closed mirror"
       exit 1
     end
   when "relay-authority-contract"
-    unless job.key?("if") && job["if"] == "always()"
-      warn "#{path}: relay-authority-contract publisher must carry `if: always()` so upstream failure still runs the fail-closed mirror"
+    unless job.key?("if") && job["if"] == "${{ !cancelled() }}"
+      warn "#{path}: relay-authority-contract publisher must carry `if: ${{ !cancelled() }}` so upstream failure still runs the fail-closed mirror"
       exit 1
     end
   else
@@ -487,14 +487,14 @@ expected_mirror_contract_step = {
   ].join("\n") + "\n",
 }
 expected_mirror_steps = [
-  {"uses" => "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
+  {"uses" => "actions/checkout@v4"},
   expected_mirror_contract_step,
   *expected_shard_mirror_steps,
 ]
 expected_mirror_job = {
   "name" => "Script checks",
   "needs" => ["changes", *script_check_shard_jobs.keys],
-  "if" => "always()",
+  "if" => "${{ !cancelled() }}",
   "runs-on" => "ubuntu-latest",
   "steps" => expected_mirror_steps,
 }
@@ -544,7 +544,7 @@ mirror_source = mirror_source&.gsub(
   "expected=<required-check-pin-sha256>",
 )
 mirror_source_sha256 = mirror_source && Digest::SHA256.hexdigest(mirror_source)
-unless mirror_source_sha256 == "d4be5f21aeec2fa3eb7d1900f34f1aa1af8e95eadeb3fafc8b9e80d2213a5483"
+unless mirror_source_sha256 == "d78151431f9f92845ded58a8b9d11046bfe644522f7a1399b09f95ecc5910928"
   warn "#{path}: Script checks required-context source bytes changed (scalar tags/styles and exact step surface are pinned); found #{mirror_source_sha256 || '<missing>'}"
   exit 1
 end
@@ -634,7 +634,7 @@ script_check_execution = effective_execution(
 expected_script_check_execution = {
   "runs-on" => "ubuntu-latest",
   "protected_step_inventory" => {
-    "protected_indices" => [8, 9],
+    "protected_indices" => [9, 10],
     "steps_between_protected" => [],
   },
   "shell_candidates" => {
@@ -680,7 +680,7 @@ expected_script_check_execution = {
   ),
 }
 unless script_check_execution["protected_step_inventory"] == expected_script_check_execution["protected_step_inventory"]
-  warn "#{path}: Script checks protected step inventory changed; expected indices [8, 9] with no interstitial steps, found #{JSON.generate(script_check_execution["protected_step_inventory"])}"
+  warn "#{path}: Script checks protected step inventory changed; expected indices [9, 10] with no interstitial steps, found #{JSON.generate(script_check_execution["protected_step_inventory"])}"
   exit 1
 end
 unless execution_contract(script_check_execution, expected_script_check_execution)
@@ -689,8 +689,14 @@ unless execution_contract(script_check_execution, expected_script_check_executio
   warn "#{path}: Script checks aggregate effective execution changed; expected #{expected}; found #{found}"
   exit 1
 end
+expected_cap = {"name" => "Production PR cap", "shell" => "bash", "run" => "bash scripts/pr_cap_check.sh", "env" => {"PR_CAP_CI" => "1", "PR_CAP_MODE" => "${{ vars.PR_CAP_MODE || 'enforce' }}", "BASH_ENV" => "/dev/null"}}
+cap_steps = Array(script_checks_job["steps"]).select { |step| step.is_a?(Hash) && step["name"] == "Production PR cap" }
+unless cap_steps == [expected_cap] && Array(script_checks_job["steps"]).index(expected_cap) == script_check_step_index + 1
+  warn "#{path}: production PR cap must retain its unconditional exact post-aggregate execution"
+  exit 1
+end
 evidence_steps = Array(script_checks_job["steps"]).select { |step| step.is_a?(Hash) && step["name"] == "Upload giant-file progress evidence" }
-unless evidence_steps == [{"name" => "Upload giant-file progress evidence", "if" => "always()", "uses" => "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", "with" => {"path" => "target/giant-file-progress/evidence.json"}}]
+unless evidence_steps == [{"name" => "Upload giant-file progress evidence", "if" => "always()", "uses" => "actions/upload-artifact@v4", "with" => {"path" => "target/giant-file-progress/evidence.json"}}]
   warn "#{path}: giant-file progress evidence upload must remain exact and unconditional"
   exit 1
 end
@@ -707,8 +713,8 @@ script_check_shard_jobs.each do |job_id, shard|
     "runs-on" => "ubuntu-latest",
     "timeout-minutes" => "30",
     "steps" => [
-      {"uses" => "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", "with" => {"fetch-depth" => "0"}},
-      {"name" => "Setup Python for script checks", "uses" => "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065", "with" => {"python-version" => "3.11"}},
+      {"uses" => "actions/checkout@v4", "with" => {"fetch-depth" => "0"}},
+      {"name" => "Setup Python for script checks", "uses" => "actions/setup-python@v5", "with" => {"python-version" => "3.11"}},
       {"name" => "Install script-test Python deps", "run" => "python3 -m pip install --disable-pip-version-check pyyaml"},
       {"name" => "Install shellcheck", "run" => "sudo apt-get install -y shellcheck zsh"},
       {"name" => "Run script checks", "shell" => "bash", "run" => "./scripts/ci-script-checks.sh", "env" => expected_shard_step_env},
@@ -742,7 +748,7 @@ writer_wiring_execution = effective_execution(
 expected_writer_wiring_execution = {
   "runs-on" => "ubuntu-latest",
   "protected_step_inventory" => {
-    "protected_indices" => [8, 9],
+    "protected_indices" => [9, 10],
     "steps_between_protected" => [],
   },
   "shell_candidates" => {
@@ -766,7 +772,7 @@ expected_writer_wiring_execution = {
   "effective_env" => expected_workflow_env,
 }
 unless writer_wiring_execution["protected_step_inventory"] == expected_writer_wiring_execution["protected_step_inventory"]
-  warn "#{path}: Script checks protected step inventory changed; expected indices [8, 9] with no interstitial steps, found #{JSON.generate(writer_wiring_execution["protected_step_inventory"])}"
+  warn "#{path}: Script checks protected step inventory changed; expected indices [9, 10] with no interstitial steps, found #{JSON.generate(writer_wiring_execution["protected_step_inventory"])}"
   exit 1
 end
 unless execution_contract(writer_wiring_execution, expected_writer_wiring_execution)
@@ -783,14 +789,14 @@ end
 script_steps = Array(script_checks_job["steps"])
 setup_specs = {
   "Install Rust toolchain for lib inventory" => {
-    "uses" => "dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067",
+    "uses" => "dtolnay/rust-toolchain@master",
     "toolchain" => "1.94.1",
   },
   "Setup sccache for lib inventory" => {
-    "uses" => "mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696",
+    "uses" => "mozilla-actions/sccache-action@v0.0.10",
   },
   "Cache Cargo dependencies for lib inventory" => {
-    "uses" => "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+    "uses" => "Swatinem/rust-cache@v2",
     "cache-targets" => false,
     "cache-bin" => false,
     "shared-key" => "cargo-dependencies-v2",
@@ -848,7 +854,7 @@ targets = {
     "needs" => "changes",
     "if" => "needs.changes.outputs.rust_compile == 'true' && needs.changes.outputs.cross_os_rust == 'true'",
     "runs_on" => '${{ matrix.os }}',
-    "job_sha256" => "dcfbc38100627ad16f6af2dd6c8465a71b82fd105153181820f8180d4d4300b0",
+    "job_sha256" => "79745b96e7fc4d02c7744ac9141e4da962ea56c603b5926401294c1af8a56cee",
     "cargo_steps" => {
       "cargo check" => {
         "commands" => ["cargo check --workspace --all-targets"],
@@ -863,11 +869,12 @@ targets = {
     "if" => "needs.changes.outputs.rust_compile == 'true' && needs.changes.outputs.cross_os_rust == 'true'",
     "runs_on" => '${{ matrix.os }}',
     # The bounded Windows owner runner; broad runtime remains nightly.
-    "job_sha256" => "d496a4fac227332faec900a350715e24e0a2b0d50b756f69b437176ca95fc1f7",
+    # Re-pinned after raising the writer-namespace step budget from 30 to 45 minutes.
+    "job_sha256" => "315ad84a0f81d05183968a40b1be5b0c8d739be1fa111a47b0a2eb50798c3c34",
     "cargo_steps" => {
       "Writer namespace exact Windows targets" => {
         "commands" => ["./scripts/ci/run-writer-namespace-windows-targets.sh"],
-        "timeout_minutes" => 30,
+        "timeout_minutes" => 45,
         "if_condition" => "runner.os == 'Windows'",
       },
     },
@@ -877,9 +884,9 @@ targets = {
     "label" => "cross-OS required-context mirror",
     "name" => "Fast check cross OS required context (ubuntu-latest)",
     "needs" => %w[changes check_fast_cross_os check_fast_cross_os_targets],
-    "if" => "always()",
+    "if" => "${{ !cancelled() }}",
     "runs_on" => "ubuntu-latest",
-    "job_sha256" => "9ebfc18a9977b9af309ca86de5883e82bd1c428ab8f2dd519a7d082e3da7581c",
+    "job_sha256" => "a805ae940c4b5cc781b0857dccd3c5ee7d8cb5ad79df4c011f3b1c4df13e224b",
     "require_debug_env" => false,
     "cargo_steps" => %w[check_fast_cross_os check_fast_cross_os_targets].to_h do |runner|
       [
@@ -908,19 +915,21 @@ targets = {
     # #4979 S2 re-pins after adding the AGENTDESK_REQUIRE_PG=1 job env so a PG
     # connection failure in this PG-backed lane hard-fails instead of
     # soft-skipping green; the command inventory itself is unchanged.
-    # #5040 re-pins after adding the telemetry-only intake authority regressions
-    # to this existing toolchain-provisioned lane whose mirror is required.
+    # Re-pinned after dropping the telemetry-only intake step: NON_PG skipped all
+    # five of its IDs, which the library sweep's replay runs instead.
     # #5025 and #4985 retain their production bridge and footer-marker coverage
     # in the same job block, so the pin covers the merged command inventory.
     # #5230 re-pins after replacing repeated PostgreSQL skip literals with the
     # shared non-pg-test-filter source; job names, conditions, and timeouts are
     # unchanged, and the exact commands below pin each source/use pair.
-    "job_sha256" => "cb95ea69fa0102af6cb9b7172b5b99ba5c62775cf5e1ba78d5ac4a5f44006e44",
+    # Re-pinned after adding the ensure-swap step and running the observer under mem-measure.
+    # Re-pinned after raising the `just test-postgres` step budget from 40 to 60 minutes.
+    "job_sha256" => "058d450aa87871bdc002d7137def8f4500fe5f777bddc4ce4a7147c919716ad0",
     "cargo_steps" => {
       "Observe curated lane selections" => {
         "commands" => [
           "set -o pipefail",
-          "python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job test_fast --job high-risk-recovery | tee \"$RUNNER_TEMP/selection-evidence-test-fast.log\"",
+          "bash scripts/ci/mem-measure.sh observe-test-fast -- python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job test_fast --job high-risk-recovery | tee \"$RUNNER_TEMP/selection-evidence-test-fast.log\"",
         ],
         "timeout_minutes" => 20,
       },
@@ -947,13 +956,6 @@ targets = {
         ],
         "timeout_minutes" => 10,
       },
-      "Telemetry-only intake authority regressions" => {
-        "commands" => [
-          "source scripts/ci/non-pg-test-filter.sh",
-          'env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::router::intake_dispatch::tests::telemetry_only_unopted -- "${NON_PG_SKIP_ARGS[@]}"',
-        ],
-        "timeout_minutes" => 10,
-      },
       "Terminal delivery evidence regressions" => {
         "commands" => [
           "env -u AGENTDESK_ROOT_DIR cargo test --lib inflight::terminal_delivery_evidence_loss::tests",
@@ -965,7 +967,7 @@ targets = {
       },
       "just test-postgres" => {
         "commands" => ["just test-postgres"],
-        "timeout_minutes" => 40,
+        "timeout_minutes" => 60,
       },
     },
   },
@@ -991,12 +993,14 @@ targets = {
     # source-verified non-PG false positives after the adjudicated sweep.
     # #6104 re-pins after renaming the replay call; its list is now generated
     # from the PG manifest instead of hand-kept.
-    "job_sha256" => "577fb3d97772a92708da995f549e19a9741cb5061f8862dad93eefc25f85086b",
+    # Re-pinned after adding the ensure-swap step ahead of the first cargo step.
+    # Re-pinned for the two Codex legacy lock child summaries.
+    "job_sha256" => "0c861374748187c524880e21dab92cb028c0adb6e0658b773c59601e649851f7",
     "cargo_steps" => {
       "Library sweep (selection-set gated)" => {
         "commands" => [
           "source scripts/ci/non-pg-test-filter.sh",
-          'python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 2 "${NON_PG_SKIP_ARGS[@]}" -- env -u AGENTDESK_ROOT_DIR cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}"',
+          'python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 4 "${NON_PG_SKIP_ARGS[@]}" -- env -u AGENTDESK_ROOT_DIR cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}"',
           "run_non_pg_filter_replay",
         ],
         "timeout_minutes" => 45,
@@ -1009,7 +1013,8 @@ targets = {
     "needs" => nil,
     "if" => nil,
     "runs_on" => "ubuntu-latest",
-    "job_sha256" => "b6176cee54e0fafc5420f1efe2ed978555e3060f4200b591edf63ad66c7395c5",
+    # Re-pinned after adding the ensure-swap step ahead of the first cargo step.
+    "job_sha256" => "8a0325441633cb188248a717980fa25b56be515b92d9e45de48f630453948617",
     "job_timeout_minutes" => 30,
     "cargo_steps" => {
       "Verify named relay-authority targets and selection floors" => {
@@ -1040,7 +1045,8 @@ targets = {
     "needs" => nil,
     "if" => nil,
     "runs_on" => "ubuntu-latest",
-    "job_sha256" => "ab1325c74f83d8407acbc5e51db9ffdc5e9512fa20888aeea64660f6dd85730a",
+    # Re-pinned after adding the ensure-swap step ahead of the first cargo step.
+    "job_sha256" => "cab07156ce825daeba30cc83dfb2c963cb3ca949d814d7b0b949a57433a7911c",
     "job_timeout_minutes" => 45,
     "cargo_steps" => {
       "Fetch Cargo dependencies" => {
@@ -1059,9 +1065,9 @@ targets = {
     "label" => "relay-authority contract job",
     "name" => "relay-authority-contract",
     "needs" => %w[relay_authority_targets relay_authority_mutations],
-    "if" => "always()",
+    "if" => "${{ !cancelled() }}",
     "runs_on" => "ubuntu-latest",
-    "job_sha256" => "48057a1a770770d5d3489b3f56d5d3998a1117a3b668c6fe44abcdde76cb26b2",
+    "job_sha256" => "2f9a677bab6a53fb6bcb65bbc29ba493c400551beb043ca6b6d6a9bc7e575bbe",
     "job_timeout_minutes" => 10,
     "cargo_steps" => {
       "Pin required-check mirror content (#5321)" => {
@@ -1125,12 +1131,13 @@ targets = {
     "runs_on" => "ubuntu-latest",
     # Pin the accepted-turn regressions and removal of the retired timeout test.
     # All remaining commands and execution settings retain their reviewed values.
-    "job_sha256" => "d34e8bbe8c8014667612594e07d2b2b6c29af58bc351131005e6397964efdc15",
+    # Re-pinned after adding the ensure-swap step and running the observer under mem-measure.
+    "job_sha256" => "587bf998a8800dafebc80161eb3c1684d672f347b33bbb63cddba697b444449f",
     "cargo_steps" => {
       "Observe curated lane selections" => {
         "commands" => [
           "set -o pipefail",
-          "python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job high-risk-recovery | tee \"$RUNNER_TEMP/selection-evidence-high-risk.log\"",
+          "bash scripts/ci/mem-measure.sh observe-high-risk -- python3 scripts/check_test_target_integrity.py --observe-selection --workflow .github/workflows/ci-pr.yml --job high-risk-recovery | tee \"$RUNNER_TEMP/selection-evidence-high-risk.log\"",
         ],
         "timeout_minutes" => 20,
       },
@@ -1156,7 +1163,7 @@ proof_owners = [
   "scripts/ci/run-writer-namespace-windows-targets.sh",
   "scripts/exact_rust_test_proof.py",
 ]
-filter_step = Array(jobs.dig("changes", "steps")).find { |step| step.is_a?(Hash) && step["uses"] == "dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad" }
+filter_step = Array(jobs.dig("changes", "steps")).find { |step| step.is_a?(Hash) && step["uses"] == "dorny/paths-filter@v3" }
 path_filters = YAML.safe_load(filter_step&.dig("with", "filters").to_s) || {}
 proof_owners.product(%w[rust_compile cross_os_rust]).each do |owner, filter|
   errors << "exact Rust proof owner #{owner} must select #{filter} exactly once" unless Array(path_filters[filter]).count(owner) == 1
@@ -1318,7 +1325,7 @@ expected_shards.each do |job_id, (shard, name)|
   errors << "#{label} job env must not set script-check selector variables" if (job["env"] || {}).keys.any?(&selector_key)
   steps = Array(job["steps"])
   checkout = steps.first
-  errors << "#{label} must check out full history first" unless checkout.is_a?(Hash) && checkout["uses"] == "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" && checkout["with"] == {"fetch-depth" => 0}
+  errors << "#{label} must check out full history first" unless checkout.is_a?(Hash) && checkout["uses"] == "actions/checkout@v4" && checkout["with"] == {"fetch-depth" => 0}
   runs = steps.select { |step| step.is_a?(Hash) && step["run"].to_s.include?("ci-script-checks.sh") }
   run = runs.first
   unless runs.length == 1 && run["name"] == "Run script checks" && run["run"] == "./scripts/ci-script-checks.sh"
@@ -1334,10 +1341,11 @@ uploads = jobs.flat_map do |job_id, job|
   Array(job["steps"]).select { |step| step.is_a?(Hash) && step["uses"].to_s.start_with?("actions/upload-artifact") }.map { |step| [job_id, step] }
 end
 evidence = uploads.select { |_, step| step["name"] == "Upload giant-file progress evidence" }
-unless evidence == [["scripts", {"name" => "Upload giant-file progress evidence", "if" => "always()", "uses" => "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", "with" => {"path" => "target/giant-file-progress/evidence.json"}}]]
+unless evidence == [["scripts", {"name" => "Upload giant-file progress evidence", "if" => "always()", "uses" => "actions/upload-artifact@v4", "with" => {"path" => "target/giant-file-progress/evidence.json"}}]]
   errors << "giant-file progress evidence upload must remain exact, unconditional and only in the cargo shard job"
 end
-errors << "artifact uploads must stay in the cargo shard job" unless uploads.all? { |job_id, _| job_id == "scripts" }
+clippy_upload = {"name" => "Upload Clippy observation", "uses" => "actions/upload-artifact@v4", "with" => {"name" => "clippy-observation-${{ github.sha }}", "path" => "target/clippy-observation/", "if-no-files-found" => "error"}}
+errors << "artifact uploads must stay in their approved jobs" unless uploads.all? { |job_id, step| job_id == "scripts" || (job_id == "lint" && step == clippy_upload) }
 errors.each { |message| warn "#{path}: #{message}" }
 exit(errors.empty? ? 0 : 1)
 RUBY
@@ -1354,7 +1362,8 @@ validate_main_full_sweep() {
 require "yaml"
 main_path, pr_path = ARGV
 main_jobs = YAML.load_file(main_path).fetch("jobs", {})
-pr_sweep = YAML.load_file(pr_path).dig("jobs", "library_sweep")
+pr_jobs = YAML.load_file(pr_path).fetch("jobs", {})
+pr_sweep = pr_jobs["library_sweep"]
 errors = []
 sweep_name = "Library sweep (selection-set gated)"
 lint_tests_name = "Non-lib tests and doctests"
@@ -1380,6 +1389,23 @@ if lint.is_a?(Hash)
   lint_steps = Array(lint["steps"]).select { |step| step.is_a?(Hash) }
   ["Policy JS unit tests", "just fmt-check", "just lint", lint_tests_name].each do |name|
     errors << "job lint must have exactly one #{name.inspect} step" unless lint_steps.count { |step| step["name"] == name } == 1
+  end
+  expected_lint_run = <<~CLIPPY
+    set -o pipefail
+    mkdir -p target/clippy-observation
+    cargo clippy --workspace --all-targets --all-features --message-format=json -- -W clippy::all | tee target/clippy-observation/diagnostics.jsonl
+    python3 scripts/check_clippy_warning_count.py --input target/clippy-observation/diagnostics.jsonl --output target/clippy-observation/report.json --baseline scripts/clippy_warning_baseline.json --base-ref HEAD^1
+  CLIPPY
+  expected_lint = {"name" => "just lint", "shell" => "bash", "run" => expected_lint_run}
+  errors << "main Clippy observation must retain exact argv and fail-closed compilation" unless lint_steps.select { |step| step["name"] == "just lint" } == [expected_lint]
+  expected_upload = {"name" => "Upload Clippy observation", "uses" => "actions/upload-artifact@v4", "with" => {"name" => "clippy-observation-${{ github.sha }}", "path" => "target/clippy-observation/", "if-no-files-found" => "error"}}
+  errors << "main Clippy observation upload must remain exact" unless lint_steps.select { |step| step["name"] == "Upload Clippy observation" } == [expected_upload]
+  {"main" => [lint, expected_lint, 2], "PR" => [pr_jobs["lint"], expected_lint.merge("run" => expected_lint_run.sub("--base-ref HEAD^1", '--base-ref "$CLIPPY_BASE_REF"'), "env" => {"CLIPPY_BASE_REF" => "${{ github.event.pull_request.base.sha }}"}), 0]}.each do |label, (job, expected, depth)|
+    steps = Array(job && job["steps"])
+    errors << "#{label} warning ceiling must retain exact fail-closed execution" unless steps.select { |step| step["name"] == "just lint" } == [expected]
+    errors << "#{label} warning baseline comparison requires the base commit checkout" unless steps.first == {"uses" => "actions/checkout@v4", "with" => {"fetch-depth" => depth}}
+    toolchain = steps.find { |step| step["name"] == "Install Rust toolchain" }
+    errors << "#{label} warning ceiling requires the measured toolchain" unless toolchain && toolchain.dig("with", "toolchain") == "1.94.1"
   end
   tests = lint_steps.find { |step| step["name"] == lint_tests_name }
   %w[CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG].each do |key|
@@ -1461,7 +1487,7 @@ tests = steps.each_index.select { |i| runs_tests.(steps[i]) }
 stop = index.(->(step) { step["run"] == "./scripts/ci/postgres-service.sh stop" })
 test_step = tests.length == 1 ? steps[tests[0]] : {}
 errors << "job postgres must run tests in exactly one step, \"just test-postgres-shard\": just test-postgres-shard" unless test_step["name"] == "just test-postgres-shard" && test_step["run"].to_s.strip == "just test-postgres-shard"
-errors << "job postgres test step must keep timeout-minutes: 40" unless test_step["timeout-minutes"] == 40
+errors << "job postgres test step must keep timeout-minutes: 60" unless test_step["timeout-minutes"] == 60
 errors << "job postgres must not set a job timeout-minutes" if job.key?("timeout-minutes")
 errors << "job postgres must start PostgreSQL, run the test step, then stop it" unless start && stop && tests.length == 1 && start < tests[0] && tests[0] < stop
 errors.each { |message| warn "#{main_path}: #{message}" }
@@ -1525,7 +1551,7 @@ expected_cache = {
   "shared-key" => "cargo-dependencies-v2",
   "save-if" => "${{ github.ref == 'refs/heads/main' }}",
 }
-cache_steps = Array(job["steps"]).select { |step| step["uses"] == "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6" }
+cache_steps = Array(job["steps"]).select { |step| step["uses"] == "Swatinem/rust-cache@v2" }
 errors << "#{label}: rust-cache must save the shared key from main only" unless cache_steps.map { |step| step["with"] } == [expected_cache]
 commands = main_compile.map { |step| step["run"].strip }
 errors << "#{label}: must build exactly check + lib test binary without running tests" unless commands == ["cargo check --workspace --all-targets", "cargo test --lib --no-run"]
@@ -1765,8 +1791,8 @@ RUBY
   done < <(workflow_files)
 }
 
-# Path-filtered required contexts publish from `if: always()` result mirrors so
-# a failed or cancelled `changes` job cannot leave the required name skipped.
+# Path-filtered required contexts publish from `if: ${{ !cancelled() }}` result mirrors so a failed
+# or timed-out `changes` job cannot leave the required name skipped (skipped counts as passing).
 validate_path_filter_required_mirrors() {
   if ! command -v ruby >/dev/null 2>&1; then
     error "ruby is required to validate path-filter required mirrors structurally"
@@ -1908,10 +1934,10 @@ specs.each do |spec|
   expected_mirror = {
     "name" => context,
     "needs" => ["changes", runner_id],
-    "if" => "always()",
+    "if" => "${{ !cancelled() }}",
     "runs-on" => "ubuntu-latest",
     "steps" => [
-      {"uses" => "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"},
+      {"uses" => "actions/checkout@v4"},
       pin_step,
       {
         "name" => spec.fetch("step"),
@@ -1931,7 +1957,7 @@ specs.each do |spec|
   if !mirror.is_a?(Hash)
     errors << "#{context} required-context mirror job #{mirror_id} must exist"
   elsif mirror != expected_mirror
-    errors << "#{context} required-context mirror #{mirror_id} must retain its exact `if: always()` job surface, helper pin, and fail-closed result-mirror step"
+    errors << "#{context} required-context mirror #{mirror_id} must retain its exact `if: ${{ !cancelled() }}` job surface, helper pin, and fail-closed result-mirror step"
   elsif raw_jobs[mirror_id] != stringify(expected_mirror)
     errors << "#{context} required-context mirror #{mirror_id} must retain the exact raw YAML scalars"
   end

@@ -52,6 +52,7 @@ pub(in super::super) struct StreamContentArmContext<'a> {
     pub(in super::super) gateway: &'a Arc<dyn TurnGateway>,
     pub(in super::super) channel_id: ChannelId,
     pub(in super::super) provider: &'a ProviderKind,
+    pub(in super::super) cancel_token: &'a CancelToken,
     pub(in super::super) recovery_lease: Option<&'a crate::services::agent_recovery::RecoveryLease>,
     pub(in super::super) expected_identity:
         &'a crate::services::discord::inflight::InflightTurnIdentity,
@@ -60,6 +61,8 @@ pub(in super::super) struct StreamContentArmContext<'a> {
     pub(in super::super) watcher_relay_available_for_turn: bool,
     pub(in super::super) standby_relay_owns_output: bool,
     pub(in super::super) terminal_control_ready_observed: bool,
+    /// Whether this frame's admission committed a Herdr provider abort.
+    pub(in super::super) herdr_aborted: bool,
     pub(in super::super) streaming_rollover_frozen_msg_ids: &'a Vec<MessageId>,
     pub(in super::super) context_compact_lower_bound_tokens: u64,
     pub(in super::super) context_window_tokens: u64,

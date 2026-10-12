@@ -276,3 +276,31 @@ pub fn run_from_args() -> Result<()> {
 
 #[cfg(test)]
 mod test_env_panic_probe;
+
+/// Shared home lifetime contracts; registration and authority admission remain internal.
+pub mod home_runtime {
+    pub use crate::services::cluster::home_supervisor::{
+        Generation, HomeBundle, HomeLifecycle, NoHomes, Phase, Refused, Settled, StopReason,
+        Supervisor, stop_all_and_join,
+    };
+    pub use crate::services::tui_o::writer::host::{ManagedWriterHandle, WriterStopped};
+}
+
+/// Read-only delegation boot status, distinct from home authority and restore readiness.
+pub mod delegation_availability {
+    pub use crate::services::cluster::home_availability::{Availability, Unavailable, state};
+}
+
+/// Prepared watcher restore API; runtime boot integration remains dormant.
+#[cfg(unix)]
+pub mod watcher_restore {
+    pub use crate::services::discord::{RetiredOWatcherRestore, restore_retired_o_watchers};
+}
+
+/// Dormant iMessage reply contracts for admission and claim/ACK integration.
+pub mod imsg_reply {
+    pub use crate::db::imsg_reply::{
+        AckOutcome, Action, ActionAck, ClaimAction, Obligation, Purpose, ack_action, claim_action,
+        read_action, read_obligation,
+    };
+}

@@ -49,7 +49,9 @@ pub mod github_issue_creation;
 pub(crate) mod hang_forensics;
 pub mod health_active_session_audit;
 pub mod health_diagnostics;
+pub(crate) mod herdr_admission;
 pub(crate) mod herdr_launch;
+pub(crate) mod imsg_reply;
 pub mod issue_announcements;
 pub mod kakao;
 pub mod kakao_message;
@@ -150,11 +152,19 @@ pub(crate) mod tui_o {
     pub(crate) mod alarm;
     pub(crate) mod channel_policy;
     pub(crate) mod cutover;
+    pub(crate) mod exact_episode;
+    pub(crate) mod exact_pg;
+    pub(crate) mod exact_submission;
+    #[cfg(all(test, unix))]
+    mod gates_m1;
+    pub(crate) mod n1_observation;
     pub(crate) mod ownership;
+    pub(crate) mod repost;
     pub(crate) mod shadow;
     pub(crate) mod shadow_host;
     pub(crate) mod store;
     pub(crate) mod topology;
+    pub(crate) mod turn_mode;
     pub(crate) mod writer;
 }
 // #3034: 4 residual dead-code items; scoped here so the lint stays
@@ -169,6 +179,7 @@ pub(crate) mod tui_steering;
 pub(crate) mod tui_turn_state;
 pub mod turn_cancel_finalizer;
 pub mod turn_cancel_queue_guard;
+pub(crate) mod turn_host;
 pub mod turn_lifecycle;
 pub mod turn_orchestrator;
 pub(crate) mod voice_conductor;

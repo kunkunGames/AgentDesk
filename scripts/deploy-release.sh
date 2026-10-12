@@ -53,6 +53,13 @@ fi
 #                                      exactly origin/main.
 #   AGENTDESK_DEPLOY_ALLOW_DIRTY=1     allow deploying with local changes.
 #   AGENTDESK_DEPLOY_TARGET_SHA=<sha>  deploy this CI-Main-green origin/main ancestor, not the tip.
+# Cluster schema order: Postgres is shared and an old binary cannot boot on a
+# schema newer than it embeds. Every --all-nodes peer builds the source built here,
+# never a newer origin/main; a deploy that advances the schema deploys the single
+# peer BEFORE this node migrates or restarts, and without --all-nodes it is refused
+# when peers exist.
+#   AGENTDESK_DEPLOY_ALLOW_SCHEMA_AHEAD_OF_PEERS=1  skip that pin and order (peers
+#                                      may be left unable to boot until redeployed).
 #   AGENTDESK_DEPLOY_SKIP_FRESHNESS=1  skip both source-identity and remote
 #                                      freshness gates for an intentional
 #                                      offline/emergency deploy. In this mode,
@@ -97,7 +104,16 @@ fi
 # Post-deploy functional smoke (#4262 — always fail-open after DEPLOY_OK):
 #   AGENTDESK_POST_DEPLOY_SMOKE_RELAY_CELL  configured TUI E2E cell for the
 #                                          single E-1 relay round-trip
-#                                          (default: claude-tui).
+#                                          (default: claude-tui). A Claude
+#                                          cell here also runs E-50.
+#   AGENTDESK_POST_DEPLOY_SMOKE_CODEX_CELL  Codex E2E cell for E-51 (default:
+#                                          codex-tui; unconfigured = skipped).
+#   AGENTDESK_POST_DEPLOY_SMOKE_CLAUDE_TURNS_DEADLINE_S
+#   AGENTDESK_POST_DEPLOY_SMOKE_CODEX_TURNS_DEADLINE_S
+#                                          hard caps for the E-50 / E-51 turn +
+#                                          !clear runs (default: 120 / 150 s,
+#                                          keeping the added smoke time under
+#                                          5 minutes).
 #   AGENTDESK_POST_DEPLOY_SMOKE_RECOVERY_GATE_S
 #                                          bounded wait for startup recovery to
 #                                          report fully_recovered before wedge
@@ -128,6 +144,9 @@ case "$POST_DEPLOY_SMOKE_SCOPE" in
     *) echo "AGENTDESK_POST_DEPLOY_SMOKE_SCOPE must be full or api" >&2; exit 2 ;;
 esac
 POST_DEPLOY_SMOKE_WEDGE_COVERAGE="not run: wedge check did not execute"
+# Set before the health gates: their channels are the deploy-nonblocking reader alarms.
+POST_DEPLOY_SMOKE_RELAY_CELL="${AGENTDESK_POST_DEPLOY_SMOKE_RELAY_CELL:-claude-tui}"
+POST_DEPLOY_SMOKE_CODEX_TURNS_CELL="${AGENTDESK_POST_DEPLOY_SMOKE_CODEX_CELL:-codex-tui}"
 # The Rust dcserver reads AGENTDESK_DCSERVER_LABEL for the plist Label; honor it first
 # so launchd Label and plist filename never diverge when the operator overrides one side.
 PLIST_REL="${AGENTDESK_DCSERVER_LABEL:-${AGENTDESK_PLIST_REL:-com.agentdesk.release}}"
@@ -178,6 +197,13 @@ DEPLOY_ALL_NODES="${AGENTDESK_DEPLOY_ALL_NODES:-0}"
 DEPLOY_PEERS_OVERRIDE=()
 DEPLOY_PEERS_FILE="${AGENTDESK_DEPLOY_PEERS_FILE:-$ADK_REL/config/deploy-peers.txt}"
 DEPLOY_PEER_INVOCATION="${AGENTDESK_DEPLOY_PEER_INVOCATION:-0}"
+# Schema-order state: running/unresolved keep the staged binary on exit; failed
+# after the schema advanced still finishes this node and then exits non-zero.
+SCHEMA_PEERS_FIRST_STATE=""
+SCHEMA_PEERS_FIRST_FAILED=0
+PEER_LEG_LAUNCHED=0
+PEER_VERDICT_MARKER="unknown"
+DEPLOY_BUILT_SOURCE_SHA=""
 DEPLOY_FAST="${AGENTDESK_DEPLOY_FAST:-0}"
 # Optional CI-green commit to deploy instead of the origin/main tip. A prebuilt
 # binary is refused with it because nothing ties that binary to the target commit.
@@ -618,6 +644,7 @@ _write_release_source_manifest() {
     AGENTDESK_MANIFEST_SKIP_FRESHNESS="${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}" \
     AGENTDESK_MANIFEST_SKIP_REMOTE_FRESHNESS="${AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS:-0}" \
     AGENTDESK_MANIFEST_O_TUI_WRITER="$(_source_o_tui_writer)" \
+    AGENTDESK_MANIFEST_O_LEDGER_OPERATOR_RESUME="$(_source_o_ledger_operator_resume)" \
     python3 - "$manifest_tmp" <<PY
 import json
 import os
@@ -643,6 +670,7 @@ payload = {
     "skip_freshness": os.environ.get("AGENTDESK_MANIFEST_SKIP_FRESHNESS", "0"),
     "skip_remote_freshness": os.environ.get("AGENTDESK_MANIFEST_SKIP_REMOTE_FRESHNESS", "0"),
     "o_tui_writer": os.environ.get("AGENTDESK_MANIFEST_O_TUI_WRITER", "unknown"),
+    "o_ledger_operator_resume": os.environ.get("AGENTDESK_MANIFEST_O_LEDGER_OPERATOR_RESUME") == "true",
 }
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
@@ -981,6 +1009,54 @@ print(value)
 PY
 }
 
+_source_o_ledger_operator_resume() {
+    python3 - "$REPO/src/services/tui_o/store/ledger.rs" <<'PY'
+import pathlib
+import re
+import sys
+try:
+    text = pathlib.Path(sys.argv[1]).read_text()
+except FileNotFoundError:
+    print("false")
+    sys.exit(0)
+except OSError:
+    print("unknown")
+    sys.exit(0)
+definitions = [line.strip() for line in text.splitlines() if "const OPERATOR_RESUME_SUPPORTED" in line]
+if not definitions:
+    print("false")
+    sys.exit(0)
+match = re.fullmatch(r"pub const OPERATOR_RESUME_SUPPORTED: bool = (true|false);", definitions[0]) if len(definitions) == 1 else None
+print(match[1] if match else "unknown")
+PY
+}
+
+_rollback_would_revert_o_ledger() {
+    # Only first use raises the floor; an unused new build can still roll back after a failed deploy.
+    local floor="$ADK_REL/o_store/operator_resume.floor"
+    [ -e "$floor" ] || [ -L "$floor" ] || return 1
+    if python3 - "$ADK_REL/runtime/release-source.json" <<'PY' 2>/dev/null
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        compatible = json.load(handle).get("o_ledger_operator_resume") is True
+except (OSError, ValueError, AttributeError):
+    compatible = False
+sys.exit(0 if compatible else 1)
+PY
+    then
+        return 1
+    fi
+    return 0
+}
+
+_source_would_revert_o_ledger() {
+    local floor="$ADK_REL/o_store/operator_resume.floor"
+    [ -e "$floor" ] || [ -L "$floor" ] || return 1
+    [ "$(_source_o_ledger_operator_resume)" != "true" ]
+}
+
 _rollback_would_revert_o_writer() {
     # Returns 0 (refuse) when this source may have the O writer on and the
     # rollback target is not recorded as an O writer build: the old binary would
@@ -1005,10 +1081,86 @@ _external_artifact_would_skip_o_writer() {
     # known to carry its switch, which the manifest then records for rollback.
     local value
     [ -n "${AGENTDESK_DEPLOY_BINARY:-}" ] || return 1
+    if [ "$(_source_o_ledger_operator_resume)" != "false" ]; then
+        echo "✗ OperatorResume capability requires this source's own build; external artifact refused" >&2
+        return 0
+    fi
     value="$(_source_o_tui_writer)"
     [ "$value" != "false" ] || return 1
     echo "✗ O writer switch is ${value} in this source; AGENTDESK_DEPLOY_BINARY is refused — deploy a build of this source" >&2
     return 0
+}
+
+_signal_release_lock_pid() {
+    local pid="$1" signal="$2" args=""
+    # A lock file can be stale or corrupt; recheck argv before every signal.
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+        args=$(ps -ww -o args= -p "$pid" 2>/dev/null || true)
+    fi
+    case "$args" in
+        "$ADK_REL/bin/agentdesk dcserver"|"$ADK_REL/bin/agentdesk dcserver "*|\
+        "$ADK_REL/bin/agentdesk --json dcserver"|"$ADK_REL/bin/agentdesk --json dcserver "*)
+            kill "$signal" "$pid" 2>/dev/null ;;
+        *)
+            echo "  ⚠ Refusing signal $signal to lock PID $pid: not the release agentdesk dcserver" >&2
+            return 1 ;;
+    esac
+}
+
+_wait_release_stopped() {
+    local target="$1" pid="$2" allow_sigkill="${3:-0}" wait_secs=0 job_loaded pid_alive
+    while :; do
+        job_loaded=0
+        pid_alive=0
+        if launchctl print "$target" >/dev/null 2>&1; then job_loaded=1; fi
+        if [ -n "$pid" ] && _signal_release_lock_pid "$pid" -0; then
+            pid_alive=1
+        else
+            pid=""
+        fi
+        if [ "$job_loaded" = 0 ] && [ "$pid_alive" = 0 ]; then
+            echo "  ✓ release job unloaded and old process terminated (${wait_secs}s)"
+            return 0
+        fi
+        if [ "$wait_secs" -ge 15 ]; then
+            # Only the main stop path retains its existing SIGKILL escalation.
+            if [ "$allow_sigkill" = 1 ] && [ "$pid_alive" = 1 ] && [ "$wait_secs" -eq 15 ]; then
+                echo "  ⚠ PID $pid did not exit after 15s — checking before SIGKILL"
+                _signal_release_lock_pid "$pid" -9 || true
+                sleep 1
+                wait_secs=16
+                continue
+            fi
+            echo "  ✗ Release stop timed out for $target after ${wait_secs}s; refusing bootstrap" >&2
+            return 1
+        fi
+        sleep 1
+        wait_secs=$((wait_secs + 1))
+    done
+}
+
+_capture_deploy_preexisting_reader_alarms() {
+    local health_body
+    DEPLOY_PREEXISTING_READER_CHANNEL_IDS=""
+    if health_body=$(curl -s --max-time 5 "http://${ADK_DEFAULT_LOOPBACK}:${REL_PORT}/api/health" 2>/dev/null); then
+        DEPLOY_PREEXISTING_READER_CHANNEL_IDS=$(printf '%s' "$health_body" | python3 -c '
+import json
+import re
+import sys
+
+body = json.load(sys.stdin)
+reasons = body.get("degraded_reasons") if isinstance(body, dict) else None
+if not isinstance(reasons, list) or not all(isinstance(reason, str) for reason in reasons):
+    raise ValueError("invalid degraded_reasons")
+ids = []
+for reason in reasons:
+    match = re.fullmatch(r"tui_o:too_many_readers:([0-9]+)", reason)
+    if match and match[1] not in ids:
+        ids.append(match[1])
+print("|".join(ids))
+' 2>/dev/null) || DEPLOY_PREEXISTING_READER_CHANNEL_IDS=""
+    fi
+    echo "▸ Pre-existing reader-count alarms (non-blocking after deploy): ${DEPLOY_PREEXISTING_READER_CHANNEL_IDS:-none}"
 }
 
 # #3858: restore the last-known-good release binary and restart the service.
@@ -1016,14 +1168,14 @@ _external_artifact_would_skip_o_writer() {
 # promoted but the deploy never reached DEPLOY_OK — i.e. ANY non-zero exit after
 # promotion, not only the explicit health-check branch (an unguarded
 # post-promotion command failing under `set -e` is covered too). Every step
-# except the restart is best-effort so a failed re-lock can NEVER skip the
-# restart (#3858 finding 3): the service must always come back up.
+# except confirming the stop and restarting is best-effort: a failed re-lock
+# cannot skip restart, but an unfinished bootout must not race bootstrap.
 _rollback_release_binary() {
     local rel_binary="${REL_BINARY:-}"
     local rel_backup="${REL_BINARY_BACKUP:-}"
     local plist="${PLIST_REL:-}"
     local rel_port="${REL_PORT:-${AGENTDESK_REL_PORT:-${ADK_DEFAULT_PORT:-8791}}}"
-    local domain
+    local domain rollback_pid=""
 
     [ -n "$rel_binary" ] && [ -n "$plist" ] || return 0
     if [ ! -f "$rel_backup" ]; then
@@ -1072,6 +1224,12 @@ _rollback_release_binary() {
         return 0
     fi
 
+    if _rollback_would_revert_o_ledger; then
+        echo "🛑 ROLLBACK REFUSED — OperatorResume floor requires a compatible O ledger reader"
+        echo "   The new binary stays live; $rel_backup is preserved. Fix forward with a compatible build."
+        return 0
+    fi
+
     echo "↩ Rolling back release binary to previous good version..."
     domain="$(_launchd_domain)" || domain="gui/$(id -u 2>/dev/null)"
     # Stop the crash-looping new process before swapping the binary back.
@@ -1080,8 +1238,17 @@ _rollback_release_binary() {
     # succeeds but process doesn't spawn, tmux fallback will restart via SSH.
     # Observed issue (#5151): explicit kickstart required after bootstrap. Scope: PG tunnel
     # only for now; release rollback suitable for future unification if measured necessary.
-    launchctl bootout "$domain/$plist" 2>/dev/null || true
+    if [ -f "$ADK_REL/runtime/dcserver.lock" ]; then
+        rollback_pid=$(cat "$ADK_REL/runtime/dcserver.lock" 2>/dev/null || true)
+    fi
+    if ! launchctl bootout "$domain/$plist"; then
+        echo "⚠ Rollback bootout failed for $domain/$plist — checking whether release stopped" >&2
+    fi
     tmux kill-session -t "${AGENTDESK_RELEASE_TMUX_SESSION:-AgentDesk-dcserver-release-manual}" 2>/dev/null || true
+    if ! _wait_release_stopped "$domain/$plist" "$rollback_pid"; then
+        echo "✗ Rollback stop was not confirmed — backup preserved; manual intervention required" >&2
+        return 0
+    fi
     # The bad binary is never locked (uchg is deferred to the success path), so
     # nouchg here is defensive. mv is an atomic same-dir rename: the backup
     # replaces the bad binary in one step — at no instant are both copies gone.
@@ -1344,6 +1511,15 @@ _cleanup_on_exit() {
         && [ "${DEPLOY_OK:-0}" != 1 ]; then
         _recover_or_preserve_past_migration_floor
     fi
+    # A peer leg that may still migrate leaves the schema unknown: keep, but do not
+    # install, the binary that can boot on it.
+    case "${SCHEMA_PEERS_FIRST_STATE:-}" in
+        running|unresolved)
+            if [ "${DEPLOY_OK:-0}" != 1 ] && [ "${MIGRATION_FLOOR_ARMED:-0}" != 1 ]; then
+                _preserve_staged_binary_for_recovery || true
+            fi
+            ;;
+    esac
     if [ -n "${STAGED_BINARY:-}" ] && [ -e "$STAGED_BINARY" ]; then
         rm -f "$STAGED_BINARY" 2>/dev/null || true
     fi
@@ -1626,6 +1802,8 @@ _wait_for_peer_deploy_verdict() {
     local expected_repo_head="$5"
     local timeout_secs="$DEPLOY_PEER_VERDICT_TIMEOUT_SECS"
     local poll_interval_secs="$DEPLOY_PEER_VERDICT_POLL_INTERVAL_SECS"
+    # The deploy host's reader snapshot is no evidence about a peer's old runtime.
+    local DEPLOY_PREEXISTING_READER_CHANNEL_IDS=""
 
     case "$timeout_secs" in
         ''|*[!0-9]*)
@@ -1659,6 +1837,7 @@ _wait_for_peer_deploy_verdict() {
                 marker_status marker_detail observed_repo_head repo_detail health_status health_detail \
                 health_body \
                 <<<"$probe_output"
+            PEER_VERDICT_MARKER="$marker_status"
         else
             marker_status="unknown"
             marker_detail="peer probe failed"
@@ -1867,6 +2046,7 @@ echo \"\$port\"")"'')"; then
         fi
     fi
 
+    PEER_LEG_LAUNCHED=1
     echo "▸ [peer:$peer] Running deploy-release.sh..."
     if ! ssh -o ConnectTimeout="$DEPLOY_SSH_CONNECT_TIMEOUT" "$peer" "bash -lc $(printf '%q' "$remote_deploy_command")"; then
         echo "✗ [peer:$peer] deploy-release.sh failed"
@@ -1906,9 +2086,188 @@ _deploy_to_all_peers() {
 
     if [ "$failures" -gt 0 ]; then
         echo "✗ Cluster deploy: $failures peer(s) failed"
-        exit 1
+        return 1
     fi
     echo "═══ Cluster Deploy Complete (all peer verdicts verified) ═══"
+}
+
+_schema_order_peers() {
+    # Peers the target pin and schema order apply to; empty for a peer leg or under the override.
+    [ "$DEPLOY_PEER_INVOCATION" != "1" ] || return 0
+    [ "${AGENTDESK_DEPLOY_ALLOW_SCHEMA_AHEAD_OF_PEERS:-0}" != "1" ] || return 0
+    _resolve_deploy_peers
+}
+
+_schema_order_refusal() {
+    # Refuses a schema-advancing deploy whose topology cannot deploy the peer first.
+    local peers="$1" peer_count peer_list
+    peer_count="$(printf '%s\n' "$peers" | grep -c .)"
+    peer_list="$(printf '%s\n' "$peers" | tr '\n' ' ')"
+    if [ "$DEPLOY_ALL_NODES" != "1" ]; then
+        echo "✗ [schema-order] this deploy advances the shared Postgres schema, but peer(s) ${peer_list}would keep a binary that cannot boot on it; rerun with --all-nodes"
+    elif [ "$peer_count" -gt 1 ]; then
+        echo "✗ [schema-order] a schema-advancing cluster deploy supports one peer; got $peer_count (${peer_list% })"
+    else
+        return 0
+    fi
+    echo "  Set AGENTDESK_DEPLOY_ALLOW_SCHEMA_AHEAD_OF_PEERS=1 only when the peers may stay unable to boot until redeployed."
+    return 1
+}
+
+_cluster_target_refusal() {
+    # An external artifact has no source the cluster peers could be pinned to.
+    [ "$DEPLOY_ALL_NODES" = "1" ] && [ -n "${AGENTDESK_DEPLOY_BINARY:-}" ] || return 0
+    echo "✗ [schema-order] AGENTDESK_DEPLOY_BINARY cannot be tied to the source the peers build; deploy a build of this source"
+    echo "  Set AGENTDESK_DEPLOY_ALLOW_SCHEMA_AHEAD_OF_PEERS=1 only when the peers may build another source."
+    return 1
+}
+
+_schema_order_guard_before_build() {
+    # Cheap fail-closed check before the build; the doctor recheck runs before migrating.
+    local peers
+    peers="$(_schema_order_peers)"
+    [ -n "$peers" ] || return 0
+    _cluster_target_refusal || return 1
+    _migration_floor_may_advance || return 0
+    _schema_order_refusal "$peers"
+}
+
+_doctor_migration_snapshot() {
+    # One comparable line of the shared schema as this binary sees it; rc 1 = unknown.
+    local binary="$1" json_tmp
+    json_tmp=$(mktemp "${TMPDIR:-/tmp}/agentdesk-schema-snapshot.XXXXXX") || return 1
+    "$binary" doctor --json >"$json_tmp" 2>/dev/null || true
+    python3 - "$json_tmp" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    sys.exit(1)
+check = next((c for c in data.get("checks", []) if c.get("id") == "postgres_connection"), None)
+evidence = (check or {}).get("evidence")
+if not isinstance(evidence, dict):
+    sys.exit(1)
+pending = evidence.get("pending_versions")
+applied = evidence.get("applied_count")
+if not isinstance(pending, list) or not isinstance(applied, int):
+    sys.exit(1)
+
+def versions(key):
+    return json.dumps(sorted(evidence.get(key) or []), separators=(",", ":"))
+
+print(
+    f"applied_count={applied} pending={versions('pending_versions')}"
+    f" missing={versions('missing_from_resolved')}"
+    f" unsuccessful={versions('unsuccessful_versions')}"
+)
+PY
+    local rc=$?
+    rm -f "$json_tmp"
+    return "$rc"
+}
+
+_classify_schema_peer_failure() {
+    # unchanged needs a finished (or never launched) peer leg and an unmoved schema.
+    local launched="$1" marker="$2" before="$3" after="$4"
+    if [ -z "$before" ] || [ -z "$after" ]; then
+        echo unresolved
+    elif [ "$before" != "$after" ]; then
+        echo advanced
+    elif [ "$launched" = "1" ] && [ "$marker" != "failure" ] && [ "$marker" != "success" ]; then
+        echo unresolved
+    else
+        echo unchanged
+    fi
+}
+
+_pin_cluster_target_to_built_source() {
+    # Every cluster peer builds exactly the staged source, never a newer origin/main,
+    # whether or not this deploy advances the schema.
+    local head_sha
+    [ "$DEPLOY_ALL_NODES" = "1" ] && [ -n "$(_schema_order_peers)" ] || return 0
+    _cluster_target_refusal || return 1
+    head_sha="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
+    if [ -z "$DEPLOY_BUILT_SOURCE_SHA" ] || [ "$head_sha" != "$DEPLOY_BUILT_SOURCE_SHA" ]; then
+        echo "✗ [schema-order] workspace HEAD (${head_sha:-unknown}) is not the source this node built (${DEPLOY_BUILT_SOURCE_SHA:-unknown}); refusing to send the peer another schema"
+        return 1
+    fi
+    if [ -n "$(git -C "$REPO" status --porcelain -- migrations/postgres 2>/dev/null)" ]; then
+        echo "✗ [schema-order] uncommitted changes under migrations/postgres cannot reach the peer; commit them first"
+        return 1
+    fi
+    if [ -n "${DEPLOY_TARGET_SHA:-}" ] && [ "$DEPLOY_TARGET_SHA" != "$DEPLOY_BUILT_SOURCE_SHA" ]; then
+        echo "✗ [schema-order] pinned target ${DEPLOY_TARGET_SHA} is not the built source ${DEPLOY_BUILT_SOURCE_SHA}"
+        return 1
+    fi
+    DEPLOY_TARGET_SHA="$DEPLOY_BUILT_SOURCE_SHA"
+    AGENTDESK_DEPLOY_TARGET_SHA="$DEPLOY_BUILT_SOURCE_SHA"
+    export AGENTDESK_DEPLOY_TARGET_SHA
+    echo "▸ [schema-order] peers pinned to the built source ${DEPLOY_BUILT_SOURCE_SHA}"
+}
+
+_run_schema_peers_first() {
+    # Deploys the peer before this node migrates when the shared schema advances.
+    local peers before after verdict
+    peers="$(_schema_order_peers)"
+    [ -n "$peers" ] || return 0
+    before="$(_doctor_migration_snapshot "$STAGED_BINARY")" || before=""
+    if ! _migration_floor_may_advance && [[ "$before" == *" pending=[] "* ]]; then
+        return 0
+    fi
+    _schema_order_refusal "$peers" || return 1
+    echo "▸ [schema-order] the shared Postgres schema advances — deploying the peer before this node migrates or restarts"
+    PEER_LEG_LAUNCHED=0
+    PEER_VERDICT_MARKER="unknown"
+    SCHEMA_PEERS_FIRST_STATE=running
+    # Arm before leaving running: a signal in between then recovers or keeps the binary.
+    if _deploy_to_all_peers "$@"; then
+        MIGRATION_FLOOR_ARMED=1
+        SCHEMA_PEERS_FIRST_STATE=completed
+        return 0
+    fi
+    after="$(_doctor_migration_snapshot "$STAGED_BINARY")" || after=""
+    verdict="$(_classify_schema_peer_failure "$PEER_LEG_LAUNCHED" "$PEER_VERDICT_MARKER" "$before" "$after")"
+    case "$verdict" in
+        unchanged)
+            SCHEMA_PEERS_FIRST_STATE=failed
+            echo "✗ [schema-order] the peer leg failed and the shared schema is unchanged ($after); this node was not migrated or restarted"
+            return 1
+            ;;
+        advanced)
+            MIGRATION_FLOOR_ARMED=1
+            SCHEMA_PEERS_FIRST_STATE=failed
+            SCHEMA_PEERS_FIRST_FAILED=1
+            echo "⚠ [schema-order] the peer leg failed after the shared schema moved (before: $before; after: $after); finishing this node on the new binary"
+            return 0
+            ;;
+        *)
+            SCHEMA_PEERS_FIRST_STATE=unresolved
+            echo "✗ [schema-order] the peer leg failed and the shared schema state is unknown (before: ${before:-unknown}; after: ${after:-unknown}; peer marker: $PEER_VERDICT_MARKER)"
+            echo "  The staged binary is kept, not installed; check the peer log and doctor, then redeploy."
+            return 1
+            ;;
+    esac
+}
+
+_finish_cluster_stage() {
+    # Peers deploy here unless they already ran before the migration; a failed
+    # peer-first leg still fails the run after this node finished.
+    if [ "$DEPLOY_ALL_NODES" = "1" ] && [ -z "$SCHEMA_PEERS_FIRST_STATE" ]; then
+        _deploy_to_all_peers "$@" || return 1
+    fi
+    if [ "$SCHEMA_PEERS_FIRST_FAILED" = "1" ]; then
+        echo "✗ [schema-order] this node finished on the new binary, but the peer leg failed after the shared schema advanced"
+        return 1
+    fi
+}
+
+_prepare_release_migrations() {
+    # The peer target is fixed first; the schema then decides only the order.
+    _pin_cluster_target_to_built_source || return 1
+    _run_schema_peers_first "$@"
 }
 
 _acquire_release_deploy_lock() {
@@ -1984,6 +2343,7 @@ export AGENTDESK_DEPLOY_FAST=$(printf '%q' "${AGENTDESK_DEPLOY_FAST:-0}")
 export AGENTDESK_DEPLOY_SKIP_FRESHNESS=$(printf '%q' "${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}")
 export AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS=$(printf '%q' "${AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS:-0}")
 export AGENTDESK_DEPLOY_TARGET_SHA=$(printf '%q' "${AGENTDESK_DEPLOY_TARGET_SHA:-}")
+export AGENTDESK_DEPLOY_ALLOW_SCHEMA_AHEAD_OF_PEERS=$(printf '%q' "${AGENTDESK_DEPLOY_ALLOW_SCHEMA_AHEAD_OF_PEERS:-0}")
 export AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT=$(printf '%q' "${AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT:-0}")
 export AGENTDESK_DEPLOY_MAX_LOADAVG=$(printf '%q' "${AGENTDESK_DEPLOY_MAX_LOADAVG:-}")
 export AGENTDESK_DEPLOY_MAX_MEM_PRESSURE_LEVEL=$(printf '%q' "${AGENTDESK_DEPLOY_MAX_MEM_PRESSURE_LEVEL:-}")
@@ -2110,6 +2470,8 @@ if [ "$DEPLOY_TEST_MODE" = "1" ]; then
     exit 0
 fi
 
+_schema_order_guard_before_build || exit 1
+
 # Ensure release dir exists
 mkdir -p "$ADK_REL"/{bin,config,data,logs}
 
@@ -2131,12 +2493,22 @@ fi
 # keeps the override behavior only while this source's O writer switch is false.
 _ensure_dashboard_dependencies
 _check_repo_remote_freshness
+if _source_would_revert_o_ledger; then
+    echo "✗ OperatorResume floor refuses this source's incompatible O ledger reader" >&2
+    exit 1
+fi
+
 if _external_artifact_would_skip_o_writer; then
     exit 1
 elif [ -n "${AGENTDESK_DEPLOY_BINARY:-}" ]; then
     SOURCE_BINARY="$AGENTDESK_DEPLOY_BINARY"
 else
     SOURCE_BINARY="$(_resolve_default_release_binary "$DEPLOY_BUILD_PROFILE")"
+fi
+# Cluster peers are pinned to this commit, so record it before building; an
+# external artifact has no source to record.
+if [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ] && [ -n "$(_schema_order_peers)" ]; then
+    DEPLOY_BUILT_SOURCE_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
 fi
 if [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ]; then
     # #5855: the deploy lock is already held here, and a queued peer deploy only
@@ -2765,6 +3137,10 @@ if [ -f "$LOCK_FILE" ]; then
     OLD_PID=$(cat "$LOCK_FILE" 2>/dev/null || true)
 fi
 
+# Postgres is shared: pin the cluster peers to this build and, when the schema
+# advances, deploy the peer before this node migrates or restarts.
+_prepare_release_migrations "$@" || exit 1
+
 # Apply the forward-only database boundary before requesting restart_pending.
 # The runtime may consume a persisted restart request and exit on its own, so no
 # drain marker or self-exit trigger may exist when candidate migration runs. The
@@ -2789,6 +3165,9 @@ fi
 # delivery frontier before launchd is allowed to stop it. The runtime consumes
 # restart_pending only after queue/checkpoint state and DrainRestart markers are
 # durable; the replacement watcher then resumes from those committed offsets.
+# Read once before restart drain can make the old runtime exit; keep the same
+# local snapshot for promotion and rollback, so later reader alarms still block.
+_capture_deploy_preexisting_reader_alarms
 AGENTDESK_RESTART_ALLOW_FOREIGN_TURNS=1
 export AGENTDESK_RESTART_ALLOW_FOREIGN_TURNS
 # #5245 Phase 2A-S: `$ADK_REL` remains the sole canonical watched root.
@@ -2821,34 +3200,16 @@ else
 fi
 # <<< END restart-durability gate (#5254)
 
-# A planned restart no longer suppresses transcript gaps: the watchdog's durable
-# pre-restart authority must remain observable until Discord delivery catches up.
-# Remove a marker left by an older deploy so its quiet window cannot mask this
-# restart boundary after the runtime has proved its replay frontier durable.
-rm -f "$ADK_REL/logs/relay-watchdog.deploy-marker" 2>/dev/null || true
 # Fixed compatibility indexes remain available until the retention sweep can
 # prove that no same-nonce canonical pending marker still depends on them.
 
 # Stop release only after migration and the durable persistence acknowledgement.
 echo "▸ Stopping release..."
 LAUNCHD_DOMAIN="$(_launchd_domain)"
-launchctl bootout "$LAUNCHD_DOMAIN/$PLIST_REL" 2>/dev/null || true
-if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-    echo "  waiting for PID $OLD_PID to exit..."
-    WAIT_SECS=0
-    while kill -0 "$OLD_PID" 2>/dev/null && [ "$WAIT_SECS" -lt 15 ]; do
-        sleep 1
-        WAIT_SECS=$((WAIT_SECS + 1))
-    done
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "  ⚠ PID $OLD_PID did not exit after 15s — sending SIGKILL"
-        kill -9 "$OLD_PID" 2>/dev/null || true
-        sleep 1
-    fi
-    echo "  ✓ old process terminated (${WAIT_SECS}s)"
-else
-    sleep 2
+if ! launchctl bootout "$LAUNCHD_DOMAIN/$PLIST_REL"; then
+    echo "⚠ Release bootout failed for $LAUNCHD_DOMAIN/$PLIST_REL — checking whether release stopped" >&2
 fi
+_wait_release_stopped "$LAUNCHD_DOMAIN/$PLIST_REL" "$OLD_PID" 1 || exit 1
 
 _post_deploy_smoke_log_identity_and_size() {
     local log_path="$1"
@@ -2979,6 +3340,11 @@ elif [ -f "$REL_BINARY" ]; then
     mv -f "$REL_BINARY_BACKUP.tmp" "$REL_BINARY_BACKUP"
 fi
 
+# Resolved once before promotion so the new-binary and rollback health gates
+# accept the same smoke channels; an unreadable config accepts none.
+DEPLOY_E2E_SMOKE_CHANNEL_IDS=$(_deploy_e2e_smoke_channel_ids "$REPO" \
+    "$ADK_REL/config/agentdesk.yaml" "$POST_DEPLOY_SMOKE_RELAY_CELL" "$POST_DEPLOY_SMOKE_CODEX_TURNS_CELL")
+echo "▸ Smoke E2E channels whose reader-count alarm does not block health: ${DEPLOY_E2E_SMOKE_CHANNEL_IDS:-none}"
 echo "▸ Promoting staged binary..."
 mv -f "$STAGED_BINARY" "$REL_BINARY"
 STAGED_BINARY=""
@@ -3293,7 +3659,6 @@ POST_DEPLOY_SMOKE_CORE_API_ENDPOINTS=(
 )
 POST_DEPLOY_SMOKE_LOG_LINES="${AGENTDESK_POST_DEPLOY_SMOKE_LOG_LINES:-500}"
 POST_DEPLOY_SMOKE_WARN_LIMIT="${AGENTDESK_POST_DEPLOY_SMOKE_WARN_LIMIT:-5}"
-POST_DEPLOY_SMOKE_RELAY_CELL="${AGENTDESK_POST_DEPLOY_SMOKE_RELAY_CELL:-claude-tui}"
 POST_DEPLOY_SMOKE_RECOVERY_GATE_S="${AGENTDESK_POST_DEPLOY_SMOKE_RECOVERY_GATE_S:-120}"
 # The E-35 phase from lease acquisition through scenario execution is capped,
 # including its live safety gate, setup/send/fetch HTTP, response wait, record
@@ -3301,6 +3666,10 @@ POST_DEPLOY_SMOKE_RECOVERY_GATE_S="${AGENTDESK_POST_DEPLOY_SMOKE_RECOVERY_GATE_S
 # seconds; 900 seconds is an operational cutoff, not that component sum.
 # Reset costs zero because E-35 forbids reset/force-cancel.
 POST_DEPLOY_SMOKE_E35_DEADLINE_S="${AGENTDESK_POST_DEPLOY_SMOKE_E35_DEADLINE_S:-900}"
+# E-50/E-51 phase caps: 120 + 150 s plus two idle preflights (5 s each) stay
+# under the 300 s budget the turn scenarios may add to the smoke.
+POST_DEPLOY_SMOKE_CLAUDE_TURNS_DEADLINE_S="${AGENTDESK_POST_DEPLOY_SMOKE_CLAUDE_TURNS_DEADLINE_S:-120}"
+POST_DEPLOY_SMOKE_CODEX_TURNS_DEADLINE_S="${AGENTDESK_POST_DEPLOY_SMOKE_CODEX_TURNS_DEADLINE_S:-150}"
 POST_DEPLOY_SMOKE_CREATE_ISSUE="${AGENTDESK_POST_DEPLOY_SMOKE_CREATE_ISSUE:-off}"
 POST_DEPLOY_SMOKE_STAMP="$(date -u '+%Y%m%dT%H%M%SZ' 2>/dev/null || printf 'unknown')-$$"
 POST_DEPLOY_SMOKE_EVIDENCE="$ADK_REL/logs/post-deploy-smoke-${POST_DEPLOY_SMOKE_STAMP}.log"
@@ -3312,6 +3681,7 @@ POST_DEPLOY_SMOKE_FAILURES=()
 POST_DEPLOY_SMOKE_RELAY_CHANNEL_ID=""
 POST_DEPLOY_SMOKE_DURABLE_COVERAGE="unevaluable: E-35 did not run"
 POST_DEPLOY_SMOKE_DURABLE_CLEAN_COVERAGE="evaluated"
+POST_DEPLOY_SMOKE_TURN_COVERAGE="not run: turn scenarios did not execute"
 
 # >>> BEGIN wedge-check region (#5244) — coverage is report-only and point-in-time
 POST_DEPLOY_SMOKE_WEDGE_MARKER_COVERAGE='evaluated: %s stall-state marker(s) observed (point-in-time)'; POST_DEPLOY_SMOKE_WEDGE_CLEAN_COVERAGE="${POST_DEPLOY_SMOKE_WEDGE_MARKER_COVERAGE/\%s/0}"
@@ -3923,6 +4293,126 @@ PY
     return 1
 }
 
+_post_deploy_smoke_run_turn_scenario() {
+    local scenario="$1" cell="$2" channel_id="$3" deadline_s="$4"
+    local output="$ADK_REL/logs/post-deploy-smoke-turns-${POST_DEPLOY_SMOKE_STAMP}"
+    local relay_log="$POST_DEPLOY_SMOKE_TMP_DIR/relay-${scenario}.log"
+    local excerpt="$POST_DEPLOY_SMOKE_TMP_DIR/dcserver-${scenario}.log"
+    local idle start_stat start_size="" head_bytes=0 start_head=""
+    local verdict rc=0 judge_rc=0
+    # Same idle proof as E-1, read fresh: an earlier phase may have left the cell busy.
+    if ! idle=$(cd "$REPO" && python3 scripts/e2e/post_deploy_turn_smoke.py preflight \
+        --base-url "http://${ADK_DEFAULT_LOOPBACK}:${REL_PORT}" --cell "$cell" \
+        --channel-id "$channel_id" --queue-runtime-root "$ADK_REL/runtime" 2>&1); then
+        _post_deploy_smoke_note "relay ${scenario}=skipped: ${cell} not proven idle (${idle})" || return 1
+        POST_DEPLOY_SMOKE_TURN_COVERAGE+=" ${scenario}=skipped"
+        return 0
+    fi
+    start_stat=$(_post_deploy_smoke_log_identity_and_size "$POST_DEPLOY_SMOKE_LOG_PATH" 2>/dev/null) || start_stat=""
+    read -r _ start_size <<< "$start_stat" || true
+    case "${start_size:-x}" in
+        *[!0-9]*|x) ;;
+        *)
+            head_bytes="$start_size"
+            [ "$head_bytes" -le "$POST_DEPLOY_SMOKE_LOG_FINGERPRINT_CAP" ] || head_bytes="$POST_DEPLOY_SMOKE_LOG_FINGERPRINT_CAP"
+            start_head=$(_post_deploy_smoke_log_head_fingerprint "$POST_DEPLOY_SMOKE_LOG_PATH" "$head_bytes" 2>/dev/null) || start_head=""
+            ;;
+    esac
+    _post_deploy_smoke_note \
+        "relay ${scenario} cell=${cell} channel=${channel_id} deadline=${deadline_s}s output=${output}" \
+        || return 1
+    (
+        cd "$REPO" || exit 1
+        python3 scripts/e2e/run_tui_relay.py \
+            --base-url "http://${ADK_DEFAULT_LOOPBACK}:${REL_PORT}" \
+            --cell "$cell" --channel-id "$channel_id" \
+            --scenarios "$REPO/tests/e2e/tui_relay/scenarios" \
+            --filter "$scenario" --no-reset-before-each \
+            --phase-deadline-s "$deadline_s" \
+            --output "$output" --queue-runtime-root "$ADK_REL/runtime" \
+            --required-agent-mode real_live --required-coverage-class live
+    ) > "$relay_log" 2>&1 || rc=$?
+    tail -n 20 "$relay_log" >> "$POST_DEPLOY_SMOKE_EVIDENCE" 2>/dev/null || true
+    # Judge only bytes appended since the run started. Rotation can reuse the inode
+    # (ext4 does), so the start head fingerprint decides; a mismatch leaves no excerpt (FAIL).
+    if [ -z "$start_head" ] \
+        || [ "$(_post_deploy_smoke_log_head_fingerprint "$POST_DEPLOY_SMOKE_LOG_PATH" "$head_bytes" 2>/dev/null)" != "$start_head" ] \
+        || ! tail -c "+$((start_size + 1))" "$POST_DEPLOY_SMOKE_LOG_PATH" > "$excerpt"; then
+        excerpt=""
+    fi
+    verdict=$(cd "$REPO" && python3 scripts/e2e/post_deploy_turn_smoke.py judge \
+        --report "$output/report.${cell}.json" \
+        --scenarios "$REPO/tests/e2e/tui_relay/scenarios" \
+        --scenario "$scenario" --cell "$cell" --channel-id "$channel_id" \
+        --log-excerpt "$excerpt" --driver-rc "$rc" 2>> "$POST_DEPLOY_SMOKE_EVIDENCE") || judge_rc=$?
+    if [ "$judge_rc" -eq 0 ] && [ -n "$verdict" ]; then
+        _post_deploy_smoke_note "$verdict" || return 1
+        POST_DEPLOY_SMOKE_TURN_COVERAGE+=" ${scenario}=pass"
+        return 0
+    fi
+    [ -n "$verdict" ] || verdict="relay ${scenario} cell=${cell} result=FAIL judge produced no verdict (rc=${judge_rc})"
+    _post_deploy_smoke_fail "${verdict} (evidence: ${output})" || true
+    POST_DEPLOY_SMOKE_TURN_COVERAGE+=" ${scenario}=FAIL"
+    return 1
+}
+
+_post_deploy_smoke_check_turn_scenarios() {
+    local failed=0 codex_channel resolve_rc
+    local config_path="$ADK_REL/config/agentdesk.yaml"
+    POST_DEPLOY_SMOKE_TURN_COVERAGE=""
+    # Ride E-1's gates: an empty channel means standby, unconfigured or unproven.
+    if [ -z "$POST_DEPLOY_SMOKE_RELAY_CHANNEL_ID" ]; then
+        POST_DEPLOY_SMOKE_TURN_COVERAGE="E-50=skipped E-51=skipped"
+        _post_deploy_smoke_note "relay E-50/E-51=skipped: E-1 resolved no relay channel" || return 1
+        return 0
+    fi
+    case "$POST_DEPLOY_SMOKE_RELAY_CELL" in
+        claude-*)
+            _post_deploy_smoke_run_turn_scenario E-50 "$POST_DEPLOY_SMOKE_RELAY_CELL" \
+                "$POST_DEPLOY_SMOKE_RELAY_CHANNEL_ID" "$POST_DEPLOY_SMOKE_CLAUDE_TURNS_DEADLINE_S" \
+                || failed=1
+            ;;
+        *)
+            POST_DEPLOY_SMOKE_TURN_COVERAGE+=" E-50=skipped"
+            _post_deploy_smoke_note "relay E-50=skipped: relay cell ${POST_DEPLOY_SMOKE_RELAY_CELL} is not a Claude cell" || return 1
+            ;;
+    esac
+    # Same machine-local resolver as E-1: channel ids are never hard-coded.
+    if codex_channel=$(python3 - "$REPO" "$config_path" "$POST_DEPLOY_SMOKE_CODEX_TURNS_CELL" \
+        2>> "$POST_DEPLOY_SMOKE_EVIDENCE" <<'PY'
+import sys
+from pathlib import Path
+
+repo, config, cell = sys.argv[1:]
+sys.path.insert(0, str(Path(repo) / "scripts" / "e2e"))
+from post_deploy_relay_continuity import SmokeConfigError, load_channel_id_from_config
+
+try:
+    print(load_channel_id_from_config(Path(config), cell))
+except (FileNotFoundError, SmokeConfigError) as error:
+    print(error, file=sys.stderr)
+    raise SystemExit(2) from error
+PY
+    ); then
+        _post_deploy_smoke_run_turn_scenario E-51 "$POST_DEPLOY_SMOKE_CODEX_TURNS_CELL" \
+            "$codex_channel" "$POST_DEPLOY_SMOKE_CODEX_TURNS_DEADLINE_S" || failed=1
+    else
+        resolve_rc=$?
+        if [ "$resolve_rc" -eq 2 ]; then
+            POST_DEPLOY_SMOKE_TURN_COVERAGE+=" E-51=skipped"
+            _post_deploy_smoke_note "relay E-51=skipped: no ${POST_DEPLOY_SMOKE_CODEX_TURNS_CELL} E2E cell configured" || return 1
+        else
+            POST_DEPLOY_SMOKE_TURN_COVERAGE+=" E-51=FAIL"
+            _post_deploy_smoke_fail \
+                "relay E-51: could not resolve ${POST_DEPLOY_SMOKE_CODEX_TURNS_CELL} channel from ${config_path}" \
+                || true
+            failed=1
+        fi
+    fi
+    POST_DEPLOY_SMOKE_TURN_COVERAGE="${POST_DEPLOY_SMOKE_TURN_COVERAGE# }"
+    [ "$failed" -eq 0 ]
+}
+
 _run_post_deploy_functional_smoke() {
     local failed=0 recovery_gap recovery_confirmed=false
     _post_deploy_smoke_wedge_reset
@@ -3930,6 +4420,7 @@ _run_post_deploy_functional_smoke() {
     POST_DEPLOY_SMOKE_FAILURES=()
     POST_DEPLOY_SMOKE_RELAY_CHANNEL_ID=""
     POST_DEPLOY_SMOKE_DURABLE_COVERAGE="unevaluable: E-35 did not run"
+    POST_DEPLOY_SMOKE_TURN_COVERAGE="not run: turn scenarios did not execute"
     mkdir -p "$ADK_REL/logs" || return 1
     : > "$POST_DEPLOY_SMOKE_EVIDENCE" || return 1
     POST_DEPLOY_SMOKE_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/agentdesk-post-deploy-smoke.XXXXXX") || return 1
@@ -3953,7 +4444,8 @@ _run_post_deploy_functional_smoke() {
     fi
     if [ "${POST_DEPLOY_SMOKE_SCOPE:-full}" = "api" ]; then
         POST_DEPLOY_SMOKE_DURABLE_COVERAGE="not evaluated: operator selected API smoke scope"
-        _post_deploy_smoke_note "relay E-1/E-35=not evaluated: API smoke scope; no provider turns or Discord test messages" || failed=1
+        POST_DEPLOY_SMOKE_TURN_COVERAGE="not evaluated: operator selected API smoke scope"
+        _post_deploy_smoke_note "relay E-1/E-35/E-50/E-51=not evaluated: API smoke scope; no provider turns or Discord test messages" || failed=1
     elif [ "$POST_DEPLOY_SMOKE_READY" = "true" ]; then
         if ! _post_deploy_smoke_check_relay_round_trip; then
             failed=1
@@ -3961,8 +4453,11 @@ _run_post_deploy_functional_smoke() {
         if ! _post_deploy_smoke_check_durable_record; then
             failed=1
         fi
+        if ! _post_deploy_smoke_check_turn_scenarios; then
+            failed=1
+        fi
     else
-        _post_deploy_smoke_note "relay E-1/E-35=not evaluated: startup recovery unconfirmed for this smoke run" || failed=1
+        _post_deploy_smoke_note "relay E-1/E-35/E-50/E-51=not evaluated: startup recovery unconfirmed for this smoke run" || failed=1
     fi
     rm -rf "$POST_DEPLOY_SMOKE_TMP_DIR" 2>/dev/null || true
     POST_DEPLOY_SMOKE_TMP_DIR=""
@@ -3985,6 +4480,7 @@ _report_post_deploy_smoke_failure() {
         printf -- '- Evidence: `%s`\n\n' "$POST_DEPLOY_SMOKE_EVIDENCE"
         printf -- '- Relay wedge coverage: `%s`\n\n' "${POST_DEPLOY_SMOKE_WEDGE_COVERAGE:-not run: wedge check did not execute}"
         printf -- "- Durable record coverage: \`%s\`\n\n" "${POST_DEPLOY_SMOKE_DURABLE_COVERAGE:-unevaluable: E-35 did not run}"
+        printf -- "- Turn scenarios: \`%s\`\n\n" "${POST_DEPLOY_SMOKE_TURN_COVERAGE:-not run: turn scenarios did not execute}"
         printf '## Findings\n\n'
         for finding in "${POST_DEPLOY_SMOKE_FAILURES[@]}"; do
             printf -- '- %s\n' "$finding"
@@ -4005,6 +4501,8 @@ evidence: ${POST_DEPLOY_SMOKE_EVIDENCE}"
 relay wedge coverage: ${POST_DEPLOY_SMOKE_WEDGE_COVERAGE:-not run: wedge check did not execute}"
     alert_text="${alert_text}
 durable record coverage: ${POST_DEPLOY_SMOKE_DURABLE_COVERAGE:-unevaluable: E-35 did not run}"
+    alert_text="${alert_text}
+turn scenarios: ${POST_DEPLOY_SMOKE_TURN_COVERAGE:-not run: turn scenarios did not execute}"
     for finding in "${POST_DEPLOY_SMOKE_FAILURES[@]}"; do
         alert_text="${alert_text}
 - ${finding}"
@@ -4082,12 +4580,15 @@ if _run_post_deploy_functional_smoke; then
             ;;
     esac
             echo "  durable record coverage: ${POST_DEPLOY_SMOKE_DURABLE_COVERAGE}"
+            echo "  turn scenarios: ${POST_DEPLOY_SMOKE_TURN_COVERAGE:-not run: turn scenarios did not execute}"
     else
             echo "△ Post-deploy functional smoke completed with coverage gap (relay wedge coverage: ${POST_DEPLOY_SMOKE_WEDGE_COVERAGE}; durable record coverage: ${POST_DEPLOY_SMOKE_DURABLE_COVERAGE}; evidence: $POST_DEPLOY_SMOKE_EVIDENCE)"
+            echo "  turn scenarios: ${POST_DEPLOY_SMOKE_TURN_COVERAGE:-not run: turn scenarios did not execute}"
     fi
 else
     echo "⚠ POST-DEPLOY FUNCTIONAL SMOKE FAILED — deploy remains healthy (fail-open)"
     echo "  relay wedge coverage: ${POST_DEPLOY_SMOKE_WEDGE_COVERAGE}"
+    echo "  turn scenarios: ${POST_DEPLOY_SMOKE_TURN_COVERAGE:-not run: turn scenarios did not execute}"
     echo "  evidence: $POST_DEPLOY_SMOKE_EVIDENCE"
     if [ -n "$POST_DEPLOY_SMOKE_TMP_DIR" ]; then
         rm -rf "$POST_DEPLOY_SMOKE_TMP_DIR" 2>/dev/null || true
@@ -4100,202 +4601,17 @@ else
 fi
 # <<< END smoke-disposition region (#5244)
 
-# ── Out-of-band relay watchdog (#4381) ────────────────────────────────────────
-# Deliberately OUTSIDE dcserver's launchd job: the watchdog must survive exactly
-# the failures it watches for (dcserver crash-looping on PG loss, #4379). The
-# repo is the source of truth — the machine-local prototype (and the 06-29
-# relay-gap-watch before it) evaporated because nothing deployed it. Runs after
-# DEPLOY_OK on purpose: a failed deploy leaves the previous watchdog untouched.
+# >>> BEGIN retired-relay-watchdog cleanup
+# Retire an old installation after a successful deploy; an absent job is a no-op.
 WATCHDOG_LABEL="com.agentdesk.relay-watchdog"
 WATCHDOG_PLIST_PATH="$HOME/Library/LaunchAgents/$WATCHDOG_LABEL.plist"
-WATCHDOG_BIN="$ADK_REL/bin/relay-watchdog.py"
-WATCHDOG_CONFIG="$ADK_REL/config/relay-watchdog.json"
-WATCHDOG_SCRIPT_CHANGED=1
-if [ -f "$WATCHDOG_BIN" ] && cmp -s "$REPO/scripts/relay_watchdog.py" "$WATCHDOG_BIN"; then
-    WATCHDOG_SCRIPT_CHANGED=0
-fi
-echo "▸ Installing out-of-band relay watchdog (#4381)..."
-if install -m 0755 "$REPO/scripts/relay_watchdog.py" "$WATCHDOG_BIN"; then
-    if [ -f "$WATCHDOG_CONFIG" ]; then
-        WATCHDOG_PYTHON="$(command -v python3 || echo /usr/bin/python3)"
-        # INVARIANT: the ENTIRE watchdog block is fail-open. We are past
-        # DEPLOY_OK, so any failure here (permissions, full disk, launchd)
-        # must degrade to a loud ⚠ warning and let the script continue —
-        # aborting would poison the exit code of a HEALTHY deploy and skip
-        # _write_release_source_manifest / _deploy_to_all_peers below.
-        # The function body runs from an `if` guard, so `set -e` is suspended
-        # inside it; every step therefore carries its own `|| return 1`.
-        #
-        # Runtime python preflight: relay_watchdog.py declares MIN_PYTHON=3.10
-        # and exits 1 below it. If `command -v python3` resolved to the macOS
-        # system 3.9, arming the plist would put KeepAlive into a silent ~30s
-        # crash-loop — refuse to arm instead (r4 review, PR #4399).
-        _xml_escape() {
-            # Plist bodies are XML: raw &, <, > (and quotes, for safety) in an
-            # operator path would render the plist plutil-invalid and the
-            # watchdog silently unarmed (r4 review, PR #4399).
-            local s=$1
-            s=${s//&/\&amp;}
-            s=${s//</\&lt;}
-            s=${s//>/\&gt;}
-            s=${s//\"/\&quot;}
-            s=${s//\'/\&apos;}
-            printf '%s' "$s"
-        }
-        _install_relay_watchdog_plist() {
-            local label_x python_x bin_x root_x
-            label_x=$(_xml_escape "$WATCHDOG_LABEL") || return 1
-            python_x=$(_xml_escape "$WATCHDOG_PYTHON") || return 1
-            bin_x=$(_xml_escape "$WATCHDOG_BIN") || return 1
-            root_x=$(_xml_escape "$ADK_REL") || return 1
-            mkdir -p "$HOME/Library/LaunchAgents" || return 1
-            cat > "$WATCHDOG_PLIST_PATH.tmp" <<PLIST_EOF || return 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$label_x</string>
-  <key>ProgramArguments</key>
-  <array><string>$python_x</string><string>$bin_x</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>ThrottleInterval</key><integer>30</integer>
-  <key>StandardOutPath</key><string>$root_x/logs/relay-watchdog.launchd.out.log</string>
-  <key>StandardErrorPath</key><string>$root_x/logs/relay-watchdog.launchd.err.log</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <key>AGENTDESK_ROOT_DIR</key><string>$root_x</string>
-  </dict>
-</dict>
-</plist>
-PLIST_EOF
-            # Atomic publish: launchd never sees a half-written plist, and an
-            # interrupted write leaves only the .tmp (cleaned by the caller).
-            mv -f "$WATCHDOG_PLIST_PATH.tmp" "$WATCHDOG_PLIST_PATH" || return 1
-        }
-        if ! "$WATCHDOG_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
-            echo "⚠ Relay watchdog requires python3 >= 3.10 (MIN_PYTHON in relay_watchdog.py);"
-            echo "  resolved runner: $WATCHDOG_PYTHON — NOT armed (arming would KeepAlive-crash-loop)."
-            echo "  Install a newer python3 (e.g. brew install python) and redeploy."
-        else
-            WATCHDOG_PLIST_BEFORE="$WATCHDOG_PLIST_PATH.deploy-prev.$$"
-            rm -f "$WATCHDOG_PLIST_BEFORE" 2>/dev/null || true
-            if [ -f "$WATCHDOG_PLIST_PATH" ]; then
-                cp -p "$WATCHDOG_PLIST_PATH" "$WATCHDOG_PLIST_BEFORE" 2>/dev/null || true
-            fi
-            if _install_relay_watchdog_plist; then
-                WATCHDOG_PLIST_CHANGED=1
-                if [ -f "$WATCHDOG_PLIST_BEFORE" ] \
-                  && cmp -s "$WATCHDOG_PLIST_BEFORE" "$WATCHDOG_PLIST_PATH"; then
-                    WATCHDOG_PLIST_CHANGED=0
-                fi
-                rm -f "$WATCHDOG_PLIST_BEFORE" 2>/dev/null || true
-                xattr -d com.apple.quarantine "$WATCHDOG_PLIST_PATH" 2>/dev/null || true
-                # #5153: neither `launchctl print` nor a `bootstrap` return code
-                # proves a SPAWN — they prove the job is LOADED. A 2026-08-06
-                # deploy printed "✓ Relay watchdog armed" while `launchctl list`
-                # showed the PID column as '-' and `pgrep` found nothing: relay
-                # gap monitoring was absent and the deploy still reported success.
-                # Judge on the PID column instead. This helper is read-only — it
-                # only queries launchd and never bootouts/bootstraps, so it cannot
-                # perturb the unload sequence below (the #5152 lesson).
-                _wd_spawned_pid() {
-                    local pid=""
-                    pid=$(launchctl list 2>/dev/null \
-                      | awk -v label="$WATCHDOG_LABEL" '$3 == label { print $1; exit }') \
-                      || pid=""
-                    # The PID column is '-' when the job is loaded but not running.
-                    case "$pid" in
-                        ''|*[!0-9]*) return 1 ;;
-                    esac
-                    printf '%s' "$pid"
-                }
-                _wd_running=0
-                if _wd_spawned_pid >/dev/null; then
-                    _wd_running=1
-                fi
-                if [ "$WATCHDOG_SCRIPT_CHANGED" = "0" ] \
-                  && [ "$WATCHDOG_PLIST_CHANGED" = "0" ] \
-                  && [ "$_wd_running" = "1" ]; then
-                    echo "✓ Relay watchdog retained ($WATCHDOG_LABEL; durable authority uninterrupted)"
-                else
-                    # Restart only when deployment material changed or the job is absent.
-                    # The watermark lives in the atomic state file, so replacement loads
-                    # the same pre-restart transcript authority before its first tick.
-                    # NOTE: This block implements the same bootout/poll/bootstrap pattern as
-                    # the PG tunnel sites, and since #5153 the same explicit kickstart and
-                    # spawn verification (#5151 mis-spawn reproduced here on 2026-08-06).
-                    launchctl bootout "$LAUNCHD_DOMAIN/$WATCHDOG_LABEL" 2>/dev/null || true
-                    _wd_bootout_polls=0
-                    while launchctl print "$LAUNCHD_DOMAIN/$WATCHDOG_LABEL" >/dev/null 2>&1; do
-                        if [ "$_wd_bootout_polls" -ge 12 ]; then
-                            echo "⚠ Relay watchdog still unloading ~6s after bootout — bootstrapping anyway"
-                            break
-                        fi
-                        sleep 0.5
-                        _wd_bootout_polls=$((_wd_bootout_polls + 1))
-                    done
-                    _wd_armed=0
-                    for _wd_attempt in 1 2 3; do
-                        if launchctl bootstrap "$LAUNCHD_DOMAIN" "$WATCHDOG_PLIST_PATH"; then
-                            _wd_armed=1
-                            break
-                        fi
-                        if [ "$_wd_attempt" -lt 3 ]; then
-                            echo "⚠ Relay watchdog bootstrap attempt $_wd_attempt failed — retrying in 2s"
-                            sleep 2
-                        fi
-                    done
-                    if [ "$_wd_armed" = "1" ]; then
-                        # #5151/#5153: bootstrap loads the plist but does not guarantee
-                        # that launchd spawns the process. Mirror the PG tunnel fix
-                        # (#5152) with an explicit kickstart, placed after the single
-                        # bootout above — a second bootout here would change that
-                        # unload sequence's meaning (the regression #5152 hit).
-                        # kickstart's own rc is NOT the verdict; the PID column is.
-                        launchctl kickstart -k "$LAUNCHD_DOMAIN/$WATCHDOG_LABEL" >/dev/null 2>&1 || true
-                        _wd_pid=""
-                        _wd_spawn_polls=0
-                        while :; do
-                            if _wd_pid=$(_wd_spawned_pid); then
-                                break
-                            fi
-                            _wd_pid=""
-                            # Same 12 x 0.5s budget as the bootout poll above.
-                            if [ "$_wd_spawn_polls" -ge 12 ]; then
-                                break
-                            fi
-                            sleep 0.5
-                            _wd_spawn_polls=$((_wd_spawn_polls + 1))
-                        done
-                        if [ -n "$_wd_pid" ]; then
-                            echo "✓ Relay watchdog armed ($WATCHDOG_LABEL; pid $_wd_pid)"
-                        else
-                            # Fail-open per this block's INVARIANT (we are past DEPLOY_OK),
-                            # but never green: withholding the ✓ is the whole point of #5153.
-                            echo "⚠ Relay watchdog bootstrapped but NOT spawned (launchctl list PID column is '-') — relay gaps will go unwatched"
-                            echo "  Recover: launchctl kickstart -k $LAUNCHD_DOMAIN/$WATCHDOG_LABEL"
-                        fi
-                    else
-                        echo "⚠ Relay watchdog bootstrap FAILED after 3 attempts — relay gaps will go unwatched"
-                    fi
-                fi
-            else
-                rm -f "$WATCHDOG_PLIST_PATH.tmp" "$WATCHDOG_PLIST_BEFORE" 2>/dev/null || true
-                echo "⚠ Relay watchdog plist write FAILED ($WATCHDOG_PLIST_PATH) — not armed"
-                echo "  Deploy continues (fail-open): fix permissions/disk space and redeploy."
-            fi
-        fi
-    else
-        echo "⚠ Relay watchdog config missing: $WATCHDOG_CONFIG"
-        echo "  Watchdog NOT armed on this node. Channel ids are operator config"
-        echo "  (never hardcoded in the repo); create the config — see the"
-        echo "  scripts/relay_watchdog.py docstring — then redeploy."
+if [ -f "$WATCHDOG_PLIST_PATH" ] || launchctl list "$WATCHDOG_LABEL" >/dev/null 2>&1; then
+    if launchctl list "$WATCHDOG_LABEL" >/dev/null 2>&1; then
+        launchctl bootout "gui/$(id -u)/$WATCHDOG_LABEL" >/dev/null 2>&1 || true
     fi
-else
-    echo "⚠ Relay watchdog staging FAILED (source: $REPO/scripts/relay_watchdog.py)"
+    rm -f "$WATCHDOG_PLIST_PATH"
 fi
+# <<< END retired-relay-watchdog cleanup
 
 _write_release_source_manifest
 
@@ -4309,8 +4625,6 @@ _write_release_source_manifest
 # Ordering is the fix, not a smarter regex: while peers are being deployed this
 # transcript carries NO terminal marker, which is the truth — there is no verdict
 # yet. A refused peer exits non-zero and the EXIT trap prints DEPLOY FAILED instead.
-if [ "$DEPLOY_ALL_NODES" = "1" ]; then
-    _deploy_to_all_peers "$@"
-fi
+_finish_cluster_stage "$@" || exit 1
 
 echo "═══ Deploy Complete ═══"

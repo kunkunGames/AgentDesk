@@ -12,15 +12,44 @@
 //! CI pins these to `env -u AGENTDESK_ROOT_DIR ... -- --test-threads=1`; a new
 //! scenario module inherits that only once it is named in the same invocation.
 
+#[cfg(unix)]
+#[path = "busy_inject_e2e_tests.rs"]
+mod busy_inject_e2e;
+#[cfg(unix)]
+#[path = "cancel_backstop_e2e_tests.rs"]
+mod cancel_backstop_e2e;
 mod catch_up_pagination_e2e;
-mod discord_mock;
+mod consumed_command_guard_e2e;
+pub(in crate::services::discord) mod discord_mock;
+// The literal test gate keeps the source censuses from reading this file as production.
+#[cfg(test)]
+#[cfg(unix)]
+#[path = "herdr_terminate_e2e_tests.rs"]
+mod herdr_terminate_e2e;
+#[cfg(test)]
+#[cfg(unix)]
+#[path = "herdr_terminate_o_e2e_tests.rs"]
+mod herdr_terminate_o_e2e;
+#[path = "n1a_turn_mode_tests.rs"]
+mod n1a_turn_mode;
 #[path = "prompt_identity_e2e_tests.rs"]
 mod prompt_identity_e2e;
 mod queue_recovery_e2e;
+#[cfg(unix)]
+#[path = "reconcile_stale_turn_e2e_tests.rs"]
+mod reconcile_stale_turn_e2e;
 mod registered_bootstrap_e2e;
+#[path = "replay_defer_intake_e2e_tests.rs"]
+mod replay_defer_intake_e2e;
 mod stale_resume_retry_e2e;
+mod stop_command_catch_up_e2e;
 #[cfg(unix)]
 mod thread_guard_host_e2e;
+// The literal test gate keeps the source censuses from reading this file as production.
+#[cfg(test)]
+#[cfg(unix)]
+#[path = "herdr_terminate_route_e2e_tests.rs"]
+mod herdr_terminate_route_e2e;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -179,7 +208,7 @@ impl RelayE2eHarness {
     }
 
     pub(super) async fn start_with_provider(stub: ProviderStub) -> Self {
-        Self::start_inner(stub, false, std::future::ready(None)).await
+        Self::start_inner(stub, false, std::future::ready(None), false).await
     }
 
     /// A runtime on the pool `storage` opens once the env lock is held; no session is bound.
@@ -187,23 +216,49 @@ impl RelayE2eHarness {
         storage: impl std::future::Future<Output = sqlx::PgPool>,
     ) -> Self {
         let storage = async { Some(storage.await) };
-        Self::start_inner(ProviderStub::Success, false, storage).await
+        Self::start_inner(ProviderStub::Success, false, storage, false).await
+    }
+
+    /// [`Self::start_unbound_on`] with the channel bound to its session.
+    pub(super) async fn start_bound_on(
+        storage: impl std::future::Future<Output = sqlx::PgPool>,
+    ) -> Self {
+        let storage = async { Some(storage.await) };
+        Self::start_inner(ProviderStub::Success, false, storage, true).await
     }
 
     /// Adds a health registry, the source of the utility bots SSH-direct
     /// announcements post through.
     pub(super) async fn start_with_health_registry() -> Self {
-        Self::start_inner(ProviderStub::Success, true, std::future::ready(None)).await
+        Self::start_inner(ProviderStub::Success, true, std::future::ready(None), false).await
     }
 
     async fn start_inner(
         stub: ProviderStub,
         with_health_registry: bool,
         storage: impl std::future::Future<Output = Option<sqlx::PgPool>>,
+        bind_with_pool: bool,
     ) -> Self {
         let env_lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        Self::start_inner_with_env_lock(
+            stub,
+            with_health_registry,
+            storage,
+            bind_with_pool,
+            env_lock,
+        )
+        .await
+    }
+
+    pub(super) async fn start_inner_with_env_lock(
+        stub: ProviderStub,
+        with_health_registry: bool,
+        storage: impl std::future::Future<Output = Option<sqlx::PgPool>>,
+        bind_with_pool: bool,
+        env_lock: std::sync::MutexGuard<'static, ()>,
+    ) -> Self {
         let root = tempfile::tempdir().expect("isolated AgentDesk root");
         let root_guard = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
             "AGENTDESK_ROOT_DIR",
@@ -232,7 +287,7 @@ impl RelayE2eHarness {
         let ctx = discord_mock::serenity_context(proxy.clone(), gateway_url).await;
         // Storage opens after the shared test-env lock, the canonical lock order.
         let pool = storage.await;
-        let unbound = pool.is_some();
+        let unbound = pool.is_some() && !bind_with_pool;
         let mut shared = crate::services::discord::make_shared_data_for_tests_with_storage(pool);
         let health_registry = with_health_registry.then(|| {
             let registry = Arc::new(crate::services::discord::health::HealthRegistry::new());
@@ -298,12 +353,54 @@ impl RelayE2eHarness {
         }
     }
 
-    /// The Discord-API injection path: production `FullEvent` intake, run to completion.
+    /// The Discord-API injection path: production `FullEvent` intake, run to completion on
+    /// its own task so the test thread never polls the debug-sized intake future.
     pub(super) async fn deliver_user_message(&self, id: u64, text: &str) -> Result<(), Error> {
+        let mut intake = AbortOnDrop(Some(self.spawn_user_message(id, text)));
+        match intake.0.as_mut().expect("intake task").await {
+            Ok(result) => result,
+            Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+            Err(join) => panic!("intake task for {id} ended without a result: {join}"),
+        }
+    }
+
+    /// Production intake of any inbound message, run on its own task.
+    pub(super) fn spawn_message(
+        &self,
+        new_message: serenity::Message,
+    ) -> tokio::task::JoinHandle<Result<(), Error>> {
+        let event = serenity::FullEvent::Message { new_message };
+        let (ctx, data) = (self.ctx.clone(), self.clone_data());
+        tokio::spawn(async move { router::handle_event(&ctx, &event, &data).await })
+    }
+
+    /// Answers `thread` as a guild thread of the fixture channel.
+    pub(super) fn add_thread(&self, thread: u64) {
+        self.mock.add_thread(thread, CHANNEL_ID);
+    }
+
+    /// Production intake of a user message on its own task, for scenarios that act
+    /// while it runs; [`Self::deliver_user_message`] awaits it.
+    pub(super) fn spawn_user_message(
+        &self,
+        id: u64,
+        text: &str,
+    ) -> tokio::task::JoinHandle<Result<(), Error>> {
         let event = serenity::FullEvent::Message {
             new_message: user_message(id, text),
         };
-        router::handle_event(&self.ctx, &event, &self.data).await
+        let (ctx, data) = (self.ctx.clone(), self.clone_data());
+        tokio::spawn(async move { router::handle_event(&ctx, &event, &data).await })
+    }
+
+    /// [`Self::run_catch_up`] on its own task.
+    pub(super) fn spawn_catch_up(&self) -> tokio::task::JoinHandle<()> {
+        let (http, shared) = (self.ctx.http.clone(), self.shared.clone());
+        let provider = self.data.provider.clone();
+        tokio::spawn(async move {
+            crate::services::discord::catch_up::catch_up_missed_messages(&http, &shared, &provider)
+                .await
+        })
     }
 
     /// Spawns production intake for `id` and returns once the mock has its
@@ -510,6 +607,21 @@ impl RelayE2eHarness {
 
     pub(super) fn release_held_note(&self) {
         self.mock.release_held_note.notify_one();
+    }
+
+    /// Holds the next history `GET` open until [`Self::release_held_history`].
+    pub(super) fn hold_next_history(&self) {
+        self.mock.hold_next_history.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) async fn wait_for_held_history(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.mock.history_held.notified())
+            .await
+            .is_ok()
+    }
+
+    pub(super) fn release_held_history(&self) {
+        self.mock.release_held_history.notify_one();
     }
 
     /// Points the notify bot at the mock; `timeout` bounds each of its requests.
@@ -741,5 +853,34 @@ mod headless_turn_provider_tests {
             assert_eq!(harness.placeholder_posts(), 0);
             assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
         }
+    }
+}
+
+/// A debug intake future polled inline overflows the 2 MiB test thread, so what a
+/// scenario awaits for intake stays under this budget.
+mod test_thread_stack_budget {
+    use super::*;
+
+    const TEST_THREAD_INTAKE_BUDGET: usize = 1024;
+
+    /// Size of the future `make` returns; the closure is never called, so no harness boots.
+    fn future_size<Fut>(
+        _make: impl FnOnce(&'static RelayE2eHarness, &'static serenity::FullEvent) -> Fut,
+    ) -> usize {
+        std::mem::size_of::<Fut>()
+    }
+
+    #[test]
+    fn deliver_user_message_keeps_intake_off_the_test_thread_stack() {
+        let intake = future_size(|h, event| router::handle_event(&h.ctx, event, &h.data));
+        let delivered = future_size(|h, _| h.deliver_user_message(1, "status?"));
+        assert!(
+            intake > TEST_THREAD_INTAKE_BUDGET,
+            "probe must see intake: {intake}"
+        );
+        assert!(
+            delivered <= TEST_THREAD_INTAKE_BUDGET,
+            "deliver_user_message future is {delivered} bytes; intake ({intake}) must run on its own task"
+        );
     }
 }

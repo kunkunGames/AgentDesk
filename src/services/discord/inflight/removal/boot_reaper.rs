@@ -13,6 +13,7 @@ pub(crate) struct BootReapReport {
     pub(super) changed: usize,
     pub(super) missing: usize,
     pub(super) incomplete: usize,
+    pub(super) protected: usize,
     pub(super) reaped_stale: usize,
     pub(super) reaped_provider_mismatch: usize,
     pub(super) reaped_malformed: usize,
@@ -56,6 +57,16 @@ impl BootReapOnce {
     }
 }
 
+/// What boot input preparation reports before the reaper may run. Only `Unconfigured`
+/// exists until a preparer installs the provider's protections here.
+pub(super) enum BootPreparation {
+    Unconfigured,
+}
+
+async fn prepare_before_reap(_provider: &ProviderKind) -> BootPreparation {
+    BootPreparation::Unconfigured
+}
+
 pub(crate) async fn reap_inflight_rows_at_boot_blocking(
     provider: &ProviderKind,
     pg_pool: Option<sqlx::PgPool>,
@@ -65,12 +76,24 @@ pub(crate) async fn reap_inflight_rows_at_boot_blocking(
     reap_inflight_rows_at_boot_with_guard(guard, provider, pg_pool).await
 }
 
-/// The first caller of a provider's pass also starts its custody notice pass.
 pub(super) async fn reap_inflight_rows_at_boot_with_guard(
     guard: &BootReapOnce,
     provider: &ProviderKind,
     pg_pool: Option<sqlx::PgPool>,
 ) -> BootReapReport {
+    let prepare = prepare_before_reap(provider);
+    reap_inflight_rows_after_preparation(guard, provider, pg_pool, prepare).await
+}
+
+/// Every caller settles boot preparation before it may reserve the provider's pass;
+/// the first caller of that pass also starts its custody notice pass.
+pub(super) async fn reap_inflight_rows_after_preparation(
+    guard: &BootReapOnce,
+    provider: &ProviderKind,
+    pg_pool: Option<sqlx::PgPool>,
+    prepare: impl std::future::Future<Output = BootPreparation>,
+) -> BootReapReport {
+    let BootPreparation::Unconfigured = prepare.await;
     let owned = provider.clone();
     let reap = move || {
         inflight_runtime_root()
@@ -111,6 +134,13 @@ pub(super) fn reap_inflight_rows_at_boot_in_root(
     let allocation = crate::services::discord::runtime_store::process_generation_binding();
     for path in entries.flatten().map(|entry| entry.path()) {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // An input-protected channel's population waits for its move or handback, untouched.
+        let channel = channel_id_from_path(&path);
+        use crate::services::discord::input_runtime::fence::{BootTarget, boot_skip};
+        if boot_skip(BootTarget::Channel(provider, channel)) {
+            report.protected += 1;
             continue;
         }
         let age_secs = inflight_age_secs_for_path(&path);
@@ -198,6 +228,7 @@ pub(super) fn reap_inflight_rows_at_boot_in_root(
         changed = report.changed,
         missing = report.missing,
         incomplete = report.incomplete,
+        protected = report.protected,
         reaped_stale = report.reaped_stale,
         reaped_provider_mismatch = report.reaped_provider_mismatch,
         reaped_malformed = report.reaped_malformed,

@@ -16,7 +16,47 @@ const DEAD_FRONTIER_CANCEL_IDENTITY_SITE: &str = "relay_recovery_dead_frontier_c
 #[path = "tests/host_deferred.rs"]
 mod host_deferred_tests;
 
+#[cfg(test)]
+#[path = "tests/retirement.rs"]
+mod retirement_tests;
+
 pub(super) async fn apply_relay_recovery_decision(
+    registry: &HealthRegistry,
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    decision: &RelayRecoveryDecision,
+    episode: Option<&circuit_breaker::RelayReattachEpisode>,
+    source: RelayRecoveryApplySource,
+) -> RelayRecoveryApplyResult {
+    if !matches!(decision.action, RelayRecoveryActionKind::ReattachWatcher) {
+        return apply_relay_recovery_decision_admitted(
+            registry, shared, provider, decision, episode, source,
+        )
+        .await;
+    }
+    let Ok(recovery) =
+        crate::services::discord::live_bridge::try_recovery(provider, decision.channel_id)
+    else {
+        return RelayRecoveryApplyResult {
+            status: "live_original_bridge_deferred",
+            removed_thread_proofs: 0,
+            removed_mailbox_token: false,
+            post_mailbox_has_cancel_token: None,
+            post_mailbox_queue_depth: None,
+            reattach_watcher_spawned: None,
+            reattach_watcher_replaced: None,
+            reattach_initial_offset: None,
+            reattach_error: None,
+        };
+    };
+    recovery
+        .run(apply_relay_recovery_decision_admitted(
+            registry, shared, provider, decision, episode, source,
+        ))
+        .await
+}
+
+async fn apply_relay_recovery_decision_admitted(
     registry: &HealthRegistry,
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -68,6 +108,29 @@ pub(super) async fn apply_relay_recovery_decision(
                     removed_mailbox_token: false,
                     post_mailbox_has_cancel_token: Some(after.cancel_token.is_some()),
                     post_mailbox_queue_depth: Some(after.intervention_queue.len()),
+                    reattach_watcher_spawned: None,
+                    reattach_watcher_replaced: None,
+                    reattach_initial_offset: None,
+                    reattach_error: None,
+                };
+            }
+            #[cfg(test)]
+            retirement_tests::host_barrier(channel).await;
+            // Automatic cleanup can lose ownership while the host check awaits.
+            if matches!(
+                source,
+                RelayRecoveryApplySource::ProbeAutoHeal | RelayRecoveryApplySource::StallWatchdog
+            ) && super::super::health::legacy_supervision::legacy_retired(
+                provider.as_str(),
+                channel.get(),
+                "orphan_token_before_finish",
+            ) {
+                return RelayRecoveryApplyResult {
+                    status: "legacy_retired",
+                    removed_thread_proofs: 0,
+                    removed_mailbox_token: false,
+                    post_mailbox_has_cancel_token: None,
+                    post_mailbox_queue_depth: None,
                     reattach_watcher_spawned: None,
                     reattach_watcher_replaced: None,
                     reattach_initial_offset: None,

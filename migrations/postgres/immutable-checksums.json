@@ -675,6 +675,41 @@
       "path": "migrations/postgres/0132_drop_office_tables.sql",
       "sha256": "84a8836d815fbcf2c56c8aeeedc4aab46a29fb3dd64af34d2b771115bbf88680",
       "version": 132
+    },
+    {
+      "path": "migrations/postgres/0133_o_channel_homes.sql",
+      "sha256": "8abee1a7c56480b0f90954c1c64bb0a725104313e143d8d66bcd67941b6b79c2",
+      "version": 133
+    },
+    {
+      "path": "migrations/postgres/0134_channel_home_epochs.sql",
+      "sha256": "bce70458c71e133d49de7d1f77215d4d56053c8f452c2f9a530e432b09c88e77",
+      "version": 134
+    },
+    {
+      "path": "migrations/postgres/0135_channel_clear_boundary_native_correlation.sql",
+      "sha256": "174c706f1328c48b7d46104d63cdd2f3394338b65b07ec7852af00a6f546dba8",
+      "version": 135
+    },
+    {
+      "path": "migrations/postgres/0136_request_replay_disposition.sql",
+      "sha256": "c8ed6585fadc1ec23945145ff609c4989e9bfc8e36d8f5ae28ef9aacc71a2d48",
+      "version": 136
+    },
+    {
+      "path": "migrations/postgres/0137_request_replay_exact_attempt.sql",
+      "sha256": "d333ad80e1bce3e99c590d406f21682a5ca2ea7a97894663a36ee11a557d0634",
+      "version": 137
+    },
+    {
+      "path": "migrations/postgres/0138_o_piece_delivery.sql",
+      "sha256": "7e834babe7a018f9a7313d1944d530a9c8e9da77e9b50c36ea39fc517274e528",
+      "version": 138
+    },
+    {
+      "path": "migrations/postgres/0139_imsg_reply_obligations.sql",
+      "sha256": "f86980b491854f579e65fb1f168db329d863eaa8a8247fc886dfe5ba8a6fd041",
+      "version": 139
     }
   ],
   "version": 1

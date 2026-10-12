@@ -16,11 +16,14 @@ pub(in crate::services::discord) use host_recovery_guard::keyed_tests::{
     seed_session_row, seed_session_row_hashed, seed_session_row_keyed,
 };
 pub(in crate::services::discord) use host_recovery_guard::{
-    KeyedTeardown, clear_channel_session, keyed_teardown, teardown_for_lookup,
+    KeyedTeardown, clear_channel_session, keyed_teardown, teardown_for_lookup, tmux_marker_is_known,
 };
 #[cfg(test)]
 mod invariant_test_capture;
 mod model;
+#[cfg(test)]
+#[path = "inflight/restart_mark_fence_tests.rs"]
+mod restart_mark_fence_tests;
 pub(in crate::services::discord) mod terminal_delivery_evidence_loss;
 
 // #3479: the pure domain model moved to `model.rs`; re-export every public
@@ -42,6 +45,7 @@ impl InflightTurnState {
 }
 
 mod episode_guard;
+mod managed_submission;
 mod store;
 
 // #3479: the FS path layout + advisory-lock guard moved to `store.rs`.
@@ -59,12 +63,18 @@ pub(in crate::services::discord) use episode_guard::{
     InflightEpisodeLockError, InflightEpisodePin, LockedInflightEpisode,
     adopt_and_lock_inflight_episode, lock_inflight_episode,
 };
+pub(in crate::services::discord) use managed_submission::{
+    ManagedSubmission, SubmissionFailure, install_managed_submission_boundary,
+};
+#[cfg(test)]
+pub(in crate::services::discord) use managed_submission::{SubmissionPhase, fault};
 pub(in crate::services::discord) use store::InflightDeliveryRewindReason;
 use store::inflight_provider_dir;
-pub(in crate::services::discord) use store::inflight_state_path;
 pub(crate) use store::lock_inflight_state_path;
 #[cfg(test)]
 use store::second_handle_try_lock;
+pub(crate) use store::try_lock_inflight_state_path;
+pub(in crate::services::discord) use store::{BorrowedInflightRow, inflight_state_path};
 
 // #3715 / #3835: the rebind-origin dead-watcher helpers, staleness predicates,
 // and stale data-row cleanup live in this capped sibling. Canonical lock sidecars
@@ -96,9 +106,13 @@ use self::rebind_reap::{
 };
 mod removal;
 #[cfg(test)]
+pub(in crate::services::discord) use removal::{
+    invalidate_stale_generation_scoped, load_inflight_probe_scoped, scoped_restore_mutant,
+};
+mod restart_mark;
+#[cfg(test)]
 pub(in crate::services::discord) use self::removal::custody_notice_text;
 pub(crate) use self::removal::invalidate_stale_generation;
-use self::removal::load_inflight_states_from_root;
 pub(in crate::services::discord) use self::removal::reap_inflight_rows_at_boot_blocking;
 #[cfg(test)]
 use self::removal::{
@@ -107,7 +121,16 @@ use self::removal::{
 pub(in crate::services::discord) use self::removal::{
     load_channel_inflight_for_probe, load_inflight_states_for_probe_from_root,
 };
+use self::removal::{
+    load_inflight_probe_from_root_excluding, load_inflight_states_from_root,
+    load_inflight_states_from_root_excluding,
+};
 pub(super) use self::removal::{log_inflight_remove, log_inflight_remove_for_path};
+#[cfg(test)]
+pub(in crate::services::discord) use self::restart_mark::short_pass_event_for_test;
+pub(in crate::services::discord) use self::restart_mark::{
+    ShortPass, mark_restart_mode_blocking, short_passes,
+};
 
 mod watcher_state;
 pub(in crate::services::discord) use self::watcher_state::{
@@ -153,7 +176,9 @@ pub(in crate::services::discord) use self::orphan_relay_reclaim::{
 // widened. The shared persist/validate primitives moved to `store.rs`.
 mod clear_store;
 #[allow(unused_imports)]
-pub(in crate::services::discord) use clear_store::operator_disposition_remove_pinned;
+pub(in crate::services::discord) use clear_store::{
+    operator_disposition_remove_borrowed, operator_disposition_remove_pinned,
+};
 mod save_store;
 
 // Shared persist/validate primitives (moved to `store.rs`): re-imported at the
@@ -179,7 +204,8 @@ pub(super) use self::save_store::{
 pub(in crate::services::discord) use self::save_store::{
     GuardedSaveOutcome, StreamRelayAuthority, bind_recovery_anchor_for_snapshot,
     bind_recovery_anchor_if_matches_identity, clear_long_running_placeholder_if_matches_identity,
-    identity_gate::runtime_stamp::CodexRange, mark_readopted_from_inflight_if_identity_unchanged,
+    identity_gate::runtime_stamp::CodexRange, is_synthetic_create_state,
+    mark_readopted_from_inflight_if_identity_unchanged,
     patch_bridge_entry_state_if_identity_unchanged,
     patch_bridge_entry_state_tracking_placeholder_clear,
     patch_restart_full_response_if_identity_unchanged, patch_restart_mode_if_matches_identity,
@@ -206,6 +232,8 @@ use self::save_store::{
 };
 
 // Clear/Abandon cluster re-exports (original visibility mirrored).
+#[cfg(unix)]
+pub(in crate::services::discord) use self::clear_store::clear_admitted_restart_terminal;
 pub(crate) use self::clear_store::{
     GuardedClearOutcome, clear_inflight_state, clear_inflight_state_if_matches,
     clear_inflight_state_if_matches_zero_owned, request_inflight_abandon_if_matches,
@@ -354,32 +382,204 @@ pub(super) fn load_inflight_states_for_sweep(
 /// Delete the inflight state file for a (provider, channel_id) pair if it
 /// still exists. Used by `placeholder_sweeper` to evict abandoned states
 /// after a final placeholder edit. Idempotent.
-pub(super) fn delete_inflight_state_file(provider: &ProviderKind, channel_id: u64) -> bool {
-    let Some(root) = inflight_runtime_root() else {
-        return false;
+pub(super) fn delete_inflight_state_file<'a>(
+    request: impl Into<InflightDeleteRequest<'a>>,
+    channel_id: u64,
+) -> bool {
+    let request = request.into();
+    let provider = request.provider;
+    let channel = channel_id;
+    let outcome = 'decision: {
+        let Some(root) = inflight_runtime_root() else {
+            break 'decision InflightDeleteOutcome::Failed;
+        };
+        let path = inflight_state_path(&root, provider, channel);
+        let Ok(_lock) = lock_inflight_state_path(&path) else {
+            break 'decision InflightDeleteOutcome::Failed;
+        };
+        if receipt_protected_path(&path) && !receipt_mutant("delete") {
+            break 'decision InflightDeleteOutcome::ProtectedReceipt;
+        }
+        log_inflight_remove_for_path(provider, channel, "delete_inflight_state_file", &path);
+        match fs::remove_file(path) {
+            Ok(()) => InflightDeleteOutcome::Deleted,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                InflightDeleteOutcome::AlreadyAbsent
+            }
+            _ => InflightDeleteOutcome::Failed,
+        }
     };
-    let path = inflight_state_path(&root, provider, channel_id);
-    let Ok(_lock) = lock_inflight_state_path(&path) else {
-        return false;
-    };
-    log_inflight_remove_for_path(provider, channel_id, "delete_inflight_state_file", &path);
-    fs::remove_file(path).is_ok()
+    if let Some(result) = request.result {
+        result.set(outcome);
+    }
+    outcome == InflightDeleteOutcome::Deleted
+}
+
+// Preserve the bool API while returning its exact lock-held decision to cleanup callers.
+pub(super) struct InflightDeleteRequest<'a> {
+    provider: &'a ProviderKind,
+    result: Option<&'a std::cell::Cell<InflightDeleteOutcome>>,
+}
+impl<'a> From<&'a ProviderKind> for InflightDeleteRequest<'a> {
+    fn from(provider: &'a ProviderKind) -> Self {
+        Self {
+            provider,
+            result: None,
+        }
+    }
 }
 
 fn now_string() -> String {
+    #[cfg(all(test, unix))]
+    if let Some(now) = receipt_boundary_tests::fixed_now() {
+        return now.into();
+    }
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-fn bump_save_generation_for_write(path: &Path, state: &mut InflightTurnState) {
-    let existing_generation = fs::read_to_string(path)
-        .ok()
-        .and_then(|content| serde_json::from_str::<InflightTurnState>(&content).ok())
+#[cfg(all(test, unix))]
+#[path = "inflight/receipt_boundary_tests.rs"]
+mod receipt_boundary_tests;
+
+pub(in crate::services::discord) fn receipt_mutant(_name: &str) -> bool {
+    #[cfg(test)]
+    if std::env::var("ADK_B3B2_MUTANT").ok().as_deref() == Some(_name) {
+        return true;
+    }
+    false
+}
+
+pub(in crate::services::discord) fn raw_before_start_receipt(content: &str) -> bool {
+    #[cfg(all(test, unix))]
+    receipt_boundary_tests::note_guard_read();
+    if receipt_mutant("off-protection")
+        && !crate::services::provider::cancel_token_claude_interrupt::herdr_stop_settlement_available()
+    {
+        return false;
+    }
+    if receipt_mutant("absent-blocks") {
+        return true;
+    }
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(value) => value
+            .as_object()
+            .is_some_and(|object| object.contains_key("herdr_before_start_stop")),
+        Err(_) => malformed_top_level_receipt_key(content),
+    }
+}
+// Detect an actual top-level key even when later bytes cannot be parsed.
+fn malformed_top_level_receipt_key(content: &str) -> bool {
+    if !content.trim_start().starts_with('{') {
+        return false;
+    }
+    let bytes = content.as_bytes();
+    let (mut depth, mut index, mut key) = (0usize, 0usize, false);
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' => {
+                depth += 1;
+                if depth == 1 {
+                    key = bytes[index] == b'{';
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return false;
+                }
+            }
+            b',' if depth == 1 => key = true,
+            b':' if depth == 1 => key = false,
+            b'"' => {
+                let start = index;
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == b'"' {
+                        break;
+                    }
+                    index += 1;
+                }
+                if index >= bytes.len() {
+                    return false;
+                }
+                let next = bytes[index + 1..]
+                    .iter()
+                    .find(|byte| !byte.is_ascii_whitespace());
+                if depth == 1
+                    && key
+                    && next == Some(&b':')
+                    && serde_json::from_str::<String>(&content[start..=index])
+                        .ok()
+                        .as_deref()
+                        == Some("herdr_before_start_stop")
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+fn receipt_protected_path(path: &Path) -> bool {
+    fs::read(path).is_ok_and(|bytes| raw_before_start_receipt(&String::from_utf8_lossy(&bytes)))
+}
+pub(in crate::services::discord) fn before_start_receipt_present(
+    provider: &ProviderKind,
+    channel: u64,
+) -> bool {
+    inflight_runtime_root()
+        .is_some_and(|root| receipt_protected_path(&inflight_state_path(&root, provider, channel)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::services::discord) enum InflightDeleteOutcome {
+    Deleted,
+    AlreadyAbsent,
+    ProtectedReceipt,
+    Failed,
+}
+pub(in crate::services::discord) fn delete_inflight_state_file_checked(
+    provider: &ProviderKind,
+    channel: u64,
+) -> InflightDeleteOutcome {
+    let result = std::cell::Cell::new(InflightDeleteOutcome::Failed);
+    delete_inflight_state_file(
+        InflightDeleteRequest {
+            provider,
+            result: Some(&result),
+        },
+        channel,
+    );
+    result.into_inner()
+}
+
+fn bump_save_generation_for_write(
+    path: &Path,
+    state: &mut InflightTurnState,
+) -> Result<(), String> {
+    let content = fs::read_to_string(path).ok();
+    let existing = content
+        .as_deref()
+        .and_then(|content| serde_json::from_str::<InflightTurnState>(content).ok());
+    if existing.is_none() && receipt_protected_path(path) {
+        return Err("policy receipt row cannot be parsed".into());
+    }
+    managed_submission::carry_forward(existing.as_ref(), state);
+    state.carry_before_start_receipt_from(existing.as_ref())?;
+    let existing_generation = existing
         .map(|existing| existing.save_generation)
         .unwrap_or(0);
     state.save_generation = existing_generation
         .saturating_add(1)
         .max(state.save_generation.saturating_add(1))
         .max(1);
+    Ok(())
 }
 
 fn turn_id_for_state(state: &InflightTurnState) -> Option<String> {
@@ -483,6 +683,7 @@ pub(super) fn inflight_state_file_exists(provider: &ProviderKind, channel_id: u6
     inflight_state_path(&root, provider, channel_id).exists()
 }
 
+#[cfg(test)]
 pub(super) fn mark_all_inflight_states_restart_mode(
     provider: &ProviderKind,
     restart_mode: InflightRestartMode,
@@ -490,40 +691,19 @@ pub(super) fn mark_all_inflight_states_restart_mode(
     mark_all_inflight_states_restart_mode_checked(provider, restart_mode).unwrap_or(0)
 }
 
+#[cfg(test)]
 pub(super) fn mark_all_inflight_states_restart_mode_checked(
     provider: &ProviderKind,
     restart_mode: InflightRestartMode,
 ) -> Result<usize, String> {
-    let Some(root) = inflight_runtime_root() else {
-        return Err("runtime root unavailable".to_string());
-    };
-    // #3860 — set restart_mode via a per-row lock-RMW instead of blind-saving
-    // the unlocked snapshot. `load_inflight_states_from_root` reads each row
-    // WITHOUT holding its advisory lock; the old code then `save`d that stale whole-row
-    // snapshot back under the lock. A draining watcher that advanced the
-    // delivery frontier (`response_sent_offset` / `last_offset`) on disk in the
-    // gap therefore had its progress overwritten (frontier regression) → the
-    // replacement watcher re-relayed `full_response[response_sent_offset..]`,
-    // i.e. a duplicate Discord send (the issue's live sub-2000-char repro).
-    // The enumeration is reused only to discover the live rows (rows its verdict
-    // would retire stay hidden and unmarked); the mutation re-reads the FRESH on-disk
-    // row under the advisory lock and sets ONLY restart_mode / restart_generation,
-    // never the frontier, so it can no longer regress a concurrent writer.
-    let states = load_inflight_states_from_root(&root, provider);
-    let mut updated = 0usize;
-    for state in states {
-        let path = inflight_state_path(&root, provider, state.channel_id);
-        if set_inflight_restart_mode_under_lock(&path, restart_mode) {
-            updated += 1;
-        } else {
-            return Err(format!(
-                "failed to persist restart mode for provider={} channel_id={}",
-                provider.as_str(),
-                state.channel_id
-            ));
-        }
+    let report = restart_mark::mark_restart_mode_report(provider, restart_mode);
+    match report.failed.first() {
+        Some(channel_id) => Err(format!(
+            "failed to persist restart mode for provider={} channel_id={channel_id}",
+            provider.as_str()
+        )),
+        None => Ok(report.marked),
     }
-    Ok(updated)
 }
 
 /// #3860 — RMW the restart-mode marker on one inflight row under its advisory lock.
@@ -539,13 +719,19 @@ fn set_inflight_restart_mode_under_lock(path: &Path, restart_mode: InflightResta
     let Ok(_lock) = lock_inflight_state_path(path) else {
         return false;
     };
+    #[cfg(test)]
+    if restart_mark::write_fault_for_test(path) {
+        return false;
+    }
     let Some(mut state) = read_inflight_state_content(path) else {
         return false;
     };
     state.set_restart_mode(restart_mode);
     state.ensure_finalizer_turn_id();
     state.updated_at = now_string();
-    bump_save_generation_for_write(path, &mut state);
+    if bump_save_generation_for_write(path, &mut state).is_err() {
+        return false;
+    }
     match serde_json::to_string_pretty(&state) {
         Ok(json) => atomic_write(path, &json).is_ok(),
         Err(_) => false,
@@ -557,11 +743,15 @@ pub(super) fn load_inflight_state(
     provider: &ProviderKind,
     channel_id: u64,
 ) -> Option<InflightTurnState> {
+    #[cfg(test)]
+    o_seed_observation::writable_load(provider, channel_id);
     let root = inflight_runtime_root()?;
     let path = inflight_state_path(&root, provider, channel_id);
     let data = fs::read_to_string(&path).ok()?;
     let (state, backfilled) = parse_inflight_state_content_with_finalizer_backfill(&data).ok()?;
     if backfilled {
+        #[cfg(test)]
+        o_seed_observation::backfill_attempt(provider, channel_id);
         backfill_finalizer_turn_id_under_lock(&root, &path, provider).or(Some(state))
     } else {
         Some(state)
@@ -585,6 +775,8 @@ pub(in crate::services::discord) fn load_inflight_state_read_only_result(
     provider: &ProviderKind,
     channel_id: u64,
 ) -> Result<Option<InflightTurnState>, String> {
+    #[cfg(test)]
+    o_seed_observation::read_only_load(provider, channel_id);
     let root = inflight_runtime_root().ok_or("inflight root unavailable")?;
     let path = inflight_state_path(&root, provider, channel_id);
     match fs::read_to_string(path) {
@@ -596,11 +788,34 @@ pub(in crate::services::discord) fn load_inflight_state_read_only_result(
     }
 }
 
+#[cfg(test)]
+#[path = "inflight/o_seed_observation.rs"]
+pub(in crate::services::discord) mod o_seed_observation;
+
+#[cfg(test)]
+#[path = "inflight/o_seed_observation_tests.rs"]
+mod o_seed_observation_tests;
+
 pub(super) fn load_inflight_states(provider: &ProviderKind) -> Vec<InflightTurnState> {
     let Some(root) = inflight_runtime_root() else {
         return Vec::new();
     };
     load_inflight_states_from_root(&root, provider)
+}
+
+pub(super) fn load_inflight_states_excluding(
+    provider: &ProviderKind,
+    exclude_channel: impl Fn(u64) -> bool,
+) -> Vec<InflightTurnState> {
+    let Some(root) = inflight_runtime_root() else {
+        return Vec::new();
+    };
+    load_inflight_states_from_root_excluding(&root, provider, exclude_channel)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(in crate::services::discord) static AFTER_EXCLUDING_SCAN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) fn latest_request_owner_user_id_for_channel(channel_id: u64) -> Option<u64> {

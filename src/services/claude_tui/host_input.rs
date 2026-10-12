@@ -1,7 +1,96 @@
 //! Host executor for Claude TUI input: the target, a gate checked before every
-//! pane mutation, and typed outcomes. Only a confirmed tmux session takes keys.
+//! pane mutation, and typed outcomes. A confirmed tmux session takes keys; a recorded
+//! Herdr pane takes them only through its own gate.
 
 use std::process::Output;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeClearSubmission {
+    NotSent,
+    Confirmed,
+    Indeterminate,
+}
+
+pub(crate) fn submit_native_clear_tmux(
+    target: &InputTarget,
+    gate: &dyn MutationGate,
+    deadline: tokio::time::Instant,
+) -> NativeClearSubmission {
+    #[cfg(not(unix))]
+    {
+        let _ = (target, gate, deadline);
+        return NativeClearSubmission::NotSent;
+    }
+    // The caller supplies the resolved target; only a confirmed tmux session takes keys.
+    let InputTarget::Tmux(session) = target else {
+        return NativeClearSubmission::NotSent;
+    };
+    super::composer_lock::try_with_composer_mutation_lock(&session, || {
+        native_clear_once(
+            &session,
+            gate,
+            deadline,
+            |remaining| tmux::capture_pane_timeout(&session, -80, remaining),
+            |remaining| capture_draft_with("tmux", &session, remaining),
+            |keys, remaining| {
+                tmux::send_keys_timeout(&session, keys, remaining).is_ok_and(|o| o.status.success())
+            },
+        )
+    })
+    .unwrap_or(NativeClearSubmission::NotSent)
+}
+
+pub(super) fn native_clear_once(
+    session: &str,
+    gate: &dyn MutationGate,
+    deadline: tokio::time::Instant,
+    mut capture: impl FnMut(std::time::Duration) -> Option<String>,
+    draft: impl FnOnce(std::time::Duration) -> Option<String>,
+    mut send: impl FnMut(&[&str], std::time::Duration) -> bool,
+) -> NativeClearSubmission {
+    // The shared subprocess owner may spend 200ms killing and 2s reaping a timed-out child.
+    let remaining = || {
+        deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .saturating_sub(std::time::Duration::from_millis(2300))
+    };
+    let budget = remaining();
+    if budget.is_zero() {
+        return NativeClearSubmission::NotSent;
+    }
+    let Some(before) = capture(budget) else {
+        return NativeClearSubmission::NotSent;
+    };
+    if !native_clear_composer_empty(&before)
+        || remaining().is_zero()
+        || super::composer_lock::admit_composer_write(session, || draft(remaining())).is_err()
+        || gate.admit(session).is_err()
+    {
+        return NativeClearSubmission::NotSent;
+    }
+    crate::services::tui_prompt_dedupe::record_discord_originated_prompt(
+        "claude", session, "/clear",
+    );
+    // One command submits only slash-command characters and Enter; no retry follows.
+    let sent = send(&["/clear", "Enter"], remaining());
+    if !sent {
+        return NativeClearSubmission::Indeterminate;
+    }
+    if !remaining().is_zero()
+        && capture(remaining()).is_some_and(|c| native_clear_composer_empty(&c))
+    {
+        NativeClearSubmission::Confirmed
+    } else {
+        NativeClearSubmission::Indeterminate
+    }
+}
+
+pub(crate) fn native_clear_composer_empty(capture: &str) -> bool {
+    use crate::services::tmux_common as tc;
+    tc::tmux_capture_indicates_claude_tui_exact_empty_composer(capture)
+        && !tc::tmux_capture_indicates_claude_tui_busy(capture)
+        && !tc::tmux_capture_indicates_claude_tui_interactive_modal(capture)
+}
 
 use super::input::{
     POST_LITERAL_SETTLE, POST_PASTE_BUFFER_SETTLE, PROMPT_READY_CANCELLED_ERROR,
@@ -9,18 +98,22 @@ use super::input::{
     prompt_marker_confirms_prompt_ready, prompt_readiness_snapshot_from_capture,
 };
 use super::startup_dialog::detect_claude_startup_dialog;
+use crate::db::dispatched_sessions::hosted_execution::HostedExecution;
 use crate::services::platform::tmux;
 use crate::services::provider::session_probe::SessionLiveness;
 use crate::services::provider::{CancelToken, cancel_requested};
 use crate::services::session_host::{
-    HostKey, HostKind, ResolvedSessionTarget, TargetHost, TmuxHost,
+    HerdrGateRefusal, HerdrMutation, HerdrTarget, HostError, HostKey, HostKind, HostMutation,
+    ResolvedSessionTarget, TargetHost, TmuxHost, herdr_endpoints,
 };
 use crate::services::tmux_common::tmux_capture_indicates_claude_tui_interactive_modal;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InputTarget {
-    /// A confirmed tmux session, the only target that takes keys.
+    /// A confirmed tmux session.
     Tmux(String),
+    /// A recorded Herdr pane; it takes keys only through its own gate.
+    Herdr(HerdrTarget),
     Refused(InputRefusal),
 }
 
@@ -30,6 +123,8 @@ pub(crate) enum InputRefusal {
     Unknown,
     Conflict,
     IdentityMismatch,
+    Composer(crate::services::tui_input::submission::Refusal),
+    Herdr(HerdrGateRefusal),
 }
 
 impl InputTarget {
@@ -39,18 +134,55 @@ impl InputTarget {
         Self::Tmux(session_name.to_string())
     }
 
-    /// Resolved host evidence; Unknown and Conflict never become tmux.
+    /// Resolved host evidence; Unknown and Conflict never become tmux. Without its stored
+    /// execution a Herdr pane has no gate, so it is refused.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_session_target(target: &ResolvedSessionTarget) -> Self {
-        match &target.host {
+        Self::from_host(&target.host, |_| {
+            Self::Refused(InputRefusal::Unsupported(HostKind::Herdr))
+        })
+    }
+
+    /// Resolved evidence with the row's stored execution: a Herdr pane becomes a target only
+    /// on a registered local endpoint that holds that execution, before any IO.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_hosted_target(
+        target: &ResolvedSessionTarget,
+        stored: &HostedExecution,
+    ) -> Self {
+        Self::from_host(&target.host, |pane| {
+            match herdr_endpoints().target(stored) {
+                Some(herdr) if herdr.pane_id() == pane => Self::Herdr(herdr),
+                Some(_) => Self::Refused(InputRefusal::Conflict),
+                None => Self::Refused(InputRefusal::Unsupported(HostKind::Herdr)),
+            }
+        })
+    }
+
+    fn from_host(host: &TargetHost, herdr: impl FnOnce(&str) -> Self) -> Self {
+        match host {
             TargetHost::Known {
                 kind: HostKind::Tmux,
                 name,
                 ..
             } => Self::Tmux(name.clone()),
+            TargetHost::Known {
+                kind: HostKind::Herdr,
+                name,
+                ..
+            } => herdr(name),
             TargetHost::Known { kind, .. } => Self::Refused(InputRefusal::Unsupported(*kind)),
             TargetHost::Unknown(_) => Self::Refused(InputRefusal::Unknown),
             TargetHost::Conflict { .. } => Self::Refused(InputRefusal::Conflict),
+        }
+    }
+
+    /// The session a tmux-only path may drive; a Herdr pane is not one.
+    pub(crate) fn tmux_session(&self) -> Result<&str, InputRefusal> {
+        match self {
+            Self::Tmux(session) => Ok(session),
+            Self::Herdr(_) => Err(InputRefusal::Unsupported(HostKind::Herdr)),
+            Self::Refused(refusal) => Err(*refusal),
         }
     }
 
@@ -72,6 +204,31 @@ impl InputTarget {
 /// Checked before every pane mutation; the execution validator implements it.
 pub(crate) trait MutationGate {
     fn admit(&self, session: &str) -> Result<(), InputRefusal>;
+    /// A cancel key only stops work; a gate may admit it where it admits no other input.
+    fn admit_cancel(&self, session: &str) -> Result<(), InputRefusal> {
+        self.admit(session)
+    }
+}
+
+/// Herdr's gate judges each write and pins the judgment for the send right after it.
+impl MutationGate for HerdrTarget {
+    fn admit(&self, session: &str) -> Result<(), InputRefusal> {
+        self.admit_as(session, HerdrMutation::Input)
+    }
+
+    fn admit_cancel(&self, session: &str) -> Result<(), InputRefusal> {
+        self.admit_as(session, HerdrMutation::Cancel)
+    }
+}
+
+impl HerdrTarget {
+    fn admit_as(&self, session: &str, mutation: HerdrMutation) -> Result<(), InputRefusal> {
+        if session != self.pane_id() {
+            self.discard_pin();
+            return Err(InputRefusal::Conflict);
+        }
+        self.pin(mutation).map_err(InputRefusal::Herdr)
+    }
 }
 
 /// Legacy tmux keeps no stored execution evidence to re-check, so it admits.
@@ -91,6 +248,11 @@ pub(crate) trait InputTransport {
     -> Result<Output, String>;
     fn send_keys(&mut self, session: &str, keys: &[HostKey]) -> Result<Output, String>;
     fn capture(&mut self, session: &str, scroll_back: i32) -> Option<String>;
+    /// The pane for the draft-protection reader; a transport that cannot keep its attributes
+    /// returns nothing, which keeps a protected pane held.
+    fn capture_draft(&mut self, _session: &str) -> Option<String> {
+        None
+    }
     fn pane_alive(&mut self, session: &str) -> bool;
     fn present(&mut self, session: &str) -> bool;
     /// Records the termination and exit reason, then kills the session.
@@ -125,6 +287,14 @@ impl InputTransport for TmuxInput {
         tmux::capture_pane(session, scroll_back)
     }
 
+    fn capture_draft(&mut self, session: &str) -> Option<String> {
+        #[cfg(test)]
+        if let Some(program) = spy::draft_route(session) {
+            return capture_draft_with(program, session, DRAFT_CAPTURE_TIMEOUT);
+        }
+        capture_draft_with("tmux", session, DRAFT_CAPTURE_TIMEOUT)
+    }
+
     fn pane_alive(&mut self, session: &str) -> bool {
         crate::services::tmux_diagnostics::tmux_session_has_live_pane(session)
     }
@@ -144,6 +314,78 @@ impl InputTransport for TmuxInput {
         );
         crate::services::tmux_diagnostics::record_tmux_exit_reason(session, reason);
         tmux::kill_session(session, reason);
+    }
+}
+
+/// Input to a Herdr pane: each write goes out under the judgment its gate pinned just
+/// before it, and retire kills nothing.
+pub(crate) struct HerdrInput<'a> {
+    target: &'a HerdrTarget,
+    buffers: std::collections::HashMap<String, String>,
+}
+
+impl<'a> HerdrInput<'a> {
+    pub(crate) fn new(target: &'a HerdrTarget) -> Self {
+        Self {
+            target,
+            buffers: Default::default(),
+        }
+    }
+}
+
+/// A Herdr write as the executor's process-shaped result: only a confirmed write succeeds.
+fn herdr_written(result: Result<HostMutation, HostError>) -> Result<Output, String> {
+    match result {
+        Ok(HostMutation::Confirmed) => Ok(Output {
+            status: Default::default(),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }),
+        Ok(HostMutation::Refused(refusal)) => Err(format!("herdr input refused: {refusal:?}")),
+        Ok(HostMutation::Indeterminate(detail)) => {
+            Err(format!("herdr input may have landed: {detail}"))
+        }
+        Err(error) => Err(format!("herdr input not sent: {error:?}")),
+    }
+}
+
+impl InputTransport for HerdrInput<'_> {
+    fn send_literal(&mut self, _session: &str, text: &str) -> Result<Output, String> {
+        herdr_written(self.target.send_text(text))
+    }
+
+    /// Kept here until its paste, which is judged again; nothing reaches the pane.
+    fn load_buffer(&mut self, buffer: &str, text: &str) -> Result<Output, String> {
+        self.target.discard_pin();
+        self.buffers.insert(buffer.to_string(), text.to_string());
+        herdr_written(Ok(HostMutation::Confirmed))
+    }
+
+    fn paste_buffer(&mut self, _s: &str, buffer: &str, _delete: bool) -> Result<Output, String> {
+        let text = self.buffers.remove(buffer);
+        let text = text.ok_or_else(|| format!("herdr paste of unknown buffer {buffer}"))?;
+        herdr_written(self.target.send_paste(&text))
+    }
+
+    fn send_keys(&mut self, _session: &str, keys: &[HostKey]) -> Result<Output, String> {
+        herdr_written(self.target.send_keys(keys))
+    }
+
+    fn capture(&mut self, _session: &str, scroll_back: i32) -> Option<String> {
+        self.target.capture(scroll_back)
+    }
+
+    fn pane_alive(&mut self, _session: &str) -> bool {
+        self.target.execution_alive()
+    }
+
+    fn present(&mut self, _session: &str) -> bool {
+        self.target.present()
+    }
+
+    /// Herdr has no kill here; the pane and its execution stay as they are.
+    fn retire(&mut self, session: &str, reason_code: &str, _reason: &str) {
+        tracing::warn!(pane = session, reason_code, "herdr pane retire refused");
     }
 }
 
@@ -171,7 +413,7 @@ pub(crate) enum InputRun {
     Cancelled {
         confirmed: usize,
     },
-    /// A send began and may have landed: later steps, Enter and retries stay unsent.
+    /// The submit fence was crossed or a send may have landed; no retry or cleanup follows.
     Indeterminate {
         confirmed: usize,
         cause: StopCause,
@@ -217,6 +459,7 @@ pub(crate) fn run_plan(
 ) -> InputRun {
     let session = match target {
         InputTarget::Tmux(session) => session.as_str(),
+        InputTarget::Herdr(herdr) => herdr.pane_id(),
         InputTarget::Refused(refusal) => return InputRun::Refused(*refusal),
     };
     let mut plan = Plan {
@@ -259,7 +502,7 @@ impl Plan<'_> {
             }
             TuiInputAction::PasteBuffer(text) => {
                 let buffer = format!("agentdesk-tui-input-{}", uuid::Uuid::new_v4());
-                self.admit()?;
+                self.admit(false)?;
                 self.send(action, Box::new(|t| t.load_buffer(&buffer, text)))?;
                 self.check_cancel()?;
                 self.mutate(action, Box::new(|t| t.paste_buffer(session, &buffer, true)))?;
@@ -296,8 +539,8 @@ impl Plan<'_> {
         Ok(())
     }
 
-    fn admit(&self) -> Result<(), InputRun> {
-        admit_after(self.gate, self.session, self.confirmed)
+    fn admit(&self, cancel: bool) -> Result<(), InputRun> {
+        admit_after(self.gate, self.session, self.confirmed, cancel)
     }
 
     fn send(&mut self, action: &TuiInputAction, send: SendOp<'_>) -> Result<(), InputRun> {
@@ -310,15 +553,25 @@ impl Plan<'_> {
     }
 
     fn mutate(&mut self, action: &TuiInputAction, send: SendOp<'_>) -> Result<(), InputRun> {
-        self.admit()?;
+        self.admit(matches!(action, TuiInputAction::Escape))?;
         self.send(action, send)?;
         self.confirmed += 1;
         Ok(())
     }
 }
 
-fn admit_after(gate: &dyn MutationGate, session: &str, confirmed: usize) -> Result<(), InputRun> {
-    gate.admit(session).map_err(|refusal| match confirmed {
+fn admit_after(
+    gate: &dyn MutationGate,
+    session: &str,
+    confirmed: usize,
+    cancel: bool,
+) -> Result<(), InputRun> {
+    let admitted = if cancel {
+        gate.admit_cancel(session)
+    } else {
+        gate.admit(session)
+    };
+    admitted.map_err(|refusal| match confirmed {
         0 => InputRun::Refused(refusal),
         confirmed => InputRun::Indeterminate {
             confirmed,
@@ -361,7 +614,8 @@ impl<'a> KeyGroups<'a> {
     }
 
     pub(crate) fn send(&mut self, keys: &[HostKey], name: &str) -> Result<(), InputRun> {
-        admit_after(self.gate, self.session, self.confirmed)?;
+        let cancel = !keys.is_empty() && keys.iter().all(|key| *key == HostKey::Escape);
+        admit_after(self.gate, self.session, self.confirmed, cancel)?;
         let session = self.session;
         with_transport(|transport| transport.send_keys(session, keys))
             .and_then(|output| ensure_named_success(output, name))
@@ -387,6 +641,18 @@ fn ensure_named_success(output: Output, name: &str) -> Result<(), String> {
     }
 }
 
+/// A plan on a Herdr pane: its own gate admits each write and pins the server for it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn run_herdr(
+    target: &HerdrTarget,
+    actions: &[TuiInputAction],
+    cancel_token: Option<&CancelToken>,
+) -> InputRun {
+    let mut input = HerdrInput::new(target);
+    let plan_target = InputTarget::Herdr(target.clone());
+    run_plan(&plan_target, target, &mut input, actions, cancel_token)
+}
+
 /// A plan on the legacy tmux session of `session_name`.
 pub(crate) fn run_legacy(
     session_name: &str,
@@ -395,6 +661,35 @@ pub(crate) fn run_legacy(
 ) -> InputRun {
     let target = InputTarget::legacy_tmux(session_name);
     with_transport(|transport| run_plan(&target, &LegacyTmuxGate, transport, actions, cancel_token))
+}
+
+/// Bounds the draft-protection capture of a pane.
+const DRAFT_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The last 80 rows with `-e`, so a faint placeholder stays apart from typed text; `program` is
+/// tmux outside tests.
+pub(crate) fn capture_draft_with(
+    program: impl AsRef<std::ffi::OsStr>,
+    session: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use crate::services::process::{configure_child_process_group, wait_with_output_timeout};
+    let mut command = crate::services::platform::binary_resolver::runtime_command(program).ok()?;
+    let args = ["-u", "capture-pane", "-p", "-e", "-t", session, "-S", "-80"];
+    command.args(args).stdin(std::process::Stdio::null());
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    configure_child_process_group(&mut command);
+    let child = command.spawn().ok()?;
+    let output = wait_with_output_timeout(child, timeout, "tmux capture-pane -e").ok()?;
+    let text = || String::from_utf8_lossy(&output.stdout).into_owned();
+    output.status.success().then(text)
+}
+
+/// The legacy tmux session as the draft-protection reader needs it.
+pub(crate) fn observe_draft(session_name: &str) -> Option<String> {
+    with_transport(|transport| transport.capture_draft(session_name))
 }
 
 /// Capture, then liveness, of the legacy tmux session: the order input reads them.
@@ -504,7 +799,14 @@ pub(crate) fn classify(
     }
     match liveness {
         SessionLiveness::Alive => {}
-        SessionLiveness::Missing => return HostInputOutcome::LegacyRecreateEligible,
+        SessionLiveness::Missing if matches!(target, InputTarget::Tmux(_)) => {
+            return HostInputOutcome::LegacyRecreateEligible;
+        }
+        SessionLiveness::Missing => {
+            return HostInputOutcome::Refused(InputRefusal::Herdr(
+                HerdrGateRefusal::PaneUnverified,
+            ));
+        }
         SessionLiveness::Unknown | SessionLiveness::ProbeFailed => {
             return HostInputOutcome::Refused(InputRefusal::Unknown);
         }
@@ -527,6 +829,8 @@ pub(crate) fn classify(
     }
 }
 
+#[cfg(all(test, unix))]
+pub(crate) use spy::FakeDraftPane;
 #[cfg(test)]
 pub(crate) use spy::{SpyGuard, SpyState};
 
@@ -540,22 +844,54 @@ mod spy {
     use super::*;
     use crate::services::session_host::tmux_key_name;
 
-    #[derive(Default)]
     pub(crate) struct SpyState {
         pub calls: Vec<String>,
         /// Answer for the n-th send (load, literal, paste or keys), counted from 0.
         pub fail_send: Option<(usize, Result<Output, String>)>,
         pub captures: VecDeque<Option<String>>,
+        /// Captures after the first payload send, independent of readiness's read count.
+        pub captures_after_send: Option<VecDeque<Option<String>>>,
+        pub draft_capture_at: Option<(usize, Option<String>)>,
         pub dead: bool,
         pub absent: bool,
         pub sends: usize,
         /// Cancels this token when the n-th (from 1) call with this prefix is recorded.
         pub cancel_on: Option<(&'static str, usize, std::sync::Arc<CancelToken>)>,
+        /// Sees each send (load, literal, paste or keys) just before the pane would receive it.
+        pub on_send: Option<SendHook>,
+    }
+
+    pub(crate) type SendHook = Box<dyn FnMut(&str)>;
+
+    impl Default for SpyState {
+        fn default() -> Self {
+            Self {
+                calls: Vec::new(),
+                fail_send: None,
+                captures: VecDeque::new(),
+                captures_after_send: None,
+                draft_capture_at: None,
+                dead: false,
+                absent: false,
+                sends: 0,
+                cancel_on: None,
+                on_send: None,
+            }
+        }
     }
 
     pub(crate) struct Spy(pub Rc<RefCell<SpyState>>);
 
     impl SpyState {
+        fn capture(&mut self) -> Option<String> {
+            if self.sends > 0
+                && let Some(after) = &mut self.captures_after_send
+            {
+                return after.pop_front().flatten();
+            }
+            self.captures.pop_front().flatten()
+        }
+
         fn record(&mut self, call: String) {
             self.calls.push(call);
             if let Some((prefix, nth, token)) = &self.cancel_on
@@ -572,6 +908,9 @@ mod spy {
     impl Spy {
         fn send(&mut self, call: String) -> Result<Output, String> {
             let mut state = self.0.borrow_mut();
+            if let Some(on_send) = state.on_send.as_mut() {
+                on_send(&call);
+            }
             state.record(call);
             let index = state.sends;
             state.sends += 1;
@@ -583,6 +922,18 @@ mod spy {
                 }
             }
         }
+    }
+
+    fn without_escapes(capture: &str) -> String {
+        let (mut out, mut chars) = (String::new(), capture.chars());
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                out.push(c);
+            } else if chars.next() == Some('[') {
+                chars.by_ref().find(|c| ('\x40'..='\x7e').contains(c));
+            }
+        }
+        out
     }
 
     pub(crate) fn exit(code: i32, stderr: &str) -> Output {
@@ -615,10 +966,23 @@ mod spy {
             self.send(format!("keys:{}", names.join("+")))
         }
 
+        /// Like tmux without `-e`: attributes are dropped.
         fn capture(&mut self, _session: &str, _scroll_back: i32) -> Option<String> {
             let mut state = self.0.borrow_mut();
             state.record("capture".to_string());
-            state.captures.pop_front().flatten()
+            state.capture().map(|c| without_escapes(&c))
+        }
+
+        fn capture_draft(&mut self, _session: &str) -> Option<String> {
+            let mut state = self.0.borrow_mut();
+            state.record("capture:draft".to_string());
+            let count = state.calls.iter().filter(|c| *c == "capture:draft").count();
+            if let Some((at, capture)) = &state.draft_capture_at
+                && *at == count
+            {
+                return capture.clone();
+            }
+            state.capture()
         }
 
         fn pane_alive(&mut self, _session: &str) -> bool {
@@ -637,6 +1001,66 @@ mod spy {
             self.0
                 .borrow_mut()
                 .record(format!("retire:{reason_code}:{reason}"));
+        }
+    }
+
+    static DRAFT_ROUTES: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>,
+    > = std::sync::LazyLock::new(Default::default);
+
+    fn draft_routes()
+    -> std::sync::MutexGuard<'static, std::collections::HashMap<String, std::path::PathBuf>> {
+        DRAFT_ROUTES.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub(super) fn draft_route(session: &str) -> Option<std::path::PathBuf> {
+        draft_routes().get(session).cloned()
+    }
+
+    /// A tmux stand-in for one session's draft capture on any thread: `-e` prints the `pane` file
+    /// as written, a capture without it drops attributes, and every call is logged.
+    #[cfg(unix)]
+    pub(crate) struct FakeDraftPane {
+        dir: tempfile::TempDir,
+        session: String,
+    }
+
+    #[cfg(unix)]
+    impl FakeDraftPane {
+        pub(crate) fn new(session: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let d = dir.path().display();
+            let script = format!(
+                "#!/bin/sh\necho \"$*\" >> '{d}/log'\ncase \" $* \" in *\" -e \"*) cat '{d}/pane' ;; \
+                 *) sed \"s/$(printf '\\033')\\[[0-9;]*m//g\" '{d}/pane' ;; esac\n"
+            );
+            let program = dir.path().join("tmux");
+            std::fs::write(&program, script).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(dir.path().join("pane"), "").unwrap();
+            draft_routes().insert(session.to_string(), program);
+            Self {
+                dir,
+                session: session.to_string(),
+            }
+        }
+
+        pub(crate) fn show(&self, pane: &str) {
+            std::fs::write(self.dir.path().join("pane"), pane).unwrap();
+        }
+
+        /// How many `-e` captures read this pane.
+        pub(crate) fn draft_reads(&self) -> usize {
+            let log = std::fs::read_to_string(self.dir.path().join("log")).unwrap_or_default();
+            log.lines().filter(|line| line.contains(" -e ")).count()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeDraftPane {
+        fn drop(&mut self) {
+            draft_routes().remove(&self.session);
         }
     }
 
@@ -663,11 +1087,14 @@ mod spy {
     }
 }
 
+pub(crate) mod guarded_submission;
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
+    use super::guarded_submission::confirm_prompt_submission_passively;
     use super::spy::{Spy, SpyGuard, SpyState, exit};
     use super::*;
     use crate::services::claude_tui::input::{
@@ -679,6 +1106,123 @@ mod tests {
     const EMPTY_COMPOSER: &str = "Claude Code v2.1.141\n\n\u{276f} \nstatus";
     const BUSY: &str = "\u{2733} Architecting\u{2026}";
     const DRAFT: &str = "\u{276f} 남은 초안 한글";
+
+    #[test]
+    fn native_clear_indeterminate_never_retries_and_keeps_discord_provenance() {
+        let _state = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let session = format!("native-clear-input-{}", uuid::Uuid::new_v4());
+        let mut sends = 0;
+        let outcome = native_clear_once(
+            &session,
+            &LegacyTmuxGate,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+            |_| Some(EMPTY_COMPOSER.into()),
+            |_| None,
+            |keys, _| {
+                assert_eq!(keys, &["/clear", "Enter"]);
+                sends += 1;
+                false
+            },
+        );
+        assert_eq!(outcome, NativeClearSubmission::Indeterminate);
+        assert_eq!(sends, 1, "Indeterminate must not resend");
+        assert_eq!(
+            crate::services::tui_prompt_dedupe::observe_prompt_by_tmux(
+                "claude", &session, "/clear"
+            ),
+            crate::services::tui_prompt_dedupe::PromptObservation::SuppressedDiscordDuplicate
+        );
+    }
+
+    #[test]
+    fn native_clear_refuses_drafts_deadlines_and_changed_execution_before_send() {
+        let _state = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let session = format!("native-clear-refuse-{}", uuid::Uuid::new_v4());
+        for capture in [None, Some(DRAFT), Some(BUSY)] {
+            assert_eq!(
+                native_clear_once(
+                    &session,
+                    &LegacyTmuxGate,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+                    |_| capture.map(str::to_owned),
+                    |_| None,
+                    |_, _| panic!("unready pane sent keys")
+                ),
+                NativeClearSubmission::NotSent
+            );
+        }
+        assert_eq!(
+            native_clear_once(
+                &session,
+                &LegacyTmuxGate,
+                tokio::time::Instant::now(),
+                |_| panic!("expired deadline captured pane"),
+                |_| None,
+                |_, _| panic!("expired deadline sent")
+            ),
+            NativeClearSubmission::NotSent
+        );
+        let refused = RefuseAfter(std::cell::Cell::new(0), InputRefusal::IdentityMismatch);
+        assert_eq!(
+            native_clear_once(
+                &session,
+                &refused,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+                |_| Some(EMPTY_COMPOSER.into()),
+                |_| None,
+                |_, _| panic!("changed execution sent")
+            ),
+            NativeClearSubmission::NotSent
+        );
+        for last in [EMPTY_COMPOSER, DRAFT] {
+            let mut captures = [EMPTY_COMPOSER, last].into_iter();
+            let result = native_clear_once(
+                &session,
+                &LegacyTmuxGate,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+                |_| captures.next().map(str::to_owned),
+                |_| None,
+                |_, _| true,
+            );
+            assert_eq!(
+                result,
+                if last == EMPTY_COMPOSER {
+                    NativeClearSubmission::Confirmed
+                } else {
+                    NativeClearSubmission::Indeterminate
+                }
+            );
+            crate::services::tui_prompt_dedupe::remove_discord_originated_prompt(
+                "claude", &session, "/clear",
+            );
+        }
+    }
+
+    #[test]
+    fn native_clear_unsupported_hosts_do_no_tmux_io() {
+        for host in [
+            known(HostKind::Herdr),
+            TargetHost::Unknown(UnknownHost::NoHostEvidence),
+        ] {
+            let target = ResolvedSessionTarget {
+                input: SessionTargetInput::RawName("native-clear-refused".into()),
+                session_key: None,
+                host,
+            };
+            assert_eq!(
+                super::super::input::submit_native_clear(
+                    &InputTarget::from_session_target(&target),
+                    &LegacyTmuxGate,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(20)
+                ),
+                NativeClearSubmission::NotSent
+            );
+        }
+    }
 
     fn state(captures: &[Option<&str>]) -> SpyState {
         SpyState {
@@ -833,13 +1377,14 @@ mod tests {
             TuiInputAction::Literal("x".to_string()),
             TuiInputAction::Enter,
         ];
-        let cases: [(
-            &[TuiInputAction],
+        type SendFailure<'a> = (
+            &'a [TuiInputAction],
             usize,
             Result<Output, String>,
             usize,
-            &str,
-        ); 4] = [
+            &'a str,
+        );
+        let cases: [SendFailure<'_>; 4] = [
             // ACK lost after the paste write.
             (&paste, 1, Err("ack lost".to_string()), 0, "ack lost"),
             (
@@ -1080,6 +1625,96 @@ mod tests {
         ] {
             for run in [send_failure.clone(), InputRun::Cancelled { confirmed: 1 }] {
                 assert!(!target.keys_may_follow(&run), "{target:?} {run:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn passive_claude_confirmation_never_retries_or_clears_a_draft() {
+        let idle = include_str!("../../../tests/fixtures/tui_input/claude-2.1.293-idle.txt");
+        for (capture, confirmed) in [
+            (Some("unknown screen"), false),
+            (Some("❯ foreign draft"), false),
+            (None, false),
+            (Some(idle), true),
+            (Some("✳ Architecting…"), true),
+            (
+                Some(
+                    "✳ Architecting…\n────────────────────\n❯ [User: A (ID:1)] stranded\n────────────────────\n",
+                ),
+                false,
+            ),
+            (
+                Some(
+                    "Do you want to proceed?\n  1. Yes\n  2. No\nEnter to confirm · esc to cancel\n✳ Architecting…",
+                ),
+                false,
+            ),
+            (Some("✳ Architecting…\n❯ \n"), false),
+            (
+                Some(
+                    "✳ Architecting…\n────────────────────\n❯ foreign\n  ❯ \n────────────────────\n",
+                ),
+                false,
+            ),
+            (
+                Some("✳ Architecting…\n❯ \nunindented continuation\n────────────────────\n"),
+                false,
+            ),
+            (
+                Some("✳ Architecting…\n────────────────────\n❯ \n────────────────────\n"),
+                true,
+            ),
+            (
+                Some(
+                    "❯ [User: A (ID:1)] previous prompt\n✳ Architecting…\n────────────────────\n❯ \n────────────────────\n",
+                ),
+                true,
+            ),
+        ] {
+            let spy = SpyGuard::install(SpyState {
+                captures: [capture.map(str::to_string)].into(),
+                ..SpyState::default()
+            });
+            assert_eq!(
+                confirm_prompt_submission_passively("passive-confirmation", None).is_ok(),
+                confirmed
+            );
+            assert!(
+                !spy.calls()
+                    .iter()
+                    .any(|c| c.starts_with("keys:") || c.starts_with("retire:"))
+            );
+        }
+    }
+
+    #[test]
+    fn passive_confirmation_checks_cancellation_before_and_after_its_only_capture() {
+        for cancel_after_capture in [false, true] {
+            let token = Arc::new(CancelToken::new());
+            let mut setup = state(&[Some(BUSY)]);
+            if cancel_after_capture {
+                setup.cancel_on = Some(("capture:draft", 1, token.clone()));
+            } else {
+                token.cancelled.store(true, Ordering::Relaxed);
+            }
+            let spy = SpyGuard::install(setup);
+            assert_eq!(
+                confirm_prompt_submission_passively("passive-cancel", Some(token.as_ref())),
+                Err(PROMPT_READY_CANCELLED_ERROR.to_string())
+            );
+            let calls = spy.calls();
+            assert_eq!(
+                calls.iter().filter(|c| c.starts_with("capture")).count(),
+                usize::from(cancel_after_capture)
+            );
+            assert!(
+                !calls
+                    .iter()
+                    .any(|c| c.starts_with("keys:") || c.starts_with("retire:"))
+            );
+            if !cancel_after_capture {
+                assert!(calls.is_empty());
             }
         }
     }

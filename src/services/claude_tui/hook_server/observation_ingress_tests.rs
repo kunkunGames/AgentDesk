@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -203,6 +205,9 @@ impl Drop for Ingress {
         reset_state_for_tests();
     }
 }
+
+#[path = "native_clear_fence_tests.rs"]
+mod native_clear_fence_tests;
 
 pub(crate) fn claude(path: &std::path::Path, session: &str) -> TuiRuntimeBinding {
     TuiRuntimeBinding {
@@ -580,6 +585,53 @@ fn discovery_grace_uses_the_production_sixty_second_boundary() {
         ingress.claude_hook("SessionStart", &a, &payload, Some(&uuid())),
         425,
         "grace never clears pane failure"
+    );
+}
+
+#[test]
+fn a_launched_pane_stays_refused_past_the_grace_until_a_pass_lists_tmux() {
+    use crate::services::tui_prompt_dedupe::binding_context::*;
+    let (_root, _env) = crate::services::tui_prompt_dedupe::binding_context::tests::fixture();
+    let ingress = Ingress::new();
+    let (tmux, a, b) = (format!("ingress-grace-{}", uuid()), uuid(), uuid());
+    let prepared = PreparedIncarnation::prepare("claude", &tmux, Some(7_495), None, false).unwrap();
+    let marker = crate::services::tmux_common::session_temp_path(&tmux, "spawn_nonce");
+    fs::create_dir_all(std::path::Path::new(&marker).parent().unwrap()).unwrap();
+    fs::write(marker, &prepared.context.execution_nonce).unwrap();
+    let encode = |context: BindingContext| {
+        let context = CapturedContext::Captured(context);
+        let observed = Default::default();
+        HookBindingEnvelope { context, observed }.encode().unwrap()
+    };
+    let launched = encode(prepared.context.clone());
+    let foreign = encode(BindingContext {
+        owner_runtime_root: "/another/runtime".into(),
+        ..prepared.context.clone()
+    });
+    let payload = ingress.payload(&b, Some("clear"));
+    let uri = format!("/hooks/claude/SessionStart?session_id={a}");
+    let send = |envelope: Option<&str>| {
+        let (status, body) = ingress.send_envelope(&uri, &payload, Some(&uuid()), envelope);
+        assert!(
+            events(7_495).is_empty(),
+            "nothing logged for an unmapped pane"
+        );
+        (status, body["reason"].as_str().map(str::to_owned))
+    };
+    TEST_DISCOVERY_CLOCK.set((false, Duration::from_secs(61)));
+    let restore = Some("Unavailable(RestoreNotReady)".to_owned());
+    assert_eq!(send(Some(&launched)), (425, restore), "launched pane");
+    assert_eq!(
+        send(None).0,
+        202,
+        "a pane without an envelope keeps the grace"
+    );
+    assert_eq!(send(Some(&foreign)).0, 202, "another runtime's pane");
+    mark_boot_discovery_complete();
+    assert_eq!(
+        send(Some(&launched)).0,
+        202,
+        "a pass that listed tmux ends it"
     );
 }
 

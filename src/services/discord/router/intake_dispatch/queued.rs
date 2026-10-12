@@ -13,6 +13,8 @@ pub(crate) enum QueuedAdmissionDisposition {
     Deferred,
     RejectedNonPortableAttachment,
     RejectedRestore,
+    /// Every source already started under a held request; that request keeps the original.
+    ConsumedToHold,
 }
 
 pub(crate) struct AdmittedQueuedIntake {
@@ -70,8 +72,23 @@ pub(crate) async fn admit_queued_intake(
         preloaded_uploads: intervention.pending_uploads.clone(),
         voice_announcement: None,
     };
-    let admission = admit_text_intake(deps, &submission).await;
-    let local_permit = match admission {
+    let local_permit = match admit_text_intake(deps, &submission).await {
+        IntakeAdmission::ConsumedToHold => {
+            tracing::warn!(
+                provider = submission.provider.as_str(),
+                channel_id = channel_id.get(),
+                user_msg_id = intervention.message_id.get(),
+                "queued intake consumed to the hold of its already started request"
+            );
+            let _ = super::super::super::mailbox_abandon_pending_dispatch(
+                deps.shared,
+                &submission.provider,
+                channel_id,
+                intervention.message_id,
+            )
+            .await;
+            return QueuedAdmissionDisposition::ConsumedToHold;
+        }
         IntakeAdmission::Local(permit) => Some(permit),
         IntakeAdmission::Forwarded { .. } | IntakeAdmission::SkippedDuplicate => None,
         IntakeAdmission::Blocked {
@@ -93,7 +110,9 @@ pub(crate) async fn admit_queued_intake(
             .await;
             return QueuedAdmissionDisposition::RejectedNonPortableAttachment;
         }
-        IntakeAdmission::DeferredOpenRoute { .. } | IntakeAdmission::Blocked { .. } => {
+        IntakeAdmission::DeferredOpenRoute { .. }
+        | IntakeAdmission::ReplayDeferred(_)
+        | IntakeAdmission::Blocked { .. } => {
             let Some(dispatch_lease) = dispatch_lease else {
                 tracing::error!(
                     provider = submission.provider.as_str(),
@@ -143,9 +162,9 @@ pub(crate) async fn finish_admitted_queued_intake(
     deps: &super::super::message_handler::IntakeDeps<'_>,
     admitted: AdmittedQueuedIntake,
     intervention: &Intervention,
-) -> Result<(), super::super::super::Error> {
+) -> Result<super::super::IntakeExecution, super::super::super::Error> {
     let Some(permit) = admitted.local_permit else {
-        return Ok(());
+        return Ok(super::super::IntakeExecution::Executed);
     };
     if let Some(announcement) = intervention.voice_announcement.as_ref() {
         crate::voice::announce_meta::global_store()
@@ -166,6 +185,20 @@ mod tests {
         let _mode = crate::config::TestEnvVarGuard::set_value_after_shared_test_env_lock(
             "ADK_INTAKE_ROUTING_MODE",
             std::ffi::OsStr::new("disabled"),
+        );
+        // A cluster-less config, data dir included, under a runtime root of its own, so a host
+        // config with the cluster enabled cannot block the Postgres-less local admission here.
+        let root = tempfile::tempdir().expect("runtime root");
+        let config = crate::runtime_layout::config_file_path(root.path());
+        std::fs::create_dir_all(config.parent().expect("config dir")).expect("create config dir");
+        std::fs::write(&config, "server: {}\ndata: {dir: data}\n").expect("write config");
+        let _root = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            root.path(),
+        );
+        let _config = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_CONFIG",
+            &config,
         );
         let shared = crate::services::discord::make_shared_data_for_tests();
         let http = std::sync::Arc::new(serenity::Http::new("Bot queued-source-id-test"));

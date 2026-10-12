@@ -129,6 +129,23 @@ PG_DB_BLOCK_HEADER = (
 _PG_DB_ENTRY = re.compile(r"^-\s+['\"]([^'\"]+)['\"]\s*$")
 
 
+@lru_cache(maxsize=None)
+def shell_lexer():
+    """The shared shell lexer beside this file, which both CI gates read shell with;
+    a missing or broken lexer raises instead of lexing nothing."""
+    path = Path(__file__).with_name("ci_shell_lex.py")
+    loaded = sys.modules.get("ci_shell_lex")
+    if loaded is not None and Path(getattr(loaded, "__file__", "")).resolve() == path.resolve():
+        return loaded
+    spec = importlib.util.spec_from_file_location("ci_shell_lex", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot import the shell lexer: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_coverage_module(repo_root: Path):
     path = repo_root / "scripts/check_test_lane_coverage.py"
     spec = importlib.util.spec_from_file_location("pg_lane_coverage", path)
@@ -286,8 +303,10 @@ def _block_scalar_style(value: str) -> str | None:
 def _strip_line_comment(line: str) -> str:
     """Cut one line at its first real comment, honouring quoted ``#``.
 
-    A ``#`` opens a comment only at the start of a line or after whitespace,
-    and never inside a quoted scalar. That rule holds in YAML and in the POSIX
+    A ``#`` opens a comment only at the start of a line or after whitespace
+    (in shell also after ``;``, ``&`` or ``|``) that no odd run of backslashes
+    escapes, and never inside a quoted
+    scalar. That rule holds in YAML and in the POSIX
     shell that runs a ``run:`` body alike, which is why one scanner serves
     both: ``run: echo "a # b"`` keeps its ``#``, and a ``#`` line inside a
     ``run: |`` block is dropped because the shell would drop it too.
@@ -304,7 +323,8 @@ def _strip_line_comment(line: str) -> str:
         if quote is None:
             if char in "'\"":
                 quote = char
-            elif char == "#" and (index == 0 or line[index - 1] in " \t"):
+            elif char == "#" and (index == 0 or line[index - 1] in " \t;&|"
+                                  and not (index - 1 - len(line[:index - 1].rstrip("\\"))) % 2):
                 return line[:index].rstrip()
         elif char == quote:
             if quote == "'" and line[index + 1:index + 2] == "'":
@@ -321,6 +341,11 @@ def _strip_line_comment(line: str) -> str:
 def _strip_comments(text: str) -> str:
     """``text`` with comments removed and every line's indentation preserved."""
     return "\n".join(_strip_line_comment(line) for line in text.splitlines())
+
+
+def strip_shell_comments(text: str) -> str:
+    """Public form of :func:`_strip_comments` for the test-target integrity gate."""
+    return _strip_comments(text)
 
 
 @lru_cache(maxsize=128)
@@ -461,34 +486,52 @@ def _inside_test_region(offset: int, ranges: Iterable[ModuleRange], external: bo
 
 def _external_test_files(repo_root: Path, coverage, counter: list[int] | None = None, findings: list[Finding] | None = None) -> set[Path]:
     src_root = (repo_root / "src").resolve()
+    declarations: dict[Path, list[tuple[Path | None, bool, Finding]]] = {}
     targets: set[Path] = set()
     for path in sorted(src_root.rglob("*.rs")):
         source = path.read_text("utf-8")
         clean = coverage.strip_rust(source)
         ranges = _module_ranges(source, clean, counter)
-        for match in _ATTR_MOD.finditer(clean):
-            if match.group("term") != ";" or not _CFG_TEST.search(match.group("attrs")):
+        attributes = {match.start("name"): match for match in _ATTR_MOD.finditer(clean)}
+        children = declarations.setdefault(path.resolve(), [])
+        for match in _MOD.finditer(clean):
+            if match.group("term") != ";":
                 continue
-            path_attr = re.search(r"#\s*\[\s*path\s*=", match.group("attrs"))
-            redirect = _PATH_ATTR.match(source, match.start("attrs") + path_attr.start(), match.end("attrs")) if path_attr else None
+            attributed = attributes.get(match.start("name"))
+            attrs = attributed.group("attrs") if attributed else ""
+            is_test = bool(_CFG_TEST.search(attrs)) or _inside_test_region(match.start(), ranges, False)
+            path_attr = re.search(r"#\s*\[\s*path\s*=", attrs)
+            redirect = _PATH_ATTR.match(source, attributed.start("attrs") + path_attr.start(), attributed.end("attrs")) if path_attr else None
             parents = _scope_at(match.start(), ranges)
             if redirect:
                 base = path.with_suffix("") if parents and path.name not in {"mod.rs", "lib.rs", "main.rs"} else path.parent
-                target = base.joinpath(*parents, redirect.group("path"))
-                candidates = (target,)
+                candidates = (base.joinpath(*parents, redirect.group("path")),)
             else:
                 base = path.parent if path.name in {"mod.rs", "lib.rs", "main.rs"} else path.with_suffix("")
                 base = base.joinpath(*parents)
                 name = match.group("name")
                 candidates = (base / f"{name}.rs", base / name / "mod.rs")
             target = next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
-            if target and target.is_relative_to(src_root):
+            if target and not target.is_relative_to(src_root):
+                target = None
+            location = attributed.start() if attributed else match.start()
+            line = source.count("\n", 0, location) + 1
+            tried = ", ".join(Path(os.path.relpath(candidate, repo_root)).as_posix() for candidate in candidates)
+            finding = Finding("unresolved-external-test-module", f"{path.relative_to(repo_root).as_posix()}:{line}", f"mod {match.group('name')}; did not resolve inside src; tried: {tried}")
+            children.append((target, is_test, finding))
+            if is_test:
+                if target:
+                    targets.add(target)
+                elif findings is not None:
+                    findings.append(finding)
+    pending = list(targets)
+    while pending:
+        for target, is_test, finding in declarations.get(pending.pop(), []):
+            if target and target not in targets:
                 targets.add(target)
-            elif findings is not None:
-                line = source.count("\n", 0, match.start()) + 1
-                tried = ", ".join(Path(os.path.relpath(candidate, repo_root)).as_posix() for candidate in candidates)
-                detail = f"mod {match.group('name')}; did not resolve inside src; tried: {tried}"
-                findings.append(Finding("unresolved-external-test-module", f"{path.relative_to(repo_root).as_posix()}:{line}", detail))
+                pending.append(target)
+            elif target is None and not is_test and findings is not None:
+                findings.append(finding)
     return targets
 
 
@@ -534,8 +577,7 @@ def discover_pg_inventory(
     receivers containing generic, tuple, reference, or ``dyn`` type syntax. A
     real Rust parser would be required to cover those forms without broad false
     positives. It skips ``src/main.rs``, ``src/bin/**`` (the current tree has
-    no such directory), sources injected by ``include!``, and attribute-free
-    external mods inside ``#[cfg(test)]`` inline modules. ``#[ignore]`` tests
+    no such directory), sources injected by ``include!``. ``#[ignore]`` tests
     remain selection/debt because their execution belongs to the ignore ledger.
     """
     repo_root = repo_root.resolve()
@@ -570,6 +612,15 @@ def discover_pg_inventory(
                 drop += 1
             return (*module[: max(0, len(module) - drop)], *parts[drop:])
         return parts
+
+    def import_bindings(module: tuple[str, ...], raw: str):
+        brace = re.fullmatch(r"(?P<base>.+)::\{(?P<items>[^{}]+)\}", raw.strip())
+        expanded = [f"{brace.group('base')}::{item.strip()}" for item in brace.group("items").split(",") if item.strip()] if brace else [raw.strip()]
+        for entry in expanded:
+            target_text, separator, alias = entry.partition(" as ")
+            target = absolute_path(module, target_text)
+            if target:
+                yield alias.strip() if separator else target[-1], target
 
     def nested(offset: int, ranges: Iterable[tuple[int, int]]) -> bool:
         return any(start < offset < end for start, end in ranges)
@@ -618,23 +669,7 @@ def discover_pg_inventory(
                 continue
             physical_module = (*physical_base, *_scope_at(use.start(), ranges))
             module = coverage._normalize_alias_path(physical_module, aliases)
-            raw = use.group("path").strip()
-            expanded: list[str]
-            brace = re.fullmatch(r"(?P<base>.+)::\{(?P<items>[^{}]+)\}", raw)
-            if brace:
-                expanded = [
-                    f"{brace.group('base')}::{item.strip()}"
-                    for item in brace.group("items").split(",")
-                    if item.strip()
-                ]
-            else:
-                expanded = [raw]
-            for entry in expanded:
-                target_text, separator, alias = entry.partition(" as ")
-                target = absolute_path(module, target_text)
-                if not target:
-                    continue
-                binding = alias.strip() if separator else target[-1]
+            for binding, target in import_bindings(module, use.group("path")):
                 if binding == "*":
                     wildcard_uses.setdefault(module, []).append(target[:-1])
                 else:
@@ -708,22 +743,26 @@ def discover_pg_inventory(
         module, name, _ = key
         by_path.setdefault((module, name), set()).add(key)
 
-    def resolve(module: tuple[str, ...], raw: str) -> set[tuple[tuple[str, ...], str, str]]:
+    def resolve(module: tuple[str, ...], raw: str, local_aliases=None, local_wildcards=()) -> set[tuple[tuple[str, ...], str, str]]:
+        bindings = {**use_aliases.get(module, {}), **(local_aliases or {})}
         if "::" in raw:
             parts = tuple(part for part in raw.split("::") if part)
-            alias = use_aliases.get(module, {}).get(parts[0]) if parts else None
+            alias = bindings.get(parts[0]) if parts else None
             target = (*alias, *parts[1:]) if alias else absolute_path(module, raw)
             return by_path.get((target[:-1], target[-1]), set()) if target else set()
+        if raw in (local_aliases or {}):
+            alias = local_aliases[raw]
+            return set(by_path.get((alias[:-1], alias[-1]), set()))
         targets = set(by_path.get((module, raw), set()))
-        alias = use_aliases.get(module, {}).get(raw)
+        alias = bindings.get(raw)
         if alias:
             targets.update(by_path.get((alias[:-1], alias[-1]), set()))
-        for base in wildcard_uses.get(module, []):
+        for base in (*wildcard_uses.get(module, []), *local_wildcards):
             targets.update(by_path.get((base, raw), set()))
         return targets
 
     def resolve_call(
-        module: tuple[str, ...], raw: str
+        module: tuple[str, ...], raw: str, local_aliases=None, local_wildcards=()
     ) -> set[tuple[tuple[str, ...], str, str]]:
         """Resolve a free call or one whole associated-call receiver path.
 
@@ -732,34 +771,45 @@ def discover_pg_inventory(
         ``a::b::TestDatabase`` receiver. Individual qualifier segments are never
         reinterpreted in the caller's module.
         """
-        targets = set(resolve(module, raw))
+        targets = set(resolve(module, raw, local_aliases, local_wildcards))
         receiver, separator, _method = raw.rpartition("::")
         if separator and not targets:
-            targets.update(resolve(module, receiver))
+            targets.update(resolve(module, receiver, local_aliases, local_wildcards))
         return targets
 
     def body_references(
         module: tuple[str, ...], body: str
     ) -> set[tuple[tuple[str, ...], str, str]]:
-        """Extract identical module-scoped references from tests and helpers."""
+        """Resolve body-local imports without leaking aliases into sibling tests."""
+        local_aliases = {}
+        local_wildcards = []
+        visible = list(body)
+        for use in _USE.finditer(body):
+            for binding, target in import_bindings(module, use.group("path")):
+                if binding == "*":
+                    local_wildcards.append(target[:-1])
+                else:
+                    local_aliases[binding] = target
+            visible[use.start():use.end()] = " " * (use.end() - use.start())
+        body = "".join(visible)
         calls = list(_CALL.finditer(body))
         ufcs_calls = list(_UFCS_CALL.finditer(body))
         occupied = [match.span() for match in (*calls, *ufcs_calls)]
         targets = {
             target
             for call in calls
-            for target in resolve_call(module, call.group("path"))
+            for target in resolve_call(module, call.group("path"), local_aliases, local_wildcards)
         }
         targets.update(
             target
             for call in ufcs_calls
-            for target in resolve(module, call.group("type"))
+            for target in resolve(module, call.group("type"), local_aliases, local_wildcards)
         )
         targets.update(
             target
             for mention in _BARE_REFERENCE.finditer(body)
             if not any(start <= mention.start() < end for start, end in occupied)
-            for target in resolve(module, mention.group("name"))
+            for target in resolve(module, mention.group("name"), local_aliases, local_wildcards)
         )
         return targets
 
@@ -926,13 +976,12 @@ def _cargo_commands(
     breaks, per the YAML folding rules, so it is emitted as its own command
     rather than folded into its neighbours.
 
-    Two forms are deliberately not modelled, both of which make the extracted
-    command WIDER than the real one -- a wider filter selects more tests, so
-    rule5 over-reports rather than under-reports on them. An explicit
-    indentation indicator that declares a content indent smaller than the
-    first content line's own indent is read at the first line's indent. And a
-    shell line continuation (a trailing ``\\``) inside a literal body is left
-    split, so ``cargo test --lib -- \\`` reads as a command with no skips.
+    An explicit indentation indicator that declares a content indent smaller
+    than the first content line's own indent is read at the first line's
+    indent, which makes the extracted command WIDER than the real one -- a
+    wider filter selects more tests, so rule5 over-reports rather than
+    under-reports on it. A shell line continuation (a trailing ``\\``) inside a
+    literal body is not joined, so a cargo test line ending in one is refused.
     """
     commands: list[str] = []
     header_indent: int | None = None
@@ -950,9 +999,9 @@ def _cargo_commands(
             value = re.sub(
                 r"[\"']?\$\{PG_INCLUDE_ARGS\[@\]\}[\"']?", included, value
             )
-        start = value.find("cargo test")
-        if start >= 0:
-            commands.append(value[start:])
+        argv = _proven_cargo_argv(value)
+        if argv is not None:
+            commands.append(shlex.join(argv))
 
     def flush() -> None:
         if pending:
@@ -986,7 +1035,8 @@ def _cargo_commands(
             continue
         if content_indent is None:
             content_indent = indent
-        value = stripped.strip('"\'')
+        # A block line is shell text as written: its quotes belong to the shell.
+        value = stripped
         if folded and indent <= content_indent:
             pending.append(value)
             continue
@@ -994,6 +1044,67 @@ def _cargo_commands(
         collect(value)
     flush()
     return commands
+
+
+# The closed set of prefixes CI runs `cargo test` behind; any other prefix is unproven.
+_ROOT_UNSET = ["env", "-u", "AGENTDESK_ROOT_DIR"]
+# The run_test_lane.py options CI passes, each with the argparse value it accepts.
+_RUN_TEST_LANE_OPTIONS = {"--lane": r"[^-].*", "--max-summaries": r"[1-9][0-9]*", "--skip": r"[^-].*"}
+
+
+def _prefix_template(words: list[str]) -> bool:
+    """Whether the raw words before `cargo` are one of the CI prefix templates."""
+    if words[:2] == ["python3", "scripts/ci-timeout.py"]:
+        return re.fullmatch(r"[1-9][0-9]*", "".join(words[2:3])) is not None \
+            and words[3:] == _ROOT_UNSET
+    if words[:2] == ["python3", "scripts/run_test_lane.py"] and "--" in words:
+        end = words.index("--")
+        names, values = words[2:end:2], words[3:end:2]
+        # argparse requires --lane; the command runs only after `--`.
+        return len(names) == len(values) and names.count("--lane") == 1 \
+            and all(re.fullmatch(_RUN_TEST_LANE_OPTIONS.get(name, r"(?!)"), value)
+                    for name, value in zip(names, values)) \
+            and words[end + 1:] == _ROOT_UNSET
+    return words in ([], _ROOT_UNSET)
+
+
+def _proven_cargo_argv(command: str) -> list[str] | None:
+    """The `cargo test` argv ``command`` runs. None when no lexed word holds a cargo
+    program and `test`; a cargo-command-unparsed ValueError unless a template proves it."""
+    lex = shell_lexer()
+    scan = lex.scan_shell(command)
+    parts = {part for token in scan.tokens if token.kind == "WORD"
+             for part in re.split(r"[^\w.]+", token.value or "")}
+    if not ("test" in parts and any(part.startswith("cargo") for part in parts)) \
+            and not lex.may_execute_cargo(scan):
+        return None
+    tokens = list(scan.tokens)
+    sourced = [token.raw for token in tokens[:3]] == ["source", NON_PG_FILTER_REL.as_posix(), "&&"]
+    tokens = tokens[3:] if sourced else tokens
+    at = next((index for index, token in enumerate(tokens) if token.value == "cargo"), -1)
+    # A prefix word is plain text, so its raw form is the word the shell runs.
+    prefix = [token.raw for token in tokens[:max(at, 0)]
+              if token.raw == token.value] if at >= 0 else None
+    arrays = {f"${{{name}[@]}}" for name in KNOWN_ARRAYS}
+    try:
+        argv = shlex.split(command[tokens[at].start:], comments=True) if at >= 0 else None
+    except ValueError:
+        argv = None
+    if scan.issues or argv is None or argv[:2] != ["cargo", "test"] \
+            or argv != [token.value for token in tokens[at:]] \
+            or len(prefix) != at or not _prefix_template(prefix) or (sourced and prefix) \
+            or any(token.kind != "WORD" or token.depth for token in tokens) \
+            or any(token.dynamic and token.value not in arrays for token in tokens):
+        raise ValueError(
+            f"cargo-command-unparsed: {command!r} crosses a shell boundary or "
+            "run-time value this gate cannot prove, so the lane filter it selects is unknown")
+    return argv
+
+
+def _lane_filter(coverage, command: str):
+    """``coverage.cargo_test_filter`` on the proven argv of the cargo test ``command`` runs."""
+    argv = _proven_cargo_argv(command)
+    return None if argv is None else coverage.cargo_test_filter(shlex.join(argv))
 
 
 def pg_lane_filters(
@@ -1013,7 +1124,7 @@ def pg_lane_filters(
                 commands.extend(coverage.just_recipe_commands(just_text, recipe))
             except ValueError:
                 pass
-    lanes = [coverage.cargo_test_filter(command) for command in commands]
+    lanes = [_lane_filter(coverage, command) for command in commands]
     return tuple(dict.fromkeys(lane for lane in lanes if lane is not None))
 
 
@@ -1027,7 +1138,7 @@ def pgless_lane_filters(
         for command in _cargo_commands(job.code, non_pg_skip_args):
             if "--all-targets" not in command or "--skip" not in command:
                 continue
-            lane = coverage.cargo_test_filter(command)
+            lane = _lane_filter(coverage, command)
             if lane is not None:
                 lanes.append(lane)
     return tuple(dict.fromkeys(lanes))
@@ -1057,7 +1168,7 @@ def pr_pgless_lane_filters(
         if "postgres-service.sh start" in job.code:
             continue
         for command in _cargo_commands(job.code, non_pg_skip_args):
-            lane = coverage.cargo_test_filter(command)
+            lane = _lane_filter(coverage, command)
             if lane is not None:
                 lanes.append(lane)
     return tuple(dict.fromkeys(lanes))
@@ -1402,6 +1513,98 @@ def load_lib_test_inventory(repo_root: Path) -> set[str]:
     return tests
 
 
+# Arrays the generated filter owns: a consumer may read them, never rebind them.
+KNOWN_ARRAYS = ("NON_PG_SKIP_ARGS", "PG_INCLUDE_ARGS")
+# A whole-line source, or one heading an `&&` chain; `|| true` or a prefix can fail open.
+_CANONICAL_SOURCE = re.compile(
+    rf"(?m)^([ \t]*)source {re.escape(NON_PG_FILTER_REL.as_posix())}[ \t]*(?:$|&&)"
+)
+# What runs the rest of a line even when the `&&`-chained source failed.
+_CHAIN_BREAK = re.compile(r"\n|;|\|\||(?<![&<>])&(?![&>])")
+_ARRAY_USE = re.compile(rf"\$\{{?({'|'.join(KNOWN_ARRAYS)})\b")
+_ARRAY_READ = re.compile(
+    rf"\$\{{[!#]?(?:{'|'.join(KNOWN_ARRAYS)})\b[^}}\n]*\}}|{_ARRAY_USE.pattern}"
+)
+_ARRAY_NAME = re.compile(rf"\b({'|'.join(KNOWN_ARRAYS)})\b")
+_SHELL_WORD = re.compile(r"[;&|()]+|[^\s;&|()]+")
+# Words opening a compound command, group or loop; a closer counts only in command position.
+_OPENERS = frozenset({"if", "case", "for", "select", "while", "until", "{"})
+_CLOSERS = frozenset({"fi", "esac", "done", "}"})
+
+
+def _at_top_level(shell: str, offset: int) -> bool:
+    """Whether the word at ``offset`` runs as the shell's own command, not quoted, heredoc
+    data, a continued line or inside a compound, function, subshell or substitution: a
+    fail-closed count."""
+    scan = shell_lexer().scan_shell(shell)
+    before = [token for token in scan.tokens if token.start < offset and not token.depth]
+    word = next((token for token in scan.tokens if token.start == offset), None)
+    # A continued line or an enclosing substitution's word leaves no newline right before
+    # it, and code left ending in `&&`, `||` or a pipe makes it their conditional part.
+    pending = next((token.raw for token in reversed(before) if token.kind != "NEWLINE"), "")
+    if word is None or word.kind != "WORD" \
+            or (before and before[-1].kind != "NEWLINE") or pending in ("&&", "||", "|", "|&"):
+        return False
+    depth = 0
+    for line in scan.syntax_masked[:offset].split("\n"):
+        words = _SHELL_WORD.findall(line)
+        for index, word in enumerate(words):
+            if word in _OPENERS:
+                depth += 1
+            elif word in _CLOSERS and (index == 0 or words[index - 1][-1] in ";&|("):
+                depth -= 1
+        # An open `(` nests; only a line led by `)` closes one, unlike a case pattern.
+        opened = line.count("(") - line.count(")")
+        if opened > 0 or line.lstrip().startswith(")"):
+            depth += opened
+        if depth < 0:
+            return False
+    return depth == 0
+
+
+def known_array_use(line: str) -> tuple[int, tuple[str, ...]] | None:
+    """Where one shell line first expands a generated array, and every one it expands."""
+    uses = list(_ARRAY_USE.finditer(shell_lexer().scan_shell(line).comment_masked))
+    if not uses:
+        return None
+    return uses[0].start(), tuple(dict.fromkeys(use.group(1) for use in uses))
+
+
+def known_array_source_problem(shell: str) -> tuple[str, int] | None:
+    """Why a generated-array use that ends ``shell``, one shell's text, is unproven.
+
+    ``("unsourced", -1)`` without a covering canonical source, ``(array, line)`` when a
+    later word but a ``$`` read rebinds one (0-based line of ``shell``), else None.
+    """
+    lex = shell_lexer()
+    scan = lex.scan_shell(shell)
+    # Past a boundary the lexer cannot prove, no later line's place in the shell is known;
+    # the use's own line ends mid-word here, so only earlier lines count.
+    if any(issue.kind in lex.OPEN_ISSUES and issue.start <= shell.rfind("\n")
+           for issue in scan.issues):
+        return ("unsourced", -1)
+    shell = scan.comment_masked
+    # A source indented past the shell's outermost lines sits inside a compound command.
+    outer = min((len(line) - len(line.lstrip()) for line in shell.split("\n") if line.strip()),
+                default=0)
+    # A quoted or nested `;` or `|` is data, not a break in the source's `&&` chain.
+    syntax = scan.syntax_masked
+    covering = [
+        source for source in _CANONICAL_SOURCE.finditer(shell)
+        if len(source.group(1)) == outer and _at_top_level(shell, source.end(1))
+        and (not source.group().endswith("&&") or not _CHAIN_BREAK.search(syntax, source.end()))
+    ]
+    if not covering:
+        return ("unsourced", -1)
+    start = covering[-1].end()
+    # Reads blank out at their own width, so offsets still locate the rebinding line.
+    unread = _ARRAY_READ.sub(lambda read: " " * len(read.group()), shell[start:])
+    rebound = _ARRAY_NAME.search(unread)
+    if rebound is None:
+        return None
+    return rebound.group(1), shell.count("\n", 0, start + rebound.start())
+
+
 def non_pg_filter_contract_errors(
     repo_root: Path, jobs: Iterable[Job]
 ) -> tuple[str, ...]:
@@ -1442,7 +1645,7 @@ def non_pg_filter_contract_errors(
                 f"{workflow}: literal --skip arguments duplicate the canonical "
                 f"definition in {NON_PG_FILTER_REL}"
             )
-        for array_name in ("NON_PG_SKIP_ARGS", "PG_INCLUDE_ARGS"):
+        for array_name in KNOWN_ARRAYS:
             if re.search(rf"(?m)^\s*{array_name}\s*(?:\+?=)", code):
                 errors.append(
                     f"{workflow}: redefines canonical {array_name} after sourcing "
@@ -1450,17 +1653,25 @@ def non_pg_filter_contract_errors(
                 )
 
     for job in relevant.values():
+        # A block scalar's shell text starts on the line after its indicator.
         run_headers = [
-            match.start()
-            for match in re.finditer(r"(?m)^\s*(?:-\s+)?run\s*:", job.code)
+            match.end() for match in re.finditer(
+                r"(?m)^\s*(?:-\s+)?run\s*:[ \t]*(?:[|>][-+0-9]*[ \t]*\n)?", job.code)
         ]
         for variable in variables:
             for match in re.finditer(re.escape(variable), job.code):
-                header = max((offset for offset in run_headers if offset < match.start()), default=-1)
-                if header < 0 or source_command not in job.code[header:match.start()]:
+                header = max((offset for offset in run_headers if offset <= match.start()), default=-1)
+                problem = ("unsourced", -1) if header < 0 else known_array_source_problem(
+                    job.code[header:match.start()])
+                if problem and problem[0] == "unsourced":
                     errors.append(
                         f"{job.key}: {variable} is used without sourcing "
                         f"{NON_PG_FILTER_REL} in the same run scalar"
+                    )
+                elif problem:
+                    errors.append(
+                        f"{job.key}: {problem[0]} is reassigned after sourcing "
+                        f"{NON_PG_FILTER_REL} and before a {variable} use"
                     )
 
     for key in sorted(NON_PG_FILTER_REQUIRED_JOBS):
@@ -1500,7 +1711,10 @@ def load_pg_include_shards(repo_root: Path) -> tuple[tuple[str, ...], ...]:
         )
         if match is None:
             raise ValueError(f"{NON_PG_FILTER_REL}: missing PG_INCLUDE_ARGS_SHARD_{index}")
-        shards.append(tuple(shlex.split(match.group(1))))
+        words = shell_lexer().shell_words(match.group(1))
+        if words is None:
+            raise ValueError(f"{NON_PG_FILTER_REL}: PG_INCLUDE_ARGS_SHARD_{index} is not plain words")
+        shards.append(words)
     return tuple(shards)
 
 
@@ -1564,6 +1778,15 @@ def pg_shard_contract_errors(repo_root: Path, jobs: Iterable[Job]) -> list[str]:
     return errors
 
 
+def non_pg_module_selectors(modules: tuple[str, ...]) -> tuple[str, ...]:
+    """Drop module selectors whose substring matches are already covered."""
+    return tuple(
+        module for module in modules
+        if not any(name in module for name in NON_PG_NAME_SKIPS)
+        and not any(other != module and other in module for other in modules)
+    )
+
+
 def non_pg_selection(repo_root: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """The skip values, and the lib tests they take with them.
 
@@ -1575,7 +1798,7 @@ def non_pg_selection(repo_root: Path) -> tuple[tuple[str, ...], tuple[str, ...]]
     coverage = _load_coverage_module(repo_root)
     modules = coverage.load_manifest_section(manifest_text, "modules", str(MANIFEST_REL))
     pg_tests = coverage.load_pg_manifest_tests(repo_root)
-    skips = tuple(NON_PG_NAME_SKIPS) + modules
+    skips = tuple(NON_PG_NAME_SKIPS) + non_pg_module_selectors(modules)
     inventory = load_lib_test_inventory(repo_root)
     if not inventory:
         raise ValueError(f"no library tests listed: {LIB_TEST_INVENTORY_REL}")

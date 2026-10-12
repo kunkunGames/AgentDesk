@@ -178,6 +178,9 @@ fn resolve_cancel_force(query_force: bool, body: &Bytes) -> bool {
     }
 }
 
+#[cfg(test)]
+thread_local! { pub(crate) static CANCEL_SERVICE_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// Cancel the active turn in a channel.
 ///
 /// Default (`force=false`): preserves the live provider session and watcher;
@@ -196,6 +199,19 @@ pub async fn cancel_turn(
     Query(query): Query<CancelTurnQuery>,
     body: Bytes,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    // A home-stop envelope is a holder's request, never a direct cancel: refused before any effect.
+    let envelope = crate::services::session_forwarding::home_stop::names_envelope(&body);
+    #[cfg(test)]
+    let envelope = envelope
+        && !crate::services::cluster::channel_home::command_mutant("cancel_endpoint_accepts_v1");
+    if envelope {
+        return Err(
+            AppError::bad_request("home stop envelope on a direct cancel")
+                .with_context("code", "home_stop_envelope_on_cancel"),
+        );
+    }
+    #[cfg(test)]
+    CANCEL_SERVICE_ENTRIES.with(|count| count.set(count.get() + 1));
     let force = resolve_cancel_force(query.force, &body);
     let forward_context = crate::services::session_forwarding::ForwardCallerContext::from(&state);
     let response = state
@@ -209,6 +225,32 @@ pub async fn cancel_turn(
         )
         .await?;
     Ok((StatusCode::OK, Json(response)))
+}
+
+/// POST /api/internal/home-stop/v1 — a gateway's user stop forwarded to a delegated channel's
+/// holder; it runs only through the trusted forward and this node's own `/stop`.
+pub async fn home_stop_v1(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let context = crate::services::session_forwarding::ForwardCallerContext::from(&state);
+    let registry = state.health_registry.clone();
+    #[cfg(test)]
+    let registry = if crate::services::cluster::channel_home::command_mutant(
+        "home_stop_runtime_binding_removed",
+    ) {
+        None
+    } else {
+        registry
+    };
+    let run = |provider, channel| async move {
+        let stop = crate::services::discord::zombie_foreground_release::run_holder_stop;
+        stop(registry.as_deref(), &provider, channel).await
+    };
+    let receive = crate::services::session_forwarding::home_stop::receive;
+    let (status, answer) = receive(&context, &headers, &body, run).await;
+    (status, Json(answer))
 }
 
 // ── GET /api/channels/:id/watcher-state ─────────────────────────
@@ -429,27 +471,46 @@ mod cancel_queue_preserve_pg_tests {
 
     #[tokio::test]
     async fn queue_truth_dispatch_cancel_serializes_unknown_pg() {
-        dispatch_cancel_observation(None).await;
+        dispatch_cancel_observation(None, false, false).await;
     }
 
     #[tokio::test]
-    async fn queue_truth_dispatch_hydration_unreachable_pg() {
-        dispatch_cancel_observation(Some(
-            crate::services::turn_orchestrator::registry_purge::MailboxRefusal::Unreachable,
-        ))
+    async fn queue_truth_dispatch_unobserved_reply_unreachable_pg() {
+        dispatch_cancel_observation(
+            Some(crate::services::turn_orchestrator::registry_purge::MailboxRefusal::Unreachable),
+            false,
+            false,
+        )
         .await;
     }
 
     #[tokio::test]
-    async fn queue_truth_dispatch_hydration_closed_pg() {
-        dispatch_cancel_observation(Some(
-            crate::services::turn_orchestrator::registry_purge::MailboxRefusal::Closed,
-        ))
+    async fn queue_truth_dispatch_unobserved_reply_closed_pg() {
+        dispatch_cancel_observation(
+            Some(crate::services::turn_orchestrator::registry_purge::MailboxRefusal::Closed),
+            false,
+            false,
+        )
         .await;
+    }
+
+    #[tokio::test]
+    async fn c1_dispatch_observed_idle_hydration_refusals_pg() {
+        use crate::services::turn_orchestrator::registry_purge::MailboxRefusal;
+        for refusal in [MailboxRefusal::Closed, MailboxRefusal::Unreachable] {
+            dispatch_cancel_observation(Some(refusal), true, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn c1_dispatch_closed_actor_finishes_offline_pg() {
+        dispatch_cancel_observation(None, false, true).await;
     }
 
     async fn dispatch_cancel_observation(
         refusal: Option<crate::services::turn_orchestrator::registry_purge::MailboxRefusal>,
+        observed_idle: bool,
+        dead: bool,
     ) {
         let temp = tempfile::tempdir().unwrap();
         let _root = crate::config::TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
@@ -476,8 +537,11 @@ mod cancel_queue_preserve_pg_tests {
                 None,
             )
             .unwrap();
-            let attempts =
-                mailboxes.insert_snapshot_only_for_test(channel, Default::default(), refusal);
+            let attempts = if observed_idle {
+                mailboxes.insert_idle_snapshot_for_test(channel, Default::default(), refusal)
+            } else {
+                mailboxes.insert_snapshot_only_for_test(channel, Default::default(), refusal)
+            };
             let registry = crate::services::discord::health::HealthRegistry::new();
             registry.register("claude".into(), shared.clone()).await;
             state.health_registry = Some(Arc::new(registry));
@@ -485,6 +549,12 @@ mod cancel_queue_preserve_pg_tests {
         } else {
             None
         };
+        if dead {
+            mailboxes.insert_unreachable_for_test(channel);
+            let registry = crate::services::discord::health::HealthRegistry::new();
+            registry.register("claude".into(), shared.clone()).await;
+            state.health_registry = Some(Arc::new(registry));
+        }
         let app = domains::ops::router(state.clone()).with_state(state);
         let request = Request::builder()
             .method(Method::POST)
@@ -493,20 +563,25 @@ mod cancel_queue_preserve_pg_tests {
             .body(Body::empty())
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let body: Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap())
                 .unwrap();
-        assert_eq!(body["active_turn_cancelled"], true);
         mailboxes.remove_fixture_for_test(channel);
-        if let Some(attempts) = attempts {
-            let closed = refusal
-                == Some(crate::services::turn_orchestrator::registry_purge::MailboxRefusal::Closed);
-            assert_eq!(
-                attempts.load(std::sync::atomic::Ordering::SeqCst),
-                if closed { 3 } else { 1 }
-            );
-            assert_eq!(body["turn_queue_preserved"], true);
+        if let Some(attempts) = attempts.as_ref().filter(|_| !observed_idle) {
+            // A hydration refusal fixture also drops CancelToken replies: no stop was judged.
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["code"], "dispatch");
+            assert_eq!(body["error"], "actor_unreachable");
+            assert!(body.get("active_turn_cancelled").is_none());
+            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_cancel_target_status(&pool, channel.get(), "turn_active").await;
+            let dispatch_status: String =
+                sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id = 'queue-truth'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(dispatch_status, "dispatched");
             let disk = crate::services::turn_orchestrator::load_channel_pending_queue_for_tests(
                 &ProviderKind::Claude,
                 token,
@@ -518,9 +593,30 @@ mod cancel_queue_preserve_pg_tests {
                 [42]
             );
         } else {
-            assert_explicit_null(&body, "turn_queue_preserved");
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["active_turn_cancelled"], true);
+            if dead {
+                assert_cancel_target_status(&pool, channel.get(), "disconnected").await;
+            }
+            if observed_idle {
+                let disk =
+                    crate::services::turn_orchestrator::load_channel_pending_queue_for_tests(
+                        &ProviderKind::Claude,
+                        token,
+                        channel,
+                    )
+                    .0;
+                assert_eq!(
+                    disk.iter().map(|x| x.message_id.get()).collect::<Vec<_>>(),
+                    [42]
+                );
+                assert_eq!(body["turn_queue_preserved"], true, "{body}");
+                assert_eq!(attempts.as_ref().unwrap().load(std::sync::atomic::Ordering::SeqCst), if refusal == Some(crate::services::turn_orchestrator::registry_purge::MailboxRefusal::Closed) { 3 } else { 1 });
+            } else {
+                assert_explicit_null(&body, "turn_queue_preserved");
+            }
+            assert_explicit_null(&body, "turn_queued_remaining");
         }
-        assert_explicit_null(&body, "turn_queued_remaining");
         pool.close().await;
         db.drop().await;
     }
@@ -548,10 +644,13 @@ mod cancel_queue_preserve_pg_tests {
             "drop",
             "hydrate-drop",
             "hydrate-closed",
+            "idle-hydrate-drop",
+            "idle-hydrate-closed",
             "purge-empty",
             "purge-queued",
             "rollback",
             "stat",
+            "corrupt",
         ]
         .into_iter()
         .enumerate()
@@ -560,11 +659,15 @@ mod cancel_queue_preserve_pg_tests {
             let _root = crate::config::TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
             let db = TestPostgresDb::create().await;
             let pool = db.connect_and_migrate().await;
-            let channel = ChannelId::new(6038750 + i as u64);
+            // 6038760.. belongs to turn_cancel_queue_guard's table, so the added row sits apart.
+            let channel = ChannelId::new(match row {
+                "corrupt" => 6_813_750,
+                _ => 6038750 + i as u64,
+            });
             seed_cancel_target(&pool, channel.get()).await;
             // A forced cancel through the runtime is kept unless its host guard can read the
             // sessions table, so the forced rows' runtime runs on the test pool.
-            let shared = if row == "purge-empty" || row == "rollback" {
+            let shared = if matches!(row, "purge-empty" | "rollback" | "corrupt") {
                 crate::services::discord::host_teardown_gate::test_support::shared_on(&pool).await
             } else {
                 make_shared_data_for_tests()
@@ -579,12 +682,15 @@ mod cancel_queue_preserve_pg_tests {
                     .await;
             }
             let snapshot = handle.snapshot().await;
-            let refusal = if row == "hydrate-closed" {
+            let refusal = if row.ends_with("hydrate-closed") {
                 MailboxRefusal::Closed
             } else {
                 MailboxRefusal::Unreachable
             };
-            let attempts = if row.starts_with("hydrate") || row.starts_with("purge") {
+            let attempts = if row.starts_with("purge") || row.starts_with("idle-hydrate") {
+                // Post-judgement queue coverage needs observed idle, not a dropped reply.
+                Some(mailboxes.insert_idle_snapshot_for_test(channel, snapshot, refusal))
+            } else if row.starts_with("hydrate") {
                 Some(mailboxes.insert_snapshot_only_for_test(channel, snapshot, refusal))
             } else {
                 None
@@ -595,7 +701,7 @@ mod cancel_queue_preserve_pg_tests {
             if row == "drop" {
                 mailboxes.insert_reply_dropping_for_test(channel);
             }
-            if row.starts_with("hydrate") {
+            if row.contains("hydrate") {
                 save_channel_queue(&provider, token, channel, &[queued_user_message(42)], None)
                     .unwrap();
             }
@@ -606,43 +712,79 @@ mod cancel_queue_preserve_pg_tests {
                 std::fs::create_dir_all(&parent).unwrap();
                 std::fs::write(parent.join(token), b"not a directory").unwrap();
             }
-            if row == "rollback" {
-                std::fs::create_dir_all(parent.join(format!("{}.json", channel.get()))).unwrap();
+            if row == "rollback" || row == "corrupt" {
                 crate::services::queue::set_pre_purge_hook_for_test(
                     channel,
                     vec![queued_user_message(42)],
                     "tokB",
                 );
             }
+            // A directory where the purge's own snapshot lives is unreadable, so S2a refuses it.
+            let unreadable = parent.join(format!("{}.json", channel.get()));
+            if row == "corrupt" {
+                std::fs::create_dir_all(&unreadable).unwrap();
+            }
             let app = if row == "purge-queued" {
                 test_router(pool.clone())
             } else {
                 registered_app(&pool, &shared).await
             };
-            let force = row.starts_with("purge") || row == "rollback";
+            let force = row.starts_with("purge") || row == "rollback" || row == "corrupt";
+            let fault_armed = std::rc::Rc::new(std::cell::Cell::new(false));
+            if row == "rollback" {
+                // The hook's restore save samples source clocks after its own fault check, so the
+                // fault armed there fails only the purge's later save, past its checked preflight.
+                let armed = fault_armed.clone();
+                Intervention::source_clock_sample_hook_for_tests(move || {
+                    crate::services::turn_orchestrator::test_support::fail_queue_saves(channel, 1);
+                    armed.set(true);
+                });
+            }
             let (status, body) = post_cancel(&app, channel.get(), force).await;
+            if row == "rollback" {
+                assert!(
+                    fault_armed.get(),
+                    "the hook's restore save must arm the fault"
+                );
+                assert_eq!(
+                    crate::services::turn_orchestrator::test_support::queue_save_faults(
+                        channel, true
+                    ),
+                    0,
+                    "the purge's save must consume the armed fault"
+                );
+            }
             mailboxes.remove_fixture_for_test(channel);
-            assert_eq!(status, StatusCode::OK, "{row}: {body}");
-            if row == "dead" || row == "drop" {
-                for key in [
-                    "queued_remaining",
-                    "queued_before",
-                    "queue_preserved",
-                    "queue_disk_present_before",
-                    "queue_disk_present_after",
-                    "queue_loss_recorded",
-                ] {
-                    assert_explicit_null(&body, key);
+            if row == "drop" || row.starts_with("hydrate") {
+                // Mailbox reply loss is unknown, not an observed idle turn.
+                assert_eq!(status, StatusCode::CONFLICT, "{row}: {body}");
+                assert_eq!(body["code"], "conflict", "{row}: {body}");
+                assert_cancel_target_status(&pool, channel.get(), "turn_active").await;
+                if let Some(attempts) = attempts {
+                    assert_eq!(
+                        attempts.load(std::sync::atomic::Ordering::SeqCst),
+                        0,
+                        "{row}"
+                    );
+                    let disk = load_channel_pending_queue_for_tests(&provider, token, channel).0;
+                    assert_eq!(
+                        disk.iter().map(|x| x.message_id.get()).collect::<Vec<_>>(),
+                        [42]
+                    );
                 }
-            } else if row.starts_with("hydrate") {
-                let expected_attempts = if refusal == MailboxRefusal::Closed {
-                    3
-                } else {
-                    1
-                };
+                assert!(
+                    dead_letter_row(&pool, channel.get()).await.is_none(),
+                    "{row}"
+                );
+            } else if row.starts_with("idle-hydrate") {
+                assert_eq!(status, StatusCode::OK, "{row}: {body}");
                 assert_eq!(
                     attempts.unwrap().load(std::sync::atomic::Ordering::SeqCst),
-                    expected_attempts,
+                    if refusal == MailboxRefusal::Closed {
+                        3
+                    } else {
+                        1
+                    },
                     "{row}"
                 );
                 assert_explicit_null(&body, "queued_remaining");
@@ -654,7 +796,11 @@ mod cancel_queue_preserve_pg_tests {
                     [42]
                 );
             } else {
+                assert_eq!(status, StatusCode::OK, "{row}: {body}");
                 assert_explicit_null(&body, "queue_loss_recorded");
+                if row == "dead" {
+                    assert_cancel_target_status(&pool, channel.get(), "disconnected").await;
+                }
                 if row == "stat" {
                     assert_explicit_null(&body, "queue_disk_present_before");
                 } else {
@@ -663,7 +809,7 @@ mod cancel_queue_preserve_pg_tests {
                     } else {
                         assert_explicit_null(&body, "queue_purged");
                     }
-                    if row == "purge-empty" {
+                    if row == "purge-empty" || row == "dead" || row == "corrupt" {
                         assert_explicit_null(&body, "queued_remaining");
                     } else {
                         assert_eq!(
@@ -671,6 +817,20 @@ mod cancel_queue_preserve_pg_tests {
                             "{row}: depth must be 1, never inferred 0: {body}"
                         );
                     }
+                }
+                if row == "corrupt" {
+                    // A refused purge keeps the directory, the restored file and the queue.
+                    assert!(unreadable.is_dir(), "{row}");
+                    let ids = |queue: Vec<Intervention>| {
+                        queue.iter().map(|x| x.message_id.get()).collect::<Vec<_>>()
+                    };
+                    let disk = load_channel_pending_queue_for_tests(&provider, "tokB", channel).0;
+                    assert_eq!(ids(disk), [42], "{row}");
+                    assert_eq!(
+                        ids(handle.snapshot().await.intervention_queue),
+                        [42],
+                        "{row}"
+                    );
                 }
             }
             pool.close().await;
@@ -721,6 +881,16 @@ mod cancel_queue_preserve_pg_tests {
             panic!("cancel body is not JSON ({status}): {error}: {raw}")
         });
         (status, body)
+    }
+
+    async fn assert_cancel_target_status(pool: &sqlx::PgPool, channel_id: u64, expected: &str) {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM sessions WHERE channel_id = $1")
+                .bind(channel_id.to_string())
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(status, expected);
     }
 
     /// A missing key must not pass as `null`: absent and unmeasured are different answers.
@@ -996,3 +1166,7 @@ mod cancel_queue_preserve_pg_tests {
         pg_db.drop().await;
     }
 }
+
+#[cfg(test)]
+#[path = "queue_api_home_stop_tests.rs"]
+pub(crate) mod home_stop_tests;

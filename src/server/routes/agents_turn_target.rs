@@ -135,6 +135,34 @@ fn resolve_bound_target(
     })
 }
 
+/// 409 when a turn that never claimed the mailbox (TUI-direct, adopted or monitor) still
+/// holds the channel, or a turn-mode transcript reads busy or unknown: a start there would
+/// report `started` and then lose the prompt.
+pub(super) async fn external_turn_conflict(
+    registry: Option<&crate::services::discord::health::HealthRegistry>,
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    use crate::services::discord::health::{ExternalHold, external_turn_hold_for_start};
+    let hold = external_turn_hold_for_start(registry, provider, channel_id).await?;
+    let error = match hold {
+        ExternalHold::Unknown => format!("channel {channel_id}'s TUI turn state is unknown"),
+        _ => format!("an external TUI turn holds channel {channel_id}"),
+    };
+    let reason = hold.reason();
+    let body = json!({"ok": false, "status": "conflict", "reason": reason, "error": error});
+    Some((StatusCode::CONFLICT, Json(body)))
+}
+
+/// The supervised presence of the agent's turn channel; null outside turn mode.
+pub(super) async fn turn_presence(pool: &sqlx::PgPool, id: &str) -> serde_json::Value {
+    let target = resolve_agent_turn_target(pool, id, None, None).await.ok();
+    let status = crate::services::discord::health::turn_presence_status;
+    target
+        .and_then(|target| status(target.channel_id))
+        .unwrap_or(serde_json::Value::Null)
+}
+
 /// Starts a headless turn on a resolved agent target; returns its turn id and start status.
 /// Shared by the turn-start route and the voice conductor.
 pub(super) async fn start_headless_turn_on_target(

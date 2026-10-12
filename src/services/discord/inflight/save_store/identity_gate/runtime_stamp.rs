@@ -1,5 +1,5 @@
 use super::*;
-use crate::services::agent_protocol::StreamMessage;
+use crate::services::agent_protocol::{NativeTerminalKind, StreamMessage};
 use crate::services::discord::inflight::store::persist_under_lock_with_snapshot;
 use crate::services::discord::outbound::delivery_record::ExactJsonlSourceIdentity;
 use crate::services::discord::turn_bridge::{tmux_generation_file_mtime_ns, tmux_runtime_paths};
@@ -12,6 +12,10 @@ pub(in crate::services::discord) struct TuiTerminalRange {
     pub(in crate::services::discord) source: ExactJsonlSourceIdentity,
     #[serde(default)]
     pub(in crate::services::discord) source_file_identity: Option<(u64, u64)>,
+    /// How the admitted frame's provider record ended the turn; `Completed` is not written, so a
+    /// completed range keeps its earlier bytes and older ranges read as `Completed`.
+    #[serde(default, skip_serializing_if = "NativeTerminalKind::is_completed")]
+    pub(in crate::services::discord) kind: NativeTerminalKind,
     // Only reconstruction from the durable captured Codex row grants this;
     // serialized frames and live admissions cannot widen cursor authority.
     #[serde(skip)]
@@ -76,6 +80,7 @@ impl InflightTurnState {
             source_start,
             complete_record_end,
             captured_source: None,
+            kind,
         } = message
         else {
             return (message, None, false);
@@ -96,7 +101,7 @@ impl InflightTurnState {
             (&tmux_session_name, &turn_nonce),
             (source_start, complete_record_end),
         );
-        (done, admitted.ok(), true)
+        (done, admitted.ok().map(|range| range.of_kind(kind)), true)
     }
 }
 fn admit_codex_terminal_range_in_root(
@@ -217,6 +222,7 @@ fn persist_terminal_range(
     local.save_generation = persisted.save_generation;
     Ok(TuiTerminalRange {
         retained_codex_terminal: false,
+        kind: NativeTerminalKind::Completed,
         identity: InflightTurnIdentity::from_state(&persisted),
         result: result.to_string(),
         rollout_path: canonical,
@@ -251,7 +257,12 @@ impl TuiTerminalRange {
             source,
             source_file_identity,
             retained_codex_terminal: false,
+            kind: NativeTerminalKind::Completed,
         }
+    }
+
+    fn of_kind(self, kind: NativeTerminalKind) -> Self {
+        Self { kind, ..self }
     }
 
     /// Reconstruct only previously admitted evidence; live validation remains
@@ -264,6 +275,8 @@ impl TuiTerminalRange {
         }
         let captured = Self {
             retained_codex_terminal: row.provider_kind() == Some(ProviderKind::Codex),
+            // Pinned evidence was required above; an older pinned row reads as a completion.
+            kind: row.tui_terminal_kind.unwrap_or_default(),
             identity: InflightTurnIdentity::from_state(row),
             result: row.full_response.clone(),
             rollout_path: row.output_path.clone()?,
@@ -794,6 +807,7 @@ mod tests {
                 turn_nonce: nonce.into(),
                 source_start: start,
                 complete_record_end: end,
+                kind: NativeTerminalKind::Completed,
             };
             let rejected = local.admit_codex_tui_terminal_frame(
                 &mut baseline,
@@ -1274,7 +1288,15 @@ impl InflightTurnState {
         ),
         observed_response: &str,
         message: StreamMessage,
-    ) -> Result<(StreamMessage, Option<TuiTerminalRange>, bool), GuardedSaveOutcome> {
+    ) -> Result<
+        (
+            StreamMessage,
+            Option<TuiTerminalRange>,
+            bool,
+            Option<NativeTerminalKind>,
+        ),
+        GuardedSaveOutcome,
+    > {
         let provider = if matches!(
             &message,
             StreamMessage::CodexTuiTerminalDone {
@@ -1303,6 +1325,7 @@ impl InflightTurnState {
             source_file_dev,
             source_file_ino,
             actor,
+            kind,
         }
         | StreamMessage::CodexTuiTerminalDone {
             result,
@@ -1319,14 +1342,19 @@ impl InflightTurnState {
                     source_file_ino,
                     actor,
                 }),
+            kind,
         }) = message
         else {
-            return Ok(self.admit_codex_tui_terminal_frame(
+            let admitted = captured_terminal_admission::admit_uncaptured_terminal(
+                self,
                 baseline,
                 expected,
                 can_deliver_directly,
                 message,
-            ));
+            );
+            return admitted
+                .await
+                .map(|(msg, range, terminal)| (msg, range, terminal, None));
         };
         let (shared, bridge_actor) = actor_authority;
         let result = if result.trim().is_empty() {
@@ -1353,106 +1381,110 @@ impl InflightTurnState {
         {
             return Err(mismatch);
         }
-        let root = inflight_runtime_root().ok_or(mismatch)?;
-        let path = inflight_state_path(&root, &provider, self.channel_id);
-        let _lock = lock_inflight_state_path(&path).map_err(|_| GuardedSaveOutcome::IoError)?;
-        let mut fresh = read_inflight_state_for_guarded_write(
-            &path,
-            &provider,
-            self.channel_id,
-            expected,
-            "turn_bridge::captured_tui_terminal_range",
-        )?;
-        crate::services::tmux_common::with_tmux_source_authority(&tmux_session_name, |authority| {
-            let (canonical, file_len) = canonical_regular_file(&transcript_path).ok_or(mismatch)?;
-            let mut binding = crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session_under_source_authority(authority)
-            .ok_or(mismatch)?;
-            let session = nonempty(session_id.as_deref())
-                .or(nonempty(self.session_id.as_deref()))
-                .unwrap_or_default()
-                .to_owned();
-            // Fresh native TUI rows and bindings omit session ID. Only this decoded
-            // FD/generation/original-actor witness can fill that missing value;
-            // conflicting known sessions remain a hard mismatch.
-            if [
-                self.session_id.as_deref(),
-                fresh.session_id.as_deref(),
-                binding.session_id.as_deref(),
-            ]
-            .into_iter()
-            .filter_map(nonempty)
-            .any(|known| known != session)
-            {
-                return Err(mismatch);
-            }
-            binding.session_id = nonempty(Some(&session)).map(str::to_owned);
-            if !can_deliver_directly
-                || self.provider_kind() != Some(provider.clone())
-                || self.runtime_kind != Some(runtime)
-                || self.turn_start_offset != Some(source_start)
-                || source_start >= complete_record_end
-                || file_len < complete_record_end
-                || generation_mtime_ns <= 0
-                || tmux_generation_file_mtime_ns(&tmux_session_name) != generation_mtime_ns
-                || file_identity(&canonical) != Some((source_file_dev, source_file_ino))
-                || !captured_binding_matches(
-                    &binding,
-                    &canonical,
-                    &session,
-                    (source_start, complete_record_end),
-                    false,
-                    runtime,
-                )
-            {
-                return Err(mismatch);
-            }
-            if fresh.turn_nonce.as_deref() != Some(turn_nonce.as_str())
-                || fresh.tmux_session_name.as_deref() != Some(tmux_session_name.as_str())
-                || fresh.runtime_kind != Some(runtime)
-                || fresh.turn_start_offset != Some(source_start)
-                || fresh.last_offset > complete_record_end
-                || fresh.restart_mode.is_some()
-                || fresh.rebind_origin
-                || fresh.terminal_delivery_committed
-                || !StreamRelayAuthority::from_state(&fresh).bridge_owns_relay()
-                || fresh
-                    .output_path
-                    .as_deref()
-                    .and_then(|path| std::fs::canonicalize(path).ok())
-                    .as_deref()
-                    != Some(canonical.as_path())
-            {
-                return Err(mismatch);
-            }
-            let before_admission = InflightEpisodePin::from_state(&fresh);
-            fresh.session_id.clone_from(&binding.session_id);
-            let range = persist_terminal_range(
-                &root,
-                &path,
-                (self, &mut *baseline),
-                fresh,
-                (&result, canonical, &session),
-                (
-                    (source_start, complete_record_end),
-                    generation_mtime_ns,
-                    Some((source_file_dev, source_file_ino)),
-                ),
-            )?;
-            crate::services::discord::tui_prompt_relay::preserve_admitted_source(
-                &before_admission,
-                baseline,
-                &captured,
-            );
-            crate::services::tui_prompt_dedupe::register_tmux_runtime_binding_under_source_authority(authority, binding);
-            Ok((
-                StreamMessage::Done { result, session_id },
-                Some(range),
-                true,
-            ))
+        if generation_mtime_ns == 0
+            && crate::services::provider::herdr_provider_terminal_only(Some(bridge_actor)).is_some()
+        {
+            let frame = herdr_terminal_admission::HerdrFrame {
+                provider,
+                result,
+                session_id,
+                path: transcript_path,
+                logical: tmux_session_name,
+                turn_nonce,
+                source_start,
+                end: complete_record_end,
+                file: (source_file_dev, source_file_ino),
+                kind,
+            };
+            return self
+                .admit_herdr_terminal(baseline, expected, can_deliver_directly, captured, frame)
+                .await;
+        }
+        let admission = captured_terminal_admission::CapturedTerminalAdmission {
+            provider,
+            runtime,
+            result,
+            session_id,
+            transcript_path,
+            tmux_session_name,
+            turn_nonce,
+            source_start,
+            complete_record_end,
+            generation_mtime_ns,
+            source_file_dev,
+            source_file_ino,
+            captured,
+            can_deliver_directly,
+            kind,
+        };
+        let mut local = self.clone();
+        let mut persisted = baseline.clone();
+        let expected = expected.clone();
+        // Keep the complete lock-held transaction off the scheduler, including release.
+        let (outcome, local, persisted) = tokio::task::spawn_blocking(move || {
+            let outcome = admission.admit(&mut local, &mut persisted, &expected);
+            (outcome, local, persisted)
         })
+        .await
+        .map_err(|_| GuardedSaveOutcome::IoError)?;
+        *self = local;
+        *baseline = persisted;
+        outcome.map(|(msg, range, terminal)| (msg, range, terminal, None))
+    }
+
+    /// A Herdr typed terminal: admitted, it becomes the turn's Done carrying its kind; refused, it
+    /// stays an error, so no Herdr terminal degrades to a terminal-capable plain Done.
+    async fn admit_herdr_terminal(
+        &mut self,
+        baseline: &mut InflightTurnState,
+        expected: &InflightTurnIdentity,
+        can_deliver_directly: bool,
+        actor: std::sync::Arc<crate::services::provider::CancelToken>,
+        frame: herdr_terminal_admission::HerdrFrame,
+    ) -> Result<
+        (
+            StreamMessage,
+            Option<TuiTerminalRange>,
+            bool,
+            Option<NativeTerminalKind>,
+        ),
+        GuardedSaveOutcome,
+    > {
+        let (mut local, mut persisted, expected) =
+            (self.clone(), baseline.clone(), expected.clone());
+        let done = StreamMessage::Done {
+            result: frame.result.clone(),
+            session_id: frame.session_id.clone(),
+        };
+        #[cfg(test)]
+        let binding_root = crate::services::tui_prompt_dedupe::binding_events::test_root();
+        // The marker, binding log and transcript reads and the lock-held commit stay off the scheduler.
+        let (admitted, local, persisted) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            crate::services::tui_prompt_dedupe::binding_events::set_test_root(
+                binding_root.as_deref(),
+            );
+            let states = (&mut local, &mut persisted);
+            let admitted = frame.admit(states, &expected, can_deliver_directly, &actor);
+            (admitted, local, persisted)
+        })
+        .await
+        .map_err(|_| GuardedSaveOutcome::IoError)?;
+        *self = local;
+        *baseline = persisted;
+        admitted.map(|kind| (done, None, true, Some(kind)))
     }
 }
 
 #[cfg(all(test, unix))]
 #[path = "runtime_stamp/claude_terminal_tests.rs"]
 mod claude_terminal_tests;
+
+#[path = "runtime_stamp/captured_terminal_admission.rs"]
+mod captured_terminal_admission;
+
+#[path = "runtime_stamp/herdr_terminal_admission.rs"]
+pub(in crate::services::discord) mod herdr_terminal_admission;
+
+#[path = "runtime_stamp/before_start_stop_admission.rs"]
+pub(in crate::services::discord::inflight) mod before_start_stop_admission;

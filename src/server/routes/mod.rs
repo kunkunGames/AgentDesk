@@ -50,8 +50,13 @@ pub mod reviews;
 pub mod routines;
 #[cfg(test)]
 mod runtime_profile_tests;
+// The literal test gate keeps the source censuses from reading this file as production.
+#[cfg(test)]
+#[cfg(unix)]
+mod herdr_legacy_tests;
 pub mod scheduled_messages;
 pub(crate) mod session_activity;
+mod session_evidence;
 pub mod settings;
 mod skill_usage_analytics;
 pub mod skills_api;
@@ -61,6 +66,9 @@ pub mod state;
 pub mod stats;
 pub mod termination_events;
 mod turn_lease;
+// Herdr hosting exists only on unix; elsewhere the route is absent.
+#[cfg(unix)]
+mod herdr_terminate;
 pub(crate) mod voice_audio;
 pub(crate) mod voice_conductor;
 pub mod voice_config;
@@ -364,8 +372,8 @@ mod audit_explicit_auth_routes_tests {
             config.server.auth_token = token_required.then(|| "slice-a-token".to_string());
             config.kanban.manager_channel_id =
                 channel_required.then(|| "slice-a-channel".to_string());
-            // Config intentionally omits auth_token during serialization; add
-            // the synthetic token explicitly to the private test fixture.
+            // `Serialize` redacts auth_token for the wire; write it into the raw
+            // fixture the way `config::save_to_path` does for the real file.
             let mut fixture = serde_json::to_value(&config).unwrap();
             fixture["server"]["auth_token"] = serde_json::json!(config.server.auth_token);
             std::fs::write(&config_path, serde_yaml::to_string(&fixture).unwrap()).unwrap();
@@ -778,3 +786,8 @@ fn response_is_json(response: &Response) -> bool {
         .map(|value| value.starts_with("application/json"))
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+pub(crate) use queue_api::home_stop_tests::{
+    app_with as home_stop_test_app, post as home_stop_test_post,
+};
