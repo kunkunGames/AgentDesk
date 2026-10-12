@@ -102,7 +102,7 @@ jobs:
 
       # Rollback rehearsal executes the runbook's literal rg command.
       - name: Install ripgrep
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: ripgrep
 
@@ -174,7 +174,7 @@ jobs:
 
       # Rollback rehearsal executes the runbook's literal rg command.
       - name: Install ripgrep
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: ripgrep
 
@@ -248,7 +248,7 @@ jobs:
 
       # Rollback rehearsal executes the runbook's literal rg command.
       - name: Install ripgrep
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2
         with:
           tool: ripgrep
 
