@@ -21,7 +21,7 @@ def valid(document):
     steps = job["steps"]
     lint = [s for s in steps if s.get("name") == "just lint"]
     upload = [s for s in steps if s.get("name") == "Upload Clippy observation"]
-    return lint == [{"name": "just lint", "shell": "bash", "run": RUN}] and upload == [{"name": "Upload Clippy observation", "uses": "actions/upload-artifact@v4", "with": {"name": "clippy-observation-${{ github.sha }}", "path": "target/clippy-observation/", "if-no-files-found": "error"}}] and not any(k in job for k in ("if", "continue-on-error"))
+    return lint == [{"name": "just lint", "shell": "bash", "run": RUN}] and upload == [{"name": "Upload Clippy observation", "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02", "with": {"name": "clippy-observation-${{ github.sha }}", "path": "target/clippy-observation/", "if-no-files-found": "error"}}] and not any(k in job for k in ("if", "continue-on-error"))
 
 
 class QualityWiringTest(unittest.TestCase):
@@ -48,7 +48,7 @@ class QualityWiringTest(unittest.TestCase):
         job = document["jobs"]["lint"]
         lint = [s for s in job["steps"] if s.get("name") == "just lint"]
         self.assertEqual(lint, [{"name": "just lint", "shell": "bash", "run": PR_RUN, "env": {"CLIPPY_BASE_REF": "${{ github.event.pull_request.base.sha }}"}}])
-        self.assertEqual(job["steps"][0], {"uses": "actions/checkout@v4", "with": {"fetch-depth": 0}})
+        self.assertEqual(job["steps"][0], {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262", "with": {"fetch-depth": 0}})
 
     def test_main_step_executes_same_argv_and_preserves_failures(self):
         with tempfile.TemporaryDirectory() as tmp:

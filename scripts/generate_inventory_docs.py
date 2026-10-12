@@ -716,7 +716,7 @@ def resolve_function_source(
 # `#[path]`, and inline test-module context; the older `_MOD_DECL_RE` name is
 # kept as an alias for callers/tests that intentionally inspect this parser.
 _MOD_DECL_RE = re.compile(
-    r"(?P<attrs>(?:\s*#\[[^\]]*\]\s*)*)"
+    r"(?P<attrs>(?:\s*#\[[^\]]*\])*)\s*"
     r"(?:pub(?:\([^)]*\))?\s+)?mod\s+"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*"
     r"(?P<kind>[{;])",

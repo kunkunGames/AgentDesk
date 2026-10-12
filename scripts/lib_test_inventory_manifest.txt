@@ -1342,6 +1342,7 @@ server::routes::herdr_terminate::tests::act_route_non_loopback_peer_or_browser_o
 server::routes::herdr_terminate::tests::act_route_rejects_unknown_or_empty_fields
 server::routes::herdr_terminate::tests::act_route_switch_off_refuses_before_any_read
 server::routes::herdr_terminate::tests::act_route_token_mode_requires_server_admin
+server::routes::hooks::tests::test_skill_usage_body_deserialization
 server::routes::kakao_calendar::tests::calendar_mutations_require_stable_nonempty_bounded_keys
 server::routes::kakao_calendar::tests::calendar_requires_real_bearer_not_claimed_identity_or_local_origin
 server::routes::kanban::update_card_validation_tests::update_card_validation_accepts_valid_metadata_json_object
