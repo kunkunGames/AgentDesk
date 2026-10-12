@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serenity::ChannelId;
 
+use super::watchdog_decisions;
 use super::{HardStopRuntimeResult, HealthRegistry, RuntimeTurnStopResult, shared_for_provider};
 use crate::services::discord::MailboxLookup::{Create, Peek};
 use crate::services::discord::turn_bridge::{ChannelJudgement, ChannelStop, keeps_turn};
@@ -196,4 +197,42 @@ pub(super) async fn finish_found_turn(
         }
         TokenFinish::Unavailable => Err(HardStopRuntimeResult::finish_unobserved()),
     }
+}
+
+pub(super) fn preserve_cancel_should_skip_provider_interrupt_for_idle_tui(
+    provider: &ProviderKind,
+    cleanup_policy: discord::TmuxCleanupPolicy,
+    tmux_ready_for_input: bool,
+    inflight_safe_to_clear: bool,
+) -> bool {
+    !cleanup_policy.should_cleanup_tmux()
+        && matches!(provider, ProviderKind::Claude)
+        && tmux_ready_for_input
+        && inflight_safe_to_clear
+}
+
+/// `legacy_name` is the session the stop judged legacy tmux; its host is not read again.
+pub(super) fn preserve_cancel_can_skip_provider_interrupt_for_idle_tui(
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    legacy_name: Option<&str>,
+    cleanup_policy: discord::TmuxCleanupPolicy,
+) -> bool {
+    let Some(tmux_session) = legacy_name.filter(|session| !session.trim().is_empty()) else {
+        return false;
+    };
+    let tmux_ready_for_input = watchdog_decisions::idle_tmux_repair_ready_for_input(
+        provider,
+        channel_id.get(),
+        tmux_session,
+    );
+    let inflight_safe_to_clear =
+        discord::inflight_state_allows_idle_tmux_repair_for_channel(provider, channel_id.get())
+            .unwrap_or(false);
+    preserve_cancel_should_skip_provider_interrupt_for_idle_tui(
+        provider,
+        cleanup_policy,
+        tmux_ready_for_input,
+        inflight_safe_to_clear,
+    )
 }

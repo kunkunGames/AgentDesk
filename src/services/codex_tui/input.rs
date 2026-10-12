@@ -105,7 +105,11 @@ const DEFAULT_LITERAL_CHUNK_CHARS: usize = 1800;
 
 mod composer_content;
 mod composer_lock;
+mod diagnostics;
+mod prompt_text;
 mod submission;
+use diagnostics::{log_prompt_ready_timeout, prompt_ready_debug_tail};
+use prompt_text::{split_literal_chunks, validate_prompt_not_empty, validate_prompt_text};
 use submission::{prompt_readiness_snapshot_with_pane, submission_snapshot_with_pane};
 pub(crate) use submission::{
     prompt_submission_fits_pane, submission_busy_in_pane, submission_draft_in_pane,
@@ -1787,82 +1791,6 @@ fn line_is_codex_composer_edge(line: &str) -> bool {
 fn is_box_drawing_char(ch: char) -> bool {
     // U+2500..U+257F Box Drawing block (covers ─ │ ╭ ╮ ╰ ╯ ┌ ┐ ┘ └ etc.)
     matches!(ch as u32, 0x2500..=0x257F)
-}
-
-fn log_prompt_ready_timeout(
-    session_name: &str,
-    readiness: PromptReadinessKind,
-    timeout: Duration,
-    snapshot: &PromptReadinessSnapshot,
-) {
-    tracing::debug!(
-        tmux_session_name = session_name,
-        readiness = readiness.label(),
-        timeout_secs = timeout.as_secs(),
-        composer_marker_detected = snapshot.composer_marker_detected,
-        prompt_draft_detected = snapshot.prompt_draft_detected,
-        previous_tui_turn_still_running =
-            snapshot.tmux_pane_alive && !snapshot.composer_marker_detected,
-        tmux_pane_alive = snapshot.tmux_pane_alive,
-        capture_available = snapshot.capture_available,
-        pane_tail = %snapshot.pane_tail,
-        "codex_tui prompt readiness timed out"
-    );
-}
-
-fn prompt_ready_debug_tail(pane: &str) -> String {
-    let mut lines = pane
-        .lines()
-        .rev()
-        .take(PROMPT_READY_DEBUG_TAIL_LINES)
-        .map(|line| line.trim_end_matches('\r'))
-        .collect::<Vec<_>>();
-    lines.reverse();
-    let tail = lines.join("\n");
-    crate::utils::format::safe_suffix(tail.trim(), PROMPT_READY_DEBUG_TAIL_BYTES).to_string()
-}
-
-fn validate_prompt_text(input: &str) -> Result<(), String> {
-    // Block terminal control channels such as ESC bracketed-paste markers,
-    // DEL, and C1 controls before either literal send or tmux paste-buffer
-    // delivery can relay them into the hosted Codex TUI. Mirrors
-    // claude_tui::input::validate_prompt_text.
-    if input
-        .chars()
-        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
-    {
-        return Err("prompt contains unsupported terminal control characters".to_string());
-    }
-    Ok(())
-}
-
-fn validate_prompt_not_empty(input: &str) -> Result<(), String> {
-    if input.trim().is_empty() {
-        return Err("prompt must contain non-whitespace text".to_string());
-    }
-    Ok(())
-}
-
-fn split_literal_chunks(input: &str, max_chars: usize) -> Vec<String> {
-    if input.is_empty() {
-        return Vec::new();
-    }
-    let max_chars = max_chars.max(1);
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut current_chars = 0usize;
-    for ch in input.chars() {
-        if current_chars >= max_chars {
-            chunks.push(std::mem::take(&mut current));
-            current_chars = 0;
-        }
-        current.push(ch);
-        current_chars += 1;
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }
 
 #[cfg(test)]

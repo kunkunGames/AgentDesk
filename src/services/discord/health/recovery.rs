@@ -57,6 +57,9 @@ mod zombie_reclaim;
 pub(crate) use zombie_reclaim::release_zombie_foreground_turn_by_tmux_name;
 
 mod stop_judgement;
+use stop_judgement::preserve_cancel_can_skip_provider_interrupt_for_idle_tui;
+#[cfg(test)]
+use stop_judgement::preserve_cancel_should_skip_provider_interrupt_for_idle_tui;
 mod stop_result;
 use stop_judgement::host_guard_preserved;
 pub(crate) use stop_judgement::{
@@ -287,44 +290,6 @@ fn clear_idle_tmux_stale_turn_inflight_if_pinned(
         }
     }
     outcome
-}
-
-fn preserve_cancel_should_skip_provider_interrupt_for_idle_tui(
-    provider: &ProviderKind,
-    cleanup_policy: discord::TmuxCleanupPolicy,
-    tmux_ready_for_input: bool,
-    inflight_safe_to_clear: bool,
-) -> bool {
-    !cleanup_policy.should_cleanup_tmux()
-        && matches!(provider, ProviderKind::Claude)
-        && tmux_ready_for_input
-        && inflight_safe_to_clear
-}
-
-/// `legacy_name` is the session the stop judged legacy tmux; its host is not read again.
-fn preserve_cancel_can_skip_provider_interrupt_for_idle_tui(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    legacy_name: Option<&str>,
-    cleanup_policy: discord::TmuxCleanupPolicy,
-) -> bool {
-    let Some(tmux_session) = legacy_name.filter(|session| !session.trim().is_empty()) else {
-        return false;
-    };
-    let tmux_ready_for_input = watchdog_decisions::idle_tmux_repair_ready_for_input(
-        provider,
-        channel_id.get(),
-        tmux_session,
-    );
-    let inflight_safe_to_clear =
-        discord::inflight_state_allows_idle_tmux_repair_for_channel(provider, channel_id.get())
-            .unwrap_or(false);
-    preserve_cancel_should_skip_provider_interrupt_for_idle_tui(
-        provider,
-        cleanup_policy,
-        tmux_ready_for_input,
-        inflight_safe_to_clear,
-    )
 }
 
 fn runtime_stop_wait_timeout() -> std::time::Duration {

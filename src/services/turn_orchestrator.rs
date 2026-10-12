@@ -30,6 +30,8 @@ pub(crate) mod input_handback;
 mod intervention;
 mod lease_release;
 mod mailbox_observation;
+mod mailbox_runtime;
+use mailbox_runtime::{finalize_turn_state, spawn_channel_mailbox};
 #[cfg(test)]
 mod mailbox_unreachable_tests;
 pub(crate) use mailbox_observation::MailboxObservationFailure;
@@ -46,6 +48,10 @@ pub(crate) use registry_purge::PurgeQueueResult;
 mod remint_fence;
 mod reply_results;
 mod source_generation;
+mod source_text;
+use source_text::{
+    ensure_source_text_segments, join_source_text_segments, push_unique_source_text_segments,
+};
 mod turn_finished_signal;
 use active_source_dedup::{
     intervention_has_active_source, intervention_sources_all_match_active,
@@ -178,24 +184,6 @@ fn intervention_age_since(last: &Intervention, current: &Intervention) -> Durati
         .unwrap_or_default()
 }
 
-fn join_source_text_segments(segments: &[SourceMessageTextSegment]) -> String {
-    let mut text = String::new();
-    for segment in segments {
-        if segment.text.is_empty() {
-            continue;
-        }
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&segment.text);
-    }
-    text
-}
-
-fn ensure_source_text_segments(intervention: &mut Intervention) {
-    intervention.source_text_segments = intervention.source_text_segments();
-}
-
 fn ensure_source_message_ids(intervention: &mut Intervention) {
     if intervention.source_message_ids.is_empty() {
         intervention
@@ -226,20 +214,6 @@ fn push_unique_source_message_queued_generations(
         if !existing
             .iter()
             .any(|owner| owner.message_id == incoming.message_id)
-        {
-            existing.push(incoming);
-        }
-    }
-}
-
-fn push_unique_source_text_segments(
-    existing: &mut Vec<SourceMessageTextSegment>,
-    incoming: impl IntoIterator<Item = SourceMessageTextSegment>,
-) {
-    for incoming in incoming {
-        if !existing
-            .iter()
-            .any(|segment| segment.message_id == incoming.message_id)
         {
             existing.push(incoming);
         }
@@ -1609,63 +1583,6 @@ struct ChannelMailboxState {
     queued_head: queued_head::HeadLedger,
 }
 
-fn finalize_turn_state(
-    state: &mut ChannelMailboxState,
-    channel_id: ChannelId,
-    persistence: Option<&QueuePersistenceContext>,
-    preserve_queue: bool,
-) -> FinishTurnResult {
-    let removed_token = release_active_turn_anchor(
-        state,
-        channel_id,
-        persistence.map(|context| &context.provider),
-    );
-    if preserve_queue {
-        return FinishTurnResult {
-            removed_token,
-            has_pending: state
-                .intervention_queue
-                .iter()
-                .any(|item| item.mode == InterventionMode::Soft),
-            mailbox_online: true,
-            queue_exit_events: Vec::new(),
-            persistence_error: None,
-        };
-    }
-    let previous_len = state.intervention_queue.len();
-    let previous_queue = state.intervention_queue.clone();
-    let pending_result = has_soft_intervention(&mut state.intervention_queue);
-    if let Some(persistence) = persistence {
-        if state.intervention_queue.len() != previous_len || !state.intervention_queue.is_empty() {
-            if let Err(error) = persist_queue_or_restore(
-                state,
-                channel_id,
-                persistence,
-                previous_queue,
-                "finish_turn",
-            ) {
-                return FinishTurnResult {
-                    removed_token,
-                    has_pending: state
-                        .intervention_queue
-                        .iter()
-                        .any(|item| item.mode == InterventionMode::Soft),
-                    mailbox_online: true,
-                    queue_exit_events: Vec::new(),
-                    persistence_error: Some(error),
-                };
-            }
-        }
-    }
-    FinishTurnResult {
-        removed_token,
-        has_pending: pending_result.has_pending,
-        mailbox_online: true,
-        queue_exit_events: pending_result.queue_exit_events,
-        persistence_error: None,
-    }
-}
-
 #[cfg(test)]
 mod turn_finished_signal_tests {
     use super::*;
@@ -1736,50 +1653,6 @@ mod turn_finished_signal_tests {
         tokio::time::timeout(std::time::Duration::from_millis(250), signal.wait())
             .await
             .expect("fresh finish should wake reset waiter");
-    }
-}
-
-fn spawn_channel_mailbox(
-    channel_id: ChannelId,
-    fence: remint_fence::FenceCell,
-    recovery_done: Arc<RecoveryDoneSignal>,
-) -> ChannelMailboxHandle {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let own_recovery_done = recovery_done.clone();
-    tokio::spawn(async move {
-        let mut state = ChannelMailboxState {
-            claim_log: claim_observation::ClaimLog::spawned(channel_id),
-            remint_fence: fence,
-            ..Default::default()
-        };
-        while let Some((msg, input_permit)) = rx.recv().await {
-            if crate::services::discord::input_runtime::fence::channel_gate(channel_id.get())
-                .is_some()
-            {
-                let signal = own_recovery_done.clone();
-                state = tokio::task::spawn_blocking(move || {
-                    crate::services::discord::input_runtime::fence::effect::synchronous(
-                        input_permit,
-                        || {
-                            crate::services::discord::input_runtime::fence::blocking(|| {
-                                input_mailbox_step(state, channel_id, msg, &signal)
-                            })
-                        },
-                    )
-                })
-                .await
-                .expect("input mailbox step panicked");
-            } else {
-                state = crate::services::discord::input_runtime::fence::effect::synchronous(
-                    input_permit,
-                    || input_mailbox_step(state, channel_id, msg, &own_recovery_done),
-                );
-            }
-        }
-    });
-    ChannelMailboxHandle {
-        sender: tx,
-        recovery_done,
     }
 }
 

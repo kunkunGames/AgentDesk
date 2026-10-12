@@ -648,6 +648,7 @@ src/
 │   │   │   ├── mod.rs
 │   │   │   └── warm_followup.rs
 │   │   ├── input/
+│   │   │   ├── diagnostics.rs
 │   │   │   ├── draft_hold.rs
 │   │   │   ├── final_ready_tests.rs
 │   │   │   ├── literal_chunks.rs
@@ -793,7 +794,9 @@ src/
 │   │   │   ├── composer_content.rs
 │   │   │   ├── composer_lock.rs
 │   │   │   ├── composer_status.rs
+│   │   │   ├── diagnostics.rs
 │   │   │   ├── inline_banner.rs
+│   │   │   ├── prompt_text.rs
 │   │   │   └── submission.rs
 │   │   ├── rollout_tail/
 │   │   │   ├── parser/
@@ -1297,6 +1300,7 @@ src/
 │   │   │   │   ├── codex_relay_generation.rs
 │   │   │   │   └── codex_spawn.rs
 │   │   │   ├── restore_inflight/
+│   │   │   │   ├── diagnostics.rs
 │   │   │   │   ├── host_probe_tests.rs
 │   │   │   │   ├── kickoff_identity.rs
 │   │   │   │   ├── kickoff_identity_tests.rs
@@ -1400,12 +1404,14 @@ src/
 │   │   │   │   ├── component_events.rs
 │   │   │   │   ├── gate.rs
 │   │   │   │   ├── queue_effects.rs
+│   │   │   │   ├── reply_context.rs
 │   │   │   │   ├── stale_turn.rs
 │   │   │   │   └── stale_turn_host_tests.rs
 │   │   │   ├── message_handler/
 │   │   │   │   ├── headless_turn/
 │   │   │   │   │   ├── entrypoints.rs
-│   │   │   │   │   └── routine_metadata.rs
+│   │   │   │   │   ├── routine_metadata.rs
+│   │   │   │   │   └── target.rs
 │   │   │   │   ├── intake_turn/
 │   │   │   │   │   ├── dispatch_stamp/
 │   │   │   │   │   │   └── tests.rs
@@ -2402,6 +2408,7 @@ src/
 │   │   ├── output_reader.rs
 │   │   ├── provider_conformance_invariant_tests.rs
 │   │   ├── read_fault.rs
+│   │   ├── readiness.rs
 │   │   ├── registry.rs
 │   │   └── session_probe.rs
 │   ├── provider_auth_profile/
@@ -2821,6 +2828,7 @@ src/
 │   │   ├── intervention.rs
 │   │   ├── lease_release.rs
 │   │   ├── mailbox_observation.rs
+│   │   ├── mailbox_runtime.rs
 │   │   ├── mailbox_unreachable_tests.rs
 │   │   ├── overflow.rs
 │   │   ├── pending_queue_persistence.rs
@@ -2835,6 +2843,7 @@ src/
 │   │   ├── remint_fence.rs
 │   │   ├── reply_results.rs
 │   │   ├── source_generation.rs
+│   │   ├── source_text.rs
 │   │   └── turn_finished_signal.rs
 │   ├── writer_protocol/
 │   │   ├── namespace/

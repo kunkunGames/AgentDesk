@@ -325,6 +325,7 @@ use queue_dispatch::{
     mailbox_restore_dequeued_head, mailbox_take_next_automatic_intervention,
     mailbox_take_next_soft_intervention,
 };
+pub(super) use recovery_engine::mark_reconcile_complete;
 use recovery_engine::restore_inflight_turns;
 use restart_report::flush_restart_reports;
 use role_map_enrichment::enrich_role_map_with_channel_ids;
@@ -2695,21 +2696,6 @@ pub(super) struct Data {
     pub(super) provider: ProviderKind,
     pub(super) voice_config: crate::voice::VoiceConfig,
     pub(super) voice_receiver: crate::voice::VoiceReceiver,
-}
-
-pub(super) fn mark_reconcile_complete(shared: &SharedData) {
-    let duration_ms = shared.restart.recovery_started_at.elapsed().as_millis();
-    let duration_ms = duration_ms.min(u64::MAX as u128) as u64;
-    let _ = shared.restart.recovery_duration_ms.compare_exchange(
-        0,
-        duration_ms,
-        std::sync::atomic::Ordering::AcqRel,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    shared
-        .restart
-        .reconcile_done
-        .store(true, std::sync::atomic::Ordering::Release);
 }
 
 pub(super) type Error = Box<dyn std::error::Error + Send + Sync>;

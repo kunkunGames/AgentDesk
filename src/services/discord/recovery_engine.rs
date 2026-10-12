@@ -577,3 +577,18 @@ pub(crate) use restore_persist_outcome::codex_restart_output_for_tests;
 pub(in crate::services::discord) use self::restore_inflight::{
     install_inflight_scoped, resume_inflight_scoped,
 };
+
+pub(in crate::services) fn mark_reconcile_complete(shared: &SharedData) {
+    let duration_ms = shared.restart.recovery_started_at.elapsed().as_millis();
+    let duration_ms = duration_ms.min(u64::MAX as u128) as u64;
+    let _ = shared.restart.recovery_duration_ms.compare_exchange(
+        0,
+        duration_ms,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    shared
+        .restart
+        .reconcile_done
+        .store(true, std::sync::atomic::Ordering::Release);
+}

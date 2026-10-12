@@ -1,4 +1,5 @@
 //! Discover the live transcript from the existing tmux pane.
+use super::inflight;
 #[cfg(unix)]
 use super::*;
 
@@ -49,4 +50,15 @@ pub(in crate::services::discord::recovery_engine) fn detect_live_tmux_output_pat
     };
     let candidates = parse_lsof_output_candidates(&stdout);
     detect_rebind_output_path_from_candidates(fallback_path, candidates)
+}
+
+pub(super) fn recovery_output_path_with_tmux_fallback(
+    state: &inflight::InflightTurnState,
+    fallback_output: String,
+) -> Option<String> {
+    state
+        .output_path
+        .clone()
+        .filter(|path| !path.is_empty())
+        .or_else(|| (!fallback_output.is_empty()).then_some(fallback_output))
 }

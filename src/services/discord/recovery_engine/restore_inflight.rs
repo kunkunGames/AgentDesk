@@ -28,17 +28,6 @@ fn build_tmux_death_diagnostic(_name: &str, _output_path: Option<&str>) -> Optio
     None
 }
 
-fn recovery_output_path_with_tmux_fallback(
-    state: &inflight::InflightTurnState,
-    fallback_output: String,
-) -> Option<String> {
-    state
-        .output_path
-        .clone()
-        .filter(|path| !path.is_empty())
-        .or_else(|| (!fallback_output.is_empty()).then_some(fallback_output))
-}
-
 #[cfg(unix)]
 use super::herdr_before_start_restart::herdr_turn_held;
 
@@ -49,23 +38,12 @@ pub(in crate::services::discord) use kickoff_identity::finish_recovered_turn_mai
 mod output_paths;
 #[cfg(unix)]
 pub(super) use output_paths::detect_live_tmux_output_path;
+use output_paths::recovery_output_path_with_tmux_fallback;
+#[path = "restore_inflight/diagnostics.rs"]
+mod diagnostics;
 #[path = "restore_inflight/replay_hold.rs"]
 mod replay_hold;
-
-fn observe_restore_inflight_snapshot(
-    provider: &ProviderKind,
-    states: &[inflight::InflightTurnState],
-    boot_elapsed: std::time::Duration,
-) {
-    let current_generation = super::runtime_store::process_generation();
-    tracing::info!(provider = %provider.as_str(), snapshot_rows = states.len(), boot_elapsed_ms = boot_elapsed.as_millis(), "restore_inflight snapshot loaded");
-    for state in states
-        .iter()
-        .filter(|state| state.born_generation != 0 && state.born_generation == current_generation)
-    {
-        tracing::warn!(provider = %provider.as_str(), channel_id = state.channel_id, user_msg_id = state.user_msg_id, born_generation = state.born_generation, current_generation, boot_elapsed_ms = boot_elapsed.as_millis(), "restore_inflight snapshot contains a row authored by the running process");
-    }
-}
+use diagnostics::observe_restore_inflight_snapshot;
 
 pub(in crate::services::discord) async fn restore_inflight_turns(
     http: &Arc<serenity::Http>,
@@ -234,36 +212,16 @@ async fn restore_inflight_states(
         // observability events back-trace to a specific agent/turn. `turn_id`
         // matches the recovered-transcript key (joins turn_started/turn_finished
         // for message-bearing turns); `agent_id` is the role bound to the channel.
-        let recovery_turn_id = super::analytics_transcript::recovered_transcript_turn_id(
-            state.channel_id,
-            state.user_msg_id,
-            state.session_key.as_deref(),
-            state.turn_start_offset,
-            &state.started_at,
-        );
-        let recovery_agent_id =
-            resolve_role_binding(channel_id, state.channel_name.as_deref()).map(|b| b.role_id);
         let recovery_reason = if restart_report_exists {
             "restart_report"
         } else {
             "restore_inflight"
         };
-        crate::services::observability::emit_recovery_fired(
-            provider.as_str(),
-            state.channel_id,
-            state.dispatch_id.as_deref(),
-            state.session_key.as_deref(),
-            Some(recovery_turn_id.as_str()),
-            recovery_agent_id.as_deref(),
-            recovery_reason,
-        );
-        emit_recovery_quality_event(
+        diagnostics::emit_recovery_fired(
             provider,
-            state.channel_id,
+            &state,
+            channel_id,
             state.dispatch_id.as_deref(),
-            state.session_key.as_deref(),
-            Some(recovery_turn_id.as_str()),
-            recovery_agent_id.as_deref(),
             recovery_reason,
         );
 
@@ -1798,33 +1756,11 @@ async fn restore_inflight_states(
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         tracing::error!("  [{ts}] {error}; main-workspace fallback blocked");
                         // #3562: back-trace the recovery to a specific agent/turn.
-                        let recovery_turn_id =
-                            super::analytics_transcript::recovered_transcript_turn_id(
-                                state.channel_id,
-                                state.user_msg_id,
-                                state.session_key.as_deref(),
-                                state.turn_start_offset,
-                                &state.started_at,
-                            );
-                        let recovery_agent_id =
-                            resolve_role_binding(channel_id, state.channel_name.as_deref())
-                                .map(|b| b.role_id);
-                        crate::services::observability::emit_recovery_fired(
-                            provider.as_str(),
-                            state.channel_id,
-                            dispatch_id.as_deref(),
-                            state.session_key.as_deref(),
-                            Some(recovery_turn_id.as_str()),
-                            recovery_agent_id.as_deref(),
-                            "worktree_missing_main_fallback_blocked",
-                        );
-                        emit_recovery_quality_event(
+                        diagnostics::emit_recovery_fired(
                             provider,
-                            state.channel_id,
+                            &state,
+                            channel_id,
                             dispatch_id.as_deref(),
-                            state.session_key.as_deref(),
-                            Some(recovery_turn_id.as_str()),
-                            recovery_agent_id.as_deref(),
                             "worktree_missing_main_fallback_blocked",
                         );
                         let recovery_context = RecoveryDeliveryContext::from_state(
@@ -2060,32 +1996,11 @@ async fn restore_inflight_states(
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::error!("  [{ts}] {error}; main-workspace fallback blocked");
                 // #3562: back-trace the recovery to a specific agent/turn.
-                let recovery_turn_id = super::analytics_transcript::recovered_transcript_turn_id(
-                    state.channel_id,
-                    state.user_msg_id,
-                    state.session_key.as_deref(),
-                    state.turn_start_offset,
-                    &state.started_at,
-                );
-                let recovery_agent_id =
-                    resolve_role_binding(channel_id, state.channel_name.as_deref())
-                        .map(|b| b.role_id);
-                crate::services::observability::emit_recovery_fired(
-                    provider.as_str(),
-                    state.channel_id,
-                    dispatch_id.as_deref(),
-                    state.session_key.as_deref(),
-                    Some(recovery_turn_id.as_str()),
-                    recovery_agent_id.as_deref(),
-                    "worktree_missing_main_fallback_blocked",
-                );
-                emit_recovery_quality_event(
+                diagnostics::emit_recovery_fired(
                     provider,
-                    state.channel_id,
+                    &state,
+                    channel_id,
                     dispatch_id.as_deref(),
-                    state.session_key.as_deref(),
-                    Some(recovery_turn_id.as_str()),
-                    recovery_agent_id.as_deref(),
                     "worktree_missing_main_fallback_blocked",
                 );
                 let recovery_context = RecoveryDeliveryContext::from_state(

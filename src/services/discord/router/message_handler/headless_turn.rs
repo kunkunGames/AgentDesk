@@ -3,14 +3,17 @@ use super::*;
 use crate::services::discord::live_bridge::register_without_requeue;
 
 mod routine_metadata;
+#[cfg(test)]
+use routine_metadata::routine_metadata_role_binding;
 use routine_metadata::{
-    fresh_routine_turn, routine_metadata_agent_id, routine_metadata_role_binding,
-    scheduled_snapshot_session_label, session_key_basis_override, valid_routine_metadata,
+    fresh_routine_turn, routine_metadata_agent_id, scheduled_snapshot_session_label,
+    session_key_basis_override, valid_routine_metadata,
 };
 
 use routine_metadata::persist_boundary_before_provider_clear;
 
 mod entrypoints;
+mod target;
 pub(in crate::services::discord) use entrypoints::*;
 
 #[allow(clippy::too_many_arguments)]
@@ -48,46 +51,20 @@ async fn start_reserved_headless_turn_admitted(
         let settings = shared.settings.read().await;
         (settings.provider.clone(), settings.allowed_tools.clone())
     };
-    let routine_role_binding = routine_metadata_role_binding(metadata.as_ref(), &settings_provider);
-    let (early_stale_session_id, early_channel_name) = {
-        let data = shared.core.lock().await;
-        data.sessions
-            .get(&channel_id)
-            .map(|session| (session.session_id.clone(), session.channel_name.clone()))
-            .unwrap_or_default()
-    };
-    let early_thread_parent =
-        super::super::super::resolve_thread_parent(&ctx.http, channel_id).await;
-    let early_resolved_channel_name = if early_channel_name.is_none() && channel_name_hint.is_none()
-    {
-        let (channel_name, _) = resolve_channel_category(&ctx.http, None, channel_id).await;
-        channel_name
-    } else {
-        None
-    };
-    let mut resolved_role_binding = if let Some(binding) = routine_role_binding {
-        ResolvedThreadRoleBinding::direct(Some(binding))
-    } else {
-        resolve_thread_role_binding(
-            channel_id,
-            early_channel_name
-                .as_deref()
-                .or(channel_name_hint.as_deref())
-                .or(early_resolved_channel_name.as_deref())
-                .or(
-                    super::super::super::adk_session::registered_channel_fallback_name(
-                        channel_id,
-                        &settings_provider,
-                    )
-                    .as_deref(),
-                ),
-            early_thread_parent.as_ref(),
-        )
-    };
-    if resolved_role_binding.role_binding.is_none() && early_thread_parent.is_none() {
-        resolved_role_binding.role_binding = metadata_parent_channel_id(metadata.as_ref())
-            .and_then(|parent_id| resolve_role_binding(parent_id, None));
-    }
+    let target::HeadlessTarget {
+        early_stale_session_id,
+        early_thread_parent,
+        early_resolved_channel_name,
+        mut resolved_role_binding,
+    } = target::resolve_headless_target(
+        ctx,
+        channel_id,
+        shared,
+        metadata.as_ref(),
+        channel_name_hint.as_deref(),
+        &settings_provider,
+    )
+    .await;
     let memory_scope_channel_id = resolved_role_binding.memory_channel_id(channel_id);
     let role_binding = resolved_role_binding.role_binding.take();
     let provider = role_binding
