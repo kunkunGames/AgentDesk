@@ -3,7 +3,11 @@ pub(crate) mod actual_submit_tests;
 #[cfg(unix)]
 use crate::services::codex_tui::verified_hold;
 mod process_session_launch;
+#[cfg(unix)]
+mod tui_tail_result;
 use process_session_launch::execute_streaming_local_process_codex;
+#[cfg(unix)]
+use tui_tail_result::resolve_codex_tui_tail_result;
 
 #[cfg(test)]
 mod c1_teardown_tests;
@@ -1944,85 +1948,6 @@ fn execute_streaming_local_tui_tmux(
         cancel_token_for_post_tail,
         tmux_session_name,
     )
-}
-
-/// Resolve the rollout-tail result for the Codex Direct TUI launch.
-///
-/// - `Ok(Some(result))` — tail succeeded; proceed to post-tail emission.
-/// - `Ok(None)` — tail failed but a cancel was observed first; the caller
-///   must suppress the Err and return `Ok(())` (the bridge's cancel arm owns
-///   finalisation and tmux teardown).
-/// - `Err(error)` — genuine tail failure; the tmux session has been killed to
-///   avoid a leak and the error propagates.
-#[cfg(unix)]
-fn resolve_codex_tui_tail_result(
-    tail_result: Result<crate::services::codex_tui::rollout_tail::CodexTuiTailResult, String>,
-    cancel_token_for_post_tail: Option<&std::sync::Arc<CancelToken>>,
-    tmux_session_name: &str,
-) -> Result<Option<crate::services::codex_tui::rollout_tail::CodexTuiTailResult>, String> {
-    let cancel_observed =
-        || crate::services::provider::cancel_requested(cancel_token_for_post_tail.map(|t| &**t));
-
-    match tail_result {
-        Ok(result) => Ok(Some(result)),
-        Err(error) => {
-            // #2172 cancel boundary: a user /stop that arrives before the
-            // rollout file is discovered surfaces as an Err from the
-            // wait_for_* helpers ("cancelled waiting for Codex rollout
-            // transcript").
-            //
-            // Two consequences must be suppressed:
-            //   (a) Killing the tmux session here contradicts the
-            //       PreserveSession default for /stop — the pane
-            //       teardown is owned by stop_active_turn's
-            //       TmuxCleanupPolicy.
-            //   (b) Returning Err is converted into
-            //       `StreamMessage::Error` by the streaming-launch
-            //       caller (router/message_handler.rs spawn_blocking
-            //       wrapper) and would reach the bridge as a transport
-            //       error instead of a cancelled turn — letting the
-            //       bridge run its error-finalisation path on a
-            //       cancelled turn.
-            //
-            // Return Ok(None) with no StreamMessage emitted: the producer
-            // is silent post-cancel and the bridge's cancel arm drives
-            // finalisation.
-            if cancel_observed() {
-                tracing::info!(
-                    tmux_session = tmux_session_name,
-                    error = %error,
-                    "Codex rollout tail cancelled before transcript; suppressing tail Err and deferring tmux cleanup to cancel path"
-                );
-                return Ok(None);
-            }
-            if verified_hold::existing_incarnation(tmux_session_name) {
-                verified_hold::wait_for_cancel(tmux_session_name, cancel_token_for_post_tail)?;
-                return Ok(None);
-            }
-            // #2182 follow-up: rollout wait / tail failures used to leak the
-            // tmux session because `?` propagated Err without cleaning the
-            // launched session. Kill it explicitly so the worktree doesn't
-            // accumulate dangling Codex TUIs.
-            tracing::warn!(
-                tmux_session = tmux_session_name,
-                error = %error,
-                "Codex rollout tail failed; killing tmux session to avoid leak"
-            );
-            record_codex_tmux_termination(
-                tmux_session_name,
-                "codex_tui_provider",
-                "rollout_tail_failed",
-                &format!("codex rollout tail failed: {error}"),
-                None,
-            );
-            record_tmux_exit_reason(tmux_session_name, &format!("rollout tail failed: {error}"));
-            crate::services::platform::tmux::kill_session(
-                tmux_session_name,
-                "codex rollout tail failed",
-            );
-            Err(error)
-        }
-    }
 }
 
 #[cfg(test)]

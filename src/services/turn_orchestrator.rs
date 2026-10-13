@@ -118,13 +118,9 @@ use queue_cancellation::{
 use queue_enqueue::enqueue_behind;
 #[cfg(test)]
 pub(crate) use queue_enqueue::enqueue_intervention;
-pub(crate) use queued_head::{HeadOutcome, HeadSettle, QueueIdentity, QueuedHeadClaim};
-#[derive(Clone, Debug)]
-pub(crate) enum TakeHeadCondition {
-    #[cfg(test)]
-    Unchecked,
-    Observed(Option<QueueIdentity>),
-}
+pub(crate) use queued_head::{
+    HeadOutcome, HeadSettle, QueueIdentity, QueuedHeadClaim, TakeHeadCondition,
+};
 pub(crate) use recovery_kickoff::RecoveryKickoffResult;
 use recovery_kickoff::{kickoff_refusal, reset_activation_signals};
 pub(crate) use reply_results::{
@@ -2119,13 +2115,7 @@ fn input_mailbox_step(
                 return state;
             }
             // Recovery may change the physical head after the selector's snapshot.
-            let selection_stale = match head_condition {
-                TakeHeadCondition::Observed(expected) => {
-                    state.intervention_queue.first().map(QueueIdentity::of) != expected
-                }
-                #[cfg(test)]
-                TakeHeadCondition::Unchecked => false,
-            };
+            let selection_stale = head_condition.is_stale(&state.intervention_queue);
             if selection_stale {
                 let _ = reply.send(TakeNextSoftResult::stale(&state.intervention_queue));
                 return state;

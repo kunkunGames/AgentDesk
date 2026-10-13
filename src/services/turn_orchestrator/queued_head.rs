@@ -23,6 +23,23 @@ pub(crate) struct QueueIdentity {
     pub(crate) sources: Vec<SourceIdentity>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum TakeHeadCondition {
+    #[cfg(test)]
+    Unchecked,
+    Observed(Option<QueueIdentity>),
+}
+
+impl TakeHeadCondition {
+    pub(super) fn is_stale(self, queue: &[Intervention]) -> bool {
+        match self {
+            Self::Observed(expected) => queue.first().map(QueueIdentity::of) != expected,
+            #[cfg(test)]
+            Self::Unchecked => false,
+        }
+    }
+}
+
 impl QueueIdentity {
     pub(crate) fn of(item: &Intervention) -> Self {
         let ids = match item.source_message_ids.as_slice() {
