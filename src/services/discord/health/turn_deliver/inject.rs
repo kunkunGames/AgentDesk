@@ -2,6 +2,9 @@
 //! the mailbox order reservation, and the hand-off of one input to `claude_tui::busy_inject` or,
 //! once enabled, `codex_tui::busy_inject`.
 
+mod names;
+
+use futures::FutureExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,17 +12,22 @@ use poise::serenity_prelude::{ChannelId, MessageId};
 
 use super::HumanInputRequest;
 use crate::services::agent_protocol::RuntimeHandoffKind;
-use crate::services::claude_tui::busy_inject::{self, Outcome, Unconfirmed, Veto};
+use crate::services::claude_tui::busy_inject::{self, Outcome};
 use crate::services::codex_tui::busy_inject as codex_inject;
 use crate::services::discord::SharedData;
 use crate::services::discord::inflight::{InflightTurnState, TurnSource};
 use crate::services::discord::inject_disposition::{self, InjectionOutcome, SourceGuard};
 use crate::services::discord::input_runtime::fence;
+use crate::services::discord::queue_io::queued_head_inject::{
+    BindingKey, binding_key, persistence_failed, queued_head_enabled,
+};
+use crate::services::imsg_reply::{self, ReplyObligation, episode};
 use crate::services::provider::ProviderKind;
 use crate::services::turn_orchestrator::{
-    ActiveTurnKind, ChannelMailboxSnapshot, ExpectedClaim, HANDBACK_NOT_WRITTEN,
-    InjectionSettlement, Intervention, ReserveOutcome,
+    ActiveTurnKind, ChannelMailboxSnapshot, ExpectedClaim, HANDBACK_NOT_WRITTEN, HeadOutcome,
+    HeadSettle, InjectionSettlement, Intervention, QueueIdentity, QueuedHeadClaim, ReserveOutcome,
 };
+use names::{codex_unconfirmed_name, codex_veto_name, unconfirmed_name, veto_name};
 use tokio::sync::OwnedMutexGuard;
 
 /// `ADK_BUSY_INJECT` turns on busy-turn injection of human input into Claude TUI sessions, read
@@ -31,6 +39,7 @@ pub(super) const INPUT_IN_FLIGHT: &str = "input_in_flight";
 const INPUT_RUNTIME_OWNED: &str = "input_runtime_owned";
 const MAILBOX_UNAVAILABLE: &str = "mailbox_unavailable";
 const NOT_BUSY: &str = "not_busy";
+const EPISODE_UNIDENTIFIED: &str = "episode_unidentified";
 /// The message is already queued, held, injected or claimed by another path.
 pub(crate) const SOURCE_OWNED: &str = "source_owned";
 pub(super) const QUEUE_NONEMPTY: &str = "queue_nonempty";
@@ -70,7 +79,8 @@ pub(crate) enum InjectAttempt {
         turn_id: String,
         veto: &'static str,
     },
-    /// The pane vetoed and the queue front was not written, or its result is unknown.
+    /// The pane vetoed or an admitted GUID stayed unbound, and the queue front was not written
+    /// or its result is unknown.
     HandbackFailed(&'static str),
     /// The owner died outside the pane effect: nothing was recorded and the paste is unknown.
     OwnerFailed {
@@ -82,11 +92,37 @@ pub(crate) enum InjectAttempt {
 /// becomes, and the claim the owner holds on it until the injection ends.
 pub(crate) enum Origin {
     External,
+    /// An admitted iMessage: its paste carries the reply contract, and its GUID is bound to the
+    /// holder's episode before any pane effect.
+    Obligated(ReplyObligation),
+    QueuedHead {
+        expected: QueueIdentity,
+        parent: Option<ChannelId>,
+        gate: fn(ChannelId, Option<ChannelId>) -> bool,
+    },
     Discord {
         message: MessageId,
         handback: Box<(Intervention, String)>,
         guard: SourceGuard,
     },
+}
+
+impl Origin {
+    pub(crate) fn queued_head_ready(provider: &ProviderKind, channel: ChannelId) -> bool {
+        !cfg!(windows)
+            && *provider == ProviderKind::Claude
+            && mode(channel.get()) != InjectMode::Off
+            && queued_head_enabled(channel.get())
+    }
+
+    pub(crate) fn queued_head_gate_enabled(
+        provider: &ProviderKind,
+        channel: ChannelId,
+        parent: Option<ChannelId>,
+        gate: fn(ChannelId, Option<ChannelId>) -> bool,
+    ) -> bool {
+        Self::queued_head_ready(provider, channel) && gate(channel, parent)
+    }
 }
 
 /// Tests never read the process env; a channel injects only when a test forces it.
@@ -183,6 +219,8 @@ struct Target {
     transition: OwnedMutexGuard<()>,
     /// Keeps an input-runtime gate from closing on the channel until the owner settles.
     input: Option<fence::Permit>,
+    row: Option<RowKey>,
+    binding: Option<BindingKey>,
 }
 
 async fn observe(
@@ -268,6 +306,7 @@ fn busy_turn(
 async fn resolve(
     shared: &Arc<SharedData>,
     request: &HumanInputRequest,
+    queued: bool,
 ) -> Result<Target, &'static str> {
     let channel = request.channel_id.get();
     let runtime = match request.provider {
@@ -284,11 +323,16 @@ async fn resolve(
         live_tui_session(shared, request, runtime, row, named)
     };
     let pane = live(row.as_ref(), named).ok_or(SESSION_UNRESOLVED)?;
+    let binding = binding_key(&pane.0);
     // An idle transcript keeps the caller's own start; a reservation is only for a live turn.
     let native_turn = busy_turn(runtime, &pane.1)?;
-    let input = match fence::lookup(&request.provider, channel) {
-        Some(gate) => Some(gate.admit().map_err(|_| INPUT_RUNTIME_OWNED)?),
-        None => None,
+    let input = if queued {
+        fence::effect::admit(&request.provider, channel).map_err(|_| INPUT_RUNTIME_OWNED)?
+    } else {
+        match fence::lookup(&request.provider, channel) {
+            Some(gate) => Some(gate.admit().map_err(|_| INPUT_RUNTIME_OWNED)?),
+            None => None,
+        }
     };
     // Held until the pane effect ends. Bounded waiters (claim handback, headless start, /clear,
     // /resume) give up after 3s; intake and kickoff never wait and fall back to their queue.
@@ -298,7 +342,9 @@ async fn resolve(
         .map_err(|_| TRANSITION_BUSY)?;
     let (snapshot, row) = observe(shared, request).await;
     let first = holder(&snapshot, row.as_ref(), channel)?;
-    backlog(&snapshot)?;
+    if !queued {
+        backlog(&snapshot)?;
+    }
     let deferred = crate::services::discord::host_defer_gate::channel_session_deferred;
     if deferred(shared, &request.provider, channel, &pane.0).await {
         return Err(SESSION_UNRESOLVED);
@@ -309,7 +355,9 @@ async fn resolve(
     test_hook::final_name_lookup(channel);
     let named = channel_name(shared, request.channel_id).await;
     let row = read(&request.provider, channel);
-    if live(row.as_ref(), named).as_ref() != Some(&pane) {
+    if live(row.as_ref(), named).as_ref() != Some(&pane)
+        || (queued && binding_key(&pane.0) != binding)
+    {
         return Err(SESSION_UNRESOLVED);
     }
     if row.as_ref().map(row_key) != first.row {
@@ -324,6 +372,8 @@ async fn resolve(
         claim: first.claim,
         transition,
         input,
+        row: first.row,
+        binding,
     })
 }
 
@@ -332,27 +382,51 @@ pub(crate) async fn attempt(
     request: &HumanInputRequest,
     origin: Origin,
 ) -> InjectAttempt {
-    let target = match resolve(shared, request).await {
+    if let Origin::QueuedHead {
+        expected,
+        parent,
+        gate,
+    } = origin
+    {
+        if !Origin::queued_head_gate_enabled(&request.provider, request.channel_id, parent, gate) {
+            return InjectAttempt::NotSent("queued_gate_off");
+        }
+        return queued_attempt(shared, request, expected, parent, gate).await;
+    }
+    let target = match resolve(shared, request, false).await {
         Ok(target) => target,
         Err(veto) => return InjectAttempt::NotSent(veto),
     };
     let channel = request.channel_id.get();
+    let reply = match &origin {
+        Origin::Obligated(reply) => match busy_episode(request, &target) {
+            Some(episode) => Some((reply.clone(), episode)),
+            None => return InjectAttempt::NotSent(EPISODE_UNIDENTIFIED),
+        },
+        _ => None,
+    };
+    let text = match &reply {
+        Some((reply, _)) => reply.frame(&request.text),
+        None => request.text.clone(),
+    };
     let input = Arc::new(Input {
         channel,
         provider: request.provider.as_str().to_string(),
         source: request.source.clone(),
         author: request.author_id.to_string(),
-        text: request.text.clone(),
+        text,
         nonce: busy_inject::fresh_nonce(),
     });
     let (session, turn_id) = (target.session.clone(), target.turn_id.clone());
     let (message, handback, guard) = match origin {
-        Origin::External => (None, request.queue_entry(), None),
+        Origin::External => (None, request.queue_entry(None), None),
+        Origin::Obligated(reply) => (None, request.queue_entry(Some(&reply)), None),
         Origin::Discord {
             message,
             handback,
             guard,
         } => (Some(message), *handback, Some(guard)),
+        Origin::QueuedHead { .. } => unreachable!("queued origin has its own owner"),
     };
     let owner = Owner {
         shared: shared.clone(),
@@ -361,6 +435,7 @@ pub(crate) async fn attempt(
         message,
         handback,
         guard,
+        reply,
     };
     // The owner outlives a cancelled request: it settles the reservation and any handback itself.
     match tokio::spawn(owner.run(target, input.clone())).await {
@@ -370,6 +445,212 @@ pub(crate) async fn attempt(
             let _ = unconfirmed(&input, &session, turn_id.clone(), "executor_failed");
             InjectAttempt::OwnerFailed { turn_id }
         }
+    }
+}
+
+/// The episode of the row the target verified; a holder that names no single turn has none.
+fn busy_episode(request: &HumanInputRequest, target: &Target) -> Option<String> {
+    let (_, user_msg_id, started_at, start_offset) = target.row.as_ref()?;
+    let holder = episode::Holder {
+        session: &target.session,
+        user_msg_id: *user_msg_id,
+        started_at,
+        start_offset: *start_offset,
+        native_turn: target.native_turn.as_deref(),
+    };
+    episode::busy(&request.provider, request.channel_id.get(), &holder)
+}
+
+async fn queued_target_matches(
+    shared: &SharedData,
+    request: &HumanInputRequest,
+    target: &Target,
+    before_effect: bool,
+) -> bool {
+    let named = channel_name(shared, request.channel_id).await;
+    let (snapshot, row) = observe(shared, request).await;
+    let claim = match (&snapshot.cancel_token, &target.claim) {
+        (None, None) => true,
+        (Some(token), Some((expected, kind, message))) => {
+            Arc::ptr_eq(token, expected)
+                && snapshot.active_turn_kind == *kind
+                && snapshot.active_user_message_id == *message
+        }
+        _ => false,
+    };
+    claim
+        && row.as_ref().map(row_key) == target.row
+        && binding_key(&target.session) == target.binding
+        && live_tui_session(
+            shared,
+            request,
+            RuntimeHandoffKind::ClaudeTui,
+            row.as_ref(),
+            named,
+        ) == Some((target.session.clone(), target.transcript.clone()))
+        && (!before_effect || busy_turn(RuntimeHandoffKind::ClaudeTui, &target.transcript).is_ok())
+}
+
+async fn queued_attempt(
+    shared: &Arc<SharedData>,
+    request: &HumanInputRequest,
+    expected: QueueIdentity,
+    parent: Option<ChannelId>,
+    gate: fn(ChannelId, Option<ChannelId>) -> bool,
+) -> InjectAttempt {
+    let target = match resolve(shared, request, true).await {
+        Ok(target) => target,
+        Err(veto) => return InjectAttempt::NotSent(veto),
+    };
+    let shared = shared.clone();
+    let request = HumanInputRequest {
+        channel_id: request.channel_id,
+        provider: request.provider.clone(),
+        text: request.text.clone(),
+        author_id: request.author_id,
+        source: request.source.clone(),
+        metadata: request.metadata.clone(),
+        channel_name_hint: request.channel_name_hint.clone(),
+    };
+    let permit = target.input.clone();
+    // The detached owner keeps the admitted effect through claim, pane I/O and durable settle.
+    let owner = async move {
+        let mailbox = shared.mailbox(request.channel_id);
+        let persistence = crate::services::discord::queue_persistence_context(
+            &shared,
+            &request.provider,
+            request.channel_id,
+        );
+        let held = mailbox
+            .claim_queued_head_if_enabled(
+                expected,
+                persistence.clone(),
+                request.channel_id,
+                parent,
+                gate,
+            )
+            .await;
+        let held = match held {
+            QueuedHeadClaim::Reserved(ticket) => ticket,
+            QueuedHeadClaim::NotEligible => return InjectAttempt::NotSent("queued_not_eligible"),
+            QueuedHeadClaim::PersistenceFailed(error) => return persistence_failed(error),
+            _ => return InjectAttempt::HandbackFailed("queued_head_blocked"),
+        };
+        let item = held.item();
+        let turn_id = Some(format!(
+            "discord:{}:{}",
+            request.channel_id, item.message_id
+        ));
+        let input = Arc::new(Input {
+            channel: request.channel_id.get(),
+            provider: request.provider.as_str().to_string(),
+            source: turn_id.clone().unwrap(),
+            author: item.author_id.to_string(),
+            text: item.text.clone(),
+            nonce: busy_inject::fresh_nonce(),
+        });
+        let mut ticket = Some(held);
+        let work = async {
+            #[cfg(test)]
+            test_hook::before_reserve(input.channel).await;
+            if !queued_target_matches(&shared, &request, &target, true).await {
+                return InjectAttempt::NotSent(HOLDER_CHANGED);
+            }
+            #[cfg(test)]
+            test_hook::owner_crash(input.channel);
+            let marked = mailbox
+                .settle_queued_head(
+                    ticket.take().unwrap(),
+                    HeadOutcome::MayHaveSent,
+                    persistence.clone(),
+                )
+                .await;
+            match marked {
+                HeadSettle::Committed(Some(kept)) => ticket = Some(kept),
+                HeadSettle::NotCommitted(kept, error) => {
+                    persistence_failed(error);
+                    ticket = Some(kept);
+                    return InjectAttempt::Unconfirmed {
+                        turn_id: turn_id.clone(),
+                        detail: "queued_phase_failed",
+                    };
+                }
+                _ => {
+                    return InjectAttempt::Unconfirmed {
+                        turn_id: turn_id.clone(),
+                        detail: "queued_phase_failed",
+                    };
+                }
+            }
+            #[cfg(test)]
+            test_hook::before_queued(input.channel, "may_have_sent").await;
+            if !queued_target_matches(&shared, &request, &target, true).await {
+                return InjectAttempt::NotSent(HOLDER_CHANGED);
+            }
+            let effect = tokio::task::spawn_blocking({
+                let (input, session, transcript, turn_id, permit) = (
+                    input.clone(),
+                    target.session.clone(),
+                    target.transcript.clone(),
+                    turn_id.clone(),
+                    target.input.clone(),
+                );
+                move || {
+                    fence::effect::synchronous(permit, || {
+                        run(
+                            &pane(input.channel, &session),
+                            &session,
+                            &transcript,
+                            turn_id,
+                            &input,
+                        )
+                    })
+                }
+            });
+            let attempt = effect.await.unwrap_or(InjectAttempt::OwnerFailed {
+                turn_id: turn_id.clone(),
+            });
+            #[cfg(test)]
+            test_hook::before_queued(input.channel, "after_effect").await;
+            if !matches!(attempt, InjectAttempt::NotSent(_))
+                && !queued_target_matches(&shared, &request, &target, false).await
+            {
+                return InjectAttempt::Unconfirmed {
+                    turn_id: turn_id.clone(),
+                    detail: HOLDER_CHANGED,
+                };
+            }
+            attempt
+        };
+        let attempt = std::panic::AssertUnwindSafe(work)
+            .catch_unwind()
+            .await
+            .unwrap_or(InjectAttempt::OwnerFailed {
+                turn_id: turn_id.clone(),
+            });
+        if let Some(ticket) = ticket {
+            let outcome = match attempt {
+                InjectAttempt::Injected { .. } => HeadOutcome::Injected,
+                InjectAttempt::NotSent(_) => HeadOutcome::NotSent,
+                _ => HeadOutcome::Unconfirmed,
+            };
+            if !matches!(
+                mailbox
+                    .settle_queued_head(ticket, outcome, persistence)
+                    .await,
+                HeadSettle::Committed(None)
+            ) {
+                return InjectAttempt::Unconfirmed {
+                    turn_id,
+                    detail: "queued_settle_unknown",
+                };
+            }
+        }
+        attempt
+    };
+    match tokio::spawn(fence::effect::scope(permit, owner)).await {
+        Ok(attempt) => attempt,
+        Err(_) => InjectAttempt::OwnerFailed { turn_id: None },
     }
 }
 
@@ -384,6 +665,8 @@ struct Owner {
     /// Dropped before the result returns, so a caller that falls back to its own intake is not
     /// refused by this claim.
     guard: Option<SourceGuard>,
+    /// An admitted iMessage's obligation and the holder episode its paste joins.
+    reply: Option<(ReplyObligation, String)>,
 }
 
 impl Owner {
@@ -395,6 +678,7 @@ impl Owner {
             message,
             handback: (handback, queued_turn),
             guard,
+            reply,
         } = self;
         let Target {
             session,
@@ -404,6 +688,7 @@ impl Owner {
             claim,
             transition,
             input: permit,
+            ..
         } = target;
         let mailbox = shared.mailbox(channel_id);
         let discord = crate::services::discord::queue_persistence_context;
@@ -423,10 +708,16 @@ impl Owner {
         };
         #[cfg(test)]
         test_hook::owner_crash(input.channel);
+        // The GUID names the holder's episode, with this paste's nonce, before the pane can take it.
+        let bound = match &reply {
+            Some((reply, episode)) => reply.bind_episode(episode, Some(&input.nonce)).await,
+            None => true,
+        };
         let pane = pane(input.channel, &session);
         let effect = tokio::task::spawn_blocking({
             let (input, session, turn_id) = (input.clone(), session.clone(), turn_id.clone());
             move || match native_turn {
+                _ if !bound => InjectAttempt::NotSent(imsg_reply::UNBOUND),
                 None => run(&pane, &session, &transcript, turn_id, &input),
                 Some(native) => {
                     let target = (session.as_str(), transcript.as_path(), native.as_str());
@@ -439,7 +730,20 @@ impl Owner {
             // The effect panicked outside its catch_unwind or never started, so it recorded nothing.
             Err(_) => unconfirmed(&input, &session, turn_id, "executor_failed"),
         };
+        // A refused paste leaves its episode before its queue entry exists; unbound, nothing queues.
+        let rebound = match (&attempt, &reply) {
+            (InjectAttempt::NotSent(_), Some((reply, episode))) => {
+                let queued = handback.message_id.get();
+                bound && reply.hand_back(episode, &input.nonce, queued).await
+            }
+            _ => true,
+        };
         let attempt = match attempt {
+            // The dropped ticket's reservation counts as gone; nothing reached the pane or queue.
+            InjectAttempt::NotSent(_) if !rebound => {
+                drop(ticket);
+                InjectAttempt::HandbackFailed(imsg_reply::UNBOUND)
+            }
             InjectAttempt::NotSent(veto) => {
                 let source = [handback.message_id.get()];
                 let handed =
@@ -637,41 +941,6 @@ fn run_codex(
     }
 }
 
-fn codex_veto_name(veto: codex_inject::Veto) -> &'static str {
-    use codex_inject::Veto;
-    match veto {
-        Veto::InvalidInput => "invalid_input",
-        Veto::LockContended => "lock_contended",
-        Veto::HumanAttached => "human_attached",
-        Veto::AttachUnknown => "attach_unknown",
-        Veto::PaneUnavailable => "pane_unavailable",
-        Veto::Modal => "modal",
-        Veto::NoComposer => "no_composer",
-        Veto::Draft => "draft",
-        Veto::QueueShown => "queue_shown",
-        Veto::NotSteerable => "not_steerable",
-        Veto::NotBusy => NOT_BUSY,
-        Veto::TurnUnknown => "turn_unknown",
-        Veto::TurnChanged => "turn_changed",
-        Veto::TranscriptUnavailable => "transcript_unavailable",
-        Veto::LoadFailed => "load_failed",
-        Veto::UnpredictableRender => "unpredictable_render",
-        Veto::LedgerFull => "ledger_full",
-    }
-}
-
-fn codex_unconfirmed_name(detail: codex_inject::Unconfirmed) -> &'static str {
-    use codex_inject::Unconfirmed;
-    match detail {
-        Unconfirmed::PasteFailed => "paste_failed",
-        Unconfirmed::AttachedAfterPaste => "attached_after_paste",
-        Unconfirmed::CaptureFailed => "capture_failed",
-        Unconfirmed::DraftNotOwned => "draft_not_owned",
-        Unconfirmed::EnterFailed => "enter_failed",
-        Unconfirmed::NotObserved => "not_observed",
-    }
-}
-
 fn unconfirmed(
     input: &Input,
     session: &str,
@@ -711,36 +980,6 @@ fn pane(channel_id: u64, session: &str) -> busy_inject::Pane {
     busy_inject::Pane::with_program(session, program)
 }
 
-fn veto_name(veto: Veto) -> &'static str {
-    match veto {
-        Veto::InvalidInput => "invalid_input",
-        Veto::LockContended => "lock_contended",
-        Veto::HumanAttached => "human_attached",
-        Veto::AttachUnknown => "attach_unknown",
-        Veto::PaneUnavailable => "pane_unavailable",
-        Veto::Modal => "modal",
-        Veto::Draft => "draft",
-        Veto::NotBusy => "not_busy",
-        Veto::TranscriptUnavailable => "transcript_unavailable",
-        Veto::LoadFailed => "load_failed",
-        Veto::UnpredictableRender => "unpredictable_render",
-    }
-}
-
-fn unconfirmed_name(detail: Unconfirmed) -> &'static str {
-    match detail {
-        Unconfirmed::PasteFailed => "paste_failed",
-        Unconfirmed::AttachedAfterPaste => "attached_after_paste",
-        Unconfirmed::CaptureFailed => "capture_failed",
-        Unconfirmed::ModalAfterPaste => "modal_after_paste",
-        Unconfirmed::DraftNotOwned => "draft_not_owned",
-        Unconfirmed::ContaminatedSubmit => "contaminated_submit",
-        Unconfirmed::CursorChangedBeforeEnter => "cursor_changed_before_enter",
-        Unconfirmed::EnterFailed => "enter_failed",
-        Unconfirmed::NotObserved => "not_observed",
-    }
-}
-
 /// Per-channel mode and tmux program for tests, so parallel tests never share a switch.
 #[cfg(test)]
 pub(crate) mod test_hook {
@@ -754,10 +993,12 @@ pub(crate) mod test_hook {
 
     static FORCED: Mutex<Option<HashMap<u64, (InjectMode, PathBuf)>>> = Mutex::new(None);
     static CODEX_ENABLED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    static QUEUED_ENABLED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
     static CRASHING: Mutex<Vec<u64>> = Mutex::new(Vec::new());
     static FINAL_LOOKUP: Mutex<Option<HashMap<u64, Arc<Notify>>>> = Mutex::new(None);
     type Park = (Arc<Notify>, Arc<Notify>);
     static BEFORE_RESERVE: Mutex<Option<HashMap<u64, Park>>> = Mutex::new(None);
+    static QUEUED_PHASE: Mutex<Option<HashMap<(u64, &'static str), Park>>> = Mutex::new(None);
     static GATEWAYLESS: Mutex<Option<HashMap<u64, Arc<Notify>>>> = Mutex::new(None);
     static OWNER_CRASHING: Mutex<Vec<u64>> = Mutex::new(Vec::new());
     static HANDBACK_FAULTS: Mutex<Vec<(u64, HandbackFault)>> = Mutex::new(Vec::new());
@@ -824,11 +1065,13 @@ pub(crate) mod test_hook {
         shared: &'a crate::services::discord::SharedData,
         request: &'a super::HumanInputRequest,
         reservation: &'a crate::services::discord::router::HeadlessTurnReservation,
+        metadata: &'a Option<serde_json::Value>,
     ) -> Option<impl std::future::Future<Output = super::super::StartAttempt> + 'a> {
         use super::super::StartAttempt;
         let starts = GATEWAYLESS.lock().unwrap_or_else(|e| e.into_inner());
         let begun = starts.as_ref()?.get(&request.channel_id.get())?.clone();
         Some(async move {
+            see_start(shared, request, metadata).await;
             begun.notify_one();
             let channel = request.channel_id;
             let owner = poise::serenity_prelude::UserId::new(request.author_id);
@@ -844,6 +1087,43 @@ pub(crate) mod test_hook {
         })
     }
 
+    /// What one gatewayless start saw as it began: its GUID's episode and its prompt's contract.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct StartSeen {
+        pub episode: Option<String>,
+        pub contract: Option<String>,
+    }
+
+    static STARTS_SEEN: Mutex<Vec<(u64, StartSeen)>> = Mutex::new(Vec::new());
+
+    async fn see_start(
+        shared: &crate::services::discord::SharedData,
+        request: &super::HumanInputRequest,
+        metadata: &Option<serde_json::Value>,
+    ) {
+        let origin = metadata
+            .as_ref()
+            .and_then(|m| m.pointer("/human_input/origin_id"));
+        let read = crate::db::imsg_reply::read_obligation;
+        let episode = match (shared.pg_pool.as_ref(), origin.and_then(|o| o.as_str())) {
+            (Some(pool), Some(origin)) => read(pool, origin).await.ok().flatten(),
+            _ => None,
+        };
+        let lead = crate::services::imsg_reply::with_started_contract;
+        let seen = StartSeen {
+            episode: episode.and_then(|row| row.episode_key),
+            contract: lead(None, Some(request.source.as_str()), metadata.as_ref()),
+        };
+        let mut starts = STARTS_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        starts.push((request.channel_id.get(), seen));
+    }
+
+    pub(crate) fn starts_seen(channel_id: u64) -> Vec<StartSeen> {
+        let starts = STARTS_SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = starts.iter().filter(|(channel, _)| *channel == channel_id);
+        mine.map(|(_, seen)| seen.clone()).collect()
+    }
+
     /// Parks the channel's next owner before its reservation: `(reached, resume)`.
     pub(crate) fn park_before_reserve(channel_id: u64) -> Park {
         let park: Park = Default::default();
@@ -852,6 +1132,28 @@ pub(crate) mod test_hook {
             .get_or_insert_with(HashMap::new)
             .insert(channel_id, park.clone());
         park
+    }
+
+    pub(crate) fn park_queued(channel: u64, stage: &'static str) -> Park {
+        let park: Park = Default::default();
+        QUEUED_PHASE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert((channel, stage), park.clone());
+        park
+    }
+
+    pub(super) async fn before_queued(channel: u64, stage: &'static str) {
+        let park = QUEUED_PHASE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .and_then(|parks| parks.remove(&(channel, stage)));
+        if let Some((reached, resume)) = park {
+            reached.notify_one();
+            resume.notified().await;
+        }
     }
 
     pub(super) async fn before_reserve(channel_id: u64) {
@@ -888,6 +1190,21 @@ pub(crate) mod test_hook {
             .insert(channel_id, (mode, program));
     }
 
+    pub(crate) fn set_queued_head(channel_id: u64, open: bool) {
+        let mut enabled = QUEUED_ENABLED.lock().unwrap_or_else(|e| e.into_inner());
+        enabled.retain(|channel| *channel != channel_id);
+        if open {
+            enabled.push(channel_id);
+        }
+    }
+
+    pub(crate) fn queued_head_enabled(channel_id: u64) -> bool {
+        QUEUED_ENABLED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&channel_id)
+    }
+
     /// Opens Codex injection on the channel, as turning the constant on would.
     pub(crate) fn enable_codex(channel_id: u64) {
         let mut enabled = CODEX_ENABLED.lock().unwrap_or_else(|e| e.into_inner());
@@ -900,6 +1217,7 @@ pub(crate) mod test_hook {
     }
 
     pub(crate) fn clear(channel_id: u64) {
+        set_queued_head(channel_id, false);
         let mut enabled = CODEX_ENABLED.lock().unwrap_or_else(|e| e.into_inner());
         enabled.retain(|channel| *channel != channel_id);
         let mut forced = FORCED.lock().unwrap_or_else(|e| e.into_inner());

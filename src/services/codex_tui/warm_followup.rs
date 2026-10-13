@@ -595,6 +595,10 @@ fn warm_followup_on(
         crate::services::tui_prompt_dedupe::register_tmux_channel(tmux_session_name, channel_id);
     }
 
+    if let Err(error) = preflight_warm_effect(tmux_session_name, report_channel_id, launch_options)
+    {
+        return CodexWarmFollowupOutcome::Terminal(Err(error));
+    }
     let outcome = super::input::submit_codex_followup_prompt(
         tmux_session_name,
         prompt,
@@ -607,6 +611,7 @@ fn warm_followup_on(
         rollout_path,
         rollout_len_before_submit,
         prompt,
+        report_channel_id,
     ) {
         return settled;
     }
@@ -646,6 +651,7 @@ fn settle_submit(
     rollout_path: &Path,
     rollout_len_before_submit: u64,
     prompt: &str,
+    report_channel_id: Option<u64>,
 ) -> Option<CodexWarmFollowupOutcome> {
     let rollout_len = || {
         std::fs::metadata(rollout_path)
@@ -686,6 +692,13 @@ fn settle_submit(
                 )));
             }
             let reason = CodexWarmFallbackReason::SubmitFailed;
+            if let Err(error) = preflight_warm_effect(
+                tmux_session_name,
+                report_channel_id,
+                &CodexLaunchOptions::new(prompt),
+            ) {
+                return Some(CodexWarmFollowupOutcome::Terminal(Err(error)));
+            }
             if let Err(error) = host_input::kill_legacy_pane(target, reason.reason_text()) {
                 return Some(CodexWarmFollowupOutcome::Terminal(Err(error)));
             }
@@ -724,6 +737,20 @@ fn settle_submit(
         }
     };
     Some(settled)
+}
+
+#[cfg(unix)]
+fn preflight_warm_effect(
+    tmux: &str,
+    channel: Option<u64>,
+    options: &CodexLaunchOptions,
+) -> Result<(), String> {
+    match crate::services::codex::tui_preflight(tmux, channel, options, None)
+        .map_err(|error| error.to_string())?
+    {
+        "verified" => Err(crate::services::codex::CodexTuiLaunchRefused::UnprovedPane.to_string()),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -1038,6 +1065,62 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn verified_warm_effect_rechecks_before_a_retry_safe_draft_kill() {
+        use crate::services::codex_tui::canary::CANARY_TMUX;
+        use crate::services::codex_tui::host_input::spy::{SpyGuard, SpyState, known, resolved};
+        let _env = crate::config::test_env_lock::acquire_shared_test_env_lock();
+        let _hooks = crate::config::TestEnvVarGuard::set_value_after_shared_test_env_lock(
+            "AGENTDESK_CODEX_DIRECT_TUI_HOOKS",
+            std::ffi::OsStr::new("0"),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        std::fs::write(&rollout, "{}\n").unwrap();
+        let prompt = "keep this draft";
+        let draft = PromptReadinessSnapshot {
+            composer_marker_detected: true,
+            prompt_draft_detected: true,
+            tmux_pane_alive: true,
+            capture_available: true,
+            pane_tail: format!(
+                "╭────────────────────────────────────────╮\n│ {prompt} ▌ │\n╰────────────────────────────────────────╯\n  ⏎ send"
+            ),
+        };
+        assert!(super::super::input::prompt_draft_matches(&draft, prompt));
+        let target = resolved(known(crate::services::session_host::HostKind::Tmux));
+        let guard = SpyGuard::install(SpyState {
+            pane_pid: Some(4242),
+            ..SpyState::default()
+        });
+        crate::services::codex::SOURCE_MODE_TEST
+            .with(|m| m.set(Some(crate::services::codex::CodexSourceMode::Verified)));
+        let outcome = settle_submit(
+            &target,
+            CANARY_TMUX,
+            CodexFollowupPromptSubmitOutcome::RetrySafeDraft {
+                first: draft.clone(),
+                second: draft,
+            },
+            &rollout,
+            3,
+            prompt,
+            Some(crate::services::codex_tui::canary::CANARY_CHANNEL),
+        );
+        crate::services::codex::SOURCE_MODE_TEST.with(|m| m.set(None));
+        assert!(matches!(
+            outcome,
+            Some(CodexWarmFollowupOutcome::Terminal(Err(_)))
+        ));
+        assert!(
+            guard.calls().is_empty(),
+            "eligibility changed before kill: {:?}",
+            guard.calls()
+        );
+        assert_eq!(std::fs::read_to_string(rollout).unwrap(), "{}\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn warm_followup_kills_and_relaunches_only_a_confirmed_tmux_session() {
         use crate::services::codex_tui::host_input::spy::{
             SpyGuard, SpyState, known, non_tmux_targets, resolved,
@@ -1104,7 +1187,7 @@ mod tests {
                 matches!(entry, CodexWarmFollowupOutcome::Terminal(Err(_))),
                 "{refusal:?}"
             );
-            let settled = settle_submit(&target, session, stranded(), &rollout, len, prompt);
+            let settled = settle_submit(&target, session, stranded(), &rollout, len, prompt, None);
             assert!(
                 matches!(settled, Some(CodexWarmFollowupOutcome::Terminal(Err(_)))),
                 "{refusal:?}: no relaunch"
@@ -1118,7 +1201,7 @@ mod tests {
         // Positive control: a confirmed tmux draft is killed in the legacy order, then relaunched.
         let tmux = resolved(known(HostKind::Tmux));
         let guard = SpyGuard::install(pinned());
-        let settled = settle_submit(&tmux, session, stranded(), &rollout, len, prompt);
+        let settled = settle_submit(&tmux, session, stranded(), &rollout, len, prompt, None);
         assert!(matches!(
             settled,
             Some(CodexWarmFollowupOutcome::FallbackAfterPaneKill(
@@ -1140,11 +1223,204 @@ mod tests {
             cause: StopCause::Refused(InputRefusal::IdentityMismatch),
         };
         let refused = CodexFollowupPromptSubmitOutcome::Refused { run };
-        let settled = settle_submit(&tmux, session, refused, &rollout, len, prompt);
+        let settled = settle_submit(&tmux, session, refused, &rollout, len, prompt, None);
         assert!(matches!(
             settled,
             Some(CodexWarmFollowupOutcome::Terminal(Err(_)))
         ));
         assert!(guard.calls().is_empty());
     }
+}
+
+#[cfg(unix)]
+pub(crate) struct VerifiedWarmRequest<'a> {
+    pub tmux: &'a str,
+    pub channel: u64,
+    pub session_id: &'a str,
+    pub cwd: &'a Path,
+    pub prompt: &'a str,
+    pub options: &'a CodexLaunchOptions,
+    pub token: std::sync::Arc<CancelToken>,
+    pub sender: Sender<StreamMessage>,
+}
+
+/// The exact warm path keeps its incarnation and never falls through to relaunch or cleanup.
+#[cfg(unix)]
+pub(crate) fn verified_warm(request: VerifiedWarmRequest<'_>) -> Result<(), String> {
+    let tmux_session_name = request.tmux;
+    let lock = crate::services::codex::codex_tui_session_turn_lock(tmux_session_name);
+    let _turn = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let token = std::sync::Arc::clone(&request.token);
+    let result = verified_warm_inner(request);
+    if let Err(error) = &result {
+        #[cfg(test)]
+        actual_boundary(&format!("held:{error}"));
+        tracing::warn!(
+            tmux_session_name,
+            error,
+            "verified warm evidence held; preserving pane"
+        );
+        return super::verified_hold::wait_for_cancel(tmux_session_name, Some(&token));
+    }
+    result
+}
+
+#[cfg(unix)]
+fn verified_warm_inner(request: VerifiedWarmRequest<'_>) -> Result<(), String> {
+    use crate::services::discord::codex_episode_snapshot;
+    use crate::services::tmux_common as tc;
+    use crate::services::tui_o::store::codex_provenance::submit_floor::PreparedLaunch;
+    use crate::services::tui_o::writer::{actor::codex_submission::Operation, host};
+    use crate::services::tui_prompt_dedupe::codex_verified::{VerifiedSourceSnapshot, provenance};
+    use provenance::dormant::construction::{
+        EpisodeEvidenceSnapshot, submit_warm, submitted_episode,
+    };
+    let runtime =
+        tokio::runtime::Handle::try_current().map_err(|_| "verified worker runtime unavailable")?;
+    let row: crate::services::discord::CodexEpisodeOwnerSnapshot = await_verified(
+        &runtime,
+        request.token.as_ref(),
+        codex_episode_snapshot(request.channel, request.tmux, &request.token),
+    )?;
+    let source = tc::with_tmux_source_authority(request.tmux, VerifiedSourceSnapshot::capture)
+        .map_err(|error| error.to_string())?;
+    if request.tmux != super::canary::CANARY_TMUX
+        || request.channel != super::canary::CANARY_CHANNEL
+        || source.context().channel_id != Some(request.channel)
+        || source.execution().source.session_id != request.session_id
+        || !super::rollout_tail::rollout_file_matches_cwd(
+            &source.execution().source.path,
+            request.cwd,
+        )
+        || judge_codex_tui_launch_options(request.tmux, request.options).is_err()
+        || crate::services::tmux_common::resolve_tmux_runtime_kind_marker(request.tmux)
+            != Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui)
+    {
+        return Err("verified warm incarnation mismatch".into());
+    }
+    let ready = host::process_readiness();
+    let port = ready
+        .submission(request.channel)
+        .ok_or("verified actor unavailable")?;
+    let launch = PreparedLaunch {
+        context: source.context().clone(),
+        episode: row.episode().clone(),
+    };
+    let reply = await_verified(
+        &runtime,
+        request.token.as_ref(),
+        port.request(Operation::Capture(Box::new((
+            launch,
+            source.execution().clone(),
+        )))),
+    )?;
+    #[cfg(test)]
+    actual_boundary("prepare_ack");
+    await_verified(&runtime, request.token.as_ref(), row.recheck())?;
+    let prepared = ready.prepared_reply(request.channel, reply)?;
+    let evidence = EpisodeEvidenceSnapshot::capture(
+        std::sync::Arc::clone(row.token()),
+        row.episode().clone(),
+    )?;
+    let guard = |send: &mut dyn FnMut() -> host_input::InputRun| {
+        let refused = || host_input::InputRun::Refused(host_input::InputRefusal::Conflict);
+        if await_verified(&runtime, request.token.as_ref(), row.recheck()).is_err() {
+            return refused();
+        }
+        tc::with_tmux_source_authority(request.tmux, |authority| {
+            if source.recheck(authority).is_err()
+                || prepared.floor().verify_before_prepare().is_err()
+                || cancel_requested(Some(request.token.as_ref()))
+            {
+                return refused();
+            }
+            ready
+                .with_current_prepared(request.channel, &prepared, send)
+                .unwrap_or_else(|_| refused())
+        })
+    };
+    let receipt = submit_warm(&evidence, &request.token, source.context(), || {
+        super::host_input::submit_verified_followup(
+            request.tmux,
+            request.prompt,
+            request.token.as_ref(),
+            &guard,
+        )
+    })?;
+    #[cfg(test)]
+    actual_boundary("submitted");
+    let submitted = submitted_episode(&evidence, &request.token, source.context(), &receipt)?;
+    let span = loop {
+        if cancel_requested(Some(request.token.as_ref())) {
+            return Ok(());
+        }
+        await_verified(&runtime, request.token.as_ref(), row.recheck())?;
+        let span = tc::with_tmux_source_authority(request.tmux, |authority| {
+            source
+                .recheck(authority)
+                .map_err(|_| "verified source changed")?;
+            super::rollout_tail::submitted_native_span(&submitted, prepared.floor())
+        })?;
+        if let Some(span) = span {
+            break span;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    #[cfg(test)]
+    actual_boundary("before_close");
+    let reply = await_verified(
+        &runtime,
+        request.token.as_ref(),
+        port.request(Operation::Close(Box::new(span.clone()))),
+    )?;
+    #[cfg(test)]
+    actual_boundary("close_ack");
+    await_verified(&runtime, request.token.as_ref(), row.recheck())?;
+    tc::with_tmux_source_authority(request.tmux, |authority| {
+        source
+            .recheck(authority)
+            .map_err(|_| "verified source changed")?;
+        ready.with_closed_reply(request.channel, reply, |closed| {
+            if closed.span() != &span {
+                return Err("closed episode mismatch");
+            }
+            provenance::admission::issue_closed(closed, &request.token).map(|_| ())
+        })?
+    })?;
+    super::rollout_tail::tail_closed_episode(&span, request.prompt, request.sender, request.token)
+}
+
+#[cfg(test)]
+type ActualBoundary = Box<dyn FnMut(&str)>;
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ACTUAL_BOUNDARY: std::cell::RefCell<Option<ActualBoundary>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn actual_boundary(stage: &str) {
+    ACTUAL_BOUNDARY.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(stage);
+        }
+    });
+}
+
+#[cfg(unix)]
+fn await_verified<T, E: ToString>(
+    runtime: &tokio::runtime::Handle,
+    token: &CancelToken,
+    work: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    runtime.block_on(async {
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                result=&mut work => return result.map_err(|error|error.to_string()),
+                ()=tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    if cancel_requested(Some(token)) {return Err("verified actor observation cancelled".into());}
+                }
+            }
+        }
+    })
 }
