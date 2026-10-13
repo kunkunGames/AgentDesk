@@ -90,6 +90,11 @@ pub(crate) trait SendBackend: Send + Sync {
         delete: bool,
     ) -> Result<(), String>;
     fn send_enter(&self, session_name: &str) -> Result<(), String>;
+    /// The pane with its attributes (`capture-pane -e`) for the draft-protection check; a backend
+    /// that cannot read it so keeps a protected pane held.
+    fn capture(&self, _session_name: &str) -> Option<String> {
+        None
+    }
 }
 
 struct TmuxSendBackend;
@@ -120,6 +125,10 @@ impl SendBackend for TmuxSendBackend {
             transport.send_keys(session_name, &[HostKey::Enter])
         })
         .map(|_| ())
+    }
+
+    fn capture(&self, session_name: &str) -> Option<String> {
+        host_input::observe_draft(session_name)
     }
 }
 
@@ -270,6 +279,24 @@ fn handle_send_with_backend(
     let mutation = crate::services::claude_tui::composer_lock::with_composer_mutation_lock(
         &session_name,
         || -> Result<(bool, Option<DateTime<Utc>>), (StatusCode, Json<Value>)> {
+            let protected = crate::services::claude_tui::composer_lock::admit_composer_write(
+                &session_name,
+                || backend.capture(&session_name),
+            );
+            if protected.is_err() {
+                return Err(draft_recovery_hold_json());
+            }
+            // A new message submitted to a Claude pane must not carry text already in its composer.
+            if req.submit && !req.text.is_empty() && !foreign_provider_pane(&session_name) {
+                let capture = backend.capture(&session_name);
+                let refusal = crate::services::claude_tui::input::composer_refusal(
+                    &session_name,
+                    capture.as_deref(),
+                );
+                if let Some(reason) = refusal {
+                    return Err((StatusCode::CONFLICT, Json(error_json(reason))));
+                }
+            }
             if !req.text.is_empty() {
                 let buffer_name = allocate_buffer_name();
                 backend
@@ -591,6 +618,21 @@ fn bad_request_json(message: &str) -> (StatusCode, Json<Value>) {
     (StatusCode::BAD_REQUEST, Json(error_json(message)))
 }
 
+/// A pane named for a provider other than Claude, whose composer the Claude reader cannot read.
+fn foreign_provider_pane(session_name: &str) -> bool {
+    use crate::services::provider::{ProviderKind, parse_provider_and_channel_from_tmux_name};
+    parse_provider_and_channel_from_tmux_name(session_name)
+        .is_some_and(|(provider, _)| provider != ProviderKind::Claude)
+}
+
+/// Nothing was sent: the pane protects a person's draft, so the caller keeps the input.
+fn draft_recovery_hold_json() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(error_json("draft_recovery_hold")),
+    )
+}
+
 /// Test-only `SendBackend` exposed to the crate so the server-layer
 /// auth-boundary integration tests (which own the middleware wiring) can mount
 /// `/tui/send` without touching tmux. Kept next to the trait it implements; the
@@ -621,6 +663,18 @@ impl SendBackend for FakeSendBackend {
     fn send_enter(&self, _session_name: &str) -> Result<(), String> {
         Ok(())
     }
+
+    fn capture(&self, _session_name: &str) -> Option<String> {
+        Some(empty_composer_for_tests())
+    }
+}
+
+/// An idle Claude pane with an empty composer, as `capture-pane -e` returns it.
+#[cfg(test)]
+pub(crate) fn empty_composer_for_tests() -> String {
+    let border = "\u{2500}".repeat(60);
+    let footer = "  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)";
+    format!("\u{23fa} Done.\n\n\n{border}\n\u{276f}\u{a0}\n{border}\n{footer}\n")
 }
 
 #[cfg(test)]
@@ -629,6 +683,19 @@ mod tests {
     use axum::http::StatusCode;
     use chrono::Utc;
     use serde_json::json;
+
+    /// The production backend reads a protected pane with its attributes, so a faint placeholder
+    /// stays apart from typed text.
+    #[cfg(unix)]
+    #[test]
+    fn the_tmux_backend_reads_the_pane_with_its_attributes() {
+        let session = format!("relay-draft-{}", uuid::Uuid::new_v4().simple());
+        let pane = host_input::FakeDraftPane::new(&session);
+        let row = "\x1b[39m\u{276f}\u{a0}\x1b[2mTry \"refactor <filepath>\"\x1b[0m\n";
+        pane.show(row);
+        assert_eq!(TmuxSendBackend.capture(&session).as_deref(), Some(row));
+        assert_eq!(pane.draft_reads(), 1);
+    }
 
     fn send_request(text: &str, submit: bool) -> SendRequest {
         SendRequest {
@@ -732,6 +799,9 @@ mod tests {
             }
             fn send_enter(&self, _session_name: &str) -> Result<(), String> {
                 Ok(())
+            }
+            fn capture(&self, _session_name: &str) -> Option<String> {
+                Some(empty_composer_for_tests())
             }
         }
 
@@ -868,11 +938,119 @@ mod tests {
             kind,
             received_at: Utc::now(),
             payload,
+            fanout: None,
         }
     }
 
     fn replay_lower_bound() -> Option<DateTime<Utc>> {
         Some(Utc::now() - chrono::Duration::seconds(1))
+    }
+
+    #[tokio::test]
+    async fn http_fanout_preserves_alias_only_live_and_registry_waits() {
+        use crate::services::claude_tui::hook_registry::{RegistryKey, global};
+        use crate::services::claude_tui::hook_server::{
+            HookServerState, hook_receiver_router_with_state,
+        };
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt;
+        let _env = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let _config = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_CONFIG",
+            &root.path().join("absent.yaml"),
+        );
+        let _dedupe = crate::services::tui_prompt_dedupe::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let command = "echo-wait-command";
+        let alias = "echo-wait-alias";
+        for sid in [command, alias] {
+            crate::services::tui_prompt_dedupe::register_provider_session(
+                "claude",
+                sid,
+                "echo-wait-pane",
+            );
+        }
+        let state = HookServerState::new();
+        let mut live = state.subscribe();
+        let key = RegistryKey::new("claude", Some(alias), None).unwrap();
+        let _ = global().claim_once(key.clone());
+        for kind in ["Stop", "SubagentStop", "Notification"] {
+            let payload = json!({"session_id": alias, "text": "ready-alias-token"});
+            let response = hook_receiver_router_with_state(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/hooks/claude/{kind}?session_id={command}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let primary = tokio::time::timeout(Duration::from_secs(5), live.recv())
+                .await
+                .expect("primary fanout missing")
+                .unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(5), live.recv())
+                .await
+                .expect("alias fanout missing")
+                .unwrap();
+            assert_eq!(event.session_id, alias);
+            assert_eq!(event.payload, primary.payload);
+            assert_eq!(event.received_at, primary.received_at);
+            let wire = serde_json::to_value(&event).unwrap();
+            assert!(wire.get("fanout").is_none());
+            let mode = if kind == "Notification" {
+                "token"
+            } else {
+                "stop"
+            };
+            let boundary = Some(event.received_at);
+            assert!(event_matches(
+                &event,
+                Some("claude"),
+                Some(alias),
+                mode,
+                Some("ready-alias-token"),
+                boundary
+            ));
+            assert!(!event_matches(
+                &event,
+                Some("claude"),
+                Some(alias),
+                mode,
+                Some(command),
+                Some(event.received_at + chrono::Duration::milliseconds(1))
+            ));
+            assert!(!event_matches(
+                &event,
+                Some("claude"),
+                Some(alias),
+                "token",
+                Some(command),
+                boundary
+            ));
+            let replay = global()
+                .claim_matching_once(key.clone(), |candidate| {
+                    event_matches_registry_replay(
+                        candidate,
+                        Some("claude"),
+                        Some(alias),
+                        mode,
+                        Some("ready-alias-token"),
+                        boundary,
+                    )
+                })
+                .expect("alias-only registry waiter");
+            assert_eq!(replay.payload, event.payload);
+            assert_eq!(replay.received_at, event.received_at);
+        }
     }
 
     #[test]
@@ -1331,7 +1509,10 @@ mod tests {
     #[test]
     fn tui_send_reaches_tmux_only_through_the_host_executor() {
         use crate::services::claude_tui::host_input::{SpyGuard, SpyState};
-        let guard = SpyGuard::install(SpyState::default());
+        let guard = SpyGuard::install(SpyState {
+            captures: [Some(empty_composer_for_tests())].into(),
+            ..SpyState::default()
+        });
         let (status, body) =
             handle_send_with_backend(send_request("한글\n둘째 줄", true), &TmuxSendBackend);
         assert_eq!(status, StatusCode::OK);
@@ -1340,6 +1521,7 @@ mod tests {
             guard.calls(),
             [
                 "present",
+                "capture:draft",
                 "load:한글\n둘째 줄",
                 "paste:delete=true",
                 "keys:Enter"

@@ -30,6 +30,7 @@ pub(crate) struct IntakeOutboxRow {
     pub attachment_refs: Value,
     pub channel_id: String,
     pub user_msg_id: String,
+    pub replay_source_message_ids: Option<Vec<String>>,
     pub request_owner_id: String,
     pub request_owner_name: Option<String>,
     pub user_text: String,
@@ -60,6 +61,8 @@ pub(crate) struct IntakeOutboxRow {
     pub owner_generation: Option<i64>,
     pub owner_instance_id: Option<String>,
     pub admission_kind: String,
+    /// The delegated home epoch this row was routed under; `None` is a gateway-rule row.
+    pub home_epoch: Option<i64>,
 }
 
 /// Per-message payload required to INSERT a fresh row. Mirrors the
@@ -74,6 +77,7 @@ pub(crate) struct InsertPendingPayload {
     pub attachment_refs: Value,
     pub channel_id: String,
     pub user_msg_id: String,
+    pub replay_source_message_ids: Option<Vec<String>>,
     pub request_owner_id: String,
     pub request_owner_name: Option<String>,
     pub user_text: String,
@@ -91,6 +95,7 @@ pub(crate) struct InsertPendingPayload {
     /// eligibility is scoped on this, not on `agents.provider`, because a
     /// cc/cdx paired agent has one `agents.provider` but two bots.
     pub provider: String,
+    pub home_epoch: Option<i64>,
 }
 
 /// INSERT a fresh `pending` row into `intake_outbox` for the given
@@ -119,14 +124,16 @@ pub(crate) async fn insert_pending(
             user_text, reply_context, has_reply_boundary, dm_hint, turn_kind,
             merge_consecutive, reply_to_user_message, defer_watcher_resume,
             wait_for_completion, preserve_on_cancel, agent_id, provider,
-            status, attempt_no, parent_outbox_id, execution_requirements, attachment_refs
+            status, attempt_no, parent_outbox_id, execution_requirements, attachment_refs,
+            home_epoch, replay_source_message_ids
         ) VALUES (
             $1, $2, $3,
             $4, $5, $6, $7,
             $8, $9, $10, $11, $12,
             $13, $14, $15,
             $16, $17, $18, $19,
-            $20, $21, $22, $23, $24
+            $20, $21, $22, $23, $24,
+            $25, $26
         )
         RETURNING id
         "#,
@@ -155,6 +162,8 @@ pub(crate) async fn insert_pending(
     .bind(parent_outbox_id)
     .bind(&payload.execution_requirements)
     .bind(&payload.attachment_refs)
+    .bind(payload.home_epoch)
+    .bind(payload.replay_source_message_ids.as_deref())
     .fetch_one(pool)
     .await?;
     Ok(id)
@@ -271,6 +280,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
                  WHERE open_row.channel_id = parent.channel_id
                    AND open_row.status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})
            )
+           AND NOT replay_sources_blocked(parent.provider, parent.channel_id, COALESCE(parent.replay_source_message_ids, ARRAY[parent.user_msg_id]))
            AND EXISTS (
                 SELECT 1 FROM worker_nodes worker
                  WHERE worker.status = 'online'
@@ -347,6 +357,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
                      WHERE open_row.channel_id = parent.channel_id
                        AND open_row.status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})
                )
+               AND NOT replay_sources_blocked(parent.provider, parent.channel_id, COALESCE(parent.replay_source_message_ids, ARRAY[parent.user_msg_id]))
              ORDER BY parent.updated_at ASC, parent.id ASC
              LIMIT 1
              FOR UPDATE OF parent SKIP LOCKED
@@ -505,10 +516,11 @@ pub(crate) async fn sweep_failed_pre_accept_once(
             merge_consecutive, reply_to_user_message, defer_watcher_resume,
             wait_for_completion, preserve_on_cancel, agent_id, provider,
             owner_instance_id, owner_generation, admission_kind,
-            status, attempt_no, parent_outbox_id, execution_requirements, attachment_refs
+            status, attempt_no, parent_outbox_id, execution_requirements, attachment_refs,
+            home_epoch, replay_source_message_ids
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                   $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                  $23, $24, $25, $26, $27)
+                  $23, $24, $25, $26, $27, $28, $29)
         RETURNING id"#,
     )
     .bind(&target)
@@ -538,6 +550,8 @@ pub(crate) async fn sweep_failed_pre_accept_once(
     .bind(source.id)
     .bind(&source.execution_requirements)
     .bind(&source.attachment_refs)
+    .bind(source.home_epoch)
+    .bind(source.replay_source_message_ids.as_deref())
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -585,30 +599,32 @@ pub(crate) async fn claim_pending_for_target_except(
 
     // With nothing held the claim runs the original statement and bindings unchanged.
     let candidate: Option<i64> = if held_channels.is_empty() {
-        sqlx::query_scalar(
+        sqlx::query_scalar(&format!(
             "SELECT io.id FROM intake_outbox io
              WHERE io.target_instance_id = $1
                AND io.status = 'pending'
                AND io.provider = $2
+               AND {HOME_CLAIM_FENCE} AND {REPLAY_CLAIM_FENCE}
              ORDER BY io.created_at ASC
              LIMIT 1
-             FOR UPDATE OF io SKIP LOCKED",
-        )
+             FOR UPDATE OF io SKIP LOCKED"
+        ))
         .bind(target_instance_id)
         .bind(provider)
         .fetch_optional(&mut *tx)
         .await?
     } else {
-        sqlx::query_scalar(
+        sqlx::query_scalar(&format!(
             "SELECT io.id FROM intake_outbox io
              WHERE io.target_instance_id = $1
                AND io.status = 'pending'
                AND io.provider = $2
                AND NOT (io.channel_id = ANY($3::TEXT[]))
+               AND {HOME_CLAIM_FENCE} AND {REPLAY_CLAIM_FENCE}
              ORDER BY io.created_at ASC
              LIMIT 1
-             FOR UPDATE OF io SKIP LOCKED",
-        )
+             FOR UPDATE OF io SKIP LOCKED"
+        ))
         .bind(target_instance_id)
         .bind(provider)
         .bind(held_channels)
@@ -621,23 +637,53 @@ pub(crate) async fn claim_pending_for_target_except(
         return Ok(None);
     };
 
-    let row: IntakeOutboxRow = sqlx::query_as(
-        "UPDATE intake_outbox
-         SET status = $3,
-             claim_owner = $2,
-             claimed_at = NOW()
-         WHERE id = $1
-         RETURNING *",
-    )
-    .bind(id)
-    .bind(claim_owner)
-    .bind(IntakeOutboxStatus::Claimed)
-    .fetch_one(&mut *tx)
-    .await?;
+    // Test-only checkpoint: lets a test move the home between this SELECT and the confirming UPDATE.
+    #[cfg(test)]
+    crate::services::cluster::intake_worker::test_executor::claim_selected().await;
+
+    let Some(row) = confirm_claim(&mut tx, id, claim_owner).await? else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
 
     tx.commit().await?;
     Ok(Some(row))
 }
+
+/// Claims the selected row only if its home still admits it; the home may have moved since.
+async fn confirm_claim(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: i64,
+    claim_owner: &str,
+) -> Result<Option<IntakeOutboxRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "UPDATE intake_outbox io
+         SET status = $3,
+             claim_owner = $2,
+             claimed_at = NOW()
+         WHERE io.id = $1 AND {HOME_CLAIM_FENCE} AND {REPLAY_CLAIM_FENCE}
+         RETURNING *"
+    ))
+    .bind(id)
+    .bind(claim_owner)
+    .bind(IntakeOutboxStatus::Claimed)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+/// A row with no home epoch is claimable only while its channel has no home row; a row routed at
+/// a home epoch only on that epoch's holder while the channel is worker-owned.
+const HOME_CLAIM_FENCE: &str = "(
+    (io.home_epoch IS NULL
+        AND NOT EXISTS (SELECT 1 FROM o_channel_homes h WHERE h.channel_id = io.channel_id))
+    OR EXISTS (
+        SELECT 1 FROM o_channel_homes h
+         WHERE h.channel_id = io.channel_id AND h.provider = io.provider
+           AND h.state = 'worker' AND h.holder = io.target_instance_id
+           AND h.epoch = io.home_epoch))";
+
+/// A request whose source already started elsewhere is never claimed or accepted as new work.
+const REPLAY_CLAIM_FENCE: &str = "NOT replay_sources_blocked(io.provider, io.channel_id, COALESCE(io.replay_source_message_ids, ARRAY[io.user_msg_id]))";
 
 /// The claim with no held channel.
 #[cfg(test)]
@@ -668,7 +714,9 @@ pub(crate) async fn return_claimed_to_pending(
          SET status = $3,
              claim_owner = NULL,
              claimed_at = NULL
-         WHERE id = $1 AND status = $4 AND claim_owner = $2",
+         WHERE id = $1 AND status = $4 AND claim_owner = $2
+           AND NOT replay_sources_blocked(provider, channel_id,
+                   COALESCE(replay_source_message_ids, ARRAY[user_msg_id]))",
     )
     .bind(id)
     .bind(claim_owner)
@@ -686,7 +734,7 @@ pub(crate) async fn return_claimed_to_pending(
 ///
 /// Returns `Ok(true)` when the row was updated; `Ok(false)` when the
 /// row was no longer in `claimed` (e.g., a stale-claim sweep beat the
-/// worker to it, or the claim_owner no longer matches). Workers MUST
+/// worker to it, or the claim_owner no longer matches) or its home moved. Workers MUST
 /// abort the turn on `Ok(false)` rather than spawning — proceeding past
 /// a lost claim is the only path that double-emits a Discord turn.
 pub(crate) async fn mark_accepted(
@@ -694,11 +742,13 @@ pub(crate) async fn mark_accepted(
     id: i64,
     claim_owner: &str,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE intake_outbox
+    // The claim's home fence in the same UPDATE: a home moved after the worker's last check refuses.
+    let result = sqlx::query(&format!(
+        "UPDATE intake_outbox io
          SET status = $3, accepted_at = NOW()
-         WHERE id = $1 AND status = $4 AND claim_owner = $2",
-    )
+         WHERE io.id = $1 AND io.status = $4 AND io.claim_owner = $2
+           AND {HOME_CLAIM_FENCE} AND {REPLAY_CLAIM_FENCE}"
+    ))
     .bind(id)
     .bind(claim_owner)
     .bind(IntakeOutboxStatus::Accepted)
@@ -735,7 +785,7 @@ pub(crate) async fn mark_spawned(
 }
 
 /// Successful completion: `spawned → done`. Worker calls this on
-/// `Ok(())` from `execute_intake_turn_core`.
+/// an executed outcome from `execute_intake_turn_core`.
 ///
 /// Returns `Ok(true)` on a real transition. `Ok(false)` with `dispatched`
 /// means the bridge handoff stamp won first and is normal; `done` means terminal
@@ -846,7 +896,9 @@ pub(crate) async fn sweep_stale_pre_accept_claims(
              claim_owner = NULL,
              claimed_at = NULL
          WHERE status = 'claimed'
-           AND claimed_at < NOW() - ($1::BIGINT * INTERVAL '1 second')",
+           AND claimed_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
+           AND NOT replay_sources_blocked(provider, channel_id,
+                   COALESCE(replay_source_message_ids, ARRAY[user_msg_id]))",
     )
     .bind(stale_after_secs.max(1))
     .bind(IntakeOutboxStatus::Pending)
@@ -888,6 +940,21 @@ pub(crate) async fn list_recent_rows(
     }
 }
 
+/// Whether the channel still has an intake row in an open status; that row owes Legacy execution.
+pub(crate) async fn channel_has_open_row(
+    pool: &PgPool,
+    channel_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM intake_outbox
+                         WHERE channel_id = $1 AND status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL}))"
+    );
+    sqlx::query_scalar(&sql)
+        .bind(channel_id)
+        .fetch_one(pool)
+        .await
+}
+
 /// Leader sweep that returns rows currently in `accepted` longer than
 /// `sla_secs` without reaching `spawned`. Round-3 P1 #3: the operator
 /// alert IS the recovery signal — auto-retry forbidden post-accept.
@@ -911,6 +978,10 @@ pub(crate) async fn list_accepted_unspawned_sla(
     .await?;
     Ok(rows)
 }
+
+#[cfg(test)]
+#[path = "intake_outbox_home_tests.rs"]
+mod home_tests;
 
 #[cfg(test)]
 mod migration_pg_tests {
@@ -1231,6 +1302,32 @@ mod migration_pg_tests {
             .await
             .expect("fresh OPEN row after parent terminal");
 
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn e1_channel_open_row_probe_sees_only_open_statuses_of_that_channel() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate().await;
+        assert!(!super::channel_has_open_row(&pool, "ch-e1").await.unwrap());
+        insert_minimal_row(&pool, "ch-e1", "msg-A", 1, "pending")
+            .await
+            .expect("open row");
+        assert!(super::channel_has_open_row(&pool, "ch-e1").await.unwrap());
+        assert!(
+            !super::channel_has_open_row(&pool, "ch-e1-other")
+                .await
+                .unwrap()
+        );
+        sqlx::query(
+            "UPDATE intake_outbox SET status='done', completed_at=NOW()
+             WHERE channel_id='ch-e1' AND user_msg_id='msg-A'",
+        )
+        .execute(&pool)
+        .await
+        .expect("transition to done");
+        assert!(!super::channel_has_open_row(&pool, "ch-e1").await.unwrap());
         pool.close().await;
         pg_db.drop().await;
     }
@@ -1627,6 +1724,7 @@ mod postgres_tests {
             required_labels: json!(["unreal"]),
             channel_id: channel.to_string(),
             user_msg_id: msg.to_string(),
+            replay_source_message_ids: None,
             request_owner_id: "user-100".to_string(),
             request_owner_name: Some("Tester".to_string()),
             user_text: "hello world".to_string(),
@@ -1640,6 +1738,7 @@ mod postgres_tests {
             wait_for_completion: false,
             preserve_on_cancel: false,
             agent_id: "agent-x".to_string(),
+            home_epoch: None,
         }
     }
 

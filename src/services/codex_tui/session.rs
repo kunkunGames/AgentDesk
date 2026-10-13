@@ -8,6 +8,7 @@ use super::rollout_index::cached_indexed_rollouts;
 use super::rollout_tail::default_codex_sessions_dir;
 
 const CODEX_TUI_LAUNCH_OPTIONS_FINGERPRINT_TEMP_EXT: &str = "codex-tui-launch-options.sha256";
+const CODEX_TUI_LAUNCH_OPTIONS_SNAPSHOT_TEMP_EXT: &str = "codex-tui-launch-options.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexTuiSessionFiles {
@@ -15,6 +16,8 @@ pub struct CodexTuiSessionFiles {
     pub legacy_codex_home_path: PathBuf,
     pub launch_options_fingerprint_path: PathBuf,
     pub legacy_launch_options_fingerprint_path: PathBuf,
+    pub launch_options_snapshot_path: PathBuf,
+    pub legacy_launch_options_snapshot_path: PathBuf,
 }
 
 impl CodexTuiSessionFiles {
@@ -42,6 +45,18 @@ impl CodexTuiSessionFiles {
                     CODEX_TUI_LAUNCH_OPTIONS_FINGERPRINT_TEMP_EXT,
                 ),
             ),
+            launch_options_snapshot_path: PathBuf::from(
+                crate::services::tmux_common::session_temp_path(
+                    tmux_session_name,
+                    CODEX_TUI_LAUNCH_OPTIONS_SNAPSHOT_TEMP_EXT,
+                ),
+            ),
+            legacy_launch_options_snapshot_path: PathBuf::from(
+                crate::services::tmux_common::legacy_tmp_session_path(
+                    tmux_session_name,
+                    CODEX_TUI_LAUNCH_OPTIONS_SNAPSHOT_TEMP_EXT,
+                ),
+            ),
         }
     }
 
@@ -50,6 +65,8 @@ impl CodexTuiSessionFiles {
         let _ = std::fs::remove_dir_all(&self.legacy_codex_home_path);
         let _ = std::fs::remove_file(&self.launch_options_fingerprint_path);
         let _ = std::fs::remove_file(&self.legacy_launch_options_fingerprint_path);
+        let _ = std::fs::remove_file(&self.launch_options_snapshot_path);
+        let _ = std::fs::remove_file(&self.legacy_launch_options_snapshot_path);
     }
 }
 
@@ -71,6 +88,55 @@ pub fn read_codex_tui_launch_options_fingerprint(tmux_session_name: &str) -> Opt
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// One launch-evidence file as read back: absent, present but unusable, or its trimmed text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LaunchEvidenceFile {
+    Missing,
+    Unreadable(String),
+    Present(String),
+}
+
+fn read_launch_evidence_file(tmux_session_name: &str, ext: &str) -> LaunchEvidenceFile {
+    let Some(path) =
+        crate::services::tmux_common::resolve_session_temp_path(tmux_session_name, ext)
+    else {
+        return LaunchEvidenceFile::Missing;
+    };
+    match std::fs::read_to_string(path) {
+        Ok(value) if value.trim().is_empty() => LaunchEvidenceFile::Unreadable("empty".to_string()),
+        Ok(value) => LaunchEvidenceFile::Present(value.trim().to_string()),
+        Err(error) => LaunchEvidenceFile::Unreadable(error.to_string()),
+    }
+}
+
+pub(crate) fn read_codex_tui_launch_options_fingerprint_file(
+    tmux_session_name: &str,
+) -> LaunchEvidenceFile {
+    read_launch_evidence_file(
+        tmux_session_name,
+        CODEX_TUI_LAUNCH_OPTIONS_FINGERPRINT_TEMP_EXT,
+    )
+}
+
+/// Per-field values behind the fingerprint, kept only to name what changed on a mismatch.
+pub(crate) fn write_codex_tui_launch_options_snapshot(
+    tmux_session_name: &str,
+    snapshot: &str,
+) -> Result<(), String> {
+    let files = CodexTuiSessionFiles::for_tmux_session(tmux_session_name);
+    std::fs::write(&files.launch_options_snapshot_path, snapshot)
+        .map_err(|error| format!("failed to write Codex TUI launch-options snapshot: {error}"))
+}
+
+pub(crate) fn read_codex_tui_launch_options_snapshot_file(
+    tmux_session_name: &str,
+) -> LaunchEvidenceFile {
+    read_launch_evidence_file(
+        tmux_session_name,
+        CODEX_TUI_LAUNCH_OPTIONS_SNAPSHOT_TEMP_EXT,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,22 +195,63 @@ pub(crate) fn write_codex_tui_rollout_marker_under_source_authority(
     if tmux_session_name.is_empty() {
         return Ok(());
     }
-    let rollout_start_offset = preserved_rollout_start_offset_for_marker(
-        tmux_session_name,
+    if super::rollout_index::rollout_is_subagent(rollout_path) {
+        tracing::warn!(tmux_session_name, rollout_path = %rollout_path.display(),
+            "refusing Codex TUI marker for a subagent rollout");
+        return Err("cannot persist a Codex TUI marker for a subagent rollout".to_string());
+    }
+    let ownership = crate::services::tui_prompt_dedupe::codex_verified_marker_metadata(
+        authority,
         rollout_path,
-        rollout_start_offset,
-    );
+        session_id,
+    )?;
     let path = crate::services::tmux_common::session_temp_path(
         tmux_session_name,
         crate::services::tmux_common::CODEX_TUI_ROLLOUT_MARKER_TEMP_EXT,
     );
-    let value = serde_json::json!({
+    let owned_marker = if ownership.is_some() {
+        crate::services::tui_prompt_dedupe::codex_verified_preservable_marker(
+            authority,
+            rollout_path,
+            session_id,
+        )
+        .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+    let rollout_start_offset = if ownership.is_some() && owned_marker.is_none() {
+        Some(0)
+    } else {
+        preserved_rollout_start_offset_for_marker(
+            tmux_session_name,
+            rollout_path,
+            rollout_start_offset,
+        )
+    };
+    let mut value = serde_json::json!({
         "rollout_path": rollout_path.display().to_string(),
         "session_id": session_id
             .map(str::trim)
             .filter(|value| !value.is_empty()),
         "rollout_start_offset": rollout_start_offset,
     });
+    if let Some(ownership) = ownership {
+        value["codex_ownership"] = ownership;
+        if let Some(relay) = owned_marker.and_then(|marker| marker.get("codex_relay").cloned()) {
+            value["codex_relay"] = relay;
+        }
+        use std::io::Write;
+        let parent = Path::new(&path)
+            .parent()
+            .ok_or("Codex marker has no parent")?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+        temp.write_all(format!("{value}\n").as_bytes())
+            .map_err(|e| e.to_string())?;
+        temp.as_file().sync_all().map_err(|e| e.to_string())?;
+        temp.persist(&path).map_err(|e| e.to_string())?;
+        return crate::services::discord::runtime_store::fsync_parent_dir(Path::new(&path))
+            .map_err(|e| e.to_string());
+    }
     std::fs::write(&path, format!("{value}\n"))
         .map_err(|error| format!("failed to write Codex TUI rollout marker: {error}"))
 }
@@ -191,43 +298,68 @@ fn install_binding(
     binding: crate::services::tui_prompt_dedupe::TuiRuntimeBinding,
     launched: bool,
 ) -> bool {
+    crate::services::tmux_common::with_tmux_source_authority(tmux_session_name, |authority| {
+        install_binding_under_source_authority(authority, rollout_start_offset, binding, launched)
+    })
+}
+
+pub(crate) fn install_codex_tui_runtime_binding_under_source_authority(
+    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
+    rollout_start_offset: Option<u64>,
+    binding: crate::services::tui_prompt_dedupe::TuiRuntimeBinding,
+) -> bool {
+    install_binding_under_source_authority(authority, rollout_start_offset, binding, false)
+}
+
+fn install_binding_under_source_authority(
+    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
+    rollout_start_offset: Option<u64>,
+    binding: crate::services::tui_prompt_dedupe::TuiRuntimeBinding,
+    launched: bool,
+) -> bool {
     use crate::services::tui_prompt_dedupe as dedupe;
+    let tmux_session_name = authority.session();
     let rollout_path = PathBuf::from(&binding.output_path);
     let session_id = binding.session_id.clone();
-    crate::services::tmux_common::with_tmux_source_authority(tmux_session_name, |authority| {
-        // A recovery install with hooks on gets the same check; its reader keeps the old source.
-        if (launched || crate::services::codex::codex_direct_tui_hook_overrides_enabled())
-            && dedupe::codex_tail_source_retired(authority, &binding)
-        {
-            tracing::info!(
-                tmux_session_name,
-                "Codex tail source retired by a hook or held on an unreadable hook history"
-            );
-            return false;
-        }
-        if let Err(error) = write_codex_tui_rollout_marker_under_source_authority(
-            authority,
-            &rollout_path,
-            session_id.as_deref(),
-            rollout_start_offset,
-        ) {
-            tracing::warn!(
-                tmux_session_name,
-                error,
-                "failed to persist Codex TUI rollout marker; runtime binding unchanged"
-            );
-            return true;
-        }
-        source_observation::observe(&rollout_path, session_id.as_deref());
-        if launched {
-            dedupe::register_launched_tmux_runtime_binding_under_source_authority(
-                authority, binding,
-            );
-        } else {
-            dedupe::register_tmux_runtime_binding_under_source_authority(authority, binding);
-        }
-        true
-    })
+    if !dedupe::codex_verified_publication_allowed(authority, &binding) {
+        return false;
+    }
+    let verified =
+        dedupe::codex_verified_marker_metadata(authority, &rollout_path, session_id.as_deref())
+            .is_ok_and(|metadata| metadata.is_some());
+    // A recovery install with hooks on gets the same check; its reader keeps the old source.
+    if (launched || crate::services::codex::codex_direct_tui_hook_overrides_enabled())
+        && dedupe::codex_tail_source_retired(authority, &binding)
+    {
+        tracing::info!(
+            tmux_session_name,
+            "Codex tail source retired by a hook or held on an unreadable hook history"
+        );
+        return false;
+    }
+    source_observation::observe(&rollout_path, session_id.as_deref());
+    if dedupe::codex_tui_binding_is_subagent(tmux_session_name, &binding) {
+        return false;
+    }
+    if let Err(error) = write_codex_tui_rollout_marker_under_source_authority(
+        authority,
+        &rollout_path,
+        session_id.as_deref(),
+        rollout_start_offset,
+    ) {
+        tracing::warn!(
+            tmux_session_name,
+            error,
+            "failed to persist Codex TUI rollout marker; runtime binding unchanged"
+        );
+        return !verified;
+    }
+    let registered = if launched {
+        dedupe::register_launched_tmux_runtime_binding_under_source_authority(authority, binding)
+    } else {
+        dedupe::register_tmux_runtime_binding_under_source_authority(authority, binding)
+    };
+    !verified || registered
 }
 
 pub fn advance_codex_tui_rollout_marker_start_offset(
@@ -811,7 +943,7 @@ mod tests {
             ),
         ] {
             let meta = serde_json::json!({"type":"session_meta","payload":{
-                "id":metadata_id,"source":source,"parent_thread_id":parent}});
+                "id":metadata_id,"cwd":root,"source":source,"parent_thread_id":parent}});
             std::fs::write(&path, format!("{meta}\n")).unwrap();
             assert_eq!(source_observation::observe(&path, Some(&id)), expected);
             let before = std::fs::read(&path).unwrap();
@@ -825,12 +957,24 @@ mod tests {
                 last_offset: 42,
                 relay_last_offset: None,
             };
+            clear_tmux_runtime_binding("AgentDesk-d1d1-observer");
+            let marker_path = crate::services::tmux_common::session_temp_path(
+                "AgentDesk-d1d1-observer",
+                crate::services::tmux_common::CODEX_TUI_ROLLOUT_MARKER_TEMP_EXT,
+            );
+            let _ = std::fs::remove_file(marker_path);
             install_codex_tui_runtime_binding("AgentDesk-d1d1-observer", Some(42), binding);
             let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
             assert!(text.contains(&format!("verdict=\"{expected}\"")), "{text}");
             assert!(
                 text.contains("launch_verified=false") && text.contains("source_metadata_only")
             );
+            if expected == "child" {
+                assert!(runtime_binding_for_tmux_session("AgentDesk-d1d1-observer").is_none());
+                assert!(read_codex_tui_rollout_marker("AgentDesk-d1d1-observer").is_none());
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                continue;
+            }
             let installed = runtime_binding_for_tmux_session("AgentDesk-d1d1-observer").unwrap();
             assert_eq!(installed.output_path, path.display().to_string());
             assert_eq!(installed.session_id.as_deref(), Some(id.as_str()));

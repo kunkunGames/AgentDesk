@@ -209,3 +209,259 @@ async fn auth_login_routes_refuse_a_target_another_host_claims() {
     let error = removed.expect_err("main's unlink finds no such profile");
     assert_ne!(error.status(), StatusCode::CONFLICT, "{error:?}");
 }
+
+// A dispatch cancel and an agent stop of a runtime turn on another host answer a conflict and
+// change no turn, session row or dispatch; a legacy turn's stop marks its row as in main.
+#[tokio::test]
+async fn stop_routes_keep_a_runtime_turn_on_another_host_pg() {
+    use crate::services::discord::host_teardown_gate::test_support::{nameless_turn, runtime};
+    let _root = crate::config::TestRuntimeRootGuard::new();
+    let _tmux = ScriptedTmux::install();
+    let (db, pool) = postgres().await;
+    let (shared, registry) = runtime(&pool).await;
+    let mut state = state(pool.clone());
+    state.health_registry = Some(registry.clone());
+    let provider = crate::services::provider::ProviderKind::Claude;
+    // A remote row reads working by its heartbeat, so no tmux probe decides the route.
+    let remote = "p6asb-remote";
+    for (n, other_host) in [true, false].into_iter().enumerate() {
+        let (agent, name) = (
+            format!("p6asb-agent-{n}"),
+            provider.build_tmux_session_name(&format!("p6asb-stop-{n}")),
+        );
+        let channel = 1_479_671_302_387_066_000 + n as u64;
+        let legacy = Case::Stored(Stored::Legacy);
+        let id = seed_turn(&pool, legacy, (&agent, &name), remote, channel).await;
+        let dispatch = format!("p6asb-dispatch-{n}");
+        sqlx::query("INSERT INTO task_dispatches (id, title, dispatch_type, status) VALUES ($1, 'p6asb', 'implementation', 'dispatched')")
+            .bind(&dispatch)
+            .execute(&pool)
+            .await
+            .expect("seed dispatch");
+        sqlx::query(
+            "UPDATE sessions SET provider = 'claude', active_dispatch_id = $2 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(&dispatch)
+        .execute(&pool)
+        .await
+        .expect("bind the dispatch");
+        let channel_id = poise::serenity_prelude::ChannelId::new(channel);
+        let token = nameless_turn(&shared, channel_id).await;
+        if other_host {
+            // The runtime's turn moved to a session whose marker names another host.
+            let moved = format!("{name}-moved");
+            let marker = crate::services::tmux_common::session_temp_path(&moved, "host_kind");
+            std::fs::create_dir_all(std::path::Path::new(&marker).parent().unwrap()).unwrap();
+            std::fs::write(&marker, "herdr").unwrap();
+            token.bind_claude_tmux_session(&moved);
+        }
+
+        let (status, Json(stop)) =
+            super::stop_agent_turn(State(state.clone()), Path(agent.clone())).await;
+        let what = format!("other_host={other_host}");
+        let cancelled = || token.cancelled.load(std::sync::atomic::Ordering::SeqCst);
+        if other_host {
+            assert_eq!(status, StatusCode::CONFLICT, "{what}: {stop}");
+            assert_eq!(
+                stop["unsupported"], "session_host_not_tmux",
+                "{what}: {stop}"
+            );
+            assert_eq!(row_status(&pool, id).await, "turn_active", "{what}");
+            assert!(!cancelled(), "{what}: the turn runs on");
+        } else {
+            assert_eq!(status, StatusCode::OK, "{what}: {stop}");
+            assert_eq!(row_status(&pool, id).await, "disconnected", "{what}");
+            assert!(cancelled(), "{what}");
+        }
+
+        let service = crate::services::queue::QueueService::new(Some(pool.clone()));
+        let cancel = service.cancel_dispatch(Some(&registry), &dispatch).await;
+        let dispatch_status: String =
+            sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id = $1")
+                .bind(&dispatch)
+                .fetch_one(&pool)
+                .await
+                .expect("dispatch status");
+        if other_host {
+            let error = cancel.expect_err("the dispatch cancel is refused");
+            assert_eq!(error.status(), StatusCode::CONFLICT, "{what}: {error:?}");
+            assert_eq!(dispatch_status, "dispatched", "{what}");
+            assert_eq!(row_status(&pool, id).await, "turn_active", "{what}");
+            assert!(!cancelled(), "{what}: the turn runs on");
+        } else {
+            assert!(cancel.is_ok(), "{what}: {cancel:?}");
+            assert_eq!(dispatch_status, "cancelled", "{what}");
+        }
+    }
+    db.drop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn command_agent_and_dispatch_refusal_leave_session_and_dispatch_working_pg() {
+    use crate::db::o_channel_homes::HomeState;
+    use crate::services::cluster::channel_home;
+    use crate::services::discord::host_teardown_gate::test_support::{nameless_turn, runtime};
+    let _root = crate::config::TestRuntimeRootGuard::new();
+    let tmux = ScriptedTmux::install();
+    let (db, pool) = postgres().await;
+    let (shared, registry) = runtime(&pool).await;
+    let mut app = state(pool.clone());
+    app.health_registry = Some(registry.clone());
+    let channel = 9200000000000106;
+    let name =
+        crate::services::provider::ProviderKind::Claude.build_tmux_session_name("home-agent-stop");
+    let id = seed_turn(
+        &pool,
+        Case::Stored(Stored::Legacy),
+        ("home-agent-stop", &name),
+        "remote-home",
+        channel,
+    )
+    .await;
+    let dispatch = "home-agent-stop-dispatch";
+    sqlx::query("INSERT INTO task_dispatches (id,title,dispatch_type,status) VALUES ($1,'home-command','implementation','dispatched')")
+        .bind(dispatch).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE sessions SET provider='claude',active_dispatch_id=$2 WHERE id=$1")
+        .bind(id)
+        .bind(dispatch)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let token = nameless_turn(&shared, poise::serenity_prelude::ChannelId::new(channel)).await;
+    let home = channel_home::register_for_test(channel, Some(HomeState::Releasing));
+    tmux.take_calls();
+    let (status, Json(body)) =
+        super::stop_agent_turn(State(app), Path("home-agent-stop".into())).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        body["error"].as_str().unwrap().contains("home_draining"),
+        "{body}"
+    );
+    let error = crate::services::queue::QueueService::new(Some(pool.clone()))
+        .cancel_dispatch(Some(&registry), dispatch)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+    assert!(error.to_string().contains("home_draining"), "{error}");
+    assert_eq!(row_status(&pool, id).await, "turn_active");
+    let status: String = sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id=$1")
+        .bind(dispatch)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "dispatched");
+    assert!(!token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(
+        crate::services::discord::host_teardown_gate::test_support::mailbox_turn_active(
+            &shared,
+            poise::serenity_prelude::ChannelId::new(channel)
+        )
+        .await
+    );
+    assert!(tmux.take_calls().iter().all(|call| !call.contains("kill")));
+    channel_home::unregister(home.channel_id());
+    pool.close().await;
+    db.drop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn command_unattributed_legacy_stop_and_dispatch_keep_off_fallback_pg() {
+    use crate::db::o_channel_homes::HomeState;
+    use crate::services::cluster::channel_home;
+    let _root = crate::config::TestRuntimeRootGuard::new();
+    let tmux = ScriptedTmux::install();
+    let (db, pool) = postgres().await;
+    assert!(
+        channel_home::admit_unattributed().is_ok(),
+        "fresh registry is off"
+    );
+    for registered in [false, true] {
+        let gate = registered
+            .then(|| channel_home::register_for_test(9200000000000200, Some(HomeState::Worker)));
+        for dispatch_case in [false, true] {
+            let label = format!("home-unattributed-{registered}-{dispatch_case}");
+            let provider = crate::services::provider::ProviderKind::Claude;
+            let name = provider.build_tmux_session_name(&label);
+            let id = seed_turn(
+                &pool,
+                Case::Stored(Stored::Legacy),
+                (&label, &name),
+                "remote-home",
+                9200000000000201 + u64::from(registered) * 2 + u64::from(dispatch_case),
+            )
+            .await;
+            sqlx::query("UPDATE sessions SET thread_channel_id=NULL WHERE id=$1")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO task_dispatches (id,title,dispatch_type,status) VALUES ($1,'unattributed','implementation','dispatched')").bind(&label).execute(&pool).await.unwrap();
+            sqlx::query("UPDATE sessions SET active_dispatch_id=$2 WHERE id=$1")
+                .bind(id)
+                .bind(&label)
+                .execute(&pool)
+                .await
+                .unwrap();
+            tmux.take_calls();
+            if dispatch_case {
+                let result = crate::services::queue::QueueService::new(Some(pool.clone()))
+                    .cancel_dispatch(None, &label)
+                    .await;
+                if registered {
+                    assert_eq!(result.unwrap_err().status(), StatusCode::CONFLICT);
+                } else {
+                    assert!(result.unwrap()["ok"].as_bool().unwrap());
+                }
+            } else {
+                let (status, Json(body)) =
+                    super::stop_agent_turn(State(state(pool.clone())), Path(label.clone())).await;
+                assert_eq!(
+                    status,
+                    if registered {
+                        StatusCode::CONFLICT
+                    } else {
+                        StatusCode::OK
+                    },
+                    "{body}"
+                );
+            }
+            assert_eq!(
+                row_status(&pool, id).await,
+                if registered {
+                    "turn_active"
+                } else {
+                    "disconnected"
+                }
+            );
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM task_dispatches WHERE id=$1")
+                    .bind(&label)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                status,
+                if !registered && dispatch_case {
+                    "cancelled"
+                } else {
+                    "dispatched"
+                }
+            );
+            let calls = tmux.take_calls();
+            if registered {
+                assert!(calls.iter().all(|call| !call.contains("kill")), "{calls:?}");
+            } else {
+                assert!(
+                    calls.iter().any(|call| call.contains(&name)),
+                    "Legacy tmux-name fallback: {calls:?}"
+                );
+            }
+        }
+        if let Some(gate) = gate {
+            channel_home::unregister(gate.channel_id());
+        }
+    }
+    pool.close().await;
+    db.drop().await;
+}

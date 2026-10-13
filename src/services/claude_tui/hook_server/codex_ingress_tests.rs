@@ -245,11 +245,13 @@ fn codex_clear_fixture_binds_the_verified_rollout_and_preserves_repeat_cursor() 
     assert_eq!(marker.rollout_path, source(event).path);
     assert_eq!(marker.session_id, h.binding().session_id);
     assert_eq!(h.binding().last_offset, 0);
+    // The binding holds the canonical path; a symlinked temp root (macOS /var) would skip the advance.
     session::advance_codex_tui_runtime_binding_and_marker_offset(
         &h.context.tmux_session,
-        &h.path,
+        &h.path.canonicalize().unwrap(),
         47,
     );
+    assert_eq!(h.binding().last_offset, 47);
     let stable = h.snapshot();
     assert_eq!(h.hook().0, 202);
     assert_eq!(
@@ -316,13 +318,33 @@ fn codex_permanent_rejections_leave_binding_log_and_cursor_untouched() {
     let h = Harness::new();
     write(&h.path, &h.header);
     let stable = h.snapshot();
-    for problem in ["filename", "source", "outside"] {
+    for problem in [
+        "filename",
+        "source",
+        "subagent",
+        "parent_thread_id",
+        "outside",
+    ] {
         let mut payload = h.payload.clone();
         match problem {
             "filename" => payload["transcript_path"] = json!(h.path.with_file_name("wrong.jsonl")),
             "source" => {
                 let mut header = h.header.clone();
                 header["payload"]["source"] = json!("exec");
+                write(&h.path, &header);
+            }
+            "subagent" | "parent_thread_id" => {
+                let captured: Value = serde_json::from_str(include_str!(
+                    "../../../../tests/fixtures/tui_input/codex-subagent-session-meta.json"
+                ))
+                .unwrap();
+                let mut header = h.header.clone();
+                if problem == "subagent" {
+                    header["payload"]["source"] = captured["payload"]["source"].clone();
+                } else {
+                    header["payload"]["parent_thread_id"] =
+                        captured["payload"]["parent_thread_id"].clone();
+                }
                 write(&h.path, &header);
             }
             _ => {

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::collections::VecDeque;
 use std::future::Future;
 use std::path::PathBuf;
@@ -156,6 +158,8 @@ struct FakeLease {
     busy: AtomicBool,
     released: Arc<AtomicUsize>,
     on_acquire: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Channels whose writer the host reported stopped for good.
+    unavailable: Mutex<Vec<u64>>,
 }
 
 struct Held(Arc<AtomicUsize>);
@@ -175,27 +179,47 @@ impl DeliveryLease for Arc<FakeLease> {
         }
         (!self.busy.load(Ordering::SeqCst)).then(|| Held(Arc::clone(&self.released)))
     }
+
+    fn writer_unavailable(&self, channel: u64) {
+        self.unavailable.lock().unwrap().push(channel);
+    }
 }
 
-#[derive(Clone, Default)]
-struct Alarms(Arc<Mutex<Vec<WriterAlarm>>>);
+/// The alarms of one harness channel; an alarm for any other channel fails the test.
+#[derive(Clone)]
+struct Alarms {
+    channel: u64,
+    raised: Arc<Mutex<Vec<WriterAlarm>>>,
+    /// The reader count the writer last reported.
+    readers: Arc<Mutex<Option<usize>>>,
+}
 
 impl AlarmSink for Alarms {
     fn raise(&self, channel: u64, alarm: WriterAlarm) {
-        assert_eq!(channel, CHANNEL);
-        self.0.lock().unwrap().push(alarm);
+        assert_eq!(channel, self.channel);
+        self.raised.lock().unwrap().push(alarm);
+    }
+
+    fn reconcile_reader_count(&self, channel: u64, count: usize) {
+        assert_eq!(channel, self.channel);
+        *self.readers.lock().unwrap() = Some(count);
     }
 }
 
 impl Alarms {
     fn taken(&self) -> Vec<WriterAlarm> {
-        std::mem::take(&mut self.0.lock().unwrap())
+        std::mem::take(&mut self.raised.lock().unwrap())
+    }
+
+    fn readers(&self) -> Option<usize> {
+        *self.readers.lock().unwrap()
     }
 }
 
 type Writer = ChannelWriter<FakePort, Arc<FakeLease>, Alarms>;
 
 struct Harness {
+    channel_id: u64,
     _runtime: tempfile::TempDir,
     store: OStore,
     gate: Arc<OwnershipGate>,
@@ -211,6 +235,13 @@ impl Harness {
 
     /// `sources` may create transcripts under the runtime root before the era begins.
     fn build(sources: impl FnOnce(&std::path::Path) -> Vec<InitSource>) -> Self {
+        Self::build_channel(CHANNEL, sources)
+    }
+
+    fn build_channel(
+        channel_id: u64,
+        sources: impl FnOnce(&std::path::Path) -> Vec<InitSource>,
+    ) -> Self {
         let runtime = tempfile::tempdir().unwrap();
         let store = OStore::open_if_enabled(&StoreConfig { enabled: true }, runtime.path())
             .unwrap()
@@ -226,12 +257,12 @@ impl Harness {
                 at,
             })
         };
-        store.begin_era(&[CHANNEL], Utc::now(), init).unwrap();
+        store.begin_era(&[channel_id], Utc::now(), init).unwrap();
         let port = Arc::new(FakePort::default());
         let ledger = runtime
             .path()
             .join("o_store")
-            .join(CHANNEL.to_string())
+            .join(channel_id.to_string())
             .join("ledger.jsonl");
         *port.ledger.lock().unwrap() = Some(ledger);
         let (gate, lease) = (
@@ -239,18 +270,26 @@ impl Harness {
             Arc::new(FakeLease::default()),
         );
         Self {
+            channel_id,
             _runtime: runtime,
             store,
             gate,
             port,
             lease,
-            alarms: Alarms::default(),
+            alarms: Alarms {
+                channel: channel_id,
+                raised: Arc::default(),
+                readers: Arc::default(),
+            },
         }
     }
 
     fn channel(&self) -> ChannelStore {
         let era = self.store.read_era().unwrap().unwrap();
-        self.store.open_channel(&era, CHANNEL).unwrap().unwrap()
+        self.store
+            .open_channel(&era, self.channel_id)
+            .unwrap()
+            .unwrap()
     }
 
     fn writer(&self) -> Writer {
@@ -737,8 +776,68 @@ async fn a_violation_recorded_while_running_stops_the_writer_before_the_next_pos
     ));
 }
 
+/// The ledger file a channel store appends to.
+fn ledger_path(harness: &Harness) -> PathBuf {
+    let dir = harness
+        ._runtime
+        .path()
+        .join("o_store")
+        .join(CHANNEL.to_string());
+    dir.join("ledger.jsonl")
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_keeps_its_store_error_and_names_a_prepared_only_while_nothing_posted_it() {
+    use crate::services::tui_o::store::fault::{self, Keep, Step as At};
+    let full = std::io::ErrorKind::StorageFull;
+    let harness = Harness::new();
+    harness.gate.acquired();
+    let mut writer = harness.writer();
+    let planted = fault::plant(&ledger_path(&harness), At::Append(Keep::All), full, None);
+    assert_eq!(writer.deliver(&piece("m1", "a")).await, Step::Stopped);
+    drop(planted);
+    writer.stop(WriterAlarm::SelectionMissing);
+    let cause = writer.stop_cause().cloned().unwrap();
+    assert!(
+        matches!(cause.alarm, WriterAlarm::Halted { .. }),
+        "{cause:?}"
+    );
+    assert_eq!(cause.io, Some(full), "the first stop keeps its cause");
+    assert_eq!(cause.unsent.as_ref().map(|unsent| unsent.serial()), Some(0));
+    assert!(harness.port.posts().is_empty());
+    assert_eq!(
+        harness.alarms.taken().len(),
+        1,
+        "only the first stop alarms"
+    );
+
+    // A failure after the POST went out names nothing, so recovery settles it from history.
+    for keep in [Keep::Nothing, Keep::Half] {
+        let harness = Harness::new();
+        harness.gate.acquired();
+        let mut writer = harness.writer();
+        let (ledger, slot) = (ledger_path(&harness), Arc::new(Mutex::new(None)));
+        let planting = Arc::clone(&slot);
+        *harness.port.on_post.lock().unwrap() = Some(Box::new(move || {
+            let planted = fault::plant(&ledger, At::Append(keep), full, Some(1));
+            *planting.lock().unwrap() = Some(planted);
+        }));
+        assert_eq!(writer.deliver(&piece("m1", "a")).await, Step::Stopped);
+        let cause = writer.stop_cause().cloned().unwrap();
+        assert_eq!((cause.io, cause.unsent), (Some(full), None), "{keep:?}");
+        assert_eq!(harness.port.posts(), ["a"]);
+    }
+}
+
 #[path = "actor_tests.rs"]
 mod actor;
+#[path = "codex_herdr_drive_tests.rs"]
+pub(crate) mod codex_herdr_drive;
+#[path = "operator_resume_tests.rs"]
+mod operator_resume;
+
+#[path = "deliver_home_tests.rs"]
+mod deliver_home;
 
 #[tokio::test(start_paused = true)]
 async fn a_gateway_return_ends_the_pause_in_process_health() {

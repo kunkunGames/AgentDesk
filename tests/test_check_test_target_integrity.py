@@ -13,6 +13,7 @@ import importlib.util
 import io
 import locale
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,31 @@ _spec.loader.exec_module(integrity)
 
 BAD_COMMAND = "cargo test --bin agentdesk high_risk_recovery:: -- --test-threads=1"
 GOOD_COMMAND = "cargo test --lib high_risk_recovery:: -- --test-threads=1"
+# The generated arrays are proven only after this source in the command's own shell.
+SOURCED = f"source {integrity.NON_PG_FILTER_REL} && "
+# Generated skip values whose PG selection reaches the fixture lib: unsharded and
+# shard 1 through the module, shard 0 through `pg_` alone.
+PG_SKIPS = ("_pg", "pg_", "postgres", "server::multinode_regression")
+PG_CASE = "server::multinode_regression::tests::pg_nested_case"
+
+
+def write_generated_filter(root: Path, skips: tuple[str, ...] = PG_SKIPS,
+                           edit=lambda text: text, pg_case: str | None = PG_CASE) -> None:
+    """The checked-in filter with its generated region rendered for ``skips`` (so the
+    real PG derivation follows it), changed by ``edit``; ``pg_case`` joins the lib."""
+    contract = integrity._membership()
+    lines = (REPO_ROOT / integrity.NON_PG_FILTER_REL).read_text("utf-8").splitlines()
+    begin = lines.index(contract.NON_PG_SELECTION_BEGIN)
+    end = lines.index(contract.NON_PG_SELECTION_END)
+    text = "\n".join([*lines[:begin], *contract.render_non_pg_selection(skips, ()),
+                      *lines[end + 1:]]) + "\n"
+    path = root / integrity.NON_PG_FILTER_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(edit(text), encoding="utf-8")
+    manifest = root / integrity.LIB_INVENTORY_MANIFEST_REL
+    ids = integrity.load_lib_inventory_manifest(manifest)
+    manifest.write_text(integrity.render_lib_inventory_manifest(
+        ids | {pg_case} if pg_case else ids), encoding="utf-8")
 
 
 def build_fixture_repo(root: Path, command: str, *,
@@ -496,8 +522,8 @@ class PathAttributeLayout(unittest.TestCase):
                     self.assertIn(f"lib ({site})", violation.detail)
 
     def test_bin_side_layout_loss_would_silence_the_gate(self) -> None:
-        # The worst shape of #5008 item 6: the bin module vanishes, so the
-        # lib-selecting command gets no finding at all and --enforce exits 0.
+        # #5008 item 6 on the bin side: if the bin module vanishes, the
+        # lib-selecting command loses the declaration its finding points at.
         commands = ("cargo test --lib bin_owned::tests::owned_case",
                     "cargo test --lib deep_child::case")
         bin_layouts = {
@@ -516,9 +542,7 @@ class PathAttributeLayout(unittest.TestCase):
                 workflow = build_layout_repo(
                     root, self.LAYOUTS["adjacent_control"], commands=commands,
                     main_rs=decl + "fn main() {}\n",
-                    manifest={"bin_owned::tests::owned_case",
-                              "deep_child::case",
-                              "high_risk_recovery::tests::recovery_case"},
+                    manifest={"high_risk_recovery::tests::recovery_case"},
                     extra_files={"src/renamed_bin.rs":
                                  "mod deep_child {}\n#[cfg(test)]\n"
                                  "mod tests { #[test] fn owned_case() {} }\n"})
@@ -608,8 +632,10 @@ class EmptyTargetRule(unittest.TestCase):
         )
         self.assertEqual([v.kind for v in violations], ["empty-target"])
 
-    def test_unfiltered_empty_bin_is_not_flagged(self) -> None:
-        self.assertEqual(run_fixture("cargo test --bin agentdesk"), [])
+    def test_unfiltered_selection_still_needs_a_test(self) -> None:
+        self.assertEqual([v.kind for v in run_fixture("cargo test --bin agentdesk")],
+                         ["empty-target"])
+        self.assertEqual(run_fixture("cargo test --lib"), [])
 
     def test_mismatch_takes_precedence_over_empty_target(self) -> None:
         violations = run_fixture(BAD_COMMAND)
@@ -723,20 +749,896 @@ class AllowlistContract(unittest.TestCase):
     def test_allowlist_cannot_excuse_target_mismatch(self) -> None:
         # A target-mismatch means the command itself is wrong; the allowlist
         # (meant for legitimately-empty platform-cfg lanes) must not hide it.
-        allow = "# attempted excuse\n" + BAD_COMMAND + "\n"
+        allow = "# reason: attempted excuse\n" + BAD_COMMAND + "\n"
         violations = run_fixture(BAD_COMMAND, allowlist=allow)
         self.assertEqual([v.kind for v in violations], ["target-mismatch"])
 
     def test_allowlist_excuses_non_mismatch_kinds(self) -> None:
-        command = "cargo test --lib bogus_module::tests"
+        command = "cargo test --lib high_risk_recovery::bogus_case"
         self.assertEqual(
             [v.kind for v in run_fixture(command)], ["zero-match"])
-        allow = "# legitimately-empty on this platform\n" + command + "\n"
+        allow = "# reason: legitimately-empty on this platform\n" + command + "\n"
         self.assertEqual(run_fixture(command, allowlist=allow), [])
 
     def test_comments_and_blanks_do_not_allowlist(self) -> None:
         allow = "# comment only\n\n"
         self.assertEqual(len(run_fixture(BAD_COMMAND, allowlist=allow)), 1)
+
+
+class ResidualSelectionContract(unittest.TestCase):
+    def test_union_and_bins_typo_fail_but_valid_selection_passes(self) -> None:
+        for selector in ("--all-targets", "--bins", ""):
+            with self.subTest(selector=selector, typo=True):
+                violations = run_fixture(
+                    f"cargo test {selector} high_risk_recovry::",
+                    bin_test=True, integration_test=True,
+                )
+                self.assertEqual([v.kind for v in violations], ["unknown-module"])
+            owned = "bin_owned::tests::owned_case" if selector == "--bins" else (
+                "high_risk_recovery::tests::recovery_case")
+            with self.subTest(selector=selector, typo=False):
+                self.assertEqual(run_fixture(
+                    f"cargo test {selector} {owned}", bin_test=True,
+                ), [])
+
+    def test_bins_cannot_select_a_library_module(self) -> None:
+        violations = run_fixture("cargo test --bins high_risk_recovery::")
+        self.assertEqual([v.kind for v in violations], ["target-mismatch"])
+        self.assertEqual(run_fixture(
+            "cargo test --lib --bins high_risk_recovery::"), [])
+
+    def test_union_includes_nested_and_manifest_integration_targets(self) -> None:
+        for selector in ("--all-targets", ""):
+            for relative in ("tests/owned.rs", "tests/owned/main.rs",
+                             "custom/integration.rs"):
+                with self.subTest(selector=selector, relative=relative), \
+                        tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    command = f"cargo test {selector} integration_owned::"
+                    workflow = build_fixture_repo(root, command)
+                    source = root / relative
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_text(
+                        "mod integration_owned { #[test] fn case() {} }\n",
+                        encoding="utf-8")
+                    if relative.startswith("custom/"):
+                        with (root / "Cargo.toml").open("a") as manifest:
+                            manifest.write(
+                                '\n[[test]]\nname = "owned"\n'
+                                f'path = "{relative}"\n')
+                    self.assertEqual(integrity.check_workflows(
+                        root, [workflow], set(), False), [])
+
+    def test_all_targets_includes_examples_and_benches(self) -> None:
+        for kind in ("example", "bench"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                command = f"cargo test --all-targets {kind}_owned::"
+                workflow = build_fixture_repo(root, command)
+                directory = "benches" if kind == "bench" else "examples"
+                source = root / f"{directory}/owned/main.rs"
+                source.parent.mkdir(parents=True)
+                source.write_text(f"mod {kind}_owned {{ #[test] fn case() {{}} }}\n",
+                                  encoding="utf-8")
+                self.assertEqual(integrity.check_workflows(
+                    root, [workflow], set(), False), [])
+
+    def test_cargo_glob_and_bare_filters_are_not_module_assertions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = "cargo test --bins --test '*' high_risk_recovery"
+            workflow = build_fixture_repo(root, command)
+            (root / "tests/owned").mkdir(parents=True)
+            (root / "tests/owned/main.rs").write_text(
+                "mod integration_owned { #[test] fn case() {} }\n", encoding="utf-8")
+            diagnostics: list[str] = []
+            self.assertEqual(integrity.check_workflows(
+                root, [workflow], set(), False, diagnostics=diagnostics), [])
+            # The lane's side of the sweep is empty; that stays visible.
+            self.assertIn("sweep-empty: filter `high_risk_recovery`",
+                          " ".join(diagnostics))
+            workflow.write_text(
+                "jobs:\n  lane:\n    steps:\n"
+                "      - run: cargo test --bins --test '*' integration_owned::\n",
+                encoding="utf-8")
+            self.assertEqual(integrity.check_workflows(
+                root, [workflow], set(), False), [])
+            workflow.write_text(
+                "jobs:\n  lane:\n    steps:\n"
+                "      - run: cargo test --bins --test 'absent*' typo::\n",
+                encoding="utf-8")
+            violations = integrity.check_workflows(root, [workflow], set(), False)
+            self.assertIn("unknown-target", [v.kind for v in violations])
+
+    def test_allowlist_needs_an_adjacent_nonempty_reason(self) -> None:
+        command = "cargo test --lib high_risk_recovery::renamed_case"
+        for prefix in ("", "#\n", "# platform exception\n", "# reason:\n",
+                       "# reason: platform exception\n\n",
+                       "# reason: platform exception\n# unrelated comment\n",
+                       "# reason: \u200b\n", "# reason: <why>\n", "# reason: <WHY>\n"):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as tmp:
+                allow = Path(tmp) / "allowlist.txt"
+                allow.write_text(prefix + command + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "directly above"):
+                    integrity.load_allowlist(allow)
+        for prefix in ("# reason: suite is cfg-gated on this platform\n",
+                       "# see #1234\n# reason: 윈도우 전용 cfg 스위트\n"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(run_fixture(command, prefix + command + "\n"), [])
+
+    def test_stale_and_duplicate_allowlist_entries_are_rejected(self) -> None:
+        stale = "cargo test --lib absent::"
+        violations = run_fixture(GOOD_COMMAND, "# reason: platform exception\n" + stale)
+        self.assertEqual([v.kind for v in violations], ["stale-allowlist"])
+        with tempfile.TemporaryDirectory() as tmp:
+            allow = Path(tmp) / "allowlist.txt"
+            allow.write_text(("# reason: platform exception\n" + stale + "\n") * 2)
+            with self.assertRaisesRegex(ValueError, "duplicate"):
+                integrity.load_allowlist(allow)
+
+    def test_allowlist_does_not_excuse_bad_target_or_inventory(self) -> None:
+        command = "cargo test --bin missing-bin owned::"
+        violations = run_fixture(command, "# reason: platform exception\n" + command)
+        self.assertEqual([v.kind for v in violations], ["unknown-target", "unknown-module"])
+        command = "cargo test --bin agentdesk bin_owned::"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = build_fixture_repo(root, command, bin_test=True)
+            (root / "src/bin_owned.rs").write_text(
+                '#[path = "missing.rs"] mod child;\n', encoding="utf-8")
+            violations = integrity.check_workflows(root, [workflow], {command}, False)
+            self.assertEqual([v.kind for v in violations], ["inventory-error"])
+
+    def test_deployed_header_cannot_supply_an_entry_reason(self) -> None:
+        header = (REPO_ROOT / "scripts/test_target_integrity_allowlist.txt").read_text()
+        command = "cargo test --lib high_risk_recovery::renamed_case"
+        for reason, expected in (("", 2), ("# reason: cfg-gated platform suite\n", 0)):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                build_fixture_repo(root, command)
+                (root / "scripts/test_target_integrity_allowlist.txt").write_text(
+                    header + reason + command + "\n", encoding="utf-8")
+                proc = subprocess.run(
+                    [sys.executable, str(SCRIPT), "--repo-root", str(root), "--enforce"],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(proc.returncode, expected, proc.stdout + proc.stderr)
+                self.assertIn("reason" if expected else "check passed",
+                              proc.stderr if expected else proc.stdout)
+
+    def test_each_allowlist_entry_consumes_its_own_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            allow = Path(tmp) / "allowlist.txt"
+            allow.write_text(
+                "# reason: platform suite\n" + GOOD_COMMAND + "\n" + BAD_COMMAND + "\n")
+            with self.assertRaisesRegex(ValueError, "reason"):
+                integrity.load_allowlist(allow)
+
+    def test_justfile_only_allowlist_entry_is_not_stale(self) -> None:
+        command = "cargo test --lib high_risk_recovery::cfg_owned"
+        self.assertEqual(run_fixture(
+            GOOD_COMMAND, "# reason: platform suite\n" + command + "\n",
+            just_text="fixture:\n    " + command + "\n"), [])
+
+    def test_stale_cli_reports_override_allowlist_path_and_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture_repo(root, GOOD_COMMAND)
+            allow = root / "override-allowlist.txt"
+            allow.write_text("# reason: obsolete platform suite\ncargo test --lib absent::\n")
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), "--repo-root", str(root),
+                 "--allowlist", str(allow), "--enforce"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("override-allowlist.txt:2: [stale-allowlist]", proc.stdout)
+
+    def test_cli_residual_triggers_and_clean_control(self) -> None:
+        cases = (
+            ("--all-targets", "", "high_risk_recovry::", "unknown-module"),
+            ("--bins", "", "high_risk_recovry::", "unknown-module"),
+            ("", "", "high_risk_recovry::", "unknown-module"),
+            ("--lib", "missing-reason", "high_risk_recovry::", "reason"),
+            ("--lib", "stale", "high_risk_recovery::", "stale-allowlist"),
+            ("--lib", "", "high_risk_recovery::", None),
+        )
+        for selector, allow_kind, filt, expected in cases:
+            with self.subTest(selector=selector, allow=allow_kind), \
+                    tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                command = f"cargo test {selector} {filt}"
+                build_fixture_repo(root, command, bin_test=True)
+                allow = root / "scripts/test_target_integrity_allowlist.txt"
+                allow.write_text(
+                    command + "\n" if allow_kind == "missing-reason" else (
+                        "# reason: stale platform exception\ncargo test --lib absent::\n"
+                        if allow_kind == "stale" else ""), encoding="utf-8")
+                proc = subprocess.run(
+                    [sys.executable, str(SCRIPT), "--repo-root", str(root), "--enforce"],
+                    capture_output=True, text=True, check=False,
+                )
+                if expected:
+                    self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIn(expected, proc.stdout + proc.stderr)
+                else:
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertIn("check passed", proc.stdout)
+
+
+class TestIdOracleContract(unittest.TestCase):
+    """Every selection is judged by libtest's filter rule over the static test
+    IDs of the targets Cargo would run; module declarations only explain a
+    miss."""
+
+    def kinds(self, command: str, **fixture) -> list[str]:
+        return [v.kind for v in run_fixture(command, **fixture)]
+
+    def test_every_target_class_flag_is_judged(self) -> None:
+        for selector in ("--tests", "--all-targets --tests", "--bins --examples",
+                         "--benches", "--lib --bin agentdesk",
+                         "--lib --test integration_only", "--lib"):
+            with self.subTest(selector=selector):
+                self.assertEqual(self.kinds(
+                    f"cargo test {selector} high_risk_recovry::",
+                    bin_test=True, integration_test=True), ["unknown-module"])
+        for selector in ("--tests", "--lib --bin agentdesk", "--lib --bins"):
+            with self.subTest(selector=selector, typo=False):
+                self.assertEqual(self.kinds(
+                    f"cargo test {selector} high_risk_recovery::"), [])
+        # `--benches` takes every `bench = true` target, the lib by default.
+        self.assertEqual(self.kinds("cargo test --benches high_risk_recovery::"), [])
+        # A module typo is not a platform-empty lane, whatever the selection.
+        command = "cargo test --lib high_risk_recovry::"
+        self.assertEqual([v.kind for v in run_fixture(
+            command, "# reason: cfg-gated suite\n" + command + "\n")],
+            ["unknown-module"])
+
+    def test_filters_match_like_libtest_including_anchors(self) -> None:
+        cases = (
+            ("cargo test --all-targets ::high_risk_recovry::", ["unknown-module"]),
+            ("cargo test --all-targets ::tests::", []),
+            # A test name never starts with `::`, so only a nested module matches.
+            ("cargo test --lib ::high_risk_recovery::", ["zero-match"]),
+            ("cargo test --lib ::multinode_regression::", []),
+            ("cargo test risk_recovery::tests", []),
+            ("cargo test --all-targets risk_recovery::tests::recovery", []),
+            ("cargo test --bins --test * high_risk_recovry", ["zero-match"]),
+        )
+        for command, kinds in cases:
+            with self.subTest(command=command):
+                self.assertEqual(self.kinds(command, integration_test=True), kinds)
+
+    def test_bare_filter_mismatch_needs_an_empty_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = build_fixture_repo(root, "cargo test --lib recovery_case")
+            (root / "tests").mkdir()
+            (root / "tests/support.rs").write_text(
+                "mod recovery_case { #[test] fn helper_case() {} }\n", encoding="utf-8")
+            self.assertEqual(integrity.check_workflows(root, [workflow], set(), False), [])
+            workflow.write_text("jobs:\n  lane:\n    steps:\n"
+                                "      - run: cargo test --lib helper_case\n")
+            self.assertEqual(
+                [v.kind for v in integrity.check_workflows(root, [workflow], set(), False)],
+                ["target-mismatch"])
+
+    def judge(self, root: Path, command: str,
+              diagnostics: list[str] | None = None,
+              allowlist: frozenset[str] = frozenset()) -> list[str]:
+        # Like CI, the run scalar sources the generated filter before its command.
+        workflow = root / ".github/workflows/ci-fixture.yml"
+        workflow.write_text("jobs:\n  lane:\n    steps:\n      - run: |\n"
+                            f"          source {integrity.NON_PG_FILTER_REL}\n"
+                            f"          {command}\n", encoding="utf-8")
+        return [v.kind for v in integrity.check_workflows(
+            root, [workflow], set(allowlist), False, diagnostics=diagnostics)
+            if v.workflow.endswith("ci-fixture.yml")]
+
+    def test_class_flags_follow_cargo_target_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture_repo(root, GOOD_COMMAND)
+            for rel, module in (("examples/owned/main.rs", "example_owned"),
+                                ("tests/disabled.rs", "disabled_only")):
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_text(f"mod {module} {{ #[test] fn case() {{}} }}\n",
+                                        encoding="utf-8")
+            with (root / "Cargo.toml").open("a") as manifest:
+                manifest.write('\n[[example]]\nname = "owned"\nbench = true\n'
+                               '\n[[test]]\nname = "disabled"\ntest = false\n'
+                               'bench = false\n')
+            for command, kinds in (
+                    ("cargo test --benches example_owned::", []),
+                    ("cargo test --all-targets disabled_only::", ["target-mismatch"]),
+                    ("cargo test --tests disabled_only::", ["target-mismatch"]),
+                    ("cargo test --test disabled disabled_only::", [])):
+                with self.subTest(command=command):
+                    self.assertEqual(self.judge(root, command), kinds)
+            cargo = root / "Cargo.toml"
+            cargo.write_text(cargo.read_text().replace(
+                'path = "src/lib.rs"\n', 'path = "src/lib.rs"\nbench = false\n', 1))
+            self.assertEqual(self.judge(root, "cargo test --benches high_risk_recovery::"),
+                             ["target-mismatch"])
+
+    def test_bare_filters_form_a_union_before_any_mismatch(self) -> None:
+        for command, kinds in (
+                ("cargo test --lib recovery_case -- integration_only_case", []),
+                ("cargo test --lib integration_only_case", ["target-mismatch"]),
+                ("cargo test --lib recovery_case -- integration_only_case "
+                 "--skip recovery_case", ["target-mismatch"]),
+                ("cargo test --lib --bin agentdesk integration_only_case",
+                 ["target-mismatch"])):
+            with self.subTest(command=command):
+                self.assertEqual(self.kinds(command, integration_test=True), kinds)
+
+    def test_union_evidence_needs_a_statically_known_skip(self) -> None:
+        # The other filter's candidate is the only union evidence; a skip
+        # whose value is unknown, or --ignored, may drop it at run time.
+        union = "cargo test --lib recovery_case -- integration_only_case"
+        for command, kinds in (
+                (f"{union} --skip other_case", []),
+                (f"{union} --skip recovery_case", ["target-mismatch"]),
+                (f"{union} --skip $SKIP", ["target-mismatch"]),
+                (f"{union} --skip=${{SKIP}}", ["target-mismatch"]),
+                (f"{union} --skip {{{{SKIP}}}}", ["target-mismatch"]),
+                (f"{union} --skip $(skips)", ["target-mismatch"]),
+                (f"{union} --skip `skips`", ["target-mismatch"]),
+                (f"{union} --ignored", ["target-mismatch"]),
+                ("cargo test --lib recovery_case -- missing_case --skip $SKIP",
+                 ["unproven-union"]),
+                ("cargo test --bins owned_case -- high_risk_recovery $EXTRA",
+                 ["unproven-union"]),
+                # This fixture has no filter file, so the generated array
+                # cannot be read and fails closed whatever the selection.
+                (f"{SOURCED}{union} ${{NON_PG_SKIP_ARGS[@]}}", ["non-pg-skip-unresolved"]),
+                (SOURCED + "cargo test --lib recovery_case -- ${NON_PG_SKIP_ARGS[@]}",
+                 ["non-pg-skip-unresolved"]),
+                (SOURCED + "cargo test --bins high_risk_recovery -- ${NON_PG_SKIP_ARGS[@]}",
+                 ["non-pg-skip-unresolved"])):
+            with self.subTest(command=command):
+                self.assertEqual(self.kinds(command, integration_test=True,
+                                            bin_test=True), kinds)
+
+    def test_a_full_union_still_needs_a_statically_known_skip(self) -> None:
+        # Every filter matching statically proves nothing once an unknown skip,
+        # even one split out of a libtest option value, may drop them all.
+        both = "cargo test --lib recovery_case -- nested_case"
+        for command, kinds in (
+                (both, []),
+                (f"{both} --skip other_case", []),
+                (f"{both} --skip case", ["zero-match"]),
+                (f"{both} --skip $SKIP", ["unproven-union"]),
+                (f"{both} --test-threads $EXTRA", ["unproven-union"]),
+                (f"{both} --skip {{{{SKIP}}}}", ["unproven-union"]),
+                (f"{both} --skip `skips`", ["unproven-union"]),
+                (f"{SOURCED}{both} ${{NON_PG_SKIP_ARGS[@]}}", ["non-pg-skip-unresolved"]),
+                ("cargo test --lib recovery_case -- missing_case --skip $SKIP",
+                 ["unproven-union"]),
+                ("cargo test --lib recovery_case -- --skip $SKIP", [])):
+            with self.subTest(command=command):
+                self.assertEqual(self.kinds(command), kinds)
+
+    def test_a_provable_empty_selection_is_judged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture_repo(root, GOOD_COMMAND)
+            for command, kinds in (
+                    ("cargo test --lib -- --ignored high_risk_recovry::",
+                     ["unknown-module"]),
+                    ("cargo test --manifest-path $PWD/Cargo.toml --lib "
+                     "high_risk_recovry::", ["unknown-module"]),
+                    ("cargo test --manifest-path ./Cargo.toml --lib "
+                     "high_risk_recovery::renamed_case", ["zero-match"])):
+                with self.subTest(command=command):
+                    self.assertEqual(self.judge(root, command), kinds)
+            diagnostics: list[str] = []
+            command = "cargo test high_risk_recovery::typo"
+            self.assertEqual(self.judge(root, command, diagnostics), [])
+            self.assertIn("runs doctests", " ".join(diagnostics))
+            cargo = root / "Cargo.toml"
+            cargo.write_text(cargo.read_text().replace(
+                'path = "src/lib.rs"\n', 'path = "src/lib.rs"\ndoctest = false\n', 1))
+            self.assertEqual(self.judge(root, command), ["zero-match"])
+            (root / integrity.LIB_INVENTORY_MANIFEST_REL).write_text(
+                integrity.render_lib_inventory_manifest(set()), encoding="utf-8")
+            self.assertEqual(self.judge(root, "cargo test --lib"), ["empty-target"])
+
+    def test_sweep_exemption_needs_a_live_test_elsewhere(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture_repo(root, GOOD_COMMAND)
+            with (root / "src/lib.rs").open("a") as lib:
+                lib.write("mod ghost {}\n")
+            for command, kinds in (
+                    ("cargo test --bins ghost", ["empty-target"]),
+                    ("cargo test --bins high_risk_recovery", []),
+                    ("cargo test --bins high_risk_recovery -- --skip high_risk_recovery",
+                     ["empty-target"]),
+                    # No static ID is known to be #[ignore], so --ignored finds
+                    # no live test elsewhere; --include-ignored keeps them all.
+                    ("cargo test --bins high_risk_recovery -- --ignored",
+                     ["empty-target"]),
+                    ("cargo test --bins high_risk_recovery -- --include-ignored", [])):
+                with self.subTest(command=command):
+                    self.assertEqual(self.judge(root, command), kinds)
+
+    def test_sweep_evidence_must_survive_the_run_time_skips(self) -> None:
+        # Another target's test proves a sweep only if it survives the run's
+        # skips: an opaque expansion may drop it; the generated array is read.
+        sweep = "cargo test --bins high_risk_recovery --"
+        array = "${NON_PG_SKIP_ARGS[@]}"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture_repo(root, GOOD_COMMAND)
+            filter_file = root / "scripts/ci/non-pg-test-filter.sh"
+            for body, command, kinds in (
+                    (None, f"{sweep} --skip other_case", []),
+                    (None, f"{sweep} --skip $SKIP", ["empty-target"]),
+                    (None, f"{sweep} --skip=${{SKIP}}", ["empty-target"]),
+                    (None, f"{sweep} --skip {{{{SKIP}}}}", ["empty-target"]),
+                    (None, f"{sweep} --skip $(skips)", ["empty-target"]),
+                    (None, f"{sweep} $EXTRA", ["empty-target"]),
+                    # Without a filter the reader can restore, the array fails closed.
+                    (None, f"{sweep} {array}", ["non-pg-skip-unresolved"]),
+                    ("  --skip _pg\n  --skip postgres\n", f"{sweep} {array}", []),
+                    ("  --skip _pg\n  --skip postgres\n", f"{sweep} {array} $EXTRA",
+                     ["empty-target"]),
+                    # Only libtest reads the array's --skip pairs.
+                    ("  --skip _pg\n  --skip postgres\n",
+                     f"cargo test --bins high_risk_recovery {array}", ["empty-target"]),
+                    ("  --skip _pg\n  --skip high_risk_recovery\n", f"{sweep} {array}",
+                     ["empty-target"]),
+                    ("  --skip _pg\n  --exact\n", f"{sweep} {array}",
+                     ["non-pg-skip-unresolved"]),
+                    ("  --skip _pg\n  --skip $EXTRA\n", f"{sweep} {array}",
+                     ["non-pg-skip-unresolved"]),
+                    ("  --skip _pg\n)\nNON_PG_SKIP_ARGS+=(\n  --skip high_risk\n",
+                     f"{sweep} {array}", ["non-pg-skip-unresolved"])):
+                if body is not None:
+                    filter_file.parent.mkdir(parents=True, exist_ok=True)
+                    filter_file.write_text(f"NON_PG_SKIP_ARGS=(\n{body})\n",
+                                           encoding="utf-8")
+                with self.subTest(body=body, command=command):
+                    self.assertEqual(self.judge(root, command), kinds)
+
+    def test_a_restored_skip_also_empties_the_selected_target(self) -> None:
+        # The generated array also skips the selected target's own candidates, so a
+        # single filter it wipes out runs 0 tests; opaque, option values too, stays unjudged.
+        array = "${NON_PG_SKIP_ARGS[@]}"
+        single = f"cargo test --lib high_risk_recovery -- {array}"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture_repo(root, GOOD_COMMAND)
+            filter_file = root / "scripts/ci/non-pg-test-filter.sh"
+            filter_file.parent.mkdir(parents=True)
+            for skip, command, kinds in (
+                    ("high_risk_recovery", single, ["zero-match"]),
+                    ("high_risk_recovery", f"cargo test --lib high_risk_recovery:: "
+                     f"-- {array}", ["zero-match"]),
+                    ("postgres", single, []),
+                    ("high_risk_recovery", f"cargo test --lib case -- {array}", []),
+                    ("high_risk_recovery", f"{single} $EXTRA", []),
+                    ("high_risk_recovery", f"{single} --test-threads $EXTRA", []),
+                    ("high_risk_recovery", f"{single} --test-threads 1", ["zero-match"])):
+                filter_file.write_text(
+                    f"NON_PG_SKIP_ARGS=(\n  --skip _pg\n  --skip {skip}\n)\n",
+                    encoding="utf-8")
+                with self.subTest(skip=skip, command=command):
+                    self.assertEqual(self.judge(root, command), kinds)
+
+    def test_a_restored_array_is_a_known_skip_for_a_union(self) -> None:
+        # A read array no longer leaves a union unproven; another opaque word,
+        # a dynamic option value or --ignored still does, and a wipe still fails.
+        array = "${NON_PG_SKIP_ARGS[@]}"
+        both = "cargo test --lib recovery_case -- nested_case"
+        dynamic_values = ("--test-threads $EXTRA", "--format ${FMT}",
+                          "--color $(color)", "--logfile $LOGFILE",
+                          "--logfile run-*.log", "-Z $FLAGS",
+                          "--test-threads=$EXTRA")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture_repo(root, GOOD_COMMAND, integration_test=True)
+            filter_file = root / "scripts/ci/non-pg-test-filter.sh"
+            filter_file.parent.mkdir(parents=True)
+            for skip, command, kinds in (
+                    ("postgres", f"{both} {array}", []),
+                    ("postgres", f"cargo test --lib recovery_case -- "
+                     f"integration_only_case {array}", []),
+                    ("postgres", f"{both} {array} $EXTRA", ["unproven-union"]),
+                    *(("postgres", f"{both} {array} {value}", ["unproven-union"])
+                      for value in dynamic_values),
+                    ("postgres", f"{both} {array} --test-threads 1", []),
+                    ("postgres", f"{both} {array} --test-threads=1", []),
+                    ("postgres", f"{both} {array} --ignored", ["unproven-union"]),
+                    ("_case", f"{both} {array}", ["zero-match"])):
+                filter_file.write_text(
+                    f"NON_PG_SKIP_ARGS=(\n  --skip _pg\n  --skip {skip}\n)\n",
+                    encoding="utf-8")
+                with self.subTest(skip=skip, command=command):
+                    self.assertEqual(self.judge(root, command), kinds)
+
+    def test_restored_skips_still_bound_an_ignored_run(self) -> None:
+        # --ignored proves no candidate runs, yet the restored skips still drop known
+        # ones; none left is its own failure that no allowlist or doctest excuses.
+        array = "${NON_PG_SKIP_ARGS[@]}"
+        single = f"cargo test --lib high_risk_recovery -- {array} --ignored"
+        both = f"cargo test --lib recovery_case -- nested_case {array} --ignored"
+        zero, union = ["non-pg-ignored-zero-match"], ["unproven-union"]
+        literal = "NON_PG_SKIP_ARGS=(\n  --skip _pg\n  --skip {}\n)\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture_repo(root, GOOD_COMMAND)
+            filter_file = root / "scripts/ci/non-pg-test-filter.sh"
+            filter_file.parent.mkdir(parents=True)
+            for skip, command, kinds in (
+                    ("high_risk_recovery", single, zero),
+                    ("postgres", single, []),
+                    ("_case", both, zero),
+                    ("recovery_case", both, union),
+                    ("postgres", both, union),
+                    ("high_risk_recovery", f"{single} $EXTRA", zero),
+                    ("recovery_case", f"{both} $EXTRA", union),
+                    ("high_risk_recovery", f"cargo test high_risk_recovery -- {array} --ignored",
+                     zero),
+                    ("x\n)\nNON_PG_SKIP_ARGS+=(\n  --skip y", single, ["non-pg-skip-unresolved"])):
+                filter_file.write_text(literal.format(skip), encoding="utf-8")
+                with self.subTest(skip=skip, command=command):
+                    self.assertEqual(self.judge(root, command), kinds)
+            filter_file.write_text(literal.format("high_risk_recovery"), encoding="utf-8")
+            self.assertEqual(self.judge(root, single, allowlist=frozenset({single})), zero)
+            filter_file.write_text(literal.format("postgres"), encoding="utf-8")
+            diagnostics: list[str] = []
+            self.assertEqual(self.judge(root, single, diagnostics), [])
+            self.assertIn("unjudged: --ignored keeps only #[ignore] tests among 1 candidate",
+                          " ".join(diagnostics))
+
+    def test_an_unreadable_generated_array_fails_closed(self) -> None:
+        # The array is known to carry skips, so a shape the reader cannot
+        # restore fails; other opaque expansions keep their verdicts.
+        array = "${NON_PG_SKIP_ARGS[@]}"
+        single = "cargo test --lib high_risk_recovery --"
+        literal = "NON_PG_SKIP_ARGS=(\n  --skip _pg\n)\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_fixture_repo(root, GOOD_COMMAND)
+            filter_file = root / "scripts/ci/non-pg-test-filter.sh"
+            filter_file.parent.mkdir(parents=True)
+            for extra in ("NON_PG_SKIP_ARGS+=(\n  --skip high_risk_recovery\n)\n",
+                          "NON_PG_SKIP_ARGS=(\n  --skip high_risk_recovery\n)\n"):
+                filter_file.write_text(literal + extra, encoding="utf-8")
+                for command, kinds in (
+                        (f"{single} {array}", ["non-pg-skip-unresolved"]),
+                        (f"{single} {array} $EXTRA", ["non-pg-skip-unresolved"]),
+                        (f"{single} $EXTRA", []),
+                        ("cargo test --lib recovery_case -- nested_case $EXTRA",
+                         ["unproven-union"])):
+                    with self.subTest(extra=extra, command=command):
+                        self.assertEqual(self.judge(root, command), kinds)
+
+    def test_checked_in_non_pg_filter_is_readable(self) -> None:
+        skips = integrity.PackageTestIds(REPO_ROOT).non_pg_skip_filters()
+        self.assertIsNotNone(skips)
+        self.assertIn("_pg", skips)
+
+    def test_a_skip_value_keeps_a_hash_inside_its_word(self) -> None:
+        # The array reads like the shell does: only a `#` opening a word is a comment.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / integrity.NON_PG_FILTER_REL
+            path.parent.mkdir(parents=True)
+            path.write_text("NON_PG_SKIP_ARGS=(\n  --skip a#b  # note\n  --skip 'c d'\n)\n",
+                            encoding="utf-8")
+            self.assertEqual(integrity.PackageTestIds(Path(tmp)).non_pg_skip_filters(),
+                             ("a#b", "c d"))
+
+    def test_default_selection_follows_cargo_test_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = build_fixture_repo(root, "cargo test example_owned::")
+            (root / "examples/owned").mkdir(parents=True)
+            (root / "examples/owned/main.rs").write_text(
+                "mod example_owned { #[test] fn case() {} }\n", encoding="utf-8")
+            self.assertEqual(
+                [v.kind for v in integrity.check_workflows(root, [workflow], set(), False)],
+                ["target-mismatch"])
+            with (root / "Cargo.toml").open("a") as manifest:
+                manifest.write('\n[[example]]\nname = "owned"\ntest = true\n')
+            self.assertEqual(integrity.check_workflows(root, [workflow], set(), False), [])
+        for command in ("cargo test --manifest-path tools/x/Cargo.toml other_mod::",
+                        "cargo test -p other other_mod::",
+                        "cargo test --doc other_mod::",
+                        "cargo test --lib -- --ignored high_risk_recovery::"):
+            with self.subTest(command=command):
+                diagnostics: list[str] = []
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    workflow = build_fixture_repo(root, command)
+                    self.assertEqual(integrity.check_workflows(
+                        root, [workflow], set(), False, diagnostics=diagnostics), [])
+                self.assertIn("unjudged", " ".join(diagnostics))
+        self.assertIs(integrity.parse_command("cargo test --bin $B x::".split()).selection,
+                      integrity.TargetSelection.UNJUDGED)
+
+
+class KnownArrayProvenance(unittest.TestCase):
+    """A generated array is the canonical one only when the command's own shell
+    sourced the filter first and nothing rebound the array before the command."""
+
+    SOURCE = f"source {integrity.NON_PG_FILTER_REL}"
+    NON_PG = 'cargo test --lib high_risk_recovery -- "${NON_PG_SKIP_ARGS[@]}"'
+    PG = 'cargo test --lib -- "${PG_INCLUDE_ARGS[@]}" --test-threads=1'
+
+    def check(self, steps, just_lines=(GOOD_COMMAND,)) -> list:
+        """Violations for one job (a tuple step is a `run: |` block, a str one
+        line) and one justfile recipe, with a readable generated filter."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = build_fixture_repo(root, GOOD_COMMAND, just_text="fixture:\n" + "".join(
+                f"    {line}\n" for line in just_lines))
+            write_generated_filter(root)
+            workflow.write_text("jobs:\n  lane:\n    steps:\n" + "".join(
+                f"      - run: {step}\n" if isinstance(step, str) else
+                "      - run: |\n" + "".join(f"          {line}\n" for line in step)
+                for step in steps), encoding="utf-8")
+            return integrity.check_workflows(root, [workflow], set(), False)
+
+    def kinds(self, steps, just_lines=(GOOD_COMMAND,)) -> list[tuple[str, str]]:
+        return [(Path(v.workflow).name, v.kind) for v in self.check(steps, just_lines)]
+
+    def test_a_run_scalar_must_source_before_the_array_it_expands(self) -> None:
+        source, non_pg, pg = self.SOURCE, self.NON_PG, self.PG
+        unsourced = [("ci-fixture.yml", "non-pg-source-unproven")]
+        pg_unsourced = [("ci-fixture.yml", "pg-include-source-unproven")]
+        redefined = [("ci-fixture.yml", "known-array-redefined")]
+        for steps, kinds in (
+                (((source, non_pg),), []),
+                (((source, pg),), []),
+                (((non_pg,),), unsourced),
+                (((pg,),), [("ci-fixture.yml", "pg-include-source-unproven")]),
+                # Each run scalar is its own shell, so an earlier step proves nothing.
+                (((source,), (non_pg,)), unsourced),
+                ((source, (non_pg,)), unsourced),
+                # Only a whole command that cannot fail open counts as the source.
+                (((f"# {source}", non_pg),), unsourced),
+                (((f'echo "{source}"', non_pg),), unsourced),
+                (((f"{source} || true", non_pg),), unsourced),
+                (((f"[ -n \"$CI\" ] && {source}", non_pg),), unsourced),
+                ((("if [ -n \"$CI\" ]; then", f"  {source}", "fi", non_pg),), unsourced),
+                # Unindented, a source in a branch, an uncalled function or heredoc data never runs.
+                ((("if false; then", source, "fi", non_pg),), unsourced),
+                ((("setup() {", source, "}", non_pg),), unsourced),
+                ((("cat <<'EOF'", source, "EOF", non_pg),), unsourced),
+                ((('echo "', source, '"', non_pg),), unsourced),
+                ((("(", source, ")", non_pg),), unsourced),
+                ((("echo \\", source, non_pg),), unsourced),
+                ((("echo \\\\", source, non_pg),), []),
+                # Code left open by `&&`, `||` or a pipe, or an open backtick, owns the source.
+                ((("false &&", source, pg),), pg_unsourced),
+                ((("true ||", "", source, pg),), pg_unsourced),
+                ((("echo |", source, non_pg),), unsourced),
+                ((("echo `", source, "`", pg),), pg_unsourced),
+                ((("true && echo ok", "echo `date`", source, pg),), []),
+                # A `#` right after the operator is a comment; inside a word it is not.
+                ((("false &&# note", source, pg),), pg_unsourced),
+                ((("true ||# note", source, pg),), pg_unsourced),
+                ((("echo |# note", source, non_pg),), unsourced),
+                ((("echo x#&&", source, pg),), pg_unsourced),
+                # An escaped operator is word data, so the `#` after it is literal.
+                ((("false && echo ok\\;#tag &&", source, pg),), pg_unsourced),
+                ((("false && echo ok\\|#tag &&", source, pg),), pg_unsourced),
+                ((("false && echo ok\\&#tag &&", source, pg),), pg_unsourced),
+                ((("false && echo ok\\\\;# note &&", source, pg),), []),
+                ((("echo ok;# note", source, pg),), []),
+                # Operators inside a substitution never leave the outer line open.
+                ((("x=$(true &&", "false)", source, pg),), []),
+                ((('echo "$(echo `date`)"', source, pg),), []),
+                ((("echo `echo \\`date\\``", source, pg),), pg_unsourced),
+                ((("while read -r x; do :; done < <(true)", source, pg),), []),
+                # Past an unclosed quote, the use may be data rather than a command.
+                (((source, "echo 'open", pg),), pg_unsourced),
+                # Quoted or escaped, `;`, `|` and `&&` are argument text, not a second command.
+                (((source, f"{non_pg} --logfile 'ci;pg.log'"),), []),
+                (((source, f"{non_pg} --logfile ci\\;pg.log"),), []),
+                (((f'{source} && cargo test --lib -- --logfile "a;b||c" "${{PG_INCLUDE_ARGS[@]}}"',),),
+                 []),
+                ((('source "$FILTER"', non_pg),), unsourced),
+                (((f"{source} && {non_pg}",),), []),
+                ((f"'{source} && {non_pg}'",), []),
+                (((f"{source} && echo ok", non_pg),), unsourced),
+                (((source, "NON_PG_SKIP_ARGS=(--skip high_risk_recovery)", non_pg),), redefined),
+                (((f"{non_pg} --ignored",),), unsourced),
+                (((source, "unset NON_PG_SKIP_ARGS", f"{non_pg} --ignored"),), redefined),
+                (((source, "PG_INCLUDE_ARGS+=(extra_case)", pg),), redefined),
+                (((source, "unset PG_INCLUDE_ARGS", pg),), redefined),
+                (((source, "NON_PG_SKIP_ARGS[0]=--exact", non_pg),), redefined),
+                (((source, 'read -ra NON_PG_SKIP_ARGS <<< "--exact"', non_pg),), redefined),
+                # A read or a comment is no rebinding, and the source overwrites an earlier value.
+                (((source, 'echo "${#NON_PG_SKIP_ARGS[@]}"', non_pg),), []),
+                (((f"{source}  # canonical arrays", "# NON_PG_SKIP_ARGS=(--exact)", non_pg),), []),
+                ((("NON_PG_SKIP_ARGS=(--skip high_risk_recovery)", source, non_pg),), []),
+                ((("if true; then", "  echo nested", "fi", source, non_pg),), []),
+                ((('case "$CI" in', "  true) echo ci ;;", "esac", "note() { echo note; }",
+                   source, non_pg),), []),
+                # Other expansions keep their own verdicts without any source.
+                ((("cargo test --lib high_risk_recovery -- $OTHER_ARGS",),), [])):
+            with self.subTest(steps=steps):
+                self.assertEqual(self.kinds(steps), kinds)
+
+    def test_messages_name_the_command_and_the_rebinding_line(self) -> None:
+        violations = self.check(((self.SOURCE, "unset NON_PG_SKIP_ARGS", self.NON_PG),))
+        self.assertEqual([(v.line, v.kind) for v in violations], [(7, "known-array-redefined")])
+        self.assertIn("NON_PG_SKIP_ARGS was assigned at line 6", violations[0].detail)
+
+    def test_a_recipe_line_sources_in_its_own_and_chain(self) -> None:
+        source, pg = self.SOURCE, self.PG
+        with tempfile.TemporaryDirectory() as tmp:
+            justfile = Path(tmp) / "justfile"
+            justfile.write_text(f"fixture:\n    {source} && {pg}\n", encoding="utf-8")
+            self.assertEqual([words[:3] for _, words, _ in integrity.extract_justfile_commands(
+                justfile)], [["cargo", "test", "--lib"]])
+        for just_lines, kinds in (
+                ((f"{source} && {pg}", f"{source} && {GOOD_COMMAND}"), []),
+                ((f"{source} && {pg} --logfile 'ci;pg.log'",), []),
+                # Every recipe line is its own shell.
+                ((source, pg), [("justfile", "pg-include-source-unproven")]),
+                ((f"source scripts/other.sh && {pg}",),
+                 [("justfile", "known-array-command-unparsed")])):
+            with self.subTest(just_lines=just_lines):
+                self.assertEqual(self.kinds(((GOOD_COMMAND,),), just_lines), kinds)
+
+    def test_an_array_outside_any_extracted_command_is_unparsed(self) -> None:
+        source, non_pg = self.SOURCE, self.NON_PG
+        unparsed = [("ci-fixture.yml", "known-array-command-unparsed")]
+        for lines in ((f"{source}; {non_pg}",),
+                      # A second command on the cargo line is never judged as its argv.
+                      (f"{source} && cargo test --lib case || {non_pg}",),
+                      (f"{source} && {non_pg} && {non_pg}",),
+                      (source, f"{non_pg} && cargo test --lib does_not_exist -- "
+                               '"${NON_PG_SKIP_ARGS[@]}"'),
+                      (source, f"{non_pg} | tee test.log"),
+                      (source, f"{non_pg} --logfile ci\\\\; echo done"),
+                      (source, f"time {non_pg}"),
+                      (source, f"bash -c '{non_pg}'"),
+                      (source, "cargo test --lib high_risk_recovery \\",
+                       '  -- "${NON_PG_SKIP_ARGS[@]}"'),
+                      (source, 'run_lane "${PG_INCLUDE_ARGS[@]}"')):
+            with self.subTest(lines=lines):
+                self.assertEqual(self.kinds((lines,)), unparsed)
+
+
+class PgIncludeRestoration(unittest.TestCase):
+    """PG_INCLUDE_ARGS is judged as the selection the generated file derives for every
+    shard its command may run under, never as an opaque expansion."""
+
+    PG = 'cargo test --lib -- "${PG_INCLUDE_ARGS[@]}" --test-threads=1'
+
+    def kinds(self, run: str = PG, recipe: str | None = PG, *, env: str = "",
+              allowlist: str = "", **generated) -> list[tuple[str, str]]:
+        """(file, kind) for one sourced run block and one sourced recipe line."""
+        source = f"source {integrity.NON_PG_FILTER_REL}"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = build_fixture_repo(root, GOOD_COMMAND, just_text=(
+                f"fixture:\n    {source} && {recipe or GOOD_COMMAND}\n"))
+            write_generated_filter(root, **generated)
+            workflow.write_text(f"jobs:\n  lane:\n{env}    steps:\n      - run: |\n"
+                                f"          {source}\n          {run}\n", encoding="utf-8")
+            allow = root / "allowlist.txt"
+            allow.write_text(allowlist, encoding="utf-8")
+            return [(Path(v.workflow).name, v.kind) for v in integrity.check_workflows(
+                root, [workflow], integrity.load_allowlist(allow), False)]
+
+    def test_each_shard_a_command_may_run_under_is_judged(self) -> None:
+        pg, run_only = self.PG, {"recipe": None}
+        workflow, recipe = "ci-fixture.yml", "justfile"
+        missing = ("_pg", "pg_", "postgres", "no_such_module")
+        zero = [(workflow, "pg-include-zero-match")] + [(recipe, "pg-include-zero-match")] * 3
+        normalized = pg.replace('"', "")
+        for name, kwargs, kinds in (
+                ("every shard selects", {}, []),
+                # A workflow sources with the shard unset; a recipe may inherit 0 or 1.
+                ("shard 0 selects nothing", {"pg_case": None},
+                 [(recipe, "pg-include-zero-match")]),
+                ("shard 1 has no positive filter", {"skips": ("pg_", "postgres")},
+                 [(recipe, "pg-include-empty")]),
+                ("nothing selected", {"skips": missing, "pg_case": None}, zero),
+                ("allowlisted", {"skips": missing, "pg_case": None,
+                                 "allowlist": f"# reason: platform-gated\n{normalized}\n"}, zero),
+                # Another filter's tests cannot stand in for the generated selection's own.
+                ("other filter beside nothing", {"run": f"{pg} high_risk_recovery",
+                                                 "recipe": f"{pg} high_risk_recovery",
+                                                 "skips": missing, "pg_case": None}, zero),
+                ("other filter beside every shard", {"run": f"{pg} high_risk_recovery",
+                                                     "recipe": f"{pg} high_risk_recovery"}, []),
+                # Restoring the array keeps every other run-time uncertainty.
+                ("other expansion", {"run": f"{pg} $EXTRA", **run_only},
+                 [(workflow, "unproven-union")] * 2),
+                ("ignored", {"run": f"{pg} --ignored", **run_only},
+                 [(workflow, "unproven-union")] * 2),
+                # Every PG match carries a NON_PG skip value, so the restored skips leave none.
+                ("ignored beside the NON_PG skips",
+                 {"run": f'{pg} "${{NON_PG_SKIP_ARGS[@]}}" --ignored', **run_only},
+                 [(workflow, "non-pg-ignored-zero-match")]),
+                ("shard named", {"env": "    env:\n      PG_INCLUDE_SHARD: 2\n", **run_only},
+                 [(workflow, "pg-include-shard-unresolved")]),
+                ("shard in a comment", {"env": "    # PG_INCLUDE_SHARD: 2\n", **run_only}, []),
+                *((f"usage {index}", {"run": run, **run_only},
+                   [(workflow, "pg-include-usage-unresolved")]) for index, run in enumerate((
+                    'cargo test --lib "${PG_INCLUDE_ARGS[@]}"',
+                    'cargo test --lib -- --skip "${PG_INCLUDE_ARGS[@]}"',
+                    'cargo test --lib -- "${PG_INCLUDE_ARGS[*]}"',
+                    f'{pg} "${{PG_INCLUDE_ARGS[@]}}"')))):
+            with self.subTest(name):
+                self.assertEqual(self.kinds(**kwargs), kinds)
+
+    def test_only_the_generated_derivation_is_restored(self) -> None:
+        unresolved = [("ci-fixture.yml", "pg-include-unresolved")]
+        for old, new in (
+                ("", ""),
+                ("index = 1;", "index = 0;"),
+                ("index += 2", "index += 1"),
+                ("  PG_INCLUDE_ARGS+=(", "  PG_EXTRA_ARGS+=("),
+                ('0) PG_INCLUDE_ARGS=("${PG_INCLUDE_ARGS_SHARD_0[@]}")',
+                 '0) PG_INCLUDE_ARGS=("${PG_INCLUDE_ARGS_SHARD_1[@]}")'),
+                ("    return 1\n", "    :\n"),
+                ("\nreadonly -a PG_INCLUDE_ARGS\n", "\n"),
+                ("\nrun_non_pg_filter_replay() {", "\nPG_INCLUDE_ARGS_SHARD_0+=(extra)\n"
+                 "run_non_pg_filter_replay() {"),
+                ("  --skip pg_\n  --skip postgres\n)\n# END", ")\n# END"),
+                ("PG_INCLUDE_ARGS_SHARD_0=(\n  pg_\n", "PG_INCLUDE_ARGS_SHARD_0=(\n  $EXTRA\n"),
+                ("# BEGIN generated", "return 0\n# BEGIN generated"),
+                ("  --skip server::multinode_regression\n)", "  --skip server::multinode_regression\n")):
+            def edit(text: str, old: str = old, new: str = new) -> str:
+                self.assertEqual(text.count(old), 1 if old else len(text) + 1)
+                return text.replace(old, new) if old else text
+            with self.subTest(old=old, new=new):
+                self.assertEqual(self.kinds(recipe=None, edit=edit), unresolved if old else [])
+
+
+class ShellBoundaryEnforcement(unittest.TestCase):
+    """The enforced gate judges every cargo test the shell would run: continued lines as
+    one command, and a cargo the lexer could not bound as unparsed."""
+
+    def enforce(self, block: tuple[str, ...], just_lines: tuple[str, ...] = (GOOD_COMMAND,)):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = build_fixture_repo(root, GOOD_COMMAND, just_text="fixture:\n" + "".join(
+                f"    {line}\n" for line in just_lines))
+            write_generated_filter(root)
+            # A plain first step keeps the extraction floor met when the block holds no command.
+            workflow.write_text(f"jobs:\n  lane:\n    steps:\n      - run: {GOOD_COMMAND}\n"
+                                "      - run: |\n" + "".join(
+                f"          {line}\n" for line in block), encoding="utf-8")
+            allow = root / "allowlist.txt"
+            allow.write_text("", encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                rc = integrity.main(["--repo-root", str(root), "--workflow", str(workflow),
+                                     "--allowlist", str(allow), "--enforce"])
+        return rc, [(Path(source).name, kind) for source, kind in re.findall(
+            r"^ERROR (\S+?):\d+: \[([\w-]+)\]", stdout.getvalue(), re.M)]
+
+    def test_every_cargo_the_shell_runs_is_judged(self) -> None:
+        zero = (1, [("ci-fixture.yml", "zero-match")])
+        unparsed = (1, [("ci-fixture.yml", "cargo-command-unparsed")])
+        for block, verdict in (
+                (("cargo test --lib -- \\", "  definitely_missing_filter"), zero),
+                (("car\\", "go test --lib missing"), zero),
+                (("cat <<EOF; cargo test --lib missing", "hello", "EOF"), unparsed),
+                (("unset x", "echo ${x:-$(cargo test --lib missing)}"), unparsed),
+                (("false && cargo test --lib missing",), unparsed),
+                (("cargo test --lib missing \\",), unparsed),
+                (("echo cargo test --lib missing",), (0, [])),
+                ((f"{GOOD_COMMAND} \\", "  --nocapture"), (0, [])),
+                ((f"{GOOD_COMMAND} \\", "", "cargo test --lib missing_alone"), zero)):
+            with self.subTest(block=block):
+                self.assertEqual(self.enforce(block), verdict)
+
+    def test_a_recipe_continues_its_line_and_keeps_the_canonical_chain(self) -> None:
+        pg = f'source {integrity.NON_PG_FILTER_REL} && cargo test --lib -- "${{PG_INCLUDE_ARGS[@]}}"'
+        self.assertEqual(self.enforce((GOOD_COMMAND,), (pg, GOOD_COMMAND)), (0, []))
+        self.assertEqual(self.enforce((GOOD_COMMAND,), ("cargo test --lib \\", "  missing_filter")),
+                         (1, [("justfile", "zero-match")]))
 
 
 class ParserContract(unittest.TestCase):
@@ -804,6 +1706,75 @@ class ParserContract(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(len(integrity.extract_justfile_commands(justfile)), 1)
+
+    def test_a_cargo_test_joined_to_another_command_is_unparsed(self) -> None:
+        # A direct cargo test refused for a control operator fails, array or not;
+        # other words, quoted text and redirections join nothing.
+        unparsed = ["cargo-command-unparsed"]
+        for command, kinds in (
+                (f"{GOOD_COMMAND} && cargo test --lib does_not_exist", unparsed),
+                (f"{GOOD_COMMAND}; echo done", unparsed),
+                (f"MODE=ci {GOOD_COMMAND} | tee test.log", unparsed),
+                (f"echo {GOOD_COMMAND} && true", []),
+                (f"time {GOOD_COMMAND} && true", []),
+                (f"{GOOD_COMMAND} --logfile 'ci;pg.log' 2>&1", []),
+                # Only a `#` opening a word starts a comment; inside one it is literal.
+                ("cargo test --lib high_risk_recovery#tag; cargo test --lib missing", unparsed),
+                ("cargo test --lib high_risk_recovery#tag", ["zero-match"]),
+                (f"{GOOD_COMMAND} # note; cargo test --lib missing", []),
+                # A closed substitution, or an escaped operator, leaves its word open.
+                (f"{GOOD_COMMAND} --logfile foo$(true)#tag; cargo test --lib missing", unparsed),
+                (f"{GOOD_COMMAND} --logfile foo$((1+2))#tag; cargo test --lib missing", unparsed),
+                (f"{GOOD_COMMAND} --logfile foo$(echo $(true))#tag; cargo test --lib missing",
+                 unparsed),
+                (f"{GOOD_COMMAND} --logfile x\\;#tag; cargo test --lib missing", unparsed),
+                (f"{GOOD_COMMAND} --logfile x\\;#tag", []),
+                (f"{GOOD_COMMAND} --logfile x\\\\;# cargo test --lib missing", unparsed),
+                ("cargo test --lib high_risk_recovery:: -- --logfile foo$(true)#tag", []),
+                # Quoted `#` and operators are data, not a comment or a second command.
+                (f"{GOOD_COMMAND} --logfile 'x#; || y'", []),
+                (f"{GOOD_COMMAND} --logfile x'#tag'", []),
+                # A direct cargo test in a later command, a substitution or past an
+                # unsupported boundary cannot be judged.
+                ("echo ok; cargo test --lib missing", unparsed),
+                (f"({GOOD_COMMAND})", unparsed),
+                (f"{{ {GOOD_COMMAND}; }}", unparsed),
+                (f"if true; then {GOOD_COMMAND}; fi", unparsed),
+                (f"echo $(cargo test --lib missing) && {GOOD_COMMAND}", unparsed),
+                (f"{GOOD_COMMAND} --logfile \"$(cargo test --lib missing)\"", unparsed),
+                (f"{GOOD_COMMAND} --logfile `cargo test --lib missing`", unparsed),
+                (f"{GOOD_COMMAND} < <(echo x)", unparsed),
+                (f"{GOOD_COMMAND} <<EOF", unparsed),
+                (f"{GOOD_COMMAND} --logfile 'unclosed", unparsed),
+                ("echo cargo test --lib missing; true", [])):
+            with self.subTest(command=command):
+                self.assertEqual([v.kind for v in run_fixture(command)], kinds)
+        just_text = f"fixture:\n    {GOOD_COMMAND} && cargo test --lib does_not_exist\n"
+        self.assertEqual([(v.workflow, v.kind) for v in run_fixture(
+            GOOD_COMMAND, just_text=just_text)], [("justfile", "cargo-command-unparsed")])
+
+    def test_unaligned_shell_words_refuse_a_direct_cargo_test(self) -> None:
+        # Words the syntax scan cannot align leave its operators unproven: a direct
+        # cargo test is refused, and a line holding none stays unflagged.
+        real = integrity._syntax_words
+        with mock.patch.object(integrity, "_syntax_words", lambda code: real(code)[:-1]):
+            for command, kinds in (
+                    (GOOD_COMMAND, [("ci-fixture.yml", "cargo-command-unparsed"),
+                                    ("justfile", "cargo-command-unparsed")]),
+                    (f"echo {GOOD_COMMAND}", [("justfile", "cargo-command-unparsed")])):
+                with self.subTest(command=command):
+                    self.assertEqual([(Path(v.workflow).name, v.kind)
+                                      for v in run_fixture(command)], kinds)
+
+    def test_the_observer_refuses_a_cargo_line_it_cannot_bound(self) -> None:
+        # Observation reads the same words: a joined line is an error, never a shorter command.
+        self.assertEqual(integrity._command_lines(f"run: {GOOD_COMMAND}  # note"),
+                         [GOOD_COMMAND.split()])
+        for line in ("cargo test --lib high_risk_recovery#tag; cargo test --lib missing",
+                     f"{GOOD_COMMAND} --logfile foo$(true)#tag; cargo test --lib missing",
+                     f"{GOOD_COMMAND} --logfile \"$(cargo test --lib missing)\""):
+            with self.subTest(line=line), self.assertRaisesRegex(RuntimeError, "could not parse"):
+                integrity._command_lines(line)
 
     def test_recognized_unsupported_env_string_split_is_inconclusive(self) -> None:
         diagnostics: list[str] = []
@@ -1479,7 +2450,8 @@ mod after_string_brace {
             '"$PYTHON" -m unittest tests.test_check_test_target_integrity'
         )
         verifier_line = (
-            'AGENTDESK_CI_TIMEOUT_REPORT=1 "$PYTHON" scripts/ci-timeout.py 900 '
+            'AGENTDESK_CI_TIMEOUT_REPORT=1 bash scripts/ci/mem-measure.sh '
+            'lib-inventory -- "$PYTHON" scripts/ci-timeout.py 1800 '
             '"$PYTHON" scripts/check_test_target_integrity.py '
             '--verify-lib-inventory'
         )

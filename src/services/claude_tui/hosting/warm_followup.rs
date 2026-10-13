@@ -108,12 +108,38 @@ fn recover_claude_tui_stranded_prompt_draft(
             ClaudeTuiStrandedPromptDraftState::IdleTranscript => DraftClear::Strong,
             ClaudeTuiStrandedPromptDraftState::UnknownTranscript => DraftClear::Gentle,
         };
-        // The composer lock `/compact` steering holds, taken once here (the submit
-        // lock comes later); the clear re-reads the pane inside it and never re-locks.
+        // The composer lock `/compact` steering holds, taken once here; inside it only a prompt
+        // AgentDesk typed is cleared, and any other text refuses before the first key.
         let cleared = crate::services::claude_tui::input::with_composer_cleanup_lock(
             tmux_session_name,
-            || clear_draft(host, tmux_session_name, clear, cancel_token.as_deref()),
+            || -> Result<Option<_>, String> {
+                let ours = crate::services::claude_tui::input::stranded_draft_is_ours(
+                    tmux_session_name,
+                    crate::services::claude_tui::input::PromptReadinessKind::ProvenWarmFollowup,
+                )?;
+                Ok(ours
+                    .then(|| clear_draft(host, tmux_session_name, clear, cancel_token.as_deref())))
+            },
         );
+        let cleared = match cleared {
+            Some(Err(held)) => return ClaudeTuiDraftRecoveryOutcome::Terminal(Err(held)),
+            Some(Ok(cleared)) => cleared,
+            None => None,
+        };
+        // A held pane or an empty composer keeps its text; the submit below holds or requeues.
+        let Some(cleared) = cleared else {
+            return ClaudeTuiDraftRecoveryOutcome::Proceed {
+                state: ClaudeTuiRecreateState {
+                    resolved_session_id,
+                    transcript_path,
+                    transcript_path_string,
+                    resume,
+                },
+                busy_waited,
+                recreate_before_submit,
+                prompt_draft_cleared_before_submit,
+            };
+        };
         let outcome = draft_outcome(draft_state, &snapshot, &cleared);
         tracing::warn!(
             tmux_session_name,
@@ -230,8 +256,12 @@ fn run_claude_tui_warm_followup_submit_and_stream(
                         "Claude TUI follow-up: cancellation observed during busy wait, aborting injection (session={})",
                         tmux_session_name
                     ));
-                    log_producer_exit(
+                    let (kind, result) = pre_submit_cancel_exit(
+                        cancel_token.as_deref(),
                         "tui_warm_followup_cancelled_during_busy_wait",
+                    );
+                    log_producer_exit(
+                        kind,
                         Some(&resolved_session_id),
                         report_channel_id,
                         0,
@@ -240,7 +270,7 @@ fn run_claude_tui_warm_followup_submit_and_stream(
                             "transcript_path": transcript_path_string,
                         }),
                     );
-                    return ClaudeTuiWarmFollowupSubmitOutcome::Terminal(Ok(()));
+                    return ClaudeTuiWarmFollowupSubmitOutcome::Terminal(result);
                 }
                 let timed_out =
                     crate::services::claude_tui::input::is_prompt_ready_timeout_error(&err);
@@ -308,8 +338,12 @@ fn run_claude_tui_warm_followup_submit_and_stream(
             "Claude TUI follow-up: cancellation observed after busy wait, aborting injection (session={})",
             tmux_session_name
         ));
-        log_producer_exit(
+        let (kind, result) = pre_submit_cancel_exit(
+            cancel_token.as_deref(),
             "tui_warm_followup_cancelled_after_busy_wait",
+        );
+        log_producer_exit(
+            kind,
             Some(&resolved_session_id),
             report_channel_id,
             0,
@@ -318,7 +352,7 @@ fn run_claude_tui_warm_followup_submit_and_stream(
                 "transcript_path": transcript_path_string,
             }),
         );
-        return ClaudeTuiWarmFollowupSubmitOutcome::Terminal(Ok(()));
+        return ClaudeTuiWarmFollowupSubmitOutcome::Terminal(result);
     }
     let turn_started_at = chrono::Utc::now();
     if let Err(error) = crate::services::claude_tui::input::send_followup_prompt_or_idle_transcript(
@@ -327,6 +361,17 @@ fn run_claude_tui_warm_followup_submit_and_stream(
         cancel_token.as_deref(),
         &transcript_path,
     ) {
+        // A held prompt is neither a cancellation nor a provider failure; nothing reached the pane.
+        if crate::services::claude_tui::submission_fence::refusal().is_some() {
+            log_producer_exit(
+                "tui_warm_followup_pre_submit_persistence_refused",
+                Some(&resolved_session_id),
+                report_channel_id,
+                0,
+                serde_json::json!({ "tmux_session_name": tmux_session_name }),
+            );
+            return ClaudeTuiWarmFollowupSubmitOutcome::Terminal(Err(error));
+        }
         if crate::services::claude_tui::input::is_prompt_ready_cancelled_error(&error) {
             debug_log(&format!(
                 "Claude TUI follow-up: cancellation observed during prompt submission, aborting injection (session={})",
@@ -462,6 +507,67 @@ fn run_claude_tui_warm_followup_submit_and_stream(
         }
     }
     ClaudeTuiWarmFollowupSubmitOutcome::FallThroughRecreate
+}
+
+/// Producer error when a turn teardown cancelled a follow-up whose prompt never reached the pane.
+const FOLLOWUP_TORN_DOWN_BEFORE_SUBMIT_ERROR: &str =
+    "claude tui follow-up was torn down before submit; the prompt was not delivered";
+
+/// Exit for a cancel seen before submit. A cleanup teardown with no stop source (an unwound,
+/// never-started turn) is a typed failure; a stop, reaction or watchdog cancel stays `Ok`.
+fn pre_submit_cancel_exit(
+    cancel_token: Option<&CancelToken>,
+    cancelled_kind: &'static str,
+) -> (&'static str, Result<(), String>) {
+    let torn_down = cancel_token
+        .is_some_and(|token| token.is_completion_cleanup() && token.cancel_source().is_none());
+    if torn_down {
+        let error = FOLLOWUP_TORN_DOWN_BEFORE_SUBMIT_ERROR.to_string();
+        return ("tui_warm_followup_torn_down_before_submit", Err(error));
+    }
+    (cancelled_kind, Ok(()))
+}
+
+#[cfg(test)]
+mod pre_submit_cancel_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn only_a_sourceless_cleanup_teardown_fails_and_stops_stay_silent() {
+        let kind = "tui_warm_followup_cancelled_during_busy_wait";
+        // `unwind_unstarted_turn`: cleanup marker, then the flip, with no stop source.
+        let teardown = CancelToken::new();
+        teardown.mark_completion_cleanup();
+        teardown.cancelled.store(true, Ordering::Relaxed);
+        // /stop, a stop reaction and the watchdog all publish a source.
+        let stop = CancelToken::new();
+        stop.publish_cancel("explicit_stop");
+        let reaction = CancelToken::new();
+        reaction.publish_cancel("stop_reaction");
+        let watchdog = CancelToken::new();
+        watchdog.set_cancel_source_kind(crate::services::provider::CancelSource::WatchdogTimeout);
+        watchdog.cancelled.store(true, Ordering::Relaxed);
+        // A stop that a later turn cleanup also marks is still the user's stop.
+        let stopped_then_cleaned = CancelToken::new();
+        stopped_then_cleaned.publish_cancel("explicit_stop");
+        stopped_then_cleaned.mark_completion_cleanup();
+        let silent = (kind, Ok(()));
+        let failed = (
+            "tui_warm_followup_torn_down_before_submit",
+            Err(FOLLOWUP_TORN_DOWN_BEFORE_SUBMIT_ERROR.to_string()),
+        );
+        #[rustfmt::skip]
+        let cases = [(Some(&teardown), failed), (Some(&stop), silent.clone()), (Some(&reaction), silent.clone()),
+            (Some(&watchdog), silent.clone()), (Some(&stopped_then_cleaned), silent.clone()), (None, silent)];
+        for (index, (token, expected)) in cases.into_iter().enumerate() {
+            assert_eq!(
+                pre_submit_cancel_exit(token, kind),
+                expected,
+                "case {index}"
+            );
+        }
+    }
 }
 
 fn claude_tui_followup_wait_error_requeue_for_retry(error: &str) -> bool {

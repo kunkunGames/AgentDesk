@@ -1,3 +1,10 @@
+#[path = "tui_followup/codex_observation.rs"]
+mod codex_observation;
+#[cfg(unix)]
+pub(super) use codex_observation::{
+    observe_codex_tui_rollout_state_for_cwd, observe_codex_tui_rollout_state_for_cwd_with_sessions,
+};
+
 use super::*;
 
 pub(super) const CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE: &str = "⚠ Claude TUI가 아직 이전 터미널 턴을 처리 중이라 이 메시지를 주입하지 않았습니다. 현재 응답이 끝난 뒤 다시 보내 주세요.";
@@ -12,25 +19,20 @@ pub(super) const CLAUDE_TUI_BUSY_FOLLOWUP_QUEUE_UNREACHABLE_NOTICE: &str =
 pub(super) fn claude_tui_busy_followup_refusal_notice(
     reason: Option<crate::services::turn_orchestrator::EnqueueRefusalReason>,
 ) -> &'static str {
+    use crate::services::turn_orchestrator::EnqueueRefusalReason as E;
     match reason {
         Some(
-            crate::services::turn_orchestrator::EnqueueRefusalReason::AlreadyActiveTurn
-            | crate::services::turn_orchestrator::EnqueueRefusalReason::AbsorbedByActiveTurn
-            | crate::services::turn_orchestrator::EnqueueRefusalReason::ClaimedSinceObservation
-            | crate::services::turn_orchestrator::EnqueueRefusalReason::SourceIdPendingOrActive,
+            E::AlreadyActiveTurn
+            | E::AbsorbedByActiveTurn
+            | E::ClaimedSinceObservation
+            | E::SourceIdPendingOrActive,
         ) => CLAUDE_TUI_BUSY_FOLLOWUP_ALREADY_ACTIVE_NOTICE,
-        Some(crate::services::turn_orchestrator::EnqueueRefusalReason::SourceIdAlreadyQueued) => {
-            CLAUDE_TUI_BUSY_FOLLOWUP_ALREADY_QUEUED_NOTICE
-        }
-        Some(crate::services::turn_orchestrator::EnqueueRefusalReason::LastItemDedup) => {
-            CLAUDE_TUI_BUSY_FOLLOWUP_DEDUP_NOTICE
-        }
-        // #3297 r3 — a post-retry purge-tombstone refusal is user-actionable
-        // the same way as an unreachable actor: resend shortly.
-        Some(crate::services::turn_orchestrator::EnqueueRefusalReason::ActorUnreachable)
-        | Some(crate::services::turn_orchestrator::EnqueueRefusalReason::MailboxClosed) => {
+        Some(E::SourceIdAlreadyQueued) => CLAUDE_TUI_BUSY_FOLLOWUP_ALREADY_QUEUED_NOTICE,
+        Some(E::LastItemDedup) => CLAUDE_TUI_BUSY_FOLLOWUP_DEDUP_NOTICE,
+        Some(E::ActorUnreachable | E::MailboxClosed | E::LockTimeout | E::InputPersistence) => {
             CLAUDE_TUI_BUSY_FOLLOWUP_QUEUE_UNREACHABLE_NOTICE
         }
+        Some(E::InputModeFenced(_)) => crate::services::discord::queue_io::INPUT_PENDING_NOTICE,
         None => CLAUDE_TUI_BUSY_FOLLOWUP_NOTICE,
     }
 }
@@ -451,85 +453,6 @@ pub(super) fn hosted_tui_busy_preflight_readiness_wait_with_claude_home(
 }
 
 #[cfg(unix)]
-pub(super) fn observe_codex_tui_rollout_state_for_cwd(
-    current_path: Option<&str>,
-    tmux_session_name: Option<&str>,
-    provider_session_id: Option<&str>,
-) -> crate::services::tui_turn_state::TuiTurnState {
-    let runtime_binding = tmux_session_name
-        .and_then(crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session)
-        .filter(|binding| {
-            binding.runtime_kind == crate::services::agent_protocol::RuntimeHandoffKind::CodexTui
-        });
-    observe_codex_tui_rollout_state_for_cwd_with_sessions(
-        current_path,
-        provider_session_id,
-        None,
-        runtime_binding.as_ref(),
-    )
-}
-
-#[cfg(unix)]
-pub(super) fn observe_codex_tui_rollout_state_for_cwd_with_sessions(
-    current_path: Option<&str>,
-    provider_session_id: Option<&str>,
-    sessions_dir: Option<&std::path::Path>,
-    runtime_binding: Option<&crate::services::tui_prompt_dedupe::TuiRuntimeBinding>,
-) -> crate::services::tui_turn_state::TuiTurnState {
-    let Some(current_path) = current_path else {
-        return crate::services::tui_turn_state::TuiTurnState::Unknown;
-    };
-    let cwd = std::path::Path::new(current_path);
-    if let Some(binding) = runtime_binding {
-        let rollout_path = std::path::Path::new(&binding.output_path);
-        if std::fs::metadata(rollout_path).is_err() {
-            return crate::services::tui_turn_state::TuiTurnState::Unknown;
-        }
-        if !crate::services::codex_tui::rollout_tail::rollout_file_matches_cwd(rollout_path, cwd) {
-            return crate::services::tui_turn_state::TuiTurnState::Unknown;
-        }
-        return crate::services::codex_tui::rollout_tail::observe_rollout_turn_state(rollout_path);
-    }
-    let resolved = sessions_dir
-        .map(std::path::Path::to_path_buf)
-        .or_else(|| crate::services::codex_tui::rollout_tail::default_codex_sessions_dir());
-    let Some(sessions_dir) = resolved else {
-        return crate::services::tui_turn_state::TuiTurnState::Unknown;
-    };
-    if let Some(provider_session_id) = provider_session_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let selection = crate::services::codex_tui::session::resolve_codex_tui_session(
-            Some(provider_session_id),
-            cwd,
-            Some(&sessions_dir),
-            false,
-        );
-        if let Some(rollout_path) = selection.rollout_path.as_deref() {
-            return crate::services::codex_tui::rollout_tail::observe_rollout_turn_state(
-                rollout_path,
-            );
-        }
-        return crate::services::tui_turn_state::TuiTurnState::Unknown;
-    }
-    let Some(rollout_path) = crate::services::codex_tui::rollout_tail::latest_rollout_for_cwd_since(
-        cwd,
-        std::time::SystemTime::UNIX_EPOCH,
-        &sessions_dir,
-    ) else {
-        // No rollout file found for this cwd — treat as idle (session not yet started).
-        return crate::services::tui_turn_state::TuiTurnState::Idle;
-    };
-    let rollout_state =
-        crate::services::codex_tui::rollout_tail::observe_rollout_turn_state(&rollout_path);
-    if rollout_state.is_busy() {
-        return rollout_state;
-    }
-    crate::services::tui_turn_state::TuiTurnState::Unknown
-}
-
-#[cfg(unix)]
 pub(super) fn tui_busy_followup_diagnostic(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -539,10 +462,30 @@ pub(super) fn tui_busy_followup_diagnostic(
     current_path: Option<&str>,
     session_id: Option<&str>,
 ) -> Option<ClaudeTuiBusyFollowupDiagnostic> {
-    if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) || remote_profile_present {
+    if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) {
         return None;
     }
     let tmux_session_name = tmux_session_name?;
+    if matches!(provider, ProviderKind::Codex)
+        && crate::services::tui_prompt_dedupe::codex_verified_input_blocked(tmux_session_name)
+    {
+        return Some(ClaudeTuiBusyFollowupDiagnostic {
+            tmux_session_name: tmux_session_name.to_owned(),
+            prompt_marker_detected: false,
+            prompt_draft_detected: false,
+            previous_tui_turn_still_running: false,
+            tmux_pane_alive: false,
+            capture_available: false,
+            watcher_state: "verified_source_unavailable",
+            watcher_owner_channel_id: None,
+            inflight_state: "not_probed",
+            transcript_turn_state: crate::services::tui_turn_state::TuiTurnState::Unknown,
+            pane_tail: "<waiting for verified source and delivery permission>".to_owned(),
+        });
+    }
+    if remote_profile_present {
+        return None;
+    }
     let selection =
         crate::services::provider_hosting::resolve_provider_session_selection_with_channel(
             provider,
@@ -745,12 +688,11 @@ pub(in crate::services::discord) async fn hosted_tui_promote_readiness_blocked(
         return busy;
     }
 
-    let nameless = super::super::super::host_defer_gate::nameless_channel_deferred;
     let (tmux_session_name, remote_profile_named, current_path, session_id) = {
         let data = shared.core.lock().await;
         let Some(session) = data.sessions.get(&channel_id) else {
             drop(data);
-            return nameless(shared, provider, channel_id.get()).await;
+            return nameless_promote_blocked(shared, provider, channel_id).await;
         };
         let tmux_session_name = if provider.uses_managed_tmux_backend() {
             session
@@ -768,8 +710,25 @@ pub(in crate::services::discord) async fn hosted_tui_promote_readiness_blocked(
         )
     };
     let Some(tmux_session_name) = tmux_session_name else {
-        return nameless(shared, provider, channel_id.get()).await;
+        return nameless_promote_blocked(shared, provider, channel_id).await;
     };
+    // Verified incarnations wait for source and permission before queue teardown.
+    #[cfg(unix)]
+    if matches!(provider, ProviderKind::Codex)
+        && crate::services::tui_prompt_dedupe::codex_verified_input_blocked(&tmux_session_name)
+    {
+        return true;
+    }
+    // ADK_TEST_CODEX_PROMOTE_READY isolates source permission from host readiness in tests.
+    #[cfg(test)]
+    if std::env::var_os("ADK_TEST_CODEX_PROMOTE_READY").is_some() {
+        return false;
+    }
+    // The host guard keeps a retired Herdr row off tmux; on a Herdr channel its turn relaunches.
+    let retired = super::super::super::host_defer_gate::configured_herdr_retired;
+    if retired(shared, provider, channel_id.get(), &tmux_session_name).await {
+        return false;
+    }
     let host = super::super::super::host_defer_gate::channel_session_deferred;
     if host(shared, provider, channel_id.get(), &tmux_session_name).await {
         return true;
@@ -813,6 +772,31 @@ pub(in crate::services::discord) async fn hosted_tui_promote_readiness_blocked(
         );
     }
     blocked
+}
+
+/// With no session name, the registered fallback name still lets a retired Herdr row promote;
+/// anything else keeps the nameless host check.
+async fn nameless_promote_blocked(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: serenity::ChannelId,
+) -> bool {
+    let fallback = crate::services::discord::adk_session::registered_channel_fallback_name;
+    let retired = super::super::super::host_defer_gate::configured_herdr_retired;
+    if provider.uses_managed_tmux_backend()
+        && let Some(name) = fallback(channel_id, provider)
+        && retired(
+            shared,
+            provider,
+            channel_id.get(),
+            &provider.build_tmux_session_name(&name),
+        )
+        .await
+    {
+        return false;
+    }
+    let nameless = super::super::super::host_defer_gate::nameless_channel_deferred;
+    nameless(shared, provider, channel_id.get()).await
 }
 
 /// #4270 A — live-dispatch promote defer: the composite the
@@ -1214,4 +1198,26 @@ pub(super) async fn apply_tui_busy_enqueue_refusal(
         notice,
     )
     .await;
+}
+
+#[cfg(test)]
+mod input_fence_contract_tests {
+    #[test]
+    fn input_fence_notice_is_pending_not_duplicate_or_success() {
+        use crate::services::discord::input_runtime::fence::Mode;
+        use crate::services::turn_orchestrator::EnqueueRefusalReason;
+        let notice = super::claude_tui_busy_followup_refusal_notice(Some(
+            EnqueueRefusalReason::InputModeFenced(Mode::Closing),
+        ));
+        assert!(notice.contains("보류됨"));
+        for reason in [
+            EnqueueRefusalReason::LockTimeout,
+            EnqueueRefusalReason::InputPersistence,
+        ] {
+            assert_eq!(
+                super::claude_tui_busy_followup_refusal_notice(Some(reason)),
+                super::CLAUDE_TUI_BUSY_FOLLOWUP_QUEUE_UNREACHABLE_NOTICE
+            );
+        }
+    }
 }

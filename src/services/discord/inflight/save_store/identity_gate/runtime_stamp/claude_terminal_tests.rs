@@ -113,6 +113,7 @@ impl Fixture {
                     source_file_ino: self.file.1,
                     actor: Arc::downgrade(&self.actor),
                 }),
+                kind: crate::services::agent_protocol::NativeTerminalKind::Completed,
             };
         }
         StreamMessage::ClaudeTuiTerminalDone {
@@ -127,6 +128,7 @@ impl Fixture {
             source_file_dev: self.file.0,
             source_file_ino: self.file.1,
             actor: Arc::downgrade(&self.actor),
+            kind: crate::services::agent_protocol::NativeTerminalKind::Completed,
         }
     }
 
@@ -144,6 +146,7 @@ impl Fixture {
                 frame,
             )
             .await
+            .map(|(message, range, terminal, _)| (message, range, terminal))
     }
 
     fn durable(&self) -> Vec<u8> {
@@ -154,6 +157,132 @@ impl Fixture {
         ))
         .unwrap()
     }
+}
+
+#[test]
+fn contended_captured_terminal_keeps_scheduler_timer_and_loopback_live() {
+    assert_terminal_lock_liveness(false);
+}
+
+#[test]
+fn contended_uncaptured_codex_terminal_keeps_scheduler_timer_and_loopback_live() {
+    assert_terminal_lock_liveness(true);
+}
+
+fn assert_terminal_lock_liveness(uncaptured: bool) {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let temp = tempfile::tempdir().unwrap();
+    let _env = crate::config::TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
+    let _dedupe = dedupe::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut fixture = runtime.block_on(Fixture::new(
+        temp.path(),
+        6_603 + u64::from(uncaptured),
+        if uncaptured {
+            ProviderKind::Codex
+        } else {
+            ProviderKind::Claude
+        },
+    ));
+    if uncaptured {
+        crate::services::codex_tui::session::write_codex_tui_rollout_marker_with_start_offset(
+            &fixture.tmux,
+            &fixture.transcript,
+            Some("raw-session"),
+            Some(0),
+        )
+        .unwrap();
+        fixture.local.output_path = None;
+        save_inflight_state_in_root(&inflight_runtime_root().unwrap(), &fixture.local).unwrap();
+        fixture.baseline = fixture.local.clone();
+        fixture.expected = InflightTurnIdentity::from_state(&fixture.local);
+    }
+    let before = fixture.durable();
+    let path = inflight_state_path(
+        &inflight_runtime_root().unwrap(),
+        &fixture.local.provider_kind().unwrap(),
+        fixture.local.channel_id,
+    );
+    let lock = lock_inflight_state_path(&path).unwrap();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    // This deadline also releases a blocking mutant without depending on Tokio progress.
+    let deadline = std::thread::spawn(move || {
+        let live = progress_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let unchanged = std::fs::read(path).unwrap() == before;
+        drop(lock);
+        (live, unchanged)
+    });
+    let mut frame = fixture.frame();
+    if uncaptured
+        && let StreamMessage::CodexTuiTerminalDone {
+            captured_source,
+            session_id,
+            ..
+        } = &mut frame
+    {
+        *captured_source = None;
+        *session_id = Some("raw-session".into());
+    }
+    let (fixture, admitted) = runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let save = tokio::spawn(async move {
+            entered_tx.send(()).unwrap();
+            let admitted = fixture.admit(frame).await;
+            (fixture, admitted)
+        });
+        entered_rx.await.unwrap();
+        let heartbeat = async { tokio::time::sleep(Duration::from_millis(20)).await };
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut byte = [0];
+            stream.read_exact(&mut byte).await.unwrap();
+            stream.write_all(&byte).await.unwrap();
+        };
+        let client = async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream.write_all(b"x").await.unwrap();
+            let mut byte = [0];
+            stream.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte, *b"x");
+        };
+        tokio::join!(heartbeat, server, client);
+        let _ = progress_tx.send(());
+        save.await.unwrap()
+    });
+    let (live, unchanged) = deadline.join().unwrap();
+    if uncaptured {
+        assert!(
+            live,
+            "uncaptured Codex terminal timer and loopback exceeded OS deadline"
+        );
+    } else {
+        assert!(
+            live,
+            "captured terminal timer and loopback exceeded OS deadline"
+        );
+    }
+    assert!(
+        unchanged,
+        "no durable mutation before acquiring the sidecar"
+    );
+    let (done, range, terminal) = admitted.unwrap();
+    assert!(terminal);
+    assert!(matches!(done, StreamMessage::Done { result, .. } if result == "answer"));
+    assert_eq!(range.unwrap().source.range, (0, fixture.end));
+    let restored: InflightTurnState = serde_json::from_slice(&fixture.durable()).unwrap();
+    assert_eq!(
+        restored.tui_terminal_source_file_identity,
+        (!uncaptured).then_some(fixture.file)
+    );
 }
 
 #[test]
@@ -409,4 +538,118 @@ fn claude_terminal_range_rejects_unproven_source_and_same_nonce_successor_withou
                 }
             }
         });
+}
+
+fn with_kind(mut frame: StreamMessage, to: NativeTerminalKind) -> StreamMessage {
+    if let StreamMessage::ClaudeTuiTerminalDone { kind, .. }
+    | StreamMessage::CodexTuiTerminalDone { kind, .. } = &mut frame
+    {
+        *kind = to;
+    }
+    frame
+}
+
+/// An admitted native terminal hands its provider's kind to the bridge in the admitted range; an
+/// uncaptured abort the legacy gate cannot verify keeps the obligation instead of becoming Done.
+#[test]
+fn an_admitted_terminal_keeps_its_kind_and_an_unverified_abort_is_never_done() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = crate::config::TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
+    let _dedupe = dedupe::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cases = [
+                (40, ProviderKind::Claude, NativeTerminalKind::Aborted),
+                (41, ProviderKind::Codex, NativeTerminalKind::Aborted),
+                (42, ProviderKind::Claude, NativeTerminalKind::Completed),
+            ];
+            for (index, provider, kind) in cases {
+                let mut fixture = Fixture::new(temp.path(), index, provider).await;
+                let frame = with_kind(fixture.frame(), kind);
+                let (done, range, _) = fixture.admit(frame).await.unwrap();
+                assert!(matches!(done, StreamMessage::Done { .. }));
+                assert_eq!(range.unwrap().kind, kind);
+            }
+            for (index, kind) in [
+                (43, NativeTerminalKind::Completed),
+                (44, NativeTerminalKind::Aborted),
+            ] {
+                let mut fixture = Fixture::new(temp.path(), index, ProviderKind::Codex).await;
+                let mut frame = with_kind(fixture.frame(), kind);
+                if let StreamMessage::CodexTuiTerminalDone {
+                    captured_source, ..
+                } = &mut frame
+                {
+                    *captured_source = None;
+                }
+                let admitted = fixture.admit(frame).await;
+                if kind == NativeTerminalKind::Completed {
+                    let (done, range, _) = admitted.unwrap();
+                    assert!(matches!(done, StreamMessage::Done { .. }) && range.is_none());
+                } else {
+                    assert!(
+                        admitted.is_err(),
+                        "an unverified abort is never a plain Done"
+                    );
+                }
+            }
+        });
+}
+
+/// The fields a terminal range persisted before it carried a kind, in their serialized order.
+#[derive(serde::Serialize)]
+struct PreKindRange<'a> {
+    identity: &'a InflightTurnIdentity,
+    result: &'a str,
+    rollout_path: &'a str,
+    session_id: &'a str,
+    source: &'a ExactJsonlSourceIdentity,
+    source_file_identity: Option<(u64, u64)>,
+}
+
+/// A completed range persists exactly the bytes it had before ranges carried a kind and reads
+/// back completed; an aborted range persists and reads back its kind.
+#[test]
+fn a_completed_range_persists_its_pre_kind_bytes_and_an_aborted_one_its_kind() {
+    let temp = tempfile::tempdir().unwrap();
+    let _env = crate::config::TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
+    let _dedupe = dedupe::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (index, kind) in [
+        (45, NativeTerminalKind::Completed),
+        (46, NativeTerminalKind::Aborted),
+    ] {
+        let range = runtime.block_on(async {
+            let mut fixture = Fixture::new(temp.path(), index, ProviderKind::Claude).await;
+            let frame = with_kind(fixture.frame(), kind);
+            fixture.admit(frame).await.unwrap().1.unwrap()
+        });
+        let bytes = serde_json::to_string(&range).unwrap();
+        let read: TuiTerminalRange = serde_json::from_str(&bytes).unwrap();
+        assert_eq!(read.kind, kind);
+        assert_eq!(serde_json::to_string(&read).unwrap(), bytes);
+        let pre_kind = serde_json::to_string(&PreKindRange {
+            identity: &range.identity,
+            result: &range.result,
+            rollout_path: &range.rollout_path,
+            session_id: &range.session_id,
+            source: &range.source,
+            source_file_identity: range.source_file_identity,
+        })
+        .unwrap();
+        match kind {
+            NativeTerminalKind::Completed => assert_eq!(bytes, pre_kind),
+            NativeTerminalKind::Aborted => assert!(bytes.ends_with(r#","kind":"Aborted"}"#)),
+        }
+    }
 }

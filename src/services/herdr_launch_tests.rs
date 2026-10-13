@@ -6,6 +6,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::db::dispatched_sessions::hosted_execution::tests::{expected, owner, pending, record};
+use crate::services::session_host::{RestoreUnverified, ServerWitness};
 use crate::services::tmux_common::host_marker::{HostKindMarker, read_host_kind_marker};
 
 const CHANNEL: &str = "1479671301387059300";
@@ -27,6 +28,7 @@ fn launch(endpoint: Option<HerdrLaunchEndpoint>) -> HerdrLaunch {
         channel_id: Some(1),
         expected_native_session_id: None,
         resume: false,
+        provider_root: None,
     }
 }
 
@@ -37,22 +39,19 @@ fn command(_: &PreparedIncarnation) -> Result<HerdrLaunchCommand, String> {
     })
 }
 
-fn stamps(root_pid: u32) -> (ProcessStamp, ProcessStamp) {
-    let evidence = expected("unused", root_pid);
-    (evidence.root, evidence.provider_process)
-}
-
 type Hook = Box<dyn Fn() + Send + Sync>;
 
 /// Records every Herdr call; `on_create`/`on_evidence` run inside the call, on its thread.
 struct FakeHost {
     reply: HerdrCreateOutcome,
-    evidence: Option<(ProcessStamp, ProcessStamp)>,
+    /// The root pid of the evidence the probe finds for the asked nonce, or its gap.
+    evidence: Mutex<Result<u32, EvidenceGap>>,
     creates: AtomicUsize,
     probes: AtomicUsize,
+    probed: Mutex<Vec<EvidenceProbe>>,
     on_create: Hook,
     on_evidence: Hook,
-    /// E7 readings in order; once empty, Off on connection 1.
+    /// E7 readings in order; once empty, Off naming server 1.
     restore: Mutex<VecDeque<RestoreResume>>,
     requests: Mutex<Vec<HerdrCreateRequest>>,
 }
@@ -61,9 +60,10 @@ impl FakeHost {
     fn new(reply: HerdrCreateOutcome) -> Self {
         Self {
             reply,
-            evidence: Some(stamps(100)),
+            evidence: Mutex::new(Ok(100)),
             creates: AtomicUsize::new(0),
             probes: AtomicUsize::new(0),
+            probed: Mutex::default(),
             on_create: Box::new(|| {}),
             on_evidence: Box::new(|| {}),
             restore: Mutex::default(),
@@ -72,7 +72,7 @@ impl FakeHost {
     }
 
     fn reading(self, readings: &[RestoreResume]) -> Self {
-        *self.restore.lock().unwrap() = readings.iter().copied().collect();
+        *self.restore.lock().unwrap() = readings.iter().cloned().collect();
         self
     }
 
@@ -86,7 +86,9 @@ impl FakeHost {
 impl HerdrLaunchHost for FakeHost {
     fn restore_resume(&self, _endpoint: &HerdrLaunchEndpoint) -> RestoreResume {
         let next = self.restore.lock().unwrap().pop_front();
-        next.unwrap_or(RestoreResume::Off { generation: 1 })
+        next.unwrap_or(RestoreResume::Off {
+            witness: ServerWitness::for_test(1),
+        })
     }
 
     fn create(&self, request: &HerdrCreateRequest) -> HerdrCreateOutcome {
@@ -96,10 +98,12 @@ impl HerdrLaunchHost for FakeHost {
         self.reply.clone()
     }
 
-    fn launch_evidence(&self, _location: &HostedLocation) -> Option<(ProcessStamp, ProcessStamp)> {
+    fn launch_evidence(&self, probe: &EvidenceProbe) -> Result<ExpectedExecution, EvidenceGap> {
         self.probes.fetch_add(1, Ordering::SeqCst);
+        self.probed.lock().unwrap().push(probe.clone());
         (self.on_evidence)();
-        self.evidence.clone()
+        let found = self.evidence.lock().unwrap().clone();
+        found.map(|root| expected(&probe.execution_nonce, root))
     }
 }
 
@@ -129,8 +133,17 @@ async fn herdr_launch_refuses_an_incomplete_endpoint_or_restore_resume_before_an
             ENDPOINT_MISSING,
         ),
     ];
-    let unverified = [RestoreResume::Unverified, RestoreResume::On]
-        .map(|reading| (Some(endpoint()), RESTORE_RESUME_NOT_OFF, Some(reading)));
+    // Windows reads the Unix socket path as not absolute, so the endpoint is refused before restore.
+    let not_off = if cfg!(windows) {
+        ENDPOINT_MISSING
+    } else {
+        RESTORE_RESUME_NOT_OFF
+    };
+    let unverified = [
+        RestoreResume::Unverified(RestoreUnverified::NoPeer),
+        RestoreResume::On,
+    ]
+    .map(|reading| (Some(endpoint()), not_off, Some(reading)));
     let cases = cases.map(|(endpoint, reason)| (endpoint, reason, None));
     for (endpoint, reason, reading) in cases.into_iter().chain(unverified) {
         let host = Arc::new(FakeHost::created("pane-1").reading(reading.as_slice()));
@@ -214,7 +227,7 @@ async fn herdr_launch_commits_pending_then_marker_then_one_create_and_fills_that
     let HerdrLaunchOutcome::Launched {
         execution_nonce,
         location,
-        evidence: true,
+        evidence: Ok(()),
     } = outcome
     else {
         panic!("{outcome:?}");
@@ -237,18 +250,22 @@ async fn herdr_launch_commits_pending_then_marker_then_one_create_and_fills_that
         ),
         ("herdr.default", "/adk/herdr.sock")
     );
-    let (root, provider_process) = stamps(100);
     let mut filled = pending;
-    filled.location = Some(location);
-    filled.expected = Some(ExpectedExecution {
-        binding_provider: "claude".into(),
-        binding_nonce: execution_nonce.clone(),
-        root,
-        provider_process,
-        provenance: EVIDENCE_PROVENANCE.into(),
-    });
+    filled.location = Some(location.clone());
+    filled.expected = Some(expected(&execution_nonce, 100));
     assert_eq!(decoded(stored(&pool).await), HostedRecord::Known(filled));
     assert_eq!(host.creates.load(Ordering::SeqCst), 1);
+    // The probe is tied to the pane, the nonce and the server the create went to.
+    let probed = host.probed.lock().unwrap().clone();
+    assert_eq!(probed.len(), 1);
+    assert_eq!(
+        (
+            &probed[0].location,
+            &probed[0].execution_nonce,
+            &probed[0].witness
+        ),
+        (&location, &execution_nonce, &ServerWitness::for_test(1))
+    );
     let presence = crate::services::tui_prompt_dedupe::binding_context::context_presence(
         "claude",
         &execution_nonce,
@@ -461,7 +478,7 @@ async fn herdr_launch_writes_the_pane_only_to_its_pending_and_keeps_stored_evide
         .unwrap();
     seed_row(&pool, None).await;
     let mut host = FakeHost::created("pane-1");
-    host.evidence = Some(stamps(500));
+    host.evidence = Mutex::new(Ok(500));
     let task_pool = pool.clone();
     host.on_evidence = Box::new(move || {
         let HostedRecord::Known(current) = decoded(run(stored(&task_pool))) else {
@@ -489,7 +506,7 @@ async fn herdr_launch_writes_the_pane_only_to_its_pending_and_keeps_stored_evide
         .unwrap();
     let HerdrLaunchOutcome::Launched {
         execution_nonce,
-        evidence: false,
+        evidence: Err(EvidenceGap::NotRecorded(_)),
         ..
     } = outcome
     else {
@@ -503,26 +520,112 @@ async fn herdr_launch_writes_the_pane_only_to_its_pending_and_keeps_stored_evide
     db.drop().await;
 }
 
+// A launch whose provider was not confirmed keeps its Pending pane; a later launch only probes
+// that pane again under the server admitted now, and records the evidence once it is found.
+#[tokio::test(flavor = "multi_thread")]
+async fn herdr_launch_probes_a_pending_pane_without_evidence_again_and_never_recreates_it_pg() {
+    let _root = crate::config::TestRuntimeRootGuard::new();
+    let db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
+    let pool = db.connect_and_migrate().await;
+    seed_row(&pool, None).await;
+    let host = Arc::new(FakeHost::created("pane-1"));
+    *host.evidence.lock().unwrap() = Err(EvidenceGap::NoneYet);
+    let relaunch = || launch_herdr_session(&pool, launch(Some(endpoint())), command, host.clone());
+    let Ok(HerdrLaunchOutcome::Launched {
+        execution_nonce: nonce,
+        location,
+        evidence: Err(EvidenceGap::NoneYet),
+    }) = relaunch().await
+    else {
+        panic!("the gap is reported");
+    };
+    let mut waiting = pending(&owner(CHANNEL), &nonce);
+    waiting.location = Some(location.clone());
+    assert_eq!(decoded(stored(&pool).await), HostedRecord::Known(waiting));
+
+    let raw = stored(&pool).await;
+    let again = relaunch().await;
+    assert_eq!(again, Err(HerdrLaunchError::Evidence(EvidenceGap::NoneYet)));
+    assert_eq!(stored(&pool).await, raw, "a failed retry writes nothing");
+
+    *host.evidence.lock().unwrap() = Ok(100);
+    let found = relaunch().await;
+    let launched = HerdrLaunchOutcome::Launched {
+        execution_nonce: nonce.clone(),
+        location: location.clone(),
+        evidence: Ok(()),
+    };
+    assert_eq!(found, Ok(launched));
+    let mut filled = pending(&owner(CHANNEL), &nonce);
+    filled.location = Some(location.clone());
+    filled.expected = Some(expected(&nonce, 100));
+    assert_eq!(decoded(stored(&pool).await), HostedRecord::Known(filled));
+    assert_eq!(
+        relaunch().await,
+        Err(HerdrLaunchError::Occupied(Some(HostedState::Pending)))
+    );
+    assert_eq!(host.creates.load(Ordering::SeqCst), 1, "never recreated");
+    // Retries probe the recorded pane; the provider must postdate the execution's context.
+    let probed = host.probed.lock().unwrap().clone();
+    let created =
+        crate::services::tui_prompt_dedupe::binding_context::execution_context("claude", &nonce)
+            .unwrap()
+            .created_at;
+    assert_eq!(probed.len(), 3);
+    for retry in &probed[1..] {
+        assert_eq!(
+            (&retry.location, &retry.execution_nonce),
+            (&location, &nonce)
+        );
+        assert_eq!(retry.launched_at, std::time::SystemTime::from(created));
+    }
+
+    // A Pending pane on an endpoint other than the admitted one is not probed.
+    let mut elsewhere = pending(&owner(CHANNEL), &nonce);
+    elsewhere.location = Some(HostedLocation {
+        endpoint_config_key: "herdr.other".into(),
+        ..location
+    });
+    sqlx::query("UPDATE sessions SET hosted_execution = $1")
+        .bind(wire(&elsewhere))
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        relaunch().await,
+        Err(HerdrLaunchError::Occupied(Some(HostedState::Pending)))
+    );
+    assert_eq!(host.probes.load(Ordering::SeqCst), 3);
+    pool.close().await;
+    db.drop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn herdr_launch_reads_restore_resume_again_right_before_create_pg() {
     let _root = crate::config::TestRuntimeRootGuard::new();
-    let off = |generation| RestoreResume::Off { generation };
-    for second in [RestoreResume::Unverified, RestoreResume::On, off(2)] {
+    let off = |pid| RestoreResume::Off {
+        witness: ServerWitness::for_test(pid),
+    };
+    for second in [
+        RestoreResume::Unverified(RestoreUnverified::NoPeer),
+        RestoreResume::On,
+        off(2),
+    ] {
         let db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
         let pool = db.connect_and_migrate().await;
         seed_row(&pool, None).await;
-        let host = Arc::new(FakeHost::created("pane-1").reading(&[off(1), second]));
+        let host = Arc::new(FakeHost::created("pane-1").reading(&[off(1), second.clone()]));
         let result = launch_herdr_session(&pool, launch(Some(endpoint())), command, host.clone());
         let result = result.await;
-        let generations: Vec<u64> = (host.requests.lock().unwrap().iter())
-            .map(|request| request.restore_off_generation)
+        let servers: Vec<u32> = (host.requests.lock().unwrap().iter())
+            .map(|request| request.restore_off_witness.pid)
             .collect();
         if second == off(2) {
             assert!(matches!(result, Ok(HerdrLaunchOutcome::Launched { .. })));
             assert_eq!(
-                generations,
+                servers,
                 [2],
-                "the create rides the connection of the latest reading"
+                "the create goes to the server of the latest reading"
             );
         } else {
             assert_eq!(
@@ -530,7 +633,7 @@ async fn herdr_launch_reads_restore_resume_again_right_before_create_pg() {
                 Err(HerdrLaunchError::NotSent(RESTORE_RESUME_NOT_OFF.into())),
                 "{second:?}: the admission-time Off is not reused for the create"
             );
-            assert!(generations.is_empty(), "{second:?}: no create");
+            assert!(servers.is_empty(), "{second:?}: no create");
             let kept = decoded(stored(&pool).await);
             assert!(
                 matches!(&kept, HostedRecord::Known(record) if record.state == HostedState::Pending),
@@ -540,6 +643,96 @@ async fn herdr_launch_reads_restore_resume_again_right_before_create_pg() {
         pool.close().await;
         db.drop().await;
     }
+}
+
+// A command or cwd that cannot run is refused before Pending, so it never occupies the row;
+// a pane whose command was not confirmed is recorded where reconcile finds it, and left alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn herdr_launch_refuses_ineligible_commands_before_pending_and_keeps_unconfirmed_panes_pg() {
+    let _root = crate::config::TestRuntimeRootGuard::new();
+    let db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
+    let pool = db.connect_and_migrate().await;
+    type Prepare = fn(&PreparedIncarnation) -> Result<HerdrLaunchCommand, String>;
+    let ineligible: [Prepare; 5] = [
+        |_| {
+            Ok(HerdrLaunchCommand {
+                cwd: "/tmp".into(),
+                command: "bash a.sh\nrm -rf x".into(),
+            })
+        },
+        |_| {
+            Ok(HerdrLaunchCommand {
+                cwd: "tmp".into(),
+                command: "bash a.sh".into(),
+            })
+        },
+        |_| {
+            Ok(HerdrLaunchCommand {
+                cwd: "/tmp".into(),
+                command: " ".into(),
+            })
+        },
+        |_| {
+            Ok(HerdrLaunchCommand {
+                cwd: "/nonexistent-adk-herdr-cwd".into(),
+                command: "bash a.sh".into(),
+            })
+        },
+        |_| {
+            Ok(HerdrLaunchCommand {
+                cwd: "/etc/hosts".into(),
+                command: "bash a.sh".into(),
+            })
+        },
+    ];
+    seed_row(&pool, None).await;
+    for prepare in ineligible {
+        let host = Arc::new(FakeHost::created("pane-1"));
+        let result =
+            launch_herdr_session(&pool, launch(Some(endpoint())), prepare, host.clone()).await;
+        assert!(
+            matches!(result, Err(HerdrLaunchError::Ineligible(_))),
+            "{result:?}"
+        );
+        assert_eq!(stored(&pool).await, None, "no Pending is installed");
+        assert_eq!(marker(), HostKindMarker::Absent);
+        assert_eq!(host.creates.load(Ordering::SeqCst), 0);
+    }
+
+    let host = Arc::new(FakeHost::new(HerdrCreateOutcome::CreatedUnconfirmed {
+        pane_id: "pane-9".into(),
+        detail: "pane opened in HOME".into(),
+    }));
+    let result = launch_herdr_session(&pool, launch(Some(endpoint())), command, host.clone()).await;
+    let Ok(HerdrLaunchOutcome::Indeterminate {
+        execution_nonce,
+        detail,
+    }) = result
+    else {
+        panic!("{result:?}");
+    };
+    assert!(detail.contains("HOME"), "{detail}");
+    let HostedRecord::Known(kept) = decoded(stored(&pool).await) else {
+        panic!("Pending must stay");
+    };
+    assert_eq!(kept.state, HostedState::Pending);
+    assert_eq!(kept.execution_nonce, execution_nonce);
+    assert_eq!(
+        kept.location.map(|location| location.pane_id),
+        Some("pane-9".into())
+    );
+    assert_eq!(
+        kept.expected, None,
+        "no evidence for an unconfirmed command"
+    );
+    assert_eq!(host.creates.load(Ordering::SeqCst), 1, "never recreated");
+    assert_eq!(
+        host.probes.load(Ordering::SeqCst),
+        0,
+        "never probed for evidence"
+    );
+    pool.close().await;
+    db.drop().await;
 }
 
 /// Every path under `root` with its bytes; a directory reads as empty.
@@ -572,8 +765,18 @@ fn herdr_launch_gate_needs_an_owned_ready_channel_with_a_checkpoint_and_changes_
         .map(|channel| (channel, RuntimeHandoffKind::ClaudeTui))
         .into();
     let root = tempfile::tempdir().unwrap();
-    let ready = |channel| o_ready_at(Some(root.path()), channel);
-    let _gate = force_launch_gate(true, Some(true));
+    let ready = |channel| o_ready_at(Some(root.path()), channel, RuntimeHandoffKind::ClaudeTui);
+    let _gate = force_writer_accepts(Some(true));
+    // Windows has no directory fsync, so the O store refuses to open and no channel is ready.
+    if cfg!(windows) {
+        use crate::services::tui_o::store::{OStore, StoreConfig};
+        let opened = OStore::open_if_enabled(&StoreConfig { enabled: true }, root.path());
+        let refused = opened.err().map(|error| error.kind());
+        assert_eq!(refused, Some(std::io::ErrorKind::Unsupported));
+        let _owned = force_channels(&channels);
+        assert!(!ready(owned));
+        return;
+    }
     let (store, era) = o_store_for_test(root.path(), &[owned]);
     {
         let _owned = force_channels(&channels);
@@ -599,14 +802,20 @@ fn herdr_launch_gate_needs_an_owned_ready_channel_with_a_checkpoint_and_changes_
         assert!(!ready(other), "the channel has no store");
         assert!(!ready(misnamed), "the checkpoint names another channel");
         assert!(!ready(garbled), "the checkpoint is unreadable");
-        assert!(!o_ready_at(None, owned), "no runtime root");
+        assert!(
+            !o_ready_at(None, owned, RuntimeHandoffKind::ClaudeTui),
+            "no runtime root"
+        );
         let empty = tempfile::tempdir().unwrap();
-        assert!(!o_ready_at(Some(empty.path()), owned), "no O store at all");
+        assert!(
+            !o_ready_at(Some(empty.path()), owned, RuntimeHandoffKind::ClaudeTui),
+            "no O store at all"
+        );
         assert!(
             store_tree(empty.path()).len() == 1,
             "the empty root gains nothing"
         );
-        let _refusing = force_launch_gate(true, Some(false));
+        let _refusing = force_writer_accepts(Some(false));
         assert!(!ready(owned), "the writer does not accept work");
     }
     {

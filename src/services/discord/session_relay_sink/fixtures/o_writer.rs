@@ -14,14 +14,32 @@ use crate::services::tui_o::store::{ChannelStore, InitSource, Initialized, OStor
 use crate::services::tui_o::writer::binding::{
     BindingCause, BindingEvent, BindingEvents, BindingEvidence, BindingRecord, BindingTarget,
 };
-use crate::services::tui_o::writer::deliver::ChannelWriter;
+use crate::services::tui_o::writer::deliver::{ChannelWriter, StopCause};
 use crate::services::tui_o::writer::{
     AlarmSink, DeliveryLease, DiscordPort, PostOutcome, SeenMessage, WriterAlarm, WriterConfig,
     actor,
 };
 
 #[derive(Default)]
-struct FakePort(Arc<Mutex<Vec<SeenMessage>>>);
+struct FakePort {
+    history: Arc<Mutex<Vec<SeenMessage>>>,
+    held: Mutex<Option<Arc<PendingPost>>>,
+}
+
+pub(super) struct PendingPost {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl PendingPost {
+    pub(super) async fn entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(super) fn release(&self) {
+        self.release.notify_one();
+    }
+}
 
 impl DiscordPort for FakePort {
     fn bot_id(&self) -> u64 {
@@ -29,8 +47,13 @@ impl DiscordPort for FakePort {
     }
 
     fn post(&self, _: u64, content: String) -> impl Future<Output = PostOutcome> + Send + 'static {
-        let history = Arc::clone(&self.0);
+        let history = Arc::clone(&self.history);
+        let held = self.held.lock().unwrap().take();
         async move {
+            if let Some(held) = held {
+                held.entered.notify_one();
+                held.release.notified().await;
+            }
             let mut history = history.lock().unwrap();
             let receipt = SeenMessage {
                 id: 101 + history.len() as u64,
@@ -47,7 +70,7 @@ impl DiscordPort for FakePort {
         _: u64,
         after: u64,
     ) -> impl Future<Output = Result<Vec<SeenMessage>, String>> + Send {
-        let history = self.0.lock().unwrap();
+        let history = self.history.lock().unwrap();
         let page = history.iter().filter(|m| m.id > after).cloned().collect();
         async move { Ok(page) }
     }
@@ -163,7 +186,7 @@ impl WriterFixture {
         }
     }
 
-    pub(super) fn start(&self) -> (watch::Sender<bool>, JoinHandle<()>) {
+    pub(super) fn start(&self) -> (watch::Sender<bool>, JoinHandle<Option<StopCause>>) {
         let (stop, stopped) = watch::channel(false);
         let (gate, port, alarms) = (self.gate.clone(), self.port.clone(), self.alarms.clone());
         let writer = ChannelWriter::new(self.channel(), gate, port, FakeLease, alarms);
@@ -181,8 +204,17 @@ impl WriterFixture {
     }
 
     pub(super) fn posts(&self) -> Vec<String> {
-        let history = self.port.0.lock().unwrap();
+        let history = self.port.history.lock().unwrap();
         history.iter().map(|m| m.content.clone()).collect()
+    }
+
+    pub(super) fn hold_next_post(&self) -> Arc<PendingPost> {
+        let held = Arc::new(PendingPost {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *self.port.held.lock().unwrap() = Some(held.clone());
+        held
     }
 
     pub(super) fn channel(&self) -> ChannelStore {

@@ -60,12 +60,39 @@ pub struct Ledger {
     records: Vec<Record>,
 }
 
+/// What exists for a channel's ledger, judged without creating anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presence {
+    Absent,
+    Present,
+    Unreadable,
+}
+
+pub fn dir(runtime_root: &Path, channel_id: u64) -> PathBuf {
+    runtime_root
+        .join("input_ledger")
+        .join(channel_id.to_string())
+}
+
+#[cfg(test)]
+thread_local! { pub(crate) static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 impl Ledger {
+    // Any directory, even an empty one, is history: a failed open may have left it behind.
+    pub fn probe(runtime_root: &Path, channel_id: u64) -> Presence {
+        let dir = dir(runtime_root, channel_id);
+        match fs::symlink_metadata(&dir) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Presence::Absent,
+            Ok(meta) if meta.is_dir() && fs::read_dir(&dir).is_ok() => Presence::Present,
+            _ => Presence::Unreadable,
+        }
+    }
+
     pub fn open(runtime_root: &Path, channel_id: u64) -> io::Result<Self> {
         durable::supported()?;
-        let dir = runtime_root
-            .join("input_ledger")
-            .join(channel_id.to_string());
+        #[cfg(test)]
+        OPENS.with(|opens| opens.set(opens.get() + 1));
+        let dir = dir(runtime_root, channel_id);
         durable::ensure_dir(&dir)?;
         let snapshot_path = dir.join("snapshot.json");
         let snapshot: Option<Snapshot> = match durable::open_file(&snapshot_path, false) {
@@ -141,6 +168,10 @@ impl Ledger {
         durable::sync_wal(&self.wal, &self.wal_path())?;
         self.wal.seek(SeekFrom::End(0))?;
         Ok(())
+    }
+
+    pub fn usable(&self) -> bool {
+        self.usable
     }
 
     pub fn snapshot(&self) -> Option<&Snapshot> {
@@ -221,5 +252,117 @@ impl Ledger {
         self.records.clear();
         self.usable = true;
         Ok(())
+    }
+}
+
+/// One channel's ledger access; dropping a handle writes nothing, so a reopen only re-reads.
+pub struct LedgerLease {
+    root: PathBuf,
+    channel: u64,
+    ledger: Option<Ledger>,
+    /// Set after an internal step error so the next access re-reads the durable state.
+    pub needs_reopen: bool,
+    #[cfg(test)]
+    pub reopens: usize,
+}
+
+impl LedgerLease {
+    pub(crate) fn new(root: &Path, channel: u64) -> Self {
+        Self {
+            root: root.to_owned(),
+            channel,
+            ledger: None,
+            needs_reopen: false,
+            #[cfg(test)]
+            reopens: 0,
+        }
+    }
+
+    pub fn get(&mut self) -> io::Result<&mut Ledger> {
+        if self.needs_reopen || !self.ledger.as_ref().is_some_and(Ledger::usable) {
+            return self.reopen();
+        }
+        self.ledger
+            .as_mut()
+            .ok_or_else(|| invalid("missing ledger"))
+    }
+
+    // The old handle is dropped before the new one opens, so at most one exists.
+    pub fn reopen(&mut self) -> io::Result<&mut Ledger> {
+        self.ledger = None;
+        #[cfg(test)]
+        {
+            self.reopens += 1;
+        }
+        let ledger = Ledger::open(&self.root, self.channel)?;
+        self.needs_reopen = false;
+        Ok(self.ledger.insert(ledger))
+    }
+
+    pub fn into_ledger(mut self) -> io::Result<Ledger> {
+        self.get()?;
+        self.ledger.ok_or_else(|| invalid("missing ledger"))
+    }
+
+    pub(crate) fn from_ledger(root: &Path, channel: u64, ledger: Ledger) -> Self {
+        let mut lease = Self::new(root, channel);
+        lease.ledger = Some(ledger);
+        lease
+    }
+}
+
+#[derive(Debug)]
+pub enum SlotError {
+    Loaned,
+    Io(io::Error),
+}
+
+/// A registered channel's only lease; while it is lent out no access can open another handle.
+pub struct LedgerSlot {
+    root: PathBuf,
+    channel: u64,
+    lease: Option<LedgerLease>,
+}
+
+impl LedgerSlot {
+    pub(crate) fn new(root: &Path, channel: u64) -> Self {
+        Self {
+            root: root.to_owned(),
+            channel,
+            lease: Some(LedgerLease::new(root, channel)),
+        }
+    }
+
+    pub fn loaned(&self) -> bool {
+        self.lease.is_none()
+    }
+
+    pub fn get(&mut self) -> Result<&mut Ledger, SlotError> {
+        let lease = self.lease.as_mut().ok_or(SlotError::Loaned)?;
+        lease.get().map_err(SlotError::Io)
+    }
+
+    pub fn reopen(&mut self) -> Result<&mut Ledger, SlotError> {
+        let lease = self.lease.as_mut().ok_or(SlotError::Loaned)?;
+        lease.reopen().map_err(SlotError::Io)
+    }
+
+    pub fn lend(&mut self) -> Result<LedgerLease, SlotError> {
+        self.lease.take().ok_or(SlotError::Loaned)
+    }
+
+    pub fn restore(&mut self, lease: LedgerLease) {
+        if self.lease.is_none() {
+            self.lease = Some(lease);
+        }
+    }
+
+    // Only after the loan is proven finished: the borrowed handle no longer exists anywhere.
+    pub fn restore_fresh(&mut self) {
+        self.restore(LedgerLease::new(&self.root, self.channel));
+    }
+
+    pub fn restore_ledger(&mut self, ledger: Ledger) {
+        self.restore(LedgerLease::from_ledger(&self.root, self.channel, ledger));
     }
 }

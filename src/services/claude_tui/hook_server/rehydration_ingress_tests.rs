@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use super::*;
 use crate::services::claude_tui::hook_server::observation_ingress::tests::*;
 use crate::services::tui_prompt_dedupe::{self as dedupe, binding_context::*, binding_events::*};
@@ -32,6 +34,7 @@ struct Reset;
 impl Drop for Reset {
     fn drop(&mut self) {
         VIEW.with_borrow_mut(|v| *v = None);
+        dedupe::pane_registration::BEFORE_JUDGED.with_borrow_mut(|v| *v = None);
         dedupe::pane_registration::BLOCK_ALIAS.set(false);
         dedupe::pane_registration::BEFORE_COMPLETE.with_borrow_mut(|v| *v = None);
     }
@@ -55,7 +58,7 @@ pub(super) fn claude_channel(tmux: &str) -> Option<u64> {
     }
     resolve_rehydrated_claude_tmux_channel_id(tmux)
 }
-pub(super) fn claude_home() -> Option<PathBuf> {
+pub(crate) fn claude_home() -> Option<PathBuf> {
     view(|v| v.home.clone())
 }
 
@@ -86,6 +89,8 @@ fn outer_failure(alias: bool, header: bool) {
         expected_native_session_id: Some(h.clone()),
         launch_mode: "fresh".into(),
         provider_root: Some(home.clone()),
+        first_prompt_digest: None,
+        source_policy: None,
     };
     let prepared = PreparedIncarnation::create(context).unwrap();
     use crate::services::tmux_common as tc;
@@ -312,6 +317,8 @@ impl RegistrationRace {
             expected_native_session_id: Some(h.clone()),
             launch_mode: "fresh".into(),
             provider_root: Some(home.clone()),
+            first_prompt_digest: None,
+            source_policy: None,
         };
         let prepared = PreparedIncarnation::create(context.clone()).unwrap();
         use crate::services::tmux_common as tc;
@@ -643,6 +650,99 @@ fn registration_alias_conflict_keeps_original_pane_unready() {
     );
 }
 
+/// A hook adopts B while the pass holds an older snapshot of the pane; the pass must not put that
+/// snapshot's source back, now or on the next pass. `launch` takes the launch-script refresh.
+fn stale_snapshot_keeps_the_adoption(launch: bool) {
+    use crate::services::claude_tui::hook_server::adoption_retry::{
+        AdoptionHttp, DurableKind, adopt_from_hook,
+    };
+    let (root, _env) = crate::services::tui_prompt_dedupe::binding_context::tests::fixture();
+    let _ingress = Ingress::new();
+    let _reset = Reset;
+    let race = RegistrationRace::new(root.path(), if launch { 7_497 } else { 7_498 });
+    let (tmux, channel, b) = (race.tmux.clone(), race.channel, race.b.clone());
+    let a_path = ingress_transcript_dir(&race).join(format!("{}.jsonl", race.a));
+    let (stale, stale_path) = if launch {
+        // A binding the launch script may replace: its transcript is gone, and with no channel
+        // mapped yet only the launch gate judges it.
+        let x = uuid();
+        (x.clone(), a_path.with_file_name(format!("{x}.jsonl")))
+    } else {
+        use crate::services::tmux_common as tc;
+        std::fs::remove_file(tc::session_temp_path(
+            &tmux,
+            tc::CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
+        ))
+        .unwrap();
+        (race.a.clone(), a_path)
+    };
+    // The source the pass would register: the launch script's A, or the snapshot's own binding.
+    let candidate = if launch {
+        race.a.clone()
+    } else {
+        stale.clone()
+    };
+    dedupe::register_provider_session("claude", &stale, &tmux);
+    dedupe::register_tmux_runtime_binding(&tmux, claude(&stale_path, &stale));
+    let names = |session: &str| {
+        let names = |e: &BindingEvent| match &e.new {
+            BindingTarget::Source(s) | BindingTarget::Resolved { source: s, .. } => {
+                s.session_id == session
+            }
+            _ => false,
+        };
+        events(channel).iter().filter(|e| names(e)).count()
+    };
+    let (seam_stale, seam_b, payload) = (stale.clone(), b.clone(), race.payload.clone());
+    dedupe::pane_registration::BEFORE_JUDGED.with_borrow_mut(|v| {
+        *v = Some(Box::new(move || {
+            let hook = HookSignal::from_payload("session_start", &payload);
+            let adopted = adopt_from_hook(&seam_stale, &seam_b, &hook);
+            assert_eq!(adopted, AdoptionHttp::Durable(DurableKind::Adopted));
+        }))
+    });
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    rehydrate_existing_claude_tui_bindings(&shared);
+    assert!(
+        dedupe::pane_registration::BEFORE_JUDGED.with_borrow(Option::is_none),
+        "the pass reached its registration"
+    );
+    let bound = || dedupe::runtime_binding_for_tmux_session(&tmux).and_then(|b| b.session_id);
+    assert_eq!(bound(), Some(b.clone()), "the adoption stands");
+    let logged = events(channel).len();
+    assert_eq!(names(&b), 1, "B logged once");
+    assert_eq!(names(&candidate), 0, "the stale source is not logged");
+    let refused = dedupe::pane_registration::pane_registration_failed(&candidate, None);
+    assert!(
+        !refused,
+        "the given-up registration leaves the pane's hooks admitted"
+    );
+    let _ = dedupe::clear_claude_session_rotation(&tmux);
+    rehydrate_existing_claude_tui_bindings(&shared);
+    assert_eq!(bound(), Some(b.clone()), "the next pass keeps B");
+    assert_eq!(names(&candidate), 0);
+    assert_eq!(
+        events(channel).len(),
+        logged,
+        "the next pass logs nothing new"
+    );
+}
+
+fn ingress_transcript_dir(race: &RegistrationRace) -> PathBuf {
+    let path = race.payload["transcript_path"].as_str().unwrap();
+    Path::new(path).parent().unwrap().to_path_buf()
+}
+
+#[test]
+fn a_stale_snapshot_never_re_registers_over_a_hook_adoption() {
+    stale_snapshot_keeps_the_adoption(false);
+}
+
+#[test]
+fn a_stale_snapshot_never_lets_the_launch_script_replace_a_hook_adoption() {
+    stale_snapshot_keeps_the_adoption(true);
+}
+
 const NEIGHBOUR_CHILD: &str = "ADK_T3BB_NEIGHBOUR_CHILD";
 
 /// Runs `name` alone in a child process with its own runtime root; true inside that child. A
@@ -845,5 +945,155 @@ fn a_live_pane_marked_for_another_host_is_not_adopted_by_name() {
         rehydrate_existing_claude_tui_bindings(&shared);
         let owner = shared.tmux_watchers.owner_channel_for_tmux_session(&tmux);
         assert_eq!(owner.is_some(), adopted, "{marker:?}");
+    }
+}
+
+// After its tmux panes, the restart pass runs the Herdr reconnect pass on a node with a local
+// endpoint, and only there.
+#[test]
+fn the_restart_pass_runs_the_herdr_reconnect_pass_after_its_tmux_panes() {
+    use crate::services::discord::recovery_engine::herdr_reader::{HerdrRig, PASSES};
+    let (root, _env) = crate::services::tui_prompt_dedupe::binding_context::tests::fixture();
+    let _ingress = Ingress::new();
+    let _reset = Reset;
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    VIEW.with_borrow_mut(|v| {
+        *v = Some(View {
+            tmux: format!("herdr-pass-{}", uuid()),
+            channel: 7_520,
+            home: root.path().join("claude-home"),
+            peers: Vec::new(),
+        })
+    });
+    let passes = || PASSES.with(std::cell::Cell::get);
+    rehydrate_existing_claude_tui_bindings(&shared);
+    assert_eq!(passes(), 0, "no local endpoint");
+    let rig = HerdrRig::start();
+    let _registry = rig.registry_on_this_thread();
+    rehydrate_existing_claude_tui_bindings(&shared);
+    assert_eq!(passes(), 1);
+}
+
+#[test]
+fn a_rehydrated_replacement_execution_uses_its_matching_launch_context_once() {
+    use crate::services::tmux_common as tc;
+    let (root, _env) = crate::services::tui_prompt_dedupe::binding_context::tests::fixture();
+    let _ingress = Ingress::new();
+    let _reset = Reset;
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    let mut peers = Vec::new();
+    for (index, (mode, expected_cause)) in [
+        ("fresh", BindingCause::Startup),
+        ("resume", BindingCause::Resume),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (tmux, channel, old, new) = (
+            format!("replacement-launch-{}", uuid()),
+            7_510 + index as u64,
+            uuid(),
+            uuid(),
+        );
+        let home = root.path().join("claude-home");
+        let cwd = root.path().join(format!("project-{index}"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let path = |session: &str| {
+            crate::services::claude_tui::transcript_tail::claude_transcript_path(
+                &cwd,
+                session,
+                Some(&home),
+            )
+            .unwrap()
+        };
+        let (old_path, new_path) = (path(&old), path(&new));
+        std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        std::fs::write(&old_path, format!("{{\"sessionId\":\"{old}\"}}\n")).unwrap();
+        std::fs::write(&new_path, format!("{{\"sessionId\":\"{new}\"}}\n")).unwrap();
+        let prepare = |session: &str, mode: &str| {
+            let prepared = PreparedIncarnation::create(BindingContext {
+                schema: 1,
+                provider: "claude".into(),
+                created_at: chrono::Utc::now(),
+                execution_nonce: uuid::Uuid::new_v4().simple().to_string(),
+                tmux_session: tmux.clone(),
+                channel_id: Some(channel),
+                owner_runtime_root: root.path().display().to_string(),
+                host: None,
+                expected_native_session_id: Some(session.into()),
+                launch_mode: mode.into(),
+                provider_root: Some(home.clone()),
+                first_prompt_digest: None,
+                source_policy: None,
+            })
+            .unwrap();
+            let marker = tc::session_temp_path(&tmux, "spawn_nonce");
+            std::fs::create_dir_all(Path::new(&marker).parent().unwrap()).unwrap();
+            std::fs::write(marker, &prepared.context.execution_nonce).unwrap();
+            prepared
+        };
+        let previous = prepare(&old, "fresh");
+        assert!(dedupe::register_rehydrated_tmux_runtime_binding(
+            "claude",
+            &tmux,
+            channel,
+            claude(&old_path, &old),
+        ));
+        let launched = prepare(&new, mode);
+        let selector = if mode == "resume" {
+            "--resume"
+        } else {
+            "--session-id"
+        };
+        std::fs::write(
+            tc::session_temp_path(&tmux, tc::CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT),
+            format!(
+                "{}cd '{}'\nexec 'claude' '{selector}' '{new}'\n",
+                launched.env_lines(),
+                cwd.display(),
+            ),
+        )
+        .unwrap();
+        VIEW.with_borrow_mut(|v| {
+            *v = Some(View {
+                tmux: tmux.clone(),
+                channel,
+                home,
+                peers: peers.clone(),
+            })
+        });
+        rehydrate_existing_claude_tui_bindings(&shared);
+        let logged = events(channel);
+        assert_eq!(logged.len(), 2, "{mode}: one replacement was logged");
+        assert_eq!(
+            logged[0].execution_nonce.as_deref(),
+            Some(previous.context.execution_nonce.as_str())
+        );
+        let replacement = &logged[1];
+        assert_eq!(replacement.cause, expected_cause, "{mode}");
+        assert_eq!(
+            replacement.execution_nonce.as_deref(),
+            Some(launched.context.execution_nonce.as_str())
+        );
+        assert_eq!(replacement.old.as_ref().unwrap().session_id, old);
+        assert!(
+            matches!(&replacement.new, BindingTarget::Source(source) if source.session_id == new)
+        );
+        assert!(replacement.evidence.hook_event.is_none());
+        assert!(replacement.parent_hint.is_none());
+        assert_eq!(
+            dedupe::runtime_binding_for_tmux_session(&tmux)
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some(new.as_str())
+        );
+        rehydrate_existing_claude_tui_bindings(&shared);
+        assert_eq!(
+            events(channel),
+            logged,
+            "{mode}: the same execution is unchanged"
+        );
+        peers.push(tmux);
     }
 }

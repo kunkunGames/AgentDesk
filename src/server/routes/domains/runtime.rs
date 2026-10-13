@@ -2,7 +2,7 @@
 //! Configuration and orchestration administration is composed separately.
 use super::super::{
     ApiRouter, AppState, agents, agents_crud, agents_turn_deliver, cluster, dispatched_sessions,
-    dispatches, dm_reply, health_api, idle_recap, monitoring, protected_api_domain,
+    dispatches, dm_reply, health_api, hooks, idle_recap, monitoring, protected_api_domain,
     provider_cli_api, queue_api, termination_events, turn_lease, voice_audio, voice_conductor,
 };
 use axum::{
@@ -124,6 +124,7 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
                 delete(monitoring::remove_monitoring),
             )
             .route("/turns/{channel_id}/cancel", post(queue_api::cancel_turn))
+            .route("/internal/home-stop/v1", post(queue_api::home_stop_v1))
             .route(
                 "/provider-cli",
                 get(provider_cli_api::get_provider_cli_status),
@@ -148,7 +149,25 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route("/voice/conductor/jobs", get(voice_conductor::list_jobs))
             .route("/voice/conductor/jobs/{id}", get(voice_conductor::get_job))
             .route("/dm-reply/register", post(dm_reply::register_handler))
-            .route("/internal/node-probe", get(cluster::node_probe)),
+            .route("/hook/reset-status", post(hooks::reset_status))
+            .route("/hook/skill-usage", post(hooks::skill_usage))
+            .route(
+                "/hook/session/{sessionKey}",
+                delete(hooks::disconnect_session),
+            )
+            .route("/internal/node-probe", get(cluster::node_probe))
+            .merge(herdr_routes()),
         state,
     )
+}
+
+/// Herdr hosting exists only on unix; elsewhere `/herdr/terminate` answers 404.
+fn herdr_routes() -> ApiRouter {
+    let routes = Router::new();
+    #[cfg(unix)]
+    let routes = routes.route(
+        "/herdr/terminate",
+        post(super::super::herdr_terminate::terminate),
+    );
+    routes
 }

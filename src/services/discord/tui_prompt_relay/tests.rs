@@ -253,6 +253,7 @@ fn abort_cleanup_records_marker_and_keeps_hourglass() {
         state: super::super::tui_direct_pending_start::PendingStartState::Waiting,
         attempt_count: 0,
         captured_source: None,
+        native_turn_id: None,
     };
     let cleanup = pending_start_abort_cleanup_fn();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -857,6 +858,9 @@ async fn task_notification_status_only_preserves_existing_turn_request_anchor() 
         ssh_direct_observation_generation:
             crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
         hook_prompt_id: None,
+        row_prompt_id: None,
+        native_turn_id: None,
+        steer_echo: false,
     };
 
     relay_observed_prompt(&shared, prompt).await;
@@ -1820,6 +1824,9 @@ fn local_control_prompt(tmux: &str, body: &str, entry_id: &str) -> ObservedTuiPr
         ssh_direct_observation_generation:
             crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
         hook_prompt_id: None,
+        row_prompt_id: None,
+        native_turn_id: None,
+        steer_echo: false,
     }
 }
 
@@ -2612,6 +2619,9 @@ async fn claude_bridge_lease_guard_cleans_no_binding_precondition_skip() {
         ssh_direct_observation_generation:
             crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
         hook_prompt_id: None,
+        row_prompt_id: None,
+        native_turn_id: None,
+        steer_echo: false,
     };
     let lease = ExternalInputRelayLease {
         channel_id: Some(channel_id.get()),
@@ -2685,6 +2695,9 @@ fn task_notification_repeat_clears_its_recorded_external_lease() {
             ssh_direct_observation_generation:
                 crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
             hook_prompt_id: None,
+            row_prompt_id: None,
+            native_turn_id: None,
+            steer_echo: false,
         };
     let lease = ExternalInputRelayLease {
         channel_id: Some(channel_id.get()),
@@ -2747,6 +2760,9 @@ fn task_notification_repeat_lease_clear_preserves_newer_turn() {
         ssh_direct_observation_generation:
             crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
         hook_prompt_id: None,
+        row_prompt_id: None,
+        native_turn_id: None,
+        steer_echo: false,
     };
     let repeat_lease = ExternalInputRelayLease {
         channel_id: Some(channel_id.get()),
@@ -3164,7 +3180,18 @@ async fn s3_completion_fixture_body(
             .active_user_message_id,
         Some(MessageId::new(880004))
     );
-    assert!(gateway.bodies.lock().unwrap().is_empty());
+    // An entry abort may post its refusal notice, never a response body.
+    assert!(
+        gateway
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|body| signal == Some(false)
+                && body.starts_with("⚠️ 이번 턴을 시작하지 못했습니다")),
+        "{}",
+        gateway.traffic_dump()
+    );
     let expected = if signal != Some(true) {
         owned
             .filter(|id| Some(*id) != durable && *id != 880004)
@@ -3269,8 +3296,9 @@ fn s3t5_codex_abort_and_recv_error_use_shared_fail_closed_completion() {
 // behavioral coverage, so `docs/relay-state-contract.md:41` — "Never use
 // `>= N`, another turn's ACK, timeout-as-success, blind skip, or blind
 // resend" — rested on nothing executable for the timeout case. Driving all
-// four against ONE anchor and COUNTING the acks makes a promoted non-ACK
-// (two `Ok`) or a lost ACK (zero `Ok`) RED on the count, not on one message.
+// four against ONE anchor makes a changed production disposition RED on its
+// per-arm assertion. The expected-table invariant separately guarantees that
+// the table itself names exactly one acknowledgement before any arm runs.
 #[cfg(unix)]
 #[test]
 fn completion_timeout_is_not_an_ack_and_preserves_anchor() {
@@ -3325,8 +3353,7 @@ fn completion_timeout_is_not_an_ack_and_preserves_anchor() {
             );
 
             // The ACK runs LAST: every non-ACK is checked against a live anchor.
-            let mut acknowledgements = 0usize;
-            for (label, completion, expected) in [
+            let dispositions = [
                 (
                     "Err(Elapsed)",
                     timed_out,
@@ -3350,7 +3377,17 @@ fn completion_timeout_is_not_an_ack_and_preserves_anchor() {
                     Ok(Ok(BridgeCompletionSignal::Finalized)),
                     Ok(()),
                 ),
-            ] {
+            ];
+            assert_eq!(
+                dispositions
+                    .iter()
+                    .filter(|(_, _, expected)| expected.is_ok())
+                    .count(),
+                1,
+                "expected table invariant: exactly one disposition must be Ok; production \
+                 detection is handled by the per-arm assertion"
+            );
+            for (label, completion, expected) in dispositions {
                 let is_ack = expected.is_ok();
                 let result = super::claude_idle_bridge::finish_idle_bridge_completion(
                     completion,
@@ -3363,21 +3400,12 @@ fn completion_timeout_is_not_an_ack_and_preserves_anchor() {
                 )
                 .await;
                 assert_eq!(result, expected, "{label}: wrong completion disposition");
-                if result.is_ok() {
-                    acknowledgements += 1;
-                }
                 assert_eq!(
                     prompt_anchor_for_response(provider.as_str(), tmux, channel.get()),
                     if is_ack { None } else { anchor },
                     "{label}: only the acknowledgement may clear the prompt anchor"
                 );
             }
-            assert_eq!(
-                acknowledgements, 1,
-                "EXACTLY ONE disposition may acknowledge delivery: two means a \
-                 non-ACK was promoted (timeout-as-success, forbidden by \
-                 relay-state-contract.md:41); zero means the ACK was lost"
-            );
             assert!(
                 gateway.deleted.lock().unwrap().is_empty(),
                 "no disposition may delete a placeholder this adapter never created"
@@ -3952,6 +3980,7 @@ async fn s5833_r2_synthetic_refresh_preserves_existing_episode_key() {
         anchor,
         &original_lease,
         None,
+        None,
     )
     .await;
     assert!(initial.claimed);
@@ -4450,33 +4479,33 @@ fn synthetic_watcher_claim_requires_live_watcher_covering_output() {
 }
 
 /// Birth-site owner table. `SessionBoundRelay` needs session-bound delivery, a live
-/// producer AND a live tmux watcher: the supervisor keeps its producer alive with no
-/// watcher, so the producer alone (#6210, formerly pinned as `SessionBoundRelay`
-/// here) left the row with no deliverer.
+/// producer AND a live tmux watcher reading this output: the sink only hears that watcher,
+/// so a producer alone or a watcher on another file leaves the row with no deliverer.
 #[test]
 fn synthetic_relay_owner_gates_session_bound_on_live_producer() {
     use super::synthetic_start::tui_direct_synthetic_relay_owner;
     use ExternalInputRelayOwner::{BridgeAdapter, SessionBoundRelay, TmuxWatcher};
 
-    // (watcher_can_own, session_bound, live_producer, tmux_watcher_live) -> owner
+    // (watcher_can_own, session_bound, live_producer, watcher_covers_output) -> owner
     let table = [
         ((true, true, true, true), TmuxWatcher),
         ((true, true, false, true), TmuxWatcher),
         ((true, false, false, true), TmuxWatcher),
-        // Watcher alive on another output path: it still forwards to the sink.
+        // Watcher reads this output under another spelling: it forwards it to the sink.
         ((false, true, true, true), SessionBoundRelay),
-        // #6210: supervisor producer alive, watcher gone -> the bridge tail delivers.
+        // Producer alive but the watcher is gone or tails another file (a Codex TUI
+        // watcher on the relay jsonl) -> the bridge tail delivers.
         ((false, true, true, false), BridgeAdapter),
         ((false, true, false, true), BridgeAdapter),
         ((false, true, false, false), BridgeAdapter),
         ((false, false, true, true), BridgeAdapter),
         ((false, false, false, false), BridgeAdapter),
     ];
-    for ((own, bound, producer, watcher), expected) in table {
+    for ((own, bound, producer, covers), expected) in table {
         assert_eq!(
-            tui_direct_synthetic_relay_owner(own, bound, producer, watcher),
+            tui_direct_synthetic_relay_owner(own, bound, producer, covers),
             expected,
-            "owner for can_own={own} session_bound={bound} producer={producer} watcher={watcher}",
+            "owner for can_own={own} session_bound={bound} producer={producer} covers={covers}",
         );
     }
 }
@@ -4746,6 +4775,9 @@ async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free(
         ssh_direct_observation_generation:
             crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
         hook_prompt_id: None,
+        row_prompt_id: None,
+        native_turn_id: None,
+        steer_echo: false,
     };
     let decision = relay_observed_prompt_injected_prompt_decision(&prompt.prompt);
     assert_eq!(
@@ -4824,6 +4856,9 @@ async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
         ssh_direct_observation_generation:
             crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
         hook_prompt_id: None,
+        row_prompt_id: None,
+        native_turn_id: None,
+        steer_echo: false,
     };
     let decision = relay_observed_prompt_injected_prompt_decision(&prompt.prompt);
     assert_eq!(decision.injected_class, InjectedPromptClass::HumanTuiDirect);
@@ -6377,6 +6412,9 @@ mod scenario_census_e2e;
 mod synthetic_bridge_handoff_pg_tests;
 
 #[cfg(unix)]
+mod background_child_close_pg_tests;
+
+#[cfg(unix)]
 #[path = "tests/o_tool_first_panel_tests.rs"]
 mod o_tool_first_panel_tests;
 #[cfg(unix)]
@@ -6384,6 +6422,9 @@ mod synthetic_terminal_ordering_tests;
 
 #[cfg(unix)]
 mod retired_pending_start_claim_tests;
+
+#[cfg(unix)]
+mod pending_start_input_fence_tests;
 
 #[cfg(unix)]
 mod relayerless_claim_tests {
@@ -6483,9 +6524,8 @@ mod relayerless_claim_tests {
         inflight::load_inflight_state(&ProviderKind::Claude, channel.get()).expect("claimed row")
     }
 
-    /// Race (a) and P2 1: the watcher dies between the owner decision and the durable save.
-    /// The `SessionBoundRelay` row is recovered by the pinned reclaim, the idle relay waits the
-    /// 300 s ownerless age (nothing sent while the row is fresh), then sends exactly once.
+    /// The watcher, on an alias of the transcript, dies between the owner decision and the save.
+    /// The pinned reclaim recovers the row; the idle relay waits the 300 s age, then sends once.
     #[tokio::test(flavor = "current_thread")]
     async fn watcher_lost_between_owner_decision_and_save_is_sent_once_after_the_age() {
         let root = tempfile::tempdir().expect("isolated inflight root");
@@ -6496,7 +6536,9 @@ mod relayerless_claim_tests {
         let mut harness = IdleRelayHarness::start(root.path(), channel.get(), tmux).await;
         let shared = harness.shared.clone();
         bind_transcript(tmux, &harness.transcript);
-        let watcher = live_watcher(tmux, "/tmp/adk-6210-race-a-other.jsonl");
+        let alias = root.path().join("race-a-alias.jsonl");
+        std::os::unix::fs::symlink(&harness.transcript, &alias).expect("transcript alias");
+        let watcher = live_watcher(tmux, alias.to_str().expect("utf8 path"));
         let cancel = watcher.cancel.clone();
         shared.tmux_watchers.insert(channel, watcher);
 
@@ -6607,3 +6649,6 @@ mod relayerless_claim_tests {
 
 #[cfg(unix)]
 mod fenced_admission_tests;
+
+#[cfg(unix)]
+mod codex_direct_owner_tests;

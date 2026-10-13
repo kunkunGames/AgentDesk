@@ -70,6 +70,9 @@ pub(super) fn close_if_idle_verdict(state: &mut ChannelMailboxState) -> Result<(
     if state.pending_user_dispatch.is_some() {
         return Err("pending_user_dispatch");
     }
+    if super::injected_inputs::holds_order(state) {
+        return Err("injection_reserved");
+    }
     state.closed = true;
     Ok(())
 }
@@ -86,13 +89,16 @@ pub(super) fn gate_closed_arm(
         return Some(msg);
     }
     let arm = match msg {
-        M::Snapshot { .. }
+        M::FreezeInput { .. }
+        | M::Snapshot { .. }
         | M::HasActiveTurn { .. }
         | M::HasBlockingActiveTurn { .. }
         | M::ActiveTurnKind { .. }
         | M::CancelToken { .. }
         | M::CloseIfIdle { .. }
-        | M::CommitCapturedReadyDelivery { .. } => return Some(msg),
+        | M::CommitCapturedReadyDelivery { .. }
+        // Clears only its own reservation, which a closed actor cannot hold.
+        | M::Injection(super::injected_inputs::InjectionMsg::Abandon { .. }) => return Some(msg),
         #[cfg(test)]
         M::AgeActiveTurnForTest { .. }
         | M::AgeInboundWaitsForTest { .. }
@@ -107,6 +113,11 @@ pub(super) fn gate_closed_arm(
             let _ = reply.send(());
             "RestoreActiveTurn"
         }
+        #[cfg(test)]
+        M::InstalledActorHandoff(request) => {
+            request.refuse(crate::services::cluster::channel_home_port::RestoreFailure::Rejected("handoff actor closed".into()));
+            "InstalledActorHandoff"
+        }
         M::RecoveryKickoff { reply, .. } => {
             let _ = reply.send(RecoveryKickoffResult::RefusedClosed);
             "RecoveryKickoff"
@@ -116,6 +127,7 @@ pub(super) fn gate_closed_arm(
             let _ = reply.send(EnqueueInterventionResult::refused(refusal, Vec::new()));
             "Enqueue"
         }
+        M::Injection(injection) => injection.refuse("actor_closed".to_string()),
         // Restitution callers read `MailboxClosed` and replay on the fresh actor.
         M::RequeueFront { reply, .. } => {
             let _ = reply.send(RequeueInterventionResult {
@@ -131,12 +143,14 @@ pub(super) fn gate_closed_arm(
         M::CancelActiveTurnWithReason { .. }
         | M::CancelActiveTurnIfCurrent { .. }
         | M::CancelActiveTurnIfCurrentWithReason { .. }
+        | M::CancelActiveTurnIfCurrentUnlessHerdr { .. }
         | M::CancelActiveTurnIfUserMessageWithReason { .. } => "CancelActiveTurn",
         M::CancelActiveBackgroundTurnIfCurrent { .. } => "CancelActiveBackgroundTurnIfCurrent",
         M::HasPendingSoftQueue { .. } => "HasPendingSoftQueue",
         M::AbandonPendingDispatch { .. } => "AbandonPendingDispatch",
         M::FinishTurn { .. } => "FinishTurn",
         M::FinishTurnIfMatches { .. } => "FinishTurnIfMatches",
+        M::FinishTurnIfToken { .. } => "FinishTurnIfToken",
         M::HardStop { .. } => "HardStop",
         M::FinishCancelledTurn { .. } => "FinishCancelledTurn",
         M::RestartDrain { .. } => "RestartDrain",
@@ -224,10 +238,27 @@ impl ChannelMailboxRegistry {
         persistence: QueuePersistenceContext,
         observed: Option<ClaimObservation>,
     ) -> EnqueueInterventionResult {
+        let input_permit = match crate::services::discord::input_runtime::fence::effect::admit(
+            &persistence.provider,
+            channel_id.get(),
+        ) {
+            Ok(permit) => permit,
+            Err(reason) => {
+                return EnqueueInterventionResult::refused(
+                    super::input_fence::enqueue_reason(reason),
+                    Vec::new(),
+                );
+            }
+        };
         for attempt in 1..=CLOSED_RETRY_ATTEMPTS {
             let result = self
                 .handle(channel_id)
-                .enqueue_observed(intervention.clone(), persistence.clone(), observed)
+                .enqueue_observed_with_permit(
+                    intervention.clone(),
+                    persistence.clone(),
+                    observed,
+                    input_permit.clone(),
+                )
                 .await;
             if result.refusal_reason != Some(EnqueueRefusalReason::MailboxClosed) {
                 return result;
@@ -278,6 +309,7 @@ impl ChannelMailboxRegistry {
 /// #3029(D): outcome of a `PurgeQueue` request.
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub(crate) struct PurgeQueueResult {
+    pub(crate) input_refusal: Option<crate::services::discord::input_runtime::fence::Failure>,
     /// Number of intervention-queue entries drained.
     pub(crate) drained: usize,
     /// Number of persisted pending-queue/dispatch files removed across token

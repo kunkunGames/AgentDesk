@@ -1,11 +1,13 @@
 use std::path::{Path, PathBuf};
 
-use clap::Args;
+use clap::{Args, Subcommand};
 
 use crate::config;
 use crate::utils::format::expand_tilde_path;
 
 mod apply;
+#[cfg(test)]
+mod apply_config_tests;
 mod plan;
 mod source;
 
@@ -64,6 +66,12 @@ impl DiscordTokenMode {
             )),
         }
     }
+}
+
+#[derive(Subcommand)]
+pub(crate) enum MigrateAction {
+    /// Import OpenClaw durable state into AgentDesk
+    Openclaw(OpenClawMigrateArgs),
 }
 
 #[derive(Clone, Debug, Args)]

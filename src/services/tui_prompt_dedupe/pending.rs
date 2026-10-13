@@ -136,6 +136,7 @@ impl Registration {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LaunchSeed {
     pub pending_seq: u64,
+    pub execution_nonce: String,
     /// The record a refusal of the registration names.
     pub line: u64,
     /// The verified current bound instead of the launch transcript, already judged against its pin.
@@ -446,6 +447,7 @@ pub(crate) fn judge_restore(
     }
     let seed = |line, pinned| LaunchSeed {
         pending_seq: live.pending.seq,
+        execution_nonce: current.to_owned(),
         line,
         pinned,
         launch: launch.clone(),
@@ -484,6 +486,18 @@ pub(crate) fn last_restore_outcome(tmux_session: &str) -> Option<PendingRestore>
     outcomes()
         .get(tmux_session)
         .map(|(_, outcome)| outcome.clone())
+}
+
+/// Drops a `Seeded` memo whose queued Pending left the hook queue unsettled, so the next pass
+/// judges the log again instead of returning early on the memo.
+pub(crate) fn forget_seeded_restore(tmux_session: &str) {
+    let mut outcomes = outcomes();
+    if matches!(
+        outcomes.get(tmux_session),
+        Some((_, PendingRestore::Seeded { .. }))
+    ) {
+        outcomes.remove(tmux_session);
+    }
 }
 
 /// Whether `binding` is a transcript a restore bound before it existed; nothing may stand in.
@@ -630,7 +644,14 @@ fn restore_under_source_authority(
             let outcome = seed.outcome(registered);
             if matches!(outcome, PendingRestore::Seeded { .. }) {
                 let (command, payload) = (&launch.session_id, &seed.payload_session_id);
-                adoption_retry::seed_restored(authority, command, payload, &seed.hook);
+                adoption_retry::seed_restored(
+                    authority,
+                    command,
+                    payload,
+                    &seed.hook,
+                    &seed.execution_nonce,
+                    (channel_id, seed.pending_seq),
+                );
             }
             outcome
         }
@@ -658,7 +679,7 @@ fn keep_channel(tmux_session: &str, channel_id: u64) {
     if channel_id != 0 && runtime_binding_for_tmux_session(tmux_session).is_some() {
         let mut state = super::STATE.lock().unwrap_or_else(|p| p.into_inner());
         state.purge_expired();
-        let recorded_at = std::time::Instant::now();
+        let recorded_at = super::Instant::now();
         let mapping = super::TimedValue {
             value: channel_id,
             recorded_at,
@@ -705,9 +726,10 @@ pub(crate) fn reset_restore_outcomes_for_tests() {
 #[cfg(test)]
 pub(crate) fn expire_channel_mapping_for_tests(tmux_session: &str) {
     let mut state = super::STATE.lock().unwrap_or_else(|p| p.into_inner());
-    let aged = std::time::Instant::now() - super::SESSION_MAPPING_TTL;
+    let aged =
+        state.aged_stamp_for_tests(super::SESSION_MAPPING_TTL + std::time::Duration::from_secs(1));
     if let Some(mapping) = state.channel_by_tmux.get_mut(tmux_session) {
-        mapping.recorded_at = aged - std::time::Duration::from_secs(1);
+        mapping.recorded_at = aged;
     }
 }
 
@@ -715,9 +737,10 @@ pub(crate) fn expire_channel_mapping_for_tests(tmux_session: &str) {
 #[cfg(test)]
 pub(crate) fn expire_runtime_binding_for_tests(tmux_session: &str) {
     let mut state = super::STATE.lock().unwrap_or_else(|p| p.into_inner());
-    let aged = std::time::Instant::now() - super::SESSION_MAPPING_TTL;
+    let aged =
+        state.aged_stamp_for_tests(super::SESSION_MAPPING_TTL + std::time::Duration::from_secs(1));
     if let Some(binding) = state.runtime_by_tmux.get_mut(tmux_session) {
-        binding.recorded_at = aged - std::time::Duration::from_secs(1);
+        binding.recorded_at = aged;
     }
 }
 
@@ -728,11 +751,9 @@ pub(crate) const CHANNEL_MAPPING_TTL: std::time::Duration = super::SESSION_MAPPI
 #[cfg(test)]
 pub(crate) fn age_channel_mapping_for_tests(tmux_session: &str, by: std::time::Duration) {
     let mut state = super::STATE.lock().unwrap_or_else(|p| p.into_inner());
+    state.aged_stamp_for_tests(by);
     if let Some(mapping) = state.channel_by_tmux.get_mut(tmux_session) {
-        mapping.recorded_at = mapping
-            .recorded_at
-            .checked_sub(by)
-            .expect("uptime spans the age");
+        mapping.recorded_at -= by;
     }
 }
 

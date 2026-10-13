@@ -1,3 +1,6 @@
+pub(crate) mod busy_inject;
+#[cfg(all(test, unix))]
+mod busy_inject_tests;
 pub(crate) mod composer_lock;
 pub mod hook_bundle;
 pub(crate) mod hook_output_guard;
@@ -20,5 +23,6 @@ pub(super) mod prompt_readiness;
 pub mod session;
 pub(crate) mod source_verify;
 pub(crate) mod startup_dialog;
+pub(crate) mod submission_fence;
 pub mod transcript_tail;
 pub mod tui_relay;

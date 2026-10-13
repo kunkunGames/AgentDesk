@@ -5,10 +5,17 @@ cargo exits 0 when a libtest filter matches zero tests, so a curated CI lane
 pairing the wrong target flag (e.g. `--bin agentdesk`) with a lib-only module
 filter runs 0 tests while its required check stays green. This gate statically
 cross-checks tracked workflow and justfile `cargo test` commands' target
-selection against where the filtered module is declared (module tree walked
-from Cargo.toml target roots, following `#[path = "..."]` redirections; no
-compilation) and the checked-in lib test-ID manifest. A filtered explicit
-target that is statically proven empty is flagged. Default mode remains
+selection with one test-ID oracle: Cargo's target selection (named targets,
+`--bins`/`--tests`/`--examples`/`--benches`/`--all-targets` by each target's
+`test`/`bench` flag, or the default `test = true` set) picks targets, and
+libtest's filter rule runs over their static test IDs (the checked-in lib
+manifest; other targets scanned from their crate roots, following
+`#[path = "..."]`; no compilation). A selection or module-path filter proven
+empty is flagged; module declarations only say where a missed filter points.
+Other crates, `--doc`, and emptiness that the lib's doctests or unknown
+`#[ignore]` marks could change are reported as unjudged. A name sweep over a
+target class whose matches are live tests in unselected targets is reported,
+not failed. Default mode remains
 diagnostic (rc=0); CI uses `--enforce`, and opt-in `--run-list-check` runs
 `cargo test ... -- --list` (compiles) to flag lanes selecting 0 tests.
 Legitimately-empty lanes (platform `#[cfg]`) are excused via
@@ -23,15 +30,19 @@ source inventory and reports both sides of the diff.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
+import importlib.util
 import os
 import re
 import shlex
 import subprocess
 import sys
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from collections.abc import Callable
+from functools import cache, partial
 from pathlib import Path
 
 MOD_DECL = re.compile(
@@ -52,18 +63,43 @@ COMMENT_OR_LITERAL = re.compile(r"""//|/\*|r\#{0,255}"|"|'""")
 NON_LINE_BREAK = re.compile(r"[^\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
 # Options consuming a value; their value must not be read as a filter.
 CARGO_VALUE_OPTIONS = {
-    "-p", "--package", "--exclude", "-j", "--jobs", "--features", "--profile",
-    "--target", "--target-dir", "--manifest-path", "--color", "--config",
+    "-p", "--package", "--exclude", "-j", "--jobs", "-F", "--features",
+    "--profile", "--target", "--target-dir", "--manifest-path", "--color",
+    "--config", "--message-format", "-Z",
     "--bin", "--test", "--bench", "--example",
 }
-TARGET_VALUE_OPTIONS = {"--bin", "--test"}
-# Target selectors we cannot statically map to a module tree (skipped).
-UNSUPPORTED_TARGET_OPTIONS = {"--bins", "--tests", "--bench", "--benches",
-                              "--example", "--examples", "--doc"}
+# Named-target options and the Cargo target kind each one selects.
+TARGET_VALUE_OPTIONS = {"--bin": "bin", "--test": "test",
+                        "--example": "example", "--bench": "bench"}
+# Multi-target flags; "tested"/"benched" are targets whose `test`/`bench`
+# manifest flag is on, and "all" is the union of the other four classes.
+TARGET_CLASS_OPTIONS = {"--bins": "bin", "--tests": "tested",
+                        "--examples": "example", "--benches": "benched",
+                        "--all-targets": "all"}
+# The manifest flag each flag-based class reads.
+CLASS_FLAGS = {"tested": "test", "benched": "bench"}
+# Cargo's per-kind defaults for the `test`, `bench` and `doctest` flags.
+TARGET_FLAG_DEFAULTS = {
+    "lib": {"test": True, "bench": True, "doctest": True},
+    "bin": {"test": True, "bench": True, "doctest": False},
+    "example": {"test": False, "bench": False, "doctest": False},
+    "test": {"test": True, "bench": False, "doctest": False},
+    "bench": {"test": False, "bench": True, "doctest": False},
+}
+# Runs whose selection the static test IDs cannot model (left unjudged).
+UNJUDGED_OPTIONS = {
+    "--doc": "doctests are not in the static test-ID inventory",
+    "--no-run": "a compile-only run selects no tests",
+}
 LIBTEST_VALUE_OPTIONS = frozenset({
     "--test-threads", "--format", "--color", "--logfile", "-Z",
 })
 SHELL_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+# A shell or just expansion whose value is unknown statically.
+DYNAMIC_TOKEN = re.compile(
+    r"\$(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*)|\{\{[^{}]*\}\}")
+# Shell or just syntax that may rewrite or word-split a libtest argument.
+SHELL_EXPANSION = re.compile(r"[$`{*?\[]")
 NICE_LEGACY_ADJUSTMENT = re.compile(r"^-[+-]?\d+$")
 LIST_SUMMARY = re.compile(r"(\d+) tests?, \d+ benchmarks")
 JOB_HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):(?:\s*#.*)?$")
@@ -78,6 +114,10 @@ SUMMARY_KEYS = {"invocations", "nonzero", "findings", "extraction_errors", "exec
 # tests are outside this parser. These exact, named differences are reviewed
 # data; any drift on either side fails --verify-lib-inventory.
 LIB_INVENTORY_STATIC_ONLY_BASE = frozenset({
+    "services::tui_o::store::windows_tests::enabling_the_store_is_refused_without_directory_fsync",
+    "services::session_host::herdr_host::windows_tests::an_unconfigured_herdr_host_refuses_every_operation",
+    "services::claude_tui::hook_server::observation_ingress::windows_tests::a_claude_transcript_without_supported_file_identity_is_refused",
+    "services::claude_tui::hook_server::observation_ingress::windows_tests::a_rollout_without_supported_file_identity_is_refused",
     "runtime_layout::windows_links::tests::windows_junction_paths_are_literal_and_removal_preserves_target",
     "runtime_layout::windows_links::tests::windows_optional_file_alias_never_copies_or_hardlinks_content",
     "services::dispatched_sessions::output::tests::windows_missing_process_is_unavailable_instead_of_empty_tmux_success",
@@ -120,6 +160,39 @@ LIB_INVENTORY_KNOWN_CARGO_ONLY = frozenset({
 })
 LIB_INVENTORY_MANIFEST_REL = Path("scripts/lib_test_inventory_manifest.txt")
 SOURCE_FLOOR_REL = Path("scripts/test_target_integrity_source_floors.txt")
+# The one run-time skip array whose generated values are read, not guessed.
+NON_PG_FILTER_REL = Path("scripts/ci/non-pg-test-filter.sh")
+NON_PG_SKIP_TOKEN = "${NON_PG_SKIP_ARGS[@]}"
+# The PG selection the same file derives from those pairs; restored, never guessed.
+PG_INCLUDE_TOKEN = "${PG_INCLUDE_ARGS[@]}"
+PG_INCLUDE_USE = re.compile(r"\$\{?PG_INCLUDE_ARGS\b")
+# The file's code after its generated region, blanks collapsed: the one derivation
+# whose PG_INCLUDE_ARGS value per PG_INCLUDE_SHARD is read without running Bash.
+PG_INCLUDE_DERIVATION = tuple("""\
+readonly -a NON_PG_SKIP_ARGS
+readonly -a NON_PG_FILTER_REPLAY
+readonly -a PG_INCLUDE_ARGS_SHARD_0
+readonly -a PG_INCLUDE_ARGS_SHARD_1
+PG_INCLUDE_ARGS=()
+for ((index = 1; index < ${#NON_PG_SKIP_ARGS[@]}; index += 2)); do
+PG_INCLUDE_ARGS+=("${NON_PG_SKIP_ARGS[$index]}")
+done
+unset index
+case "${PG_INCLUDE_SHARD-}" in
+"") ;;
+0) PG_INCLUDE_ARGS=("${PG_INCLUDE_ARGS_SHARD_0[@]}") ;;
+1) PG_INCLUDE_ARGS=("${PG_INCLUDE_ARGS_SHARD_1[@]}") ;;
+*)
+echo "PG_INCLUDE_SHARD must be 0 or 1, got: ${PG_INCLUDE_SHARD}" >&2
+return 1
+;;
+esac
+readonly -a PG_INCLUDE_ARGS""".splitlines())
+# A control operator left visible in lexed syntax; the lexer masks quoted, escaped,
+# substituted and redirection text, so `2>&1` or a quoted `;` never matches.
+SHELL_CONTROL = re.compile(r"[;&|()]")
+# Violation kind prefix for a generated array expanded without a proven source.
+KNOWN_ARRAY_KINDS = {"NON_PG_SKIP_ARGS": "non-pg", "PG_INCLUDE_ARGS": "pg-include"}
 LIB_INVENTORY_MANIFEST_HEADER = (
     "# Generated by scripts/check_test_target_integrity.py "
     "--write-lib-inventory-manifest."
@@ -152,10 +225,41 @@ class Violation:
                 f"(command: {self.command})")
 
 
-def load_allowlist(path: Path) -> set[str]:
+def allowlist_reason(row: str) -> str:
+    """The reason a `# reason: <why>` comment row gives, else "".
+
+    A reason needs a letter or digit, and the header's `<why>` placeholder
+    copied verbatim is not one.
+    """
+    match = re.fullmatch(r"#\s*reason:\s*(.*)", row)
+    reason = match.group(1).strip() if match else ""
+    if not any(char.isalnum() for char in reason) \
+            or re.fullmatch(r"<+[^<>]*>+", reason):
+        return ""
+    return reason
+
+
+def load_allowlist(path: Path) -> dict[str, int]:
     lines = path.read_text("utf-8").splitlines() if path.is_file() else []
-    return {ln.strip() for ln in lines
-            if ln.strip() and not ln.strip().startswith("#")}
+    entries: dict[str, int] = {}
+    reason = ""
+    for lineno, line in enumerate(lines, 1):
+        row = line.strip()
+        if row.startswith("#"):
+            reason = allowlist_reason(row)
+            continue
+        if row:
+            if not reason:
+                raise ValueError(
+                    f"{path}:{lineno}: allowlist entry needs a reason: the "
+                    "comment line directly above it must be `# reason: <why>` "
+                    "(lowercase `reason:`, a <why> with at least one letter "
+                    "or digit, no blank line in between)")
+            if row in entries:
+                raise ValueError(f"{path}:{lineno}: duplicate allowlist entry")
+            entries[row] = lineno
+        reason = ""
+    return entries
 
 
 def load_source_floors(path: Path) -> dict[str, int]:
@@ -193,6 +297,35 @@ def discover_targets(repo_root: Path) -> dict[str, Path]:
         targets[f"bin:{package_name}"] = main_rs
     for auto_bin in sorted((repo_root / "src/bin").glob("*.rs")):
         targets.setdefault(f"bin:{auto_bin.stem}", auto_bin)
+    return targets
+
+
+def discover_union_targets(repo_root: Path) -> dict[str, Path]:
+    """Include Cargo's integration/example/bench roots in union observations."""
+    targets = discover_targets(repo_root)
+    manifest = tomllib.loads((repo_root / "Cargo.toml").read_text("utf-8"))
+    package = manifest.get("package", {})
+    for kind, directory in (("test", "tests"), ("example", "examples"),
+                            ("bench", "benches")):
+        explicit = manifest.get(kind, [])
+        reserved = {entry.get("name") for entry in explicit}
+        for entry in explicit:
+            name = entry.get("name")
+            path = entry.get("path")
+            if name:
+                root = repo_root / path if path else repo_root / directory / f"{name}.rs"
+                if not path and not root.is_file():
+                    root = repo_root / directory / name / "main.rs"
+                if root.is_file():
+                    targets[f"{kind}:{name}"] = root
+        if not package.get(f"auto{directory}", True):
+            continue
+        roots = sorted((repo_root / directory).glob("*.rs"))
+        roots += sorted((repo_root / directory).glob("*/main.rs"))
+        for root in roots:
+            name = root.stem if root.name != "main.rs" else root.parent.name
+            if name not in reserved:
+                targets.setdefault(f"{kind}:{name}", root)
     return targets
 
 
@@ -772,13 +905,63 @@ def collect_modules(root: Path, repo_root: Path) -> dict[str, str]:
     return modules
 
 
-def _direct_cargo_test(words: list[str]) -> list[str] | None:
-    """Return cargo argv after only the deterministic supported wrappers."""
-    index = 0
+def _lex():
+    """The shell lexer the PG lane gate also reads shell with."""
+    return _membership().shell_lexer()
+
+
+def _shell_comment_start(snippet: str) -> int:
+    """Where Bash starts a comment on one line: an unquoted `#` that opens a word, so
+    one inside a word (`x#tag`, `$(true)#tag`) stays literal; else the line's length."""
+    return _lex().comment_start(snippet)
+
+
+def _syntax_words(snippet: str) -> list[str]:
+    """``snippet``'s shell words with quoted, escaped, substituted and redirection
+    text blanked to `_`, so only real control operators stay visible."""
+    return _lex().scan_shell(snippet).syntax_masked.split()
+
+
+# Reserved words that may head a command inside a one-line compound.
+_COMPOUND_HEADS = frozenset({"{", "}", "!", "if", "then", "elif", "else", "while", "until", "do"})
+
+
+def _chained_commands(scan) -> tuple[list, list]:
+    """A lexed line's outer simple commands and control operators, less a canonical
+    source heading its `&&` chain."""
+    commands = _lex().simple_commands(scan)
+    ops = [token.raw for token in scan.tokens if token.kind == "OP" and not token.depth]
+    if [token.value for token in commands[:1] for token in token] == [
+            "source", NON_PG_FILTER_REL.as_posix()] and ops[:1] == ["&&"]:
+        return commands[1:], ops[1:]
+    return commands, ops
+
+
+def _unproven_cargo(scan) -> bool:
+    """Whether a lexed line may run a cargo test outside the one command it extracts:
+    in a second command, a substitution, or past a boundary the lexer cannot prove."""
+    commands, ops = _chained_commands(scan)
+    nested = [token.value for token in scan.tokens if token.depth]
+    return _lex().may_execute_cargo(scan) \
+        or any(nested[index:index + 2] == ["cargo", "test"] for index in range(len(nested))) \
+        or ((ops or len(commands) > 1) and any(
+            _direct_cargo_test(values, values) is not None
+            for values in ([token.value or "" for token in command if token.value not in
+                            _COMPOUND_HEADS] for command in commands)))
+
+
+def _direct_cargo_test(words: list[str], syntax: list[str]) -> list[str] | None:
+    """Return cargo argv after only the deterministic supported wrappers; an empty argv
+    is a direct cargo test that a shell control operator joins to another command."""
+    # The canonical filter sourced at the head of the command's own `&&` chain.
+    index = 3 if words[:3] == ["source", NON_PG_FILTER_REL.as_posix(), "&&"] else 0
     while index < len(words):
         while index < len(words) and SHELL_ASSIGNMENT.fullmatch(words[index]):
             index += 1
         if words[index:index + 2] == ["cargo", "test"]:
+            # A second command on the line would ride along as cargo argv, unjudged.
+            if any(SHELL_CONTROL.search(word) for word in syntax[index:]):
+                return []
             return words[index:]
         if index >= len(words):
             return None
@@ -827,21 +1010,38 @@ def _direct_cargo_test(words: list[str]) -> list[str] | None:
     return None
 
 
-def _parse_command_line(line: str, *, yaml_run_scalar: bool = False,
-                        diagnostics: list[str] | None = None) \
-        -> list[str] | None:
-    """Parse one shell line; YAML quote removal is explicitly contextual."""
+def _shell_text(line: str, yaml_run_scalar: bool = False) -> str:
+    """One line as its shell reads it; YAML quote removal is explicitly contextual."""
     snippet = line.strip()
-    if not snippet or snippet.startswith("#"):
-        return None
     if yaml_run_scalar and len(snippet) >= 2 \
             and snippet[0] == snippet[-1] and snippet[0] in "\"'":
         snippet = snippet[1:-1]
-    try:
-        words = shlex.split(snippet, comments=True)
-    except ValueError:
+    return snippet
+
+
+def _parse_command_line(line: str, *, yaml_run_scalar: bool = False,
+                        diagnostics: list[str] | None = None) \
+        -> list[str] | None:
+    """Parse one shell line; YAML quote removal is explicitly contextual. An empty
+    result is a direct cargo test that a shell control operator joins to another."""
+    snippet = _shell_text(line, yaml_run_scalar)
+    if not snippet or snippet.startswith("#"):
         return None
-    cargo = _direct_cargo_test(words)
+    scan = _lex().scan_shell(snippet)
+    code = snippet[:_shell_comment_start(snippet)]
+    try:
+        words = shlex.split(code)
+    except ValueError:
+        # Unsplittable words leave even a lone direct cargo test unextracted.
+        values = [token.value for token in scan.tokens if token.kind == "WORD"]
+        lone = any(values[index:index + 2] == ["cargo", "test"] for index in range(len(values)))
+        return [] if lone or _unproven_cargo(scan) else None
+    syntax = _syntax_words(code)
+    aligned = len(syntax) == len(words)
+    # Quoted text never ends a command; unaligned words leave the syntax unproven.
+    cargo = _direct_cargo_test(words, syntax if aligned else words)
+    if (cargo and not aligned) or _unproven_cargo(scan):
+        cargo = []
     if cargo is None and diagnostics is not None and "cargo test" in snippet:
         first = next((word for word in words
                       if not SHELL_ASSIGNMENT.fullmatch(word)), "")
@@ -854,68 +1054,125 @@ def _parse_command_line(line: str, *, yaml_run_scalar: bool = False,
     return cargo
 
 
-def extract_commands(workflow: Path, diagnostics: list[str] | None = None) \
+def _continued(text: str) -> bool:
+    """Whether a shell line ends in an unescaped backslash that joins the next line to it."""
+    code = text[:_shell_comment_start(text)]
+    return (len(code) - len(code.rstrip("\\"))) % 2 == 1
+
+
+def _record_command(source: Path, lineno: int, text: str,
+                    commands: list[tuple[int, list[str], str]],
+                    diagnostics: list[str] | None, refused: list[int] | None,
+                    yaml_run_scalar: bool = False) -> None:
+    """Parse one logical shell line and file it as a command, a refusal or neither."""
+    line_diagnostics: list[str] = []
+    words = _parse_command_line(text, yaml_run_scalar=yaml_run_scalar,
+                                diagnostics=line_diagnostics)
+    if diagnostics is not None:
+        diagnostics.extend(f"{source}:{lineno}: {detail}" for detail in line_diagnostics)
+    if words:
+        commands.append((lineno, words, " ".join(words)))
+    elif words == [] and refused is not None:
+        refused.append(lineno)
+
+
+def extract_commands(workflow: Path, diagnostics: list[str] | None = None,
+                     shells: list[list[tuple[int, str]]] | None = None,
+                     refused: list[int] | None = None) \
         -> list[tuple[int, list[str], str]]:
-    """Extract literal commands only from workflow `run:` scalar context."""
+    """Extract literal commands only from workflow `run:` scalar context.
+
+    ``shells`` collects each run scalar's (line, shell text) pairs: one shell each.
+    ``refused`` collects lines whose direct cargo test is joined to another command.
+    Block lines a trailing backslash continues are parsed as one command at its first line.
+    """
     commands: list[tuple[int, list[str], str]] = []
     block_indent: int | None = None
+    content_indent: int | None = None
+    shell: list[tuple[int, str]] = []
+    pending: tuple[int, str] | None = None
     for lineno, line in enumerate(workflow.read_text("utf-8").splitlines(), 1):
         indent = len(line) - len(line.lstrip())
         if block_indent is not None and line.strip() and indent <= block_indent:
             block_indent = None
         match = re.match(r"^\s*(?:-\s*)?run:\s*(.*)$", line)
-        scalar = None
-        yaml_scalar = False
+        if pending is not None and (match or block_indent is None or not line.strip()):
+            # A blank line or the block's end finishes a continued command as it stands.
+            _record_command(workflow, pending[0], pending[1].removesuffix("\\")
+                            if not line.strip() else pending[1], commands, diagnostics, refused)
+            pending = None
         if match:
             value = match.group(1).strip()
+            shell = []
+            if shells is not None:
+                shells.append(shell)
             if value in {"|", "|-", "|+", ">", ">-", ">+"}:
-                block_indent = indent
+                block_indent, content_indent = indent, None
                 continue
-            scalar, yaml_scalar = value, True
-        elif block_indent is not None and indent > block_indent:
-            scalar = line.strip()
-        if scalar is None:
+            shell.append((lineno, _shell_text(value, True)))
+            _record_command(workflow, lineno, value, commands, diagnostics, refused, True)
             continue
-        line_diagnostics: list[str] = []
-        words = _parse_command_line(
-            scalar, yaml_run_scalar=yaml_scalar,
-            diagnostics=line_diagnostics,
-        )
-        if diagnostics is not None:
-            diagnostics.extend(
-                f"{workflow}:{lineno}: {detail}" for detail in line_diagnostics
-            )
-        if words is not None:
-            commands.append((lineno, words, " ".join(words)))
+        if block_indent is None or indent <= block_indent:
+            continue
+        content_indent = indent if content_indent is None else content_indent
+        # Block lines keep their YAML indentation, which shows what a compound command holds.
+        shell.append((lineno, line.rstrip()))
+        first, text = (pending[0], pending[1][:-1] + line[min(indent, content_indent):]) \
+            if pending is not None else (lineno, line.strip())
+        pending = None
+        if _continued(text):
+            pending = (first, text)
+        else:
+            _record_command(workflow, first, text, commands, diagnostics, refused)
+    if pending is not None:
+        _record_command(workflow, *pending, commands, diagnostics, refused)
     return commands
 
 
 def extract_justfile_commands(justfile: Path,
-                              diagnostics: list[str] | None = None) \
+                              diagnostics: list[str] | None = None,
+                              shells: list[list[tuple[int, str]]] | None = None,
+                              refused: list[int] | None = None) \
         -> list[tuple[int, list[str], str]]:
-    """Extract literal commands from recipe bodies, without evaluating just."""
+    """Extract literal commands from recipe bodies, without evaluating just.
+
+    ``shells`` collects every recipe line alone: just runs each in a new shell.
+    ``refused`` collects lines whose direct cargo test is joined to another command.
+    Recipe lines a trailing backslash continues are parsed as one command at its first line.
+    """
     commands: list[tuple[int, list[str], str]] = []
     in_recipe = False
+    pending: tuple[int, str] | None = None
     for lineno, line in enumerate(justfile.read_text("utf-8").splitlines(), 1):
+        if pending is not None and not (in_recipe and line[:1].isspace() and line.strip()):
+            _record_command(justfile, *pending, commands, diagnostics, refused)
+            pending = None
         if line and not line[0].isspace():
             in_recipe = bool(RECIPE_HEADER.match(line))
             continue
         if not in_recipe or not line or not line[0].isspace():
             continue
-        line_diagnostics: list[str] = []
-        words = _parse_command_line(line, diagnostics=line_diagnostics)
-        if diagnostics is not None:
-            diagnostics.extend(
-                f"{justfile}:{lineno}: {detail}" for detail in line_diagnostics
-            )
-        if words is not None:
-            commands.append((lineno, words, " ".join(words)))
+        if shells is not None:
+            shells.append([(lineno, line.strip())])
+        first, text = (pending[0], pending[1][:-1] + line.strip()) \
+            if pending is not None else (lineno, line.strip())
+        pending = None
+        if _continued(text):
+            pending = (first, text)
+        else:
+            _record_command(justfile, first, text, commands, diagnostics, refused)
+    if pending is not None:
+        _record_command(justfile, *pending, commands, diagnostics, refused)
     return commands
 
 
 class TargetSelection(Enum):
+    # Every selected target is named without a glob.
     EXPLICIT = "explicit"
     ALL_TARGETS = "all-targets"
+    # A multi-target flag or glob: a filter may sweep targets it misses.
+    UNION = "union"
+    DEFAULT = "default"
     UNJUDGED = "unjudged"
 
 
@@ -928,6 +1185,22 @@ class CommandSpec:
     selection: TargetSelection = TargetSelection.UNJUDGED
     skipped: bool = False
     target_inconclusive: bool = False
+    classes: tuple[str, ...] = ()
+    packages: tuple[str, ...] = ()
+    unjudged: str = ""
+    manifest_path: str = ""
+    # libtest `--ignored`: only #[ignore] tests among the selection run.
+    ignored_only: bool = False
+    # A run-time expansion may add a --skip (or --exact/--ignored) unseen here.
+    unknown_skip: bool = False
+    # Of those expansions, the generated NON_PG_SKIP_ARGS array, or any other.
+    non_pg_skip: bool = False
+    opaque_skip: bool = False
+    # PG_INCLUDE_ARGS as one whole libtest word: restored per shard before judging,
+    # and a restored selection running nothing is the generated array's fault.
+    pg_include: bool = False
+    # Restored, the array's own positive filters: their selection alone must run tests.
+    pg_filters: tuple[str, ...] = ()
 
 
 def parse_command(words: list[str]) -> CommandSpec:
@@ -939,16 +1212,38 @@ def parse_command(words: list[str]) -> CommandSpec:
     targets: list[str] = []
     filters: list[str] = []
     skip_filters: list[str] = []
+    classes: list[str] = []
+    packages: list[str] = []
     exact = False
-    all_targets = False
-    unsupported = False
+    unjudged = ""
+    manifest_path = ""
+    ignored_only = False
     target_inconclusive = False
+    unknown_skip = non_pg_skip = opaque_skip = pg_include = False
 
     def dynamic(token: str) -> bool:
-        return bool(re.search(
-            r"\$(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*)|\{\{[^{}]*\}\}",
-            token,
-        ))
+        return bool(DYNAMIC_TOKEN.search(token))
+
+    def skip_value(value: str) -> None:
+        nonlocal unknown_skip, opaque_skip
+        if SHELL_EXPANSION.search(value):
+            unknown_skip = opaque_skip = True
+        else:
+            skip_filters.append(value)
+
+    def bare_word(token: str, libtest: bool = False) -> None:
+        nonlocal unknown_skip, non_pg_skip, opaque_skip, pg_include
+        # An expansion may word-split into --skip/--exact/--ignored at run time.
+        if SHELL_EXPANSION.search(token):
+            unknown_skip = True
+            if libtest and token == NON_PG_SKIP_TOKEN:
+                non_pg_skip = True
+            elif libtest and token == PG_INCLUDE_TOKEN:
+                pg_include = True
+            else:
+                opaque_skip = True
+        if not token.startswith("-") and not dynamic(token):
+            filters.append(token)
 
     def consume_filter_option(tokens: list[str], position: int) -> int | None:
         nonlocal exact
@@ -956,39 +1251,48 @@ def parse_command(words: list[str]) -> CommandSpec:
         if token == "--exact":
             exact = True
         elif token == "--skip" and position + 1 < len(tokens):
-            if not dynamic(tokens[position + 1]):
-                skip_filters.append(tokens[position + 1])
+            skip_value(tokens[position + 1])
             return position + 1
         elif token.startswith("--skip="):
-            value = token.partition("=")[2]
-            if not dynamic(value):
-                skip_filters.append(value)
+            skip_value(token.partition("=")[2])
         else:
             return None
         return position
+    def option_value(name: str, value: str) -> None:
+        nonlocal target_inconclusive, unjudged, manifest_path
+        if name in TARGET_VALUE_OPTIONS:
+            if dynamic(value):
+                target_inconclusive = True
+            else:
+                targets.append(f"{TARGET_VALUE_OPTIONS[name]}:{value}")
+        elif name in ("-p", "--package"):
+            if dynamic(value):
+                unjudged = unjudged or "a dynamic package hides the selection"
+            packages.append(value)
+        elif name == "--manifest-path":
+            manifest_path = value
+
     index = 0
     while index < len(before):
         token = before[index]
-        if token in TARGET_VALUE_OPTIONS and index + 1 < len(before):
-            kind = "bin" if token == "--bin" else "test"
-            if dynamic(before[index + 1]):
-                target_inconclusive = True
-            else:
-                targets.append(f"{kind}:{before[index + 1]}")
-            index += 2
-            continue
-        if token == "--lib":
+        name, equals, value = token.partition("=")
+        if equals and name in CARGO_VALUE_OPTIONS:
+            option_value(name, value)
+        elif token in CARGO_VALUE_OPTIONS and index + 1 < len(before):
+            option_value(token, before[index + 1])
+            index += 1
+        elif token == "--lib":
             targets.append("lib")
-        elif token == "--all-targets":
-            all_targets = True
-        elif token in UNSUPPORTED_TARGET_OPTIONS:
-            unsupported = True
+        elif token in TARGET_CLASS_OPTIONS:
+            classes.append(TARGET_CLASS_OPTIONS[token])
+        elif token in ("--workspace", "--all"):
+            packages.append("--workspace")
+        elif token in UNJUDGED_OPTIONS:
+            unjudged = unjudged or f"{token}: {UNJUDGED_OPTIONS[token]}"
         elif (consumed := consume_filter_option(before, index)) is not None:
             index = consumed
-        elif token in CARGO_VALUE_OPTIONS:
-            index += 1
-        elif not token.startswith("-") and not dynamic(token):
-            filters.append(token)
+        else:
+            bare_word(token)
         index += 1
     index = 0
     while index < len(after):
@@ -998,25 +1302,35 @@ def parse_command(words: list[str]) -> CommandSpec:
             index = consumed
         elif token in LIBTEST_VALUE_OPTIONS:
             index += 1
-        elif not token.startswith("-") and not dynamic(token):
-            filters.append(token)
+            # An expanded value may word-split into extra --skip/filter words.
+            if index < len(after) and SHELL_EXPANSION.search(after[index]):
+                unknown_skip = opaque_skip = True
+        elif token == "--ignored":
+            ignored_only = True
+        else:
+            bare_word(token, libtest=True)
         index += 1
 
     targets_tuple = tuple(dict.fromkeys(targets))
-    if unsupported:
+    classes_tuple = tuple(dict.fromkeys(classes))
+    if unjudged:
         selection = TargetSelection.UNJUDGED
-    elif all_targets:
+    elif "all" in classes_tuple:
         selection = TargetSelection.ALL_TARGETS
+    elif classes_tuple or any(char in target for target in targets_tuple
+                              for char in "*?["):
+        selection = TargetSelection.UNION
     elif targets_tuple:
         selection = TargetSelection.EXPLICIT
-    else:
+    elif target_inconclusive:
         selection = TargetSelection.UNJUDGED
+    else:
+        selection = TargetSelection.DEFAULT
     return CommandSpec(
         targets_tuple, tuple(filters), tuple(skip_filters), exact, selection,
-        unsupported or (
-            selection is TargetSelection.UNJUDGED and not target_inconclusive
-        ),
-        target_inconclusive,
+        bool(unjudged), target_inconclusive, classes_tuple,
+        tuple(dict.fromkeys(packages)), unjudged, manifest_path, ignored_only,
+        unknown_skip, non_pg_skip, opaque_skip, pg_include,
     )
 
 
@@ -1038,18 +1352,199 @@ def _lib_selection(spec: CommandSpec, test_ids: frozenset[str]) \
     ))
 
 
+class PackageTestIds:
+    """One run's lazy view of this package's targets and static test IDs.
+
+    The lib side reads the reviewed manifest; every other target is scanned
+    from its crate root. A target whose IDs cannot be read keeps the error.
+    """
+
+    def __init__(self, repo_root: Path,
+                 lib_test_ids: frozenset[str] | None = None) -> None:
+        self.repo_root = repo_root
+        self.lib_test_ids = lib_test_ids
+        self._manifest: dict | None = None
+        self._roots: dict[str, Path] | None = None
+        self._ids: dict[str, frozenset[str] | str] = {}
+        self._non_pg: tuple[str, ...] | None = None
+        self._non_pg_read = False
+        self._pg_include: dict[str, tuple[str, ...]] | str | None = None
+
+    def manifest(self) -> dict:
+        if self._manifest is None:
+            self._manifest = tomllib.loads(
+                (self.repo_root / "Cargo.toml").read_text("utf-8"))
+        return self._manifest
+
+    def ids(self, target: str) -> frozenset[str] | str:
+        """Static test IDs of `target`, or why they cannot be read."""
+        if target not in self._ids:
+            try:
+                if target == "lib" and self.lib_test_ids is not None:
+                    found = self.lib_test_ids
+                else:
+                    if self._roots is None:
+                        self._roots = discover_union_targets(self.repo_root)
+                    root = self._roots.get(target)
+                    if root is None and target.startswith("test:"):
+                        root = integration_test_root(
+                            self.repo_root, target.partition(":")[2])
+                    if root is None or not root.is_file():
+                        raise ValueError(f"missing source for {target}")
+                    inventory = collect_static_tests(root, self.repo_root)
+                    if inventory.module_errors:
+                        raise ValueError(f"{target}: {inventory.module_errors}")
+                    found = frozenset(inventory.tests)
+            except (OSError, UnicodeError, ValueError,
+                    tomllib.TOMLDecodeError) as error:
+                found = str(error) or type(error).__name__
+            self._ids[target] = found
+        return self._ids[target]
+
+    def non_pg_skip_filters(self) -> tuple[str, ...] | None:
+        """NON_PG_SKIP_ARGS's --skip values; None unless one literal holds them all."""
+        if not self._non_pg_read:
+            self._non_pg_read = True
+            try:
+                text = (self.repo_root / NON_PG_FILTER_REL).read_text("utf-8")
+            except (OSError, UnicodeError):
+                text = ""
+            # Besides the one literal, only reads and the readonly lock may name it.
+            rest = re.sub(r"^\s*#.*$|^readonly -a NON_PG_SKIP_ARGS$|"
+                          r"\$\{#?NON_PG_SKIP_ARGS\[[^\]]*\]\}", "", text,
+                          flags=re.MULTILINE)
+            bodies = re.findall(r"^NON_PG_SKIP_ARGS=\((.*?)^\)$", rest,
+                                re.MULTILINE | re.DOTALL)
+            words = (_lex().shell_words(bodies[0]) or ()) \
+                if len(bodies) == 1 and rest.count("NON_PG_SKIP_ARGS") == 1 else ()
+            values = tuple(words[1::2])
+            if words and len(words) % 2 == 0 and set(words[::2]) == {"--skip"} \
+                    and all(value and not SHELL_EXPANSION.search(value)
+                            for value in values):
+                self._non_pg = values
+        return self._non_pg
+
+    def pg_include_selections(self) -> dict[str, tuple[str, ...]] | str:
+        """PG_INCLUDE_ARGS for PG_INCLUDE_SHARD unset (""), 0 and 1, else why the
+        generated file does not prove them; only its canonical shape is read."""
+        if self._pg_include is None:
+            self._pg_include = self._read_pg_include()
+        return self._pg_include
+
+    def _read_pg_include(self) -> dict[str, tuple[str, ...]] | str:
+        skips = self.non_pg_skip_filters()
+        if skips is None:
+            return "its NON_PG_SKIP_ARGS pairs are unreadable"
+        contract = _membership()
+        try:
+            lines = (self.repo_root / NON_PG_FILTER_REL).read_text("utf-8").splitlines()
+            start = lines.index(contract.NON_PG_SELECTION_BEGIN)
+            stop = lines.index(contract.NON_PG_SELECTION_END, start)
+            region = lines[start:stop + 1]
+            replay_at = region.index("NON_PG_FILTER_REPLAY=(") + 1
+            replay = tuple(line.strip() for line in region[replay_at:region.index(")", replay_at)])
+            # The shards are PGM's own split of the pairs, so the region must render from them.
+            shards = contract.pg_include_shards(skips)
+            expected = contract.render_non_pg_selection(skips, replay)
+        except (OSError, UnicodeError, ValueError) as error:
+            return str(error) or type(error).__name__
+        code = [" ".join(line.split()) for line in lines[stop + 1:]
+                if line.strip() and not line.lstrip().startswith("#")]
+        size = len(PG_INCLUDE_DERIVATION)
+        # Only comments precede the region, so nothing can guard or skip the derivation.
+        if any(line.strip() and not line.lstrip().startswith("#") for line in lines[:start]) \
+                or lines.count(contract.NON_PG_SELECTION_BEGIN) != 1 or region != expected \
+                or tuple(code[:size]) != PG_INCLUDE_DERIVATION \
+                or any("PG_INCLUDE" in line for line in code[size:]):
+            return "it departs from the generated region or the PG_INCLUDE_ARGS derivation"
+        return {"": skips, "0": shards[0], "1": shards[1]}
+
+    def target_flag(self, target: str, flag: str) -> bool:
+        """A target's `test`/`bench`/`doctest` flag: manifest, else Cargo's default."""
+        kind, _, name = target.partition(":")
+        manifest = self.manifest()
+        table = manifest.get("lib", {}) if kind == "lib" else next(
+            (entry for entry in manifest.get(kind, [])
+             if entry.get("name") == name), {})
+        return table.get(flag, TARGET_FLAG_DEFAULTS[kind][flag]) is True
+
+    def outside_package(self, spec: CommandSpec) -> str:
+        """Why `--manifest-path`/`-p`/`--workspace` reach tests this inventory never sees."""
+        if spec.manifest_path:
+            # Commands run from the repository root, where `$PWD` is that root.
+            path = re.sub(r"^\$(?:PWD\b|\{PWD\})", str(self.repo_root),
+                          spec.manifest_path)
+            if DYNAMIC_TOKEN.search(path):
+                return f"--manifest-path {spec.manifest_path} hides the crate"
+            if (self.repo_root / path).resolve() \
+                    != (self.repo_root / "Cargo.toml").resolve():
+                return f"--manifest-path {spec.manifest_path} is another crate"
+        manifest = self.manifest()
+        members = set(manifest.get("workspace", {}).get("members", [])) - {"."}
+        for package in spec.packages:
+            if package == "--workspace":
+                if members:
+                    return "--workspace also runs other members' tests"
+            elif package != manifest.get("package", {}).get("name"):
+                return f"package `{package}` is outside this inventory"
+        return ""
+
+
+def _selected_targets(spec: CommandSpec, universe: tuple[str, ...],
+                      view: PackageTestIds) -> tuple[str, ...]:
+    """Cargo's target selection over the known targets, named ones first."""
+    picked = [
+        resolved for target in spec.targets
+        for resolved in (
+            (tuple(key for key in universe if fnmatch.fnmatchcase(key, target))
+             or (target,))
+            if any(char in target for char in "*?[") else (target,)
+        )
+    ]
+    for kind in (*spec.classes,
+                 *(("tested",) if spec.selection is TargetSelection.DEFAULT
+                   else ())):
+        kinds = ("lib", "bin", "tested", "benched", "example") \
+            if kind == "all" else (kind,)
+        picked.extend(
+            key for key in universe
+            if any(key == "lib" if each == "lib"
+                   else view.target_flag(key, CLASS_FLAGS[each])
+                   if each in CLASS_FLAGS else key.startswith(f"{each}:")
+                   for each in kinds)
+        )
+    return tuple(dict.fromkeys(picked))
+
+
 def validate_command(spec: CommandSpec, inventories: dict[str, dict[str, str]],
                      repo_root: Path,
-                     lib_test_ids: frozenset[str] | None = None) \
+                     lib_test_ids: frozenset[str] | None = None, *,
+                     view: PackageTestIds | None = None,
+                     notes: list[str] | None = None) \
         -> list[tuple[str, str]]:
-    """Return (kind, detail) findings for one parsed cargo test command."""
+    """Return (kind, detail) findings for one parsed cargo test command.
+
+    One oracle judges every selection: libtest's own filter rule (substring,
+    or equality under --exact, minus --skip) over the static test IDs of the
+    targets Cargo would run. `inventories` names the known targets and their
+    module declarations, which only explain where a missed filter points.
+    """
     findings: list[tuple[str, str]] = []
+    view = view or PackageTestIds(repo_root, lib_test_ids)
+    if spec.skipped:
+        return findings
+    try:
+        outside = view.outside_package(spec)
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        return [("inventory-error", f"Cargo.toml: {error}")]
+    if outside:
+        if notes is not None and (spec.filters or spec.skip_filters):
+            notes.append(f"unjudged: {outside}")
+        return findings
+    selected_targets = _selected_targets(spec, tuple(inventories), view)
     selected: dict[str, str] = {}
-    selected_targets = (tuple(inventories)
-                        if spec.selection is TargetSelection.ALL_TARGETS
-                        else spec.targets)
     for target in selected_targets:
-        if target.startswith("test:"):
+        if target.startswith("test:") and target not in inventories:
             name = target.partition(":")[2]
             path = integration_test_root(repo_root, name)
             if not path.is_file():
@@ -1057,69 +1552,151 @@ def validate_command(spec: CommandSpec, inventories: dict[str, dict[str, str]],
                     f"--test {name}: neither tests/{name}.rs nor "
                     f"tests/{name}/main.rs exists")))
                 continue
-            # setdefault evaluates its argument even on a hit, so it
-            # re-walked an integration root already inventoried here.
-            if target not in inventories:
-                inventories[target] = collect_modules(path, repo_root)
+            inventories[target] = collect_modules(path, repo_root)
         if target not in inventories:
             findings.append(("unknown-target",
                              f"target `{target}` not found in Cargo.toml"))
             continue
         selected.update(inventories[target])
-    lib_judged = lib_test_ids is not None and "lib" in selected_targets
-    if lib_judged and spec.selection is TargetSelection.EXPLICIT \
-            and not spec.target_inconclusive and selected_targets == ("lib",) \
-            and not _lib_selection(spec, lib_test_ids):
-        findings.append(("zero-match", (
-            "lib inventory final selection matches 0 test IDs in "
-            f"{LIB_INVENTORY_MANIFEST_REL}"
-        )))
-    # Non-lib selection uses the same static test-ID subset as the lib scanner;
-    # cfg expansion, include! and macro-generated tests remain outside it.
-    nonlib_ids: set[str] | None = None
-    if spec.filters and not spec.target_inconclusive and not findings \
-            and spec.selection is TargetSelection.EXPLICIT \
-            and "lib" not in selected_targets:
-        nonlib_ids = set()
-        try:
-            roots = discover_targets(repo_root)
-            for target in selected_targets:
-                root = (integration_test_root(repo_root, target.partition(":")[2])
-                        if target.startswith("test:") else roots.get(target))
-                if root is None or not root.is_file():
-                    raise ValueError(f"missing source for {target}")
-                inventory = collect_static_tests(root, repo_root)
-                if inventory.module_errors:
-                    raise ValueError(f"{target}: {inventory.module_errors}")
-                nonlib_ids.update(inventory.tests)
-        except (OSError, UnicodeError, ValueError) as error:
-            return [("inventory-error", str(error))]
-    for filt in (() if spec.target_inconclusive else spec.filters):
-        lead = filt.split("::", 1)[0]
-        if not lead or lead in selected:
+    if spec.selection is TargetSelection.UNJUDGED or spec.target_inconclusive:
+        if notes is not None and (spec.filters or spec.skip_filters):
+            notes.append("unjudged: a dynamic target value hides the selection")
+        return findings
+    judged = tuple(target for target in selected_targets if target in inventories)
+    selected_ids: set[str] = set()
+    for target in judged:
+        ids = view.ids(target)
+        if isinstance(ids, str):
+            return findings + [("inventory-error", ids)]
+        selected_ids.update(ids)
+    selection_name = "/".join(judged) or "no target"
+    sweep = spec.selection is not TargetSelection.EXPLICIT
+    restored = view.non_pg_skip_filters() if spec.non_pg_skip else ()
+    if restored is None:
+        # The array is known to carry skips; unread, it is not merely opaque.
+        return findings + [("non-pg-skip-unresolved", (
+            f"{NON_PG_FILTER_REL} holds no single readable NON_PG_SKIP_ARGS "
+            "literal of --skip pairs, so the skips this run passes are unknown"))]
+    # The skip rule a sweep's evidence must survive; an opaque expansion or
+    # --ignored (no static ID is known to be #[ignore]) leaves none provable.
+    live_rule: CommandSpec | None = spec
+    if spec.ignored_only or spec.opaque_skip \
+            or (spec.unknown_skip and not spec.non_pg_skip):
+        live_rule = None
+    elif spec.non_pg_skip:
+        # Restored, the array is a known skip list, not a run-time unknown.
+        live_rule = replace(spec, skip_filters=spec.skip_filters + restored,
+                            unknown_skip=False)
+    # Restored skips drop the selected targets' own candidates too.
+    rule = live_rule if live_rule is not None else spec
+    # --ignored proves no candidate runs, yet the restored skips still drop known ones.
+    candidate_rule = replace(rule, skip_filters=spec.skip_filters + restored) \
+        if spec.ignored_only and spec.non_pg_skip else rule
+    final = _lib_selection(candidate_rule, frozenset(selected_ids))
+    if spec.pg_include and not _lib_selection(replace(rule, filters=spec.pg_filters),
+                                              frozenset(selected_ids)):
+        # The generated selection itself runs nothing, whatever other filters add:
+        # no allowlist or doctest excuses it.
+        return findings + [("pg-include-zero-match", (
+            f"restored PG_INCLUDE_ARGS's own positive filters select 0 static test IDs "
+            f"in {selection_name} after the run's skip filters"))]
+    swept_elsewhere = 0
+    empty: list[tuple[str, str]] = []
+    for filt in spec.filters:
+        if _filter_matches(frozenset(selected_ids), filt, spec.exact):
             continue
-        declared_in = {
-            target: modules[lead]
-            for target, modules in inventories.items() if lead in modules
-        }
-        if declared_in:
-            sites = ", ".join(f"{t} ({site})" for t, site in
-                              sorted(declared_in.items()))
-            findings.append(("target-mismatch", (
-                f"filter `{filt}` names module `{lead}` declared in {sites}, "
-                f"but the command only selects {'/'.join(spec.targets)}; the "
-                f"filter matches 0 tests there and cargo still exits 0")))
-        elif "::" in filt and not lib_judged:
-            findings.append(("unknown-module", (
-                f"module-path filter `{filt}`: leading segment `{lead}` is "
-                f"not a module in any known target")))
-    if nonlib_ids is not None and not findings \
-            and not _lib_selection(spec, frozenset(nonlib_ids)):
-        kind = "zero-match" if nonlib_ids else "empty-target"
-        findings.append((kind, (
-            f"selected target(s) {'/'.join(selected_targets)} final selection "
-            "matches 0 statically discovered test IDs")))
-    return findings
+        # A leading `::` only anchors the match; the first named segment is
+        # the module the filter points at.
+        lead = next((part for part in filt.split("::") if part), "")
+        declared: list[str] = []
+        matched: list[str] = []
+        live = False
+        for target, modules in sorted(inventories.items()):
+            if target in judged:
+                continue
+            if lead in modules and lead not in selected:
+                declared.append(f"{target} ({modules[lead]})")
+            ids = view.ids(target)
+            hits = frozenset() if isinstance(ids, str) else _filter_matches(
+                ids, filt, spec.exact)
+            if hits:
+                matched.append(f"{target} ({len(hits)} test ID(s))")
+            live = live or (live_rule is not None and bool(_lib_selection(
+                replace(live_rule, filters=(filt,)), hits)))
+        elsewhere = "; ".join(
+            ([f"module `{lead}` declared in {', '.join(declared)}"]
+             if declared else [])
+            + ([f"test IDs in {', '.join(matched)}"] if matched else []))
+        mismatch = ("target-mismatch", (
+            f"filter `{filt}` names {elsewhere}, but the command only "
+            f"selects {selection_name}; the filter matches 0 tests there "
+            "and cargo still exits 0"))
+        if "::" in filt:
+            if elsewhere:
+                findings.append(mismatch)
+            elif lead and lead not in selected:
+                findings.append(("unknown-module", (
+                    f"module-path filter `{filt}`: `{lead}` is not a module in "
+                    "any known target and no test ID matches it")))
+            else:
+                empty.append(("zero-match", (
+                    f"module-path filter `{filt}` matches 0 test IDs in "
+                    f"{selection_name}")))
+        elif final and not (rule.unknown_skip or spec.ignored_only):
+            continue  # libtest ORs the filters; the union already selects tests
+        elif elsewhere and not sweep:
+            findings.append(mismatch)
+        elif final:
+            # The union rests on candidates a run-time restriction may drop.
+            restriction = ("a dynamic --skip or libtest argument"
+                           if rule.unknown_skip else "--ignored")
+            findings.append(("unproven-union", (
+                f"filter `{filt}` matches 0 tests in {selection_name}; only "
+                f"the other filters' {len(final)} candidate test ID(s) keep "
+                f"the run non-empty, and {restriction} may remove them all")))
+        elif live:
+            # A name sweep across a target class: an empty side is visible,
+            # not fatal, while a typo matching nothing anywhere still fails.
+            swept_elsewhere += 1
+            if notes is not None:
+                notes.append(
+                    f"sweep-empty: filter `{filt}` selects 0 tests in "
+                    f"{selection_name}; it points at {elsewhere}")
+    if len(spec.filters) > 1 and rule.unknown_skip and final \
+            and not findings and not empty:
+        # Every filter matched, yet a run-time skip may still drop all of them.
+        names = ", ".join(f"`{filt}`" for filt in spec.filters)
+        findings.append(("unproven-union", (
+            f"filters {names} match {len(final)} candidate test ID(s) in "
+            f"{selection_name}, and a dynamic --skip or libtest argument may "
+            "remove them all")))
+    if spec.ignored_only and spec.non_pg_skip and not final:
+        # No known candidate is left for --ignored: no allowlist or doctest excuses it.
+        findings.append(("non-pg-ignored-zero-match", (
+            "--ignored with restored NON_PG_SKIP_ARGS leaves 0 known candidate test IDs in "
+            f"{selection_name} (before generated skips: "
+            f"{len(_lib_selection(rule, frozenset(selected_ids)))}); ignored execution "
+            "remains unproven")))
+    if not findings and not empty and not final \
+            and not (spec.filters and swept_elsewhere == len(spec.filters)):
+        empty.append(("zero-match" if selected_ids else "empty-target", (
+            f"selected target(s) {selection_name} final selection matches 0 "
+            "statically discovered test IDs")))
+    if spec.selection is TargetSelection.DEFAULT and empty \
+            and "lib" in inventories and view.target_flag("lib", "doctest"):
+        # A target-less run also runs the lib's doctests, which no static
+        # inventory lists, so emptiness there is reported rather than proven.
+        if notes is not None:
+            notes.extend(f"unjudged: {detail}; the default selection also "
+                         "runs doctests" for _, detail in empty)
+        empty = []
+    if spec.ignored_only and final and not findings and not empty \
+            and notes is not None:
+        # Candidates exist, but the static inventory cannot tell which of
+        # them are #[ignore]; an empty candidate set fails above instead.
+        notes.append(f"unjudged: --ignored keeps only #[ignore] tests among "
+                     f"{len(final)} candidate test ID(s)")
+    return findings + empty
 
 
 def run_list_check(words: list[str], repo_root: Path) -> str | None:
@@ -1137,14 +1714,20 @@ def run_list_check(words: list[str], repo_root: Path) -> str | None:
 def _command_lines(text: str) -> list[list[str]]:
     commands: list[list[str]] = []
     for line in text.splitlines():
+        snippet = line.strip()
+        scan = _lex().scan_shell(snippet)
         try:
-            words = shlex.split(line.strip(), comments=True)
+            words = shlex.split(snippet[:_shell_comment_start(snippet)])
         except ValueError as error:
-            raise RuntimeError(f"could not parse command: {line.strip()}") from error
+            raise RuntimeError(f"could not parse command: {snippet}") from error
         if words[:1] == ["run:"]:
             words = words[1:]
         if any(words[index:index + 2] == ["cargo", "test"]
                for index in range(len(words) - 1)):
+            # A joined, nested or unproven part would be observed as another command.
+            if scan.issues or len(_chained_commands(scan)[0]) > 1 \
+                    or any(token.depth or token.kind == "REDIR" for token in scan.tokens):
+                raise RuntimeError(f"could not parse command: {snippet}")
             commands.append(words)
     return commands
 
@@ -1177,7 +1760,7 @@ def curated_commands(repo_root: Path, workflow: Path,
     commands = _command_lines(text)
     for line in text.splitlines():
         try:
-            words = shlex.split(line.strip(), comments=True)
+            words = shlex.split(line.strip()[:_shell_comment_start(line.strip())])
         except ValueError:
             continue
         if words[:1] == ["run:"]:
@@ -1447,15 +2030,103 @@ def evidence_verification_errors(rendered: str) -> list[str]:
     return errors
 
 
-def check_workflows(repo_root: Path, workflows: list[Path], allowlist: set[str],
+@cache
+def _membership():
+    """The PG lane checker, owner of the shared source/use contract; loaded on use
+    so importers that copy this file alone keep working."""
+    path = Path(__file__).with_name("check_pg_test_lane_membership.py")
+    spec = importlib.util.spec_from_file_location("pg_lane_membership_contract", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot import the source/use contract: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def known_array_findings(shells: list[list[tuple[int, str]]], extracted: set[int],
+                         scope: str) -> dict[int, list[tuple[str, str]]]:
+    """Findings by line for the generated arrays one file's shells expand.
+
+    An extracted cargo test command may expand them only after the canonical source
+    in its own shell, and no other command may expand them unseen by this gate.
+    """
+    contract = _membership()
+    findings: dict[int, list[tuple[str, str]]] = {}
+    for shell in shells:
+        for index, (lineno, text) in enumerate(shell):
+            use = contract.known_array_use(text)
+            if use is None:
+                continue
+            start, arrays = use
+            if lineno not in extracted:
+                findings[lineno] = [("known-array-command-unparsed", (
+                    f"{', '.join(arrays)} is expanded by a command this gate cannot "
+                    "extract as a cargo test invocation, so the run it shapes is unchecked"))]
+                continue
+            problem = contract.known_array_source_problem(
+                "\n".join([*(line for _, line in shell[:index]), text[:start]]))
+            if problem is None:
+                continue
+            array, at = problem
+            if array == "unsourced":
+                findings[lineno] = [(f"{KNOWN_ARRAY_KINDS[name]}-source-unproven", (
+                    f"${{{name}[@]}} requires an earlier `source {NON_PG_FILTER_REL}` in the "
+                    f"same {scope}, alone on its line or heading this command's `&&` chain"))
+                    for name in arrays]
+            else:
+                findings[lineno] = [("known-array-redefined", (
+                    f"{array} was assigned at line {shell[at][0]} after the canonical "
+                    "source and before this cargo test invocation"))]
+    return findings
+
+
+def pg_include_findings(words: list[str], spec: CommandSpec, shards: tuple[str, ...] | None,
+                        view: PackageTestIds,
+                        judge: Callable[[CommandSpec], list[tuple[str, str]]]) \
+        -> list[tuple[str, str]]:
+    """Judge a PG_INCLUDE_ARGS command once per PG_INCLUDE_SHARD value it may run
+    under (``shards``, None when unprovable), the array's words restored in place."""
+    if not spec.pg_include or sum(bool(PG_INCLUDE_USE.search(word)) for word in words) != 1:
+        return [("pg-include-usage-unresolved", (
+            f"only one whole \"{PG_INCLUDE_TOKEN}\" libtest word after `--` can be "
+            "restored, so the arguments this expansion passes are unknown"))]
+    selections = view.pg_include_selections()
+    if isinstance(selections, str):
+        return [("pg-include-unresolved", (
+            f"PG_INCLUDE_ARGS is a canonical known array, but {NON_PG_FILTER_REL} has "
+            f"no provable derived selection: {selections}"))]
+    if shards is None:
+        return [("pg-include-shard-unresolved", (
+            "this workflow names PG_INCLUDE_SHARD, so it cannot be proved unset, 0 or 1 "
+            "at the canonical source point"))]
+    at = words.index(PG_INCLUDE_TOKEN)
+    findings: list[tuple[str, str]] = []
+    for shard in shards:
+        args = selections[shard]
+        own = parse_command(["cargo", "test", "--", *args]).filters
+        if own:
+            # Reparsed, the restored words keep libtest's meaning and every other expansion.
+            found = judge(replace(parse_command([*words[:at], *args, *words[at + 1:]]),
+                                  pg_include=True, pg_filters=own))
+        else:
+            found = [("pg-include-empty", "PG_INCLUDE_ARGS contains no positive libtest "
+                      "filters; an empty expansion would widen this run")]
+        label = f"PG_INCLUDE_SHARD={shard}" if shard else "PG_INCLUDE_SHARD unset"
+        findings.extend((kind, f"{label}: {detail}") for kind, detail in found)
+    return findings
+
+
+def check_workflows(repo_root: Path, workflows: list[Path], allowlist: set[str] | dict[str, int],
                     with_list_check: bool,
                     lib_test_ids: frozenset[str] | None = None,
                     source_floors: dict[str, int] | None = None,
-                    diagnostics: list[str] | None = None) \
+                    diagnostics: list[str] | None = None,
+                    allowlist_path: Path | None = None) \
         -> list[Violation]:
     inventories = {
         target: collect_modules(root, repo_root)
-        for target, root in discover_targets(repo_root).items()
+        for target, root in discover_union_targets(repo_root).items()
     }
     if lib_test_ids is None:
         try:
@@ -1464,14 +2135,29 @@ def check_workflows(repo_root: Path, workflows: list[Path], allowlist: set[str],
             )
         except (OSError, ValueError):
             lib_test_ids = None
+    view = PackageTestIds(repo_root, lib_test_ids)
+    shells: dict[Path, list[list[tuple[int, str]]]] = {}
+    refused: dict[Path, list[int]] = {}
     workflow_sources = [
-        (path, extract_commands(path, diagnostics)) for path in workflows
+        (path, extract_commands(path, diagnostics, shells.setdefault(path, []),
+                                refused.setdefault(path, [])))
+        for path in workflows
     ]
     justfile = repo_root / "justfile"
-    just_commands = extract_justfile_commands(justfile, diagnostics) \
-        if justfile.is_file() else []
+    just_commands = extract_justfile_commands(
+        justfile, diagnostics, shells.setdefault(justfile, []),
+        refused.setdefault(justfile, [])) if justfile.is_file() else []
     sources = [*workflow_sources, (justfile, just_commands)]
     violations: list[Violation] = []
+    active_commands = {normalized for _, commands in sources
+                       for _, _, normalized in commands}
+    allowlist_path = allowlist_path or repo_root / "scripts/test_target_integrity_allowlist.txt"
+    allowlist_source = (str(allowlist_path.relative_to(repo_root))
+                       if allowlist_path.is_relative_to(repo_root) else str(allowlist_path))
+    violations.extend(Violation(
+        allowlist_source, allowlist.get(command, 0) if isinstance(allowlist, dict) else 0,
+        command, "stale-allowlist", "allowlist entry matches no extracted cargo test command",
+    ) for command in sorted(set(allowlist) - active_commands))
     if source_floors is not None:
         extracted = {
             "workflows": sum(len(commands) for _, commands in workflow_sources),
@@ -1487,20 +2173,52 @@ def check_workflows(repo_root: Path, workflows: list[Path], allowlist: set[str],
     for source, commands in sources:
         rel = (str(source.relative_to(repo_root))
                if source.is_relative_to(repo_root) else str(source))
+        extracted = {lineno for lineno, _, _ in commands}
+        known = known_array_findings(
+            shells.get(source, []), extracted,
+            "recipe line" if source == justfile else "run scalar")
+        texts = {lineno: text.strip() for shell in shells.get(source, []) for lineno, text in shell}
+        if source == justfile:
+            # A recipe may inherit any shard, and sourcing fails on every other value.
+            shards: tuple[str, ...] | None = ("", "0", "1")
+        else:
+            # A workflow that never names the shard leaves it unset where a job sources the file.
+            named = "PG_INCLUDE_SHARD" in _membership().strip_shell_comments(
+                source.read_text("utf-8"))
+            shards = None if named else ("",)
+        violations.extend(Violation(rel, lineno, texts[lineno], kind, detail)
+                          for lineno, found in sorted(known.items())
+                          if lineno not in extracted for kind, detail in found)
+        # A known array on the line already names it; any other refusal is reported here.
+        violations.extend(Violation(rel, lineno, texts[lineno], "cargo-command-unparsed", (
+            "a shell control operator joins this cargo test invocation to another command, "
+            "so this gate cannot extract it and the run goes unchecked"))
+            for lineno in refused.get(source, []) if lineno not in known)
         for lineno, words, normalized in commands:
+            if lineno in known:
+                # The array's value is unproven, so nothing restored from it is judged.
+                violations.extend(Violation(rel, lineno, normalized, kind, detail)
+                                  for kind, detail in known[lineno])
+                continue
             allowlisted = normalized in allowlist
             spec = parse_command(words)
+            notes: list[str] = []
+            if spec.skipped and (spec.filters or spec.skip_filters):
+                notes.append(f"unjudged: {spec.unjudged}")
+            judge = partial(validate_command, inventories=inventories, repo_root=repo_root,
+                            lib_test_ids=lib_test_ids, view=view, notes=notes)
+            findings = pg_include_findings(words, spec, shards, view, judge) \
+                if any(PG_INCLUDE_USE.search(word) for word in words) else judge(spec)
+            if diagnostics is not None:
+                diagnostics.extend(f"{rel}:{lineno}: {note} (command: {normalized})"
+                                   for note in notes)
             if spec.skipped:
                 continue
-            findings = validate_command(
-                spec, inventories, repo_root, lib_test_ids
-            )
             if allowlisted:
-                # The allowlist only excuses legitimately-empty lanes; a
-                # target-mismatch means the command itself is wrong and must
-                # be fixed, never allowlisted (enforced here, not just docs).
+                # A platform exception excuses emptiness, not a broken
+                # target, module path or unreadable source inventory.
                 findings = [(kind, detail) for kind, detail in findings
-                            if kind == "target-mismatch"]
+                            if kind not in {"zero-match", "empty-target"}]
             if with_list_check and not findings and not allowlisted:
                 detail = run_list_check(words, repo_root)
                 if detail:
@@ -1750,13 +2468,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"test-target integrity: cannot read source floors: {error}",
               file=sys.stderr)
         return 2
-    allowlist = load_allowlist(args.allowlist or (
-        repo_root / "scripts/test_target_integrity_allowlist.txt"))
+    allowlist_path = (args.allowlist or (
+        repo_root / "scripts/test_target_integrity_allowlist.txt")).resolve()
+    try:
+        allowlist = load_allowlist(allowlist_path)
+    except (OSError, ValueError) as error:
+        print(f"test-target integrity: invalid allowlist: {error}", file=sys.stderr)
+        return 2
     diagnostics: list[str] = []
     violations = check_workflows(repo_root,
                                  [Path(w).resolve() for w in workflows],
                                  allowlist, args.run_list_check, lib_test_ids,
-                                 source_floors, diagnostics)
+                                 source_floors, diagnostics, allowlist_path)
     for diagnostic in diagnostics:
         print(f"test-target integrity: {diagnostic}")
     for violation in violations:

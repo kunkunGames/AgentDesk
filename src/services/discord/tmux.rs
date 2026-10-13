@@ -53,6 +53,9 @@ use super::{
 #[path = "execution_identity.rs"]
 pub(in crate::services::discord) mod execution_identity;
 mod monitor_auto_turn_inflight;
+#[cfg(test)]
+#[path = "tmux/n1a_monitor_tests.rs"]
+mod n1a_monitor_tests;
 #[path = "tmux_placeholder_suppression/mod.rs"]
 mod placeholder_suppression;
 #[path = "tmux_reattach_offsets.rs"]
@@ -61,6 +64,21 @@ mod tmux_reattach_offsets;
 mod tmux_session_files;
 #[path = "watchers/lifecycle.rs"]
 mod watcher_lifecycle;
+#[cfg(all(test, unix))]
+pub(crate) use watcher_lifecycle::commit_codex_watcher_restore_for_tests;
+#[cfg(all(test, unix))]
+pub(crate) use watcher_lifecycle::commit_codex_watcher_restore_to_empty_registry_for_tests;
+
+#[cfg(test)]
+pub(in crate::services::discord) use watcher_lifecycle::InstallFixture;
+#[cfg(test)]
+pub(in crate::services::discord) use watcher_lifecycle::n4d2_entry_support;
+#[cfg(test)]
+pub(in crate::services::discord) use watcher_lifecycle::n4d2_pause_install_after_host;
+pub use watcher_lifecycle::{
+    OOnlyInstallOutcome, OOnlyInstallReason, OOnlyInstallRequest, install_retired_o_watcher,
+};
+pub use watcher_lifecycle::{RetiredOWatcherRestore, restore_retired_o_watchers};
 
 use self::monitor_auto_turn_inflight::ensure_monitor_auto_turn_inflight;
 use self::placeholder_suppression::*;
@@ -77,16 +95,15 @@ use self::tmux_session_files::{
 pub(crate) use self::tmux_session_files::{stamp_spawn_markers, write_spawn_nonce};
 #[rustfmt::skip]
 #[cfg(test)]
-pub(in crate::services::discord) use self::watcher_lifecycle::{claim_cross_channel_tmux_watcher_for_test, evict_claim_before_adoption_for_test};
+pub(in crate::services::discord) use self::watcher_lifecycle::{CLAIM_PAUSE, claim_cross_channel_tmux_watcher_for_test, claim_or_replace_watcher, claim_or_reuse_watcher, evict_claim_before_adoption_for_test};
 use self::watcher_lifecycle::*;
 pub(in crate::services::discord) use self::watcher_lifecycle::{
-    ThreadFollowUpParent, WatcherClaimIncarnation, claim_or_replace_watcher,
-    claim_or_replace_watcher_with_thread_parent, claim_or_reuse_watcher,
-    claim_or_reuse_watcher_with_thread_parent, clear_recovery_handled_channels,
-    fail_dispatch_for_ready_for_input_stall, refresh_session_heartbeat_from_tmux_output,
-    restore_tmux_watchers, session_belongs_to_current_runtime, store_recovery_handled_channels,
-    thread_follow_up_parent_channel_id, thread_follow_up_parent_from_live,
-    try_claim_watcher_with_thread_parent,
+    HostSnapshot, ThreadFollowUpParent, WatchHost, WatchWithheld, WatcherClaimIncarnation,
+    claim_or_replace_watcher_for_host, claim_or_reuse_watcher_for_host,
+    clear_recovery_handled_channels, fail_dispatch_for_ready_for_input_stall,
+    refresh_session_heartbeat_from_tmux_output, restore_tmux_watchers,
+    session_belongs_to_current_runtime, store_recovery_handled_channels,
+    thread_follow_up_parent_channel_id, thread_follow_up_parent_from_live, watch_host_of,
 };
 use super::watcher_lifecycle_decision::*;
 const READY_FOR_INPUT_IDLE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
@@ -1011,6 +1028,14 @@ async fn start_monitor_auto_turn_when_available(
     data_start_offset: u64,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> MonitorAutoTurnStart {
+    if crate::services::tui_o::turn_mode::transcript_turns(channel_id.get()) {
+        return MonitorAutoTurnStart {
+            acquired: false,
+            deferred: false,
+            synthetic_message_id: None,
+            ledger_generation: None,
+        };
+    }
     let mut deferred = false;
     let synthetic_message_id = MessageId::new(data_start_offset.max(1));
 

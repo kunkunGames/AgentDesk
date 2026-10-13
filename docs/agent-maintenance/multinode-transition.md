@@ -700,6 +700,21 @@ redeploy leaves the old values live in the plist.
   before merging.
 
 ### Audited touches
+- 2026-10-09 — #5817 cluster schema order in `scripts/deploy-release.sh`: the
+  shared Postgres schema is cluster-wide, and a binary refuses to boot on a
+  migration it does not embed. Every `--all-nodes` peer is pinned to the source
+  this node built, schema change or not, so a newer origin/main never reaches it;
+  an external artifact cannot be pinned and is refused. A deploy that advances the
+  schema (manifest floor before the build, candidate `doctor` pending versions
+  before migrating) also deploys its single peer before this node migrates or
+  restarts; without `--all-nodes` or with two or more peers it is refused. A
+  failed peer leg is judged by comparing the same staged binary's schema
+  snapshot before and after: unchanged aborts this
+  node untouched, moved finishes this node forward and still fails the run, and
+  unknown keeps the staged binary without installing it.
+  `AGENTDESK_DEPLOY_ALLOW_SCHEMA_AHEAD_OF_PEERS=1` restores the previous unpinned order.
+  This is deploy tooling only: no lease, leader check, or runtime authority is
+  added, and two operators deploying from both nodes at once remain unserialized.
 - 2026-07-30 — #5014 / PR #5020 destructive cancel commit: the inflight
   sidecar flock, watcher cancel `AtomicBool`, and registry identity CAS remain
   **worker-local** authority. The primitive adds no PostgreSQL lease, distributed
@@ -1900,6 +1915,14 @@ redeploy leaves the old values live in the plist.
   write. Per-turn prompt assembly joins the shared boundary while reading
   `session_transcripts`, so restart or worker reassignment cannot cross a clear.
   This adds no leader lease, singleton, or routing decision.
+- #6577 native clear correlation (migration 0135, `runtime.native_clear_enabled`, default off) — **Shared boundary
+  row, worker-local judgment**: a native clear stores its opaque ticket and
+  generation on the same `channel_session_clear_boundaries` row, in the statement
+  that advances `clear_generation`, plus a completion mark. Only the node named
+  by the ticket's host may act on an unresolved row; the completion CAS only makes
+  completion idempotent and refuses stale generations. No lease or singleton; the
+  user clear and the intake admission that settles an unresolved row are its only
+  callers, both only while the switch is on.
 - #4551 fresh routine context severance and verified start evidence — **Existing
   leader-owned routine state, worker-local provider launch**: the routine
   executor records turn-matched start evidence in the shared `routine_runs` row,

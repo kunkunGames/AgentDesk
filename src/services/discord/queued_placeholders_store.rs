@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use poise::serenity_prelude::{ChannelId, MessageId};
 use serde::{Deserialize, Serialize};
 
-use crate::services::discord::runtime_store;
+use crate::services::discord::{input_runtime::fence, runtime_store};
 use crate::services::provider::ProviderKind;
 
 /// Wire format for a single queued-placeholder mapping. Stored as a JSON
@@ -87,6 +87,24 @@ pub(super) fn save_channel_queued_placeholders(
     channel_id: ChannelId,
     entries: &[(MessageId, MessageId)],
 ) {
+    if fence::lookup(provider, channel_id.get()).is_none() {
+        return save_channel_queued_placeholders_unfenced(
+            provider, token_hash, channel_id, entries,
+        );
+    }
+    if let Err(error) = fence::write(provider, channel_id.get(), || {
+        save_entries_checked(channel_file_path(provider, token_hash, channel_id), entries)
+    }) {
+        tracing::warn!(channel_id = channel_id.get(), %error, "input accessory persistence refused");
+    }
+}
+
+fn save_channel_queued_placeholders_unfenced(
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel_id: ChannelId,
+    entries: &[(MessageId, MessageId)],
+) {
     let Some(path) = channel_file_path(provider, token_hash, channel_id) else {
         return;
     };
@@ -107,6 +125,43 @@ pub(super) fn save_channel_queued_placeholders(
     if let Ok(json) = serde_json::to_string_pretty(&payload) {
         let _ = runtime_store::atomic_write(&path, &json);
     }
+}
+
+fn save_entries_checked(
+    path: Option<PathBuf>,
+    entries: &[(MessageId, MessageId)],
+) -> Result<(), String> {
+    let path = path.ok_or_else(|| "AgentDesk runtime root unavailable".to_owned())?;
+    if entries.is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => runtime_store::fsync_parent_dir(&path).map_err(|error| error.to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    } else {
+        let payload: Vec<_> = entries
+            .iter()
+            .map(|(user, placeholder)| QueuedPlaceholderEntry {
+                user_message_id: user.get(),
+                placeholder_message_id: placeholder.get(),
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?;
+        runtime_store::atomic_write(&path, &json)?;
+        runtime_store::fsync_parent_dir(&path).map_err(|error| error.to_string())
+    }
+}
+
+fn snapshot_map(
+    map: &dashmap::DashMap<(ChannelId, MessageId), MessageId>,
+    channel_id: ChannelId,
+) -> Vec<(MessageId, MessageId)> {
+    map.iter()
+        .filter_map(|kv| {
+            let (channel, user) = *kv.key();
+            (channel == channel_id).then_some((user, *kv.value()))
+        })
+        .collect()
 }
 
 fn save_channel_entries(path: Option<PathBuf>, entries: &[(MessageId, MessageId)]) {
@@ -138,6 +193,27 @@ pub(super) fn save_channel_queue_exit_placeholder_clears(
     channel_id: ChannelId,
     entries: &[(MessageId, MessageId)],
 ) {
+    if fence::lookup(provider, channel_id.get()).is_none() {
+        return save_channel_queue_exit_placeholder_clears_unfenced(
+            provider, token_hash, channel_id, entries,
+        );
+    }
+    if let Err(error) = fence::write(provider, channel_id.get(), || {
+        save_entries_checked(
+            pending_clear_channel_file_path(provider, token_hash, channel_id),
+            entries,
+        )
+    }) {
+        tracing::warn!(channel_id = channel_id.get(), %error, "input accessory persistence refused");
+    }
+}
+
+fn save_channel_queue_exit_placeholder_clears_unfenced(
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel_id: ChannelId,
+    entries: &[(MessageId, MessageId)],
+) {
     save_channel_entries(
         pending_clear_channel_file_path(provider, token_hash, channel_id),
         entries,
@@ -155,6 +231,69 @@ pub(super) fn load_queued_placeholders(
     token_hash: &str,
 ) -> HashMap<(ChannelId, MessageId), MessageId> {
     load_entries(store_root(), provider, token_hash)
+}
+
+#[cfg(test)]
+pub(super) fn load_channel_queued_placeholders_checked(
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel: ChannelId,
+) -> Result<HashMap<(ChannelId, MessageId), MessageId>, String> {
+    if crate::services::discord::inflight::scoped_restore_mutant("post-filter") {
+        return Ok(load_queued_placeholders(provider, token_hash)
+            .into_iter()
+            .filter(|((id, _), _)| *id == channel)
+            .collect());
+    }
+    if fence::lookup(provider, channel.get()).is_some() {
+        return Err("input-protected placeholder restore".into());
+    }
+    let path =
+        channel_file_path(provider, token_hash, channel).ok_or("placeholder root unavailable")?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let entries: Vec<QueuedPlaceholderEntry> =
+        serde_json::from_str(&content).map_err(|error| error.to_string())?;
+    let mut loaded = HashMap::new();
+    for entry in entries {
+        if entry.user_message_id == 0 || entry.placeholder_message_id == 0 {
+            return Err("zero placeholder identity".into());
+        }
+        let key = (channel, MessageId::new(entry.user_message_id));
+        let card = MessageId::new(entry.placeholder_message_id);
+        if loaded
+            .insert(key, card)
+            .is_some_and(|previous| previous != card)
+        {
+            return Err("conflicting persisted placeholder owner".into());
+        }
+    }
+    Ok(loaded)
+}
+
+#[cfg(test)]
+pub(super) fn persist_channel_from_map_checked(
+    map: &dashmap::DashMap<(ChannelId, MessageId), MessageId>,
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel: ChannelId,
+) -> Result<(), String> {
+    let result = fence::write(provider, channel.get(), || {
+        if fence::lookup(provider, channel.get()).is_some() {
+            return Err("input-protected placeholder restore".into());
+        }
+        save_entries_checked(
+            channel_file_path(provider, token_hash, channel),
+            &snapshot_map(map, channel),
+        )
+    });
+    if crate::services::discord::inflight::scoped_restore_mutant("persist-error-complete") {
+        return Ok(());
+    }
+    result
 }
 
 pub(super) fn load_queue_exit_placeholder_clears(
@@ -195,7 +334,19 @@ fn load_entries(
         };
         let Ok(items) = serde_json::from_str::<Vec<QueuedPlaceholderEntry>>(&content) else {
             // Malformed file — drop it so future writes succeed cleanly.
-            let _ = fs::remove_file(&path);
+            if fence::lookup(provider, channel_id.get()).is_none() {
+                let _ = fs::remove_file(&path);
+            } else {
+                let _ = fence::write(provider, channel_id.get(), || {
+                    let latest = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+                    if latest == content {
+                        fs::remove_file(&path).map_err(|error| error.to_string())?;
+                        runtime_store::fsync_parent_dir(&path)
+                            .map_err(|error| error.to_string())?;
+                    }
+                    Ok(())
+                });
+            }
             continue;
         };
         for item in items {
@@ -216,6 +367,25 @@ pub(super) fn persist_channel_from_map(
     token_hash: &str,
     channel_id: ChannelId,
 ) {
+    if fence::lookup(provider, channel_id.get()).is_none() {
+        return persist_channel_from_map_unfenced(map, provider, token_hash, channel_id);
+    }
+    if let Err(error) = fence::write(provider, channel_id.get(), || {
+        save_entries_checked(
+            channel_file_path(provider, token_hash, channel_id),
+            &snapshot_map(map, channel_id),
+        )
+    }) {
+        tracing::warn!(channel_id = channel_id.get(), %error, "input accessory persistence refused");
+    }
+}
+
+fn persist_channel_from_map_unfenced(
+    map: &dashmap::DashMap<(ChannelId, MessageId), MessageId>,
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel_id: ChannelId,
+) {
     let entries: Vec<(MessageId, MessageId)> = map
         .iter()
         .filter_map(|kv| {
@@ -230,7 +400,63 @@ pub(super) fn persist_channel_from_map(
     save_channel_queued_placeholders(provider, token_hash, channel_id, &entries);
 }
 
+pub(super) async fn persist_map_on_worker(
+    map: &dashmap::DashMap<(ChannelId, MessageId), MessageId>,
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel_id: ChannelId,
+    pending_clear: bool,
+) {
+    if fence::lookup(provider, channel_id.get()).is_none() {
+        if pending_clear {
+            persist_queue_exit_placeholder_clears_channel_from_map(
+                map, provider, token_hash, channel_id,
+            );
+        } else {
+            persist_channel_from_map(map, provider, token_hash, channel_id);
+        }
+        return;
+    }
+    let entries = snapshot_map(map, channel_id);
+    let provider = provider.clone();
+    let token_hash = token_hash.to_owned();
+    fence::effect::io(move || {
+        if pending_clear {
+            save_channel_queue_exit_placeholder_clears(
+                &provider,
+                &token_hash,
+                channel_id,
+                &entries,
+            );
+        } else {
+            save_channel_queued_placeholders(&provider, &token_hash, channel_id, &entries);
+        }
+    })
+    .await;
+}
+
 pub(super) fn persist_queue_exit_placeholder_clears_channel_from_map(
+    map: &dashmap::DashMap<(ChannelId, MessageId), MessageId>,
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel_id: ChannelId,
+) {
+    if fence::lookup(provider, channel_id.get()).is_none() {
+        return persist_queue_exit_placeholder_clears_channel_from_map_unfenced(
+            map, provider, token_hash, channel_id,
+        );
+    }
+    if let Err(error) = fence::write(provider, channel_id.get(), || {
+        save_entries_checked(
+            pending_clear_channel_file_path(provider, token_hash, channel_id),
+            &snapshot_map(map, channel_id),
+        )
+    }) {
+        tracing::warn!(channel_id = channel_id.get(), %error, "input accessory persistence refused");
+    }
+}
+
+fn persist_queue_exit_placeholder_clears_channel_from_map_unfenced(
     map: &dashmap::DashMap<(ChannelId, MessageId), MessageId>,
     provider: &ProviderKind,
     token_hash: &str,
@@ -248,4 +474,146 @@ pub(super) fn persist_queue_exit_placeholder_clears_channel_from_map(
         })
         .collect();
     save_channel_queue_exit_placeholder_clears(provider, token_hash, channel_id, &entries);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn c1_shared_async_accessory_writes_existing_effect_after_closing() {
+        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            root.path(),
+        );
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let channel = ChannelId::new(6_325_413);
+        let gate = fence::Gate::protect(shared.provider.clone(), channel.get()).unwrap();
+        let _health = fence::test_health::Clear::new(&gate);
+        fence::effect::scope(Some(gate.admit().unwrap()), async {
+            let _closing = gate.close().unwrap();
+            let persist_lock = shared.queued_placeholders_persist_lock(channel);
+            let guard = persist_lock.lock().await;
+            shared
+                .insert_queued_placeholder_on_worker_locked(
+                    channel,
+                    MessageId::new(7),
+                    MessageId::new(107),
+                )
+                .await;
+            let card_path =
+                channel_file_path(&shared.provider, &shared.token_hash, channel).unwrap();
+            let card: Vec<QueuedPlaceholderEntry> =
+                serde_json::from_slice(&fs::read(&card_path).unwrap()).unwrap();
+            assert_eq!(
+                (card[0].user_message_id, card[0].placeholder_message_id),
+                (7, 107)
+            );
+            assert_eq!(
+                shared
+                    .remove_queued_placeholder_on_worker_locked(channel, MessageId::new(7))
+                    .await,
+                Some(MessageId::new(107))
+            );
+            assert!(!card_path.exists());
+            drop(guard);
+            shared
+                .add_pending_queue_exit_placeholder_clear_one(
+                    channel,
+                    MessageId::new(8),
+                    MessageId::new(108),
+                )
+                .await;
+            let path =
+                pending_clear_channel_file_path(&shared.provider, &shared.token_hash, channel)
+                    .unwrap();
+            let entries: Vec<QueuedPlaceholderEntry> =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].user_message_id, 8);
+            assert_eq!(entries[0].placeholder_message_id, 108);
+            shared
+                .remove_pending_queue_exit_placeholder_clears(
+                    channel,
+                    &[(MessageId::new(8), MessageId::new(108))],
+                )
+                .await;
+            assert!(!path.exists());
+        })
+        .await;
+    }
+    #[test]
+    fn b2_placeholder_off_delta_zero_and_protected_failures_are_observable() {
+        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_ROOT_DIR",
+            root.path(),
+        );
+        let provider = ProviderKind::Claude;
+        let off = ChannelId::new(6_325_307);
+        let entries = [(MessageId::new(8), MessageId::new(108))];
+        let path = channel_file_path(&provider, "off", off).unwrap();
+        save_channel_queued_placeholders(&provider, "off", off, &entries);
+        let expected = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        save_channel_queued_placeholders_unfenced(&provider, "off", off, &entries);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        let map = dashmap::DashMap::new();
+        map.insert((off, entries[0].0), entries[0].1);
+        persist_channel_from_map(&map, &provider, "off", off);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        save_channel_queue_exit_placeholder_clears(&provider, "off", off, &entries);
+        let clear = pending_clear_channel_file_path(&provider, "off", off).unwrap();
+        assert_eq!(fs::read(&clear).unwrap(), expected);
+        persist_queue_exit_placeholder_clears_channel_from_map(&map, &provider, "off", off);
+        assert_eq!(fs::read(&clear).unwrap(), expected);
+        fs::write(&path, b"invalid").unwrap();
+        assert!(load_queued_placeholders(&provider, "off").is_empty());
+        assert!(!path.exists());
+        save_channel_queued_placeholders(&provider, "off", off, &[]);
+        save_channel_queue_exit_placeholder_clears(&provider, "off", off, &[]);
+        assert!(!clear.exists());
+        assert!(
+            !root.path().join("runtime/discord_inflight").exists(),
+            "off accessories never add a sidecar"
+        );
+        let channel = ChannelId::new(6_325_308);
+        let gate = fence::Gate::protect(provider.clone(), channel.get()).unwrap();
+        let _health =
+            crate::services::discord::input_runtime::fence::test_health::Clear::new(&gate);
+        let protected = channel_file_path(&provider, "blocked", channel).unwrap();
+        fs::create_dir_all(protected.parent().unwrap().parent().unwrap()).unwrap();
+        fs::write(protected.parent().unwrap(), b"not a directory").unwrap();
+        save_channel_queued_placeholders(&provider, "valid", channel, &entries);
+        let valid = channel_file_path(&provider, "valid", channel).unwrap();
+        assert_eq!(fs::read(&valid).unwrap(), expected);
+        fs::write(&valid, b"invalid").unwrap();
+        assert!(load_queued_placeholders(&provider, "valid").is_empty());
+        assert!(!valid.exists());
+        save_channel_queue_exit_placeholder_clears(&provider, "valid", channel, &entries);
+        assert_eq!(
+            fs::read(pending_clear_channel_file_path(&provider, "valid", channel).unwrap())
+                .unwrap(),
+            expected
+        );
+        save_channel_queued_placeholders(&provider, "blocked", channel, &entries);
+        assert!(!protected.exists());
+        assert!(
+            fence::health_reasons()
+                .iter()
+                .any(|reason| reason.contains("channel=6325308") && reason.contains("Persistence"))
+        );
+        gate.clear_failure_for_test();
+        let closing = gate.close().unwrap();
+        save_channel_queued_placeholders(&provider, "closed", channel, &entries);
+        assert!(
+            !channel_file_path(&provider, "closed", channel)
+                .unwrap()
+                .exists()
+        );
+        gate.clear_failure_for_test();
+        drop(closing);
+    }
 }

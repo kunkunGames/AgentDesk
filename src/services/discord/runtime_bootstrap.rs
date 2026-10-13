@@ -1,6 +1,11 @@
+use super::codex_adoption_runtime::boot::{BootRole, record_role};
 use super::*;
-use crate::services::cluster::node_registry::GatewayWaiterGuard;
+use crate::services::cluster::{home_availability, node_registry::GatewayWaiterGuard};
 
+#[cfg(test)]
+pub mod boot_retirement;
+#[cfg(test)]
+mod channel_homes_tests;
 mod deferred_restart;
 mod framework_setup;
 mod gateway_handback_breaker;
@@ -20,6 +25,16 @@ mod o_writer_host;
 mod orphan_recovery;
 mod queued_placeholders;
 mod queued_recovery;
+
+#[cfg(all(test, unix))]
+pub(in crate::services::discord) async fn restore_queued_and_inflight_for_tests(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+) -> Vec<(ChannelId, MessageId, MessageId)> {
+    queued_recovery::restore_queued_and_inflight_work(http, shared, provider).await
+}
+
 mod recovery_flush;
 mod relay_dlq_redelivery;
 mod restored_state;
@@ -128,6 +143,11 @@ pub(super) fn committed_nonce() -> Option<String> {
 
 /// Entry point: start the Discord bot
 pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBotContext) {
+    if crate::services::codex::codex_source_mode_snapshot()
+        == crate::services::codex::CodexSourceMode::Invalid
+    {
+        tracing::error!("invalid Codex source mode; new Codex launches are refused");
+    }
     let RunBotContext {
         global_active,
         global_finalizing,
@@ -191,6 +211,9 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     );
 
     let boot_config = crate::config::load_graceful();
+    let homes = HomeSettings::of(&boot_config);
+    // Records the boot judgement before delegation effects start.
+    let home_availability = install_home_availability(&provider, &homes, pg_pool.is_some());
     let modules = boot_config.cluster.runtime_profile.modules();
     let voice_config = boot_config.voice;
     let voice_barge_in = Arc::new(if modules.voice {
@@ -242,6 +265,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         bot_settings,
         &provider,
         RuntimeServices {
+            home_availability,
             initial_skills,
             token_hash: token_hash.clone(),
             api_port,
@@ -276,6 +300,19 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     // Only the utility branch leaves earlier: it builds no runtime or mint surface. Its
     // doctor handles only health-registered runtimes, which register after their reaper.
     super::inflight::reap_inflight_rows_at_boot_blocking(&provider, shared.pg_pool.clone()).await;
+    // Turn mode is fixed before the relay restores pending starts for the channels it confirms.
+    let confirmed = super::tui_direct_pending_start::turn_retirement::confirm_at_boot(
+        &provider,
+        boot_config.tui_o.as_ref(),
+    );
+    super::turn_presence::supervisor::register(&provider, &confirmed);
+    // Installed before the relay starts, so the first discovery pass is observed; off, `None`.
+    let adoption = super::codex_adoption_runtime::install(
+        &shared,
+        &provider,
+        &token_hash,
+        boot_config.tui_o.as_ref(),
+    );
     super::tui_prompt_relay::spawn_tui_prompt_relay(shared.clone(), provider.clone());
 
     // Phase 5.2 of intake-node-routing (issue #2009): populate
@@ -290,14 +327,23 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     // returns Err on already-set), preserving the leader's existing
     // semantics.
     let _ = shared.http.cached_bot_token.set(token.to_string());
+    // Presence sends only after the token is set, and only where turn mode is configured.
+    let turn = boot_config.tui_o.as_ref().map(|config| &config.turn);
+    if turn.is_some_and(|turn| turn.all_owned || !turn.channels.is_empty()) {
+        super::turn_presence::supervisor::spawn(shared.clone(), provider.clone());
+    }
 
     if !modules.gateway {
+        record_role(adoption.as_ref(), BootRole::RestWorker);
         health_registry
             .register_worker(provider.as_str().to_string(), shared.clone())
             .await;
         spawns::run_bot_spawn_deferred_restart_poller(&shared, &provider);
         #[cfg(unix)]
         spawns::run_bot_spawn_reachability_observation(&shared, &provider);
+        // Delegated homes hold their channels before any restored or new turn can run there.
+        start_channel_homes(&shared, &provider, HomeRole::RestWorker, &homes).await;
+        o_writer_host::spawn_delegated(&shared, &provider, boot_config.tui_o.as_ref());
         // REST workers persist the same mailbox state as Gateway runtimes.
         // Restore it before polling new intake; never replay Discord history.
         queued_recovery::restore_worker_queues(&shared, &provider).await;
@@ -350,6 +396,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         GatewayLeaseOutcome::Proceed(Some(acquired)) => (Some(acquired.lease), acquired.waiter),
         GatewayLeaseOutcome::Proceed(None) => (None, None),
         GatewayLeaseOutcome::Standby => {
+            record_role(adoption.as_ref(), BootRole::Standby);
             // Standby can execute full turns through the intake worker. Always
             // register its SharedData so detailed health proves either the real
             // active state or an explicit idle provider entry. This also makes
@@ -361,6 +408,8 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
             spawns::run_bot_spawn_deferred_restart_poller(&shared, &provider);
             #[cfg(unix)]
             spawns::run_bot_spawn_reachability_observation(&shared, &provider);
+            start_channel_homes(&shared, &provider, HomeRole::Standby, &homes).await;
+            o_writer_host::spawn_delegated(&shared, &provider, boot_config.tui_o.as_ref());
             run_bot_maybe_spawn_intake_worker(&shared, &provider);
             spawn_standby_gateway_retry(
                 shared.clone(),
@@ -378,6 +427,7 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
         }
     };
 
+    record_role(adoption.as_ref(), BootRole::Gateway);
     // Register and fence the gateway runtime before it can admit intake-worker
     // work. The poise setup callback no longer owns marker-poller startup.
     health_registry
@@ -386,6 +436,8 @@ pub(crate) async fn run_bot(token: &str, provider: ProviderKind, context: RunBot
     spawns::run_bot_spawn_deferred_restart_poller(&shared, &provider);
     #[cfg(unix)]
     spawns::run_bot_spawn_reachability_observation(&shared, &provider);
+    // Registered before the writer host reads the registry for each channel's gate.
+    start_channel_homes(&shared, &provider, HomeRole::Gateway, &homes).await;
     run_bot_maybe_spawn_intake_worker(&shared, &provider);
     crate::services::tui_o::shadow_host::spawn_if_enabled(boot_config.tui_o.as_ref());
     let pg_gateway = gateway_lease.is_some();
@@ -444,6 +496,168 @@ async fn register_standby_and_settle_reconcile(
         .register_standby(provider.as_str().to_string(), shared.clone())
         .await;
     mark_reconcile_complete(shared);
+}
+
+/// The provider runtime a delegated home boots in; it decides what "turns restored" means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HomeRole {
+    Gateway,
+    Standby,
+    RestWorker,
+}
+
+/// The flag a delegated drain reads as "persisted turns restored": `reconcile_done` where recovery
+/// ran first (gateway, REST worker); a standby or utility gateway sets it unrestored, so never.
+async fn turns_restored(shared: &SharedData, role: HomeRole) -> Arc<std::sync::atomic::AtomicBool> {
+    let restores = match role {
+        HomeRole::Gateway => shared.settings.read().await.agent.is_none(),
+        HomeRole::RestWorker => true,
+        HomeRole::Standby => false,
+    };
+    if restores {
+        Arc::clone(&shared.restart.reconcile_done)
+    } else {
+        Arc::default()
+    }
+}
+
+/// The boot config a delegated home start reads: its switch and this node's cluster id.
+#[derive(Clone, Debug, Default)]
+struct HomeSettings {
+    switch: Option<bool>,
+    instance_id: Option<String>,
+}
+
+impl HomeSettings {
+    fn of(config: &crate::config::Config) -> Self {
+        let instance_id = config.cluster.instance_id.as_deref().map(str::trim);
+        Self {
+            switch: config.runtime.channel_home_delegation_enabled,
+            instance_id: instance_id.filter(|id| !id.is_empty()).map(str::to_owned),
+        }
+    }
+}
+
+/// Records whether this provider's delegated homes can run; one that cannot holds every selected
+/// Herdr channel. With the switch off it returns before any read.
+fn install_home_availability(
+    provider: &ProviderKind,
+    settings: &HomeSettings,
+    has_pool: bool,
+) -> Option<crate::services::cluster::home_availability::Registration> {
+    home_availability::install_enabled(
+        provider.as_str(),
+        settings.switch,
+        || home_availability::preflight(has_pool, settings.instance_id.as_deref()),
+        || selected_herdr_channels(provider),
+    )
+}
+
+/// The selected channels with a Herdr endpoint on any node: those a delegation may name.
+fn selected_herdr_channels(provider: &ProviderKind) -> std::collections::BTreeSet<u64> {
+    use crate::services::agent_protocol::RuntimeHandoffKind::{ClaudeTui, CodexTui};
+    use crate::services::tui_o::channel_policy::BootChannels;
+    let read = |boot: Option<&BootChannels>| {
+        let configured = |channel: &u64| {
+            let kind = boot.and_then(|boot| boot.kind(*channel));
+            let ours = matches!(
+                (provider, kind),
+                (ProviderKind::Claude, Some(ClaudeTui)) | (ProviderKind::Codex, Some(CodexTui))
+            );
+            ours && crate::config::session_hosts::herdr_endpoint(*channel).is_some()
+        };
+        let selected = boot.map(|boot| boot.selected().iter().copied().filter(configured));
+        selected.map(Iterator::collect).unwrap_or_default()
+    };
+    #[cfg(not(test))]
+    return read(crate::services::tui_o::channel_policy::boot());
+    #[cfg(test)]
+    crate::services::tui_o::cutover::test_override::with_channels(read)
+}
+
+/// Registers the delegated homes this provider runtime takes part in and starts their lease and
+/// drain; with `runtime.channel_home_delegation_enabled` off it returns before any read.
+async fn start_channel_homes(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    role: HomeRole,
+    settings: &HomeSettings,
+) -> Vec<Arc<crate::services::cluster::channel_home_boot::HomeGate>> {
+    use crate::services::cluster::channel_home_boot::{self, Boot, BootPort};
+    let switch = settings.switch;
+    if switch != Some(true) {
+        return Vec::new();
+    }
+    let restored = turns_restored(shared, role).await;
+    let candidates = || {
+        let selected = crate::services::tui_o::channel_policy::boot();
+        let here = |channel: &u64| herdr_runs_here(*channel);
+        let selected = selected.map(|boot| boot.selected().iter().copied().filter(here));
+        selected.map(Iterator::collect).unwrap_or_default()
+    };
+    channel_home_boot::start(switch, || {
+        let pool = shared.pg_pool.clone()?;
+        let local = settings.instance_id.clone()?;
+        let rows = channel_home_boot::listed(&pool);
+        let port = |channel: u64| {
+            let reset = legacy_reset(shared, provider, channel);
+            BootPort::reading(channel, Arc::clone(&restored), reset)
+        };
+        Some(Boot {
+            provider: provider.as_str().to_owned(),
+            local,
+            pool,
+            rows,
+            candidates: candidates(),
+            port,
+        })
+    })
+    .await
+}
+
+/// Whether the channel's Herdr endpoint runs on this node.
+fn herdr_runs_here(channel: u64) -> bool {
+    let endpoint = crate::config::session_hosts::herdr_endpoint(channel);
+    let local = crate::config::session_hosts::local_node();
+    endpoint.is_some_and(|endpoint| Some(endpoint.execution_node) == local)
+}
+
+/// A releasing drain's reset of the channel's Legacy session through main's managed reset; a
+/// channel whose Herdr endpoint runs here keeps its pane and row.
+fn legacy_reset(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel: u64,
+) -> crate::services::cluster::channel_home_boot::LegacyReset {
+    use crate::services::cluster::channel_home_boot::ResetRefused;
+    let (shared, provider) = (Arc::clone(shared), provider.clone());
+    Arc::new(move || {
+        let (shared, provider) = (Arc::clone(&shared), provider.clone());
+        Box::pin(async move {
+            if herdr_runs_here(channel) {
+                return Ok(());
+            }
+            let http = shared.serenity_http_or_token_fallback();
+            let http =
+                http.ok_or_else(|| ResetRefused::Refused("no Discord REST client".into()))?;
+            let reset = super::commands::control::reset_channel_provider_state_for_home_drain(
+                &http,
+                &shared,
+                &provider,
+                ChannelId::new(channel),
+                "channel home release",
+                true,
+                false,
+                false,
+            );
+            match reset.await {
+                super::admin_host_guard::ManagedReset::Applied(_) => Ok(()),
+                super::admin_host_guard::ManagedReset::Refused(reason) => {
+                    Err(ResetRefused::Refused(reason))
+                }
+            }
+        })
+    })
 }
 
 #[cfg(test)]
@@ -955,6 +1169,17 @@ agents:
                 "reaper must precede {later}"
             );
         }
+        let token = body.find("cached_bot_token.set(").unwrap();
+        let presence = body.find("turn_presence::supervisor::spawn(").unwrap();
+        assert!(
+            token < presence,
+            "presence never sends before the bot token is set"
+        );
+        let confirm = body.find("turn_retirement::confirm_at_boot(").unwrap();
+        assert!(
+            at < confirm && confirm < body.find("spawn_tui_prompt_relay(").unwrap(),
+            "turn mode is fixed after the reaper and before pending starts are restored"
+        );
     }
 }
 
@@ -1021,12 +1246,20 @@ mod restart_lifecycle_characterization_tests {
     fn build_shared_with_injected_shutdown_remaining(
         shutdown_remaining: &Arc<AtomicUsize>,
     ) -> Arc<SharedData> {
+        build_shared_with_home_availability(shutdown_remaining, None)
+    }
+
+    fn build_shared_with_home_availability(
+        shutdown_remaining: &Arc<AtomicUsize>,
+        home_availability: Option<home_availability::Registration>,
+    ) -> Arc<SharedData> {
         let voice = Arc::new(voice_barge_in::VoiceBargeInRuntime::disabled());
         let health_registry = Arc::new(health::HealthRegistry::new());
         run_bot_build_shared_data(
             DiscordBotSettings::default(),
             &ProviderKind::Claude,
             RuntimeServices {
+                home_availability,
                 initial_skills: Vec::new(),
                 token_hash: "s3-restart-characterization-token-hash".to_string(),
                 api_port: 9,
@@ -1071,6 +1304,35 @@ mod restart_lifecycle_characterization_tests {
             .start_paused(true)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn background_provider_keeps_availability_after_its_boot_future_returns() {
+        let _root = crate::config::TestRuntimeRootGuard::new();
+        let _allocation = isolate_runtime_root(&crate::config::runtime_root().unwrap());
+        runtime_store::set_process_generation_for_tests(None);
+        paused_rt().block_on(async {
+            let availability = home_availability::install(
+                "claude",
+                Err(home_availability::Unavailable::MissingPool),
+                || [7].into(),
+            );
+            let shared = build_shared_with_home_availability(
+                &Arc::new(AtomicUsize::new(1)),
+                Some(availability),
+            );
+            let background = Arc::clone(&shared);
+            drop(shared);
+            assert_eq!(
+                home_availability::refusal(7),
+                Some(home_availability::Unavailable::MissingPool)
+            );
+            drop(background);
+            assert_eq!(
+                home_availability::state("claude"),
+                home_availability::Availability::Off
+            );
+        });
     }
 
     #[test]

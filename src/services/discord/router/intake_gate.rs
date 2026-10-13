@@ -7,9 +7,14 @@ use super::intake_queue_transaction::{
 };
 
 mod busy_duplicate_notice;
+pub(super) mod busy_inject;
 mod component_events;
 mod gate;
 mod queue_effects;
+mod reply_context;
+use reply_context::build_reply_context;
+#[cfg(test)]
+use reply_context::{AttachmentReplyItem, format_attachment_reply_context};
 mod stale_turn;
 
 pub(in crate::services::discord) use gate::should_process_turn_message;
@@ -175,125 +180,6 @@ async fn resolve_voice_transcript_announcement_for_intake(
     }
 }
 
-async fn build_reply_context(
-    ctx: &serenity::Context,
-    channel_id: serenity::ChannelId,
-    new_message: &serenity::Message,
-) -> Option<String> {
-    let ref_msg = new_message.referenced_message.as_ref()?;
-    let ref_author = &ref_msg.author.name;
-    let ref_content = ref_msg.content.trim();
-    let ref_text = if ref_content.is_empty() {
-        let attachments = ref_msg
-            .attachments
-            .iter()
-            .map(AttachmentReplyItem::from)
-            .collect::<Vec<_>>();
-        format_attachment_reply_context(ref_author, ref_msg.id.get(), &attachments)
-    } else {
-        let truncated = truncate_str(ref_content, 500);
-        format!(
-            "[Reply context]\nAuthor: {}\nContent: {}",
-            ref_author, truncated
-        )
-    };
-
-    let mut context_parts = Vec::new();
-    if let Ok(preceding) = channel_id
-        .messages(
-            &ctx.http,
-            serenity::builder::GetMessages::new()
-                .before(ref_msg.id)
-                .limit(4),
-        )
-        .await
-    {
-        let mut msgs: Vec<_> = preceding
-            .iter()
-            .filter(|m| !m.content.trim().is_empty())
-            .collect();
-        msgs.reverse();
-        let mut budget: usize = 1000;
-        for m in msgs
-            .iter()
-            .rev()
-            .take(4)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            let entry = format!("{}: {}", m.author.name, truncate_str(m.content.trim(), 300));
-            if entry.len() > budget {
-                break;
-            }
-            budget -= entry.len();
-            context_parts.push(entry);
-        }
-    }
-
-    if context_parts.is_empty() {
-        Some(ref_text)
-    } else {
-        let preceding_ctx = context_parts.join("\n");
-        Some(format!(
-            "[Reply context — preceding conversation]\n{}\n\n{}",
-            preceding_ctx, ref_text
-        ))
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct AttachmentReplyItem {
-    filename: String,
-    size: u32,
-    description: Option<String>,
-}
-
-impl From<&serenity::Attachment> for AttachmentReplyItem {
-    fn from(attachment: &serenity::Attachment) -> Self {
-        Self {
-            filename: attachment.filename.clone(),
-            size: attachment.size,
-            description: attachment.description.clone(),
-        }
-    }
-}
-
-fn format_attachment_reply_context(
-    ref_author: &str,
-    ref_message_id: u64,
-    attachments: &[AttachmentReplyItem],
-) -> String {
-    if attachments.is_empty() {
-        return format!("[Reply to {}'s message (no text content)]", ref_author);
-    }
-
-    let mut lines = vec![
-        "[Reply context]".to_string(),
-        format!("Author: {ref_author}"),
-        format!("Canonical Discord message id: {ref_message_id}"),
-        "Content: [message has attachments but no text]".to_string(),
-        "Attachments:".to_string(),
-    ];
-    for (index, attachment) in attachments.iter().take(10).enumerate() {
-        let description = attachment.description.as_deref().unwrap_or("").trim();
-        let mut line = format!(
-            "{}. {} ({} bytes)",
-            index + 1,
-            attachment.filename,
-            attachment.size
-        );
-        if !description.is_empty() {
-            line.push_str(&format!(" — {}", truncate_str(description, 160)));
-        }
-        lines.push(line);
-    }
-    if attachments.len() > 10 {
-        lines.push(format!("... {} more attachment(s)", attachments.len() - 10));
-    }
-    lines.join("\n")
-}
-
 pub(in crate::services::discord) async fn handle_event(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
@@ -452,7 +338,8 @@ pub(in crate::services::discord) async fn handle_event(
                                     iv.message_id == new_message.id
                                         || iv.source_message_ids.contains(&new_message.id)
                                 });
-                            if already_intake {
+                            let (take, id) = (busy_inject::thread_may_take, new_message.id);
+                            if already_intake || !take(&data.provider, parent_channel, id) {
                                 thread_promotion_blocked = true;
                                 // Mark thread-processed so subsequent duplicates are no-ops.
                                 e.insert((now, true));
@@ -637,6 +524,12 @@ pub(in crate::services::discord) async fn handle_event(
                     channel_id,
                     effective_channel_id,
                 );
+                return Ok(());
+            }
+            // A redelivered message an injection already took stops before anything acts on it.
+            let parent = (effective_channel_id != channel_id).then_some(effective_channel_id);
+            let taken = busy_inject::already_taken;
+            if taken(&data.provider, channel_id, parent, new_message.id) {
                 return Ok(());
             }
             if !is_voice_transcript_announcement
@@ -936,6 +829,14 @@ pub(in crate::services::discord) async fn handle_event(
             // `LazyLock`, avoiding a per-message compile cost in the hot path.
             let cmd_text = strip_leading_bot_mention(text);
             if cmd_text.starts_with('!') {
+                // Recorded before the handler, so even a silent or failing command is
+                // settled by catch-up instead of replaying as a provider prompt.
+                super::super::catch_up::consumed_commands::record(
+                    &data.provider,
+                    channel_id,
+                    new_message.id,
+                )
+                .await;
                 // Skill prompts enter central admission with their upload paths
                 // still in the submission. Do not inject them into this
                 // gateway's local session before owner routing has admitted
@@ -1229,6 +1130,25 @@ pub(in crate::services::discord) async fn handle_event(
                     return Ok(());
                 }
                 // No active turn — fall through to normal processing below
+            }
+
+            // A busy Claude TUI pane takes any admitted text before intake queues or starts it.
+            let live = busy_inject::LiveText {
+                channel_id,
+                parent,
+                message_id: new_message.id,
+                author_id: user_id,
+                author_is_bot: new_message.author.bot,
+                author_is_allowed_automation: author_excluded_from_cancel_preservation,
+                text,
+                reply_context: reply_context.as_deref(),
+                has_reply_boundary,
+                carries_more_than_text: !upload_records.is_empty()
+                    || !new_message.attachments.is_empty()
+                    || resolved_voice_announcement.is_some(),
+            };
+            if busy_inject::offered(ctx, data, &live).await {
+                return Ok(());
             }
 
             // Queue messages while AI is in progress (executed as next turn after current finishes)
@@ -1578,12 +1498,20 @@ pub(in crate::services::discord) async fn handle_event(
 
             // Checkpoint: message about to be processed as a turn
             // (#2044 F12 — monotonic).
-            super::super::advance_last_message_checkpoint(
-                &data.shared,
-                &data.provider,
-                channel_id,
-                new_message.id,
-            );
+            let checkpoint = || {
+                super::super::advance_last_message_checkpoint(
+                    &data.shared,
+                    &data.provider,
+                    channel_id,
+                    new_message.id,
+                );
+            };
+            // A replay-deferred direct dispatch checkpoints only once its custody is settled.
+            let settle_checkpoint = attachment_local_permit.is_none()
+                && super::checkpoint_waits_for_admission(channel_id);
+            if !settle_checkpoint {
+                checkpoint();
+            }
 
             // #796: classify the originating sender so the race handler in
             // `handle_text_message` knows whether it's safe to delete the
@@ -1659,6 +1587,8 @@ pub(in crate::services::discord) async fn handle_event(
             };
             if let Some(permit) = attachment_local_permit {
                 super::finish_admitted_text_intake(&deps, permit, submission).await?;
+            } else if settle_checkpoint {
+                super::dispatch_live_text_intake(&deps, submission, checkpoint).await?;
             } else {
                 super::dispatch_text_intake(&deps, submission).await?;
             }

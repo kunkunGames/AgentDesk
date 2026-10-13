@@ -62,6 +62,7 @@ impl ManagedReset {
 
 /// Puts back the input an intake took from `channel_id` when a refused reset stops it before
 /// its turn: the uploads lead the channel's pending list again and its clear flag returns.
+/// `false` when the channel has no session to take it back.
 pub(crate) async fn return_intake_input(
     shared: &SharedData,
     channel_id: ChannelId,
@@ -69,7 +70,7 @@ pub(crate) async fn return_intake_input(
         crate::services::cluster::attachment_transfer::uploads::PendingUploads,
         Option<bool>,
     ),
-) {
+) -> bool {
     let mut data = shared.core.lock().await;
     let Some(session) = data.sessions.get_mut(&channel_id) else {
         let (channel_id, lost) = (channel_id.get(), uploads.len());
@@ -78,12 +79,13 @@ pub(crate) async fn return_intake_input(
             lost,
             "no session to return a refused intake's input to"
         );
-        return;
+        return false;
     };
     session.pending_uploads.splice(0..0, uploads);
     if let Some(cleared) = was_cleared {
         session.cleared = cleared;
     }
+    true
 }
 
 /// Why a reset that kills or recreates the channel's managed session may not touch it. A
@@ -98,13 +100,139 @@ pub(super) async fn managed_reset_refusal(
 ) -> Option<String> {
     let kills = reset_provider_state && provider.uses_managed_tmux_backend();
     if !(kills || recreate_tmux) {
-        return None;
+        // A Herdr-configured channel keeps its provider state whatever the runtime's backend.
+        return reset_provider_state.then(|| configured_refusal(channel_id.get()))?;
     }
     let name = session_channel_name(shared, channel_id).await;
     let reason = reset_refusal(shared, provider, channel_id, explicit_session_key, name).await?;
     let channel_id = channel_id.get();
     tracing::warn!(channel_id, %reason, "managed session reset refused");
     Some(reason)
+}
+
+/// Where a channel clear goes, judged before its first change.
+pub(crate) enum ResetTarget {
+    /// Main's managed tmux reset.
+    LegacyTmux,
+    /// The provider's own `/clear` through its host's adapter; the pane is kept.
+    NativeClear(HostAdapter),
+    Refused(String),
+}
+
+pub(crate) enum HostAdapter {
+    /// The planned pane clear and the session key whose selector it clears and saves.
+    #[cfg(unix)]
+    Herdr(Box<crate::services::session_host::HerdrClearPlan>, String),
+}
+
+/// A channel clear's target. With the Claude and the provider's Herdr switches off, or no Herdr
+/// endpoint for the channel, it is exactly [`managed_reset_refusal`]'s verdict, key unresolved.
+pub(super) async fn clear_reset_target<F>(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    explicit_session_key: Option<&str>,
+    session_key: impl FnOnce() -> F,
+) -> ResetTarget
+where
+    F: std::future::Future<Output = Option<String>>,
+{
+    #[cfg(unix)]
+    if (crate::services::turn_host::herdr_turn_switched_on()
+        || crate::services::turn_host::herdr_turn_switched_on_for(provider))
+        && crate::config::session_hosts::herdr_endpoint(channel_id.get()).is_some()
+    {
+        use crate::services::session_host::HerdrClearRefusal;
+        let refused = |refusal: HerdrClearRefusal| ResetTarget::Refused(refusal.to_string());
+        let Some(pool) = shared.pg_pool.as_ref() else {
+            return refused(HerdrClearRefusal::NoDatabase);
+        };
+        let Some(key) = session_key().await else {
+            return refused(HerdrClearRefusal::NoSessionKey);
+        };
+        let read = read_herdr_clear(Some(pool), provider, channel_id.get(), Some(&key)).await;
+        let read = match read {
+            Ok(read) => read,
+            Err(reason) => return ResetTarget::Refused(reason),
+        };
+        let judged = tokio::task::spawn_blocking(move || read.target(key)).await;
+        return judged.unwrap_or_else(|error| ResetTarget::Refused(error.to_string()));
+    }
+    #[cfg(not(unix))]
+    let _ = session_key;
+    let refusal = managed_reset_refusal;
+    match refusal(
+        shared,
+        provider,
+        channel_id,
+        true,
+        false,
+        explicit_session_key,
+    )
+    .await
+    {
+        Some(reason) => ResetTarget::Refused(reason),
+        None => ResetTarget::LegacyTmux,
+    }
+}
+
+/// What a configured channel's clear is judged on: its row as the turn host reads it, and O's
+/// rotation projection, both read before any Herdr I/O.
+#[cfg(unix)]
+pub(crate) struct HerdrClearRead {
+    channel: u64,
+    row: Option<crate::db::dispatched_sessions::hosted_execution::HostedRecord>,
+    unsettled: Option<usize>,
+}
+
+#[cfg(unix)]
+pub(crate) const HERDR_CODEX_CLEAR_UNSUPPORTED: &str = "herdr_native_clear_unsupported(codex)";
+
+#[cfg(unix)]
+pub(crate) async fn read_herdr_clear(
+    pool: Option<&PgPool>,
+    provider: &ProviderKind,
+    channel: u64,
+    session_key: Option<&str>,
+) -> Result<HerdrClearRead, String> {
+    use crate::services::turn_host::{TurnHost, for_turn};
+    let plan = match for_turn(pool, provider, channel, session_key).await {
+        // The native clear helper commits only on Claude's clear record; Codex has none yet.
+        TurnHost::Herdr(_) if *provider == ProviderKind::Codex => {
+            return Err(HERDR_CODEX_CLEAR_UNSUPPORTED.into());
+        }
+        TurnHost::Herdr(plan) => plan,
+        TurnHost::Refused(refusal) => return Err(refusal.to_string()),
+        TurnHost::Tmux => return Err("herdr clear: the channel resolved to tmux".into()),
+    };
+    let row = plan.row.map(|observed| observed.record);
+    let unsettled = crate::services::tui_o::writer::host::rotation_unsettled(channel);
+    Ok(HerdrClearRead {
+        channel,
+        row,
+        unsettled,
+    })
+}
+
+#[cfg(unix)]
+impl HerdrClearRead {
+    /// Plans the clear on the pane; it blocks on the socket.
+    pub(crate) fn target(self, session_key: String) -> ResetTarget {
+        let plan = crate::services::session_host::plan_clear;
+        match plan(self.channel, self.row.as_ref(), self.unsettled) {
+            Ok(plan) => ResetTarget::NativeClear(HostAdapter::Herdr(Box::new(plan), session_key)),
+            Err(refusal) => ResetTarget::Refused(refusal.to_string()),
+        }
+    }
+}
+
+/// Why a Herdr-configured channel's tmux session is left as it is, whatever its stored rows say.
+pub(crate) fn configured_refusal(channel_id: u64) -> Option<String> {
+    let endpoint = crate::config::session_hosts::herdr_endpoint(channel_id)?;
+    let key = endpoint.key;
+    Some(format!(
+        "Herdr 설정 채널(endpoint `{key}`)이라 tmux 세션을 바꾸지 않아요"
+    ))
 }
 
 /// The in-memory `channel_name` first, then the registered fallback name; with neither, only
@@ -116,6 +244,21 @@ async fn reset_refusal(
     explicit_session_key: Option<&str>,
     channel_name: Option<String>,
 ) -> Option<String> {
+    let approved_tmux =
+        explicit_session_key.and_then(super::session_identity::tmux_name_from_session_key);
+    if let Some(reason) = super::commands::control::verified_codex_reset_refusal_for_target(
+        shared,
+        provider,
+        channel_id,
+        approved_tmux.as_deref(),
+    )
+    .await
+    {
+        return Some(reason.to_owned());
+    }
+    if let Some(reason) = configured_refusal(channel_id.get()) {
+        return Some(reason);
+    }
     // Test runtimes built without a pool predate the guard; production requires PostgreSQL.
     #[cfg(test)]
     if shared.pg_pool.is_none() {
@@ -151,7 +294,7 @@ async fn session_channel_name(shared: &SharedData, channel_id: ChannelId) -> Opt
 }
 
 /// A provider-state reset of one channel judged once, read only, on the runtime, channel name,
-/// key and turn it acts on; [`ManagedResetVerdict::apply`] runs on that target without judging again.
+/// key and turn it acts on; [`ManagedResetVerdict::apply`] rechecks the target and source policy.
 #[must_use]
 pub(crate) struct ManagedResetVerdict {
     shared: Arc<SharedData>,
@@ -218,6 +361,13 @@ impl ManagedResetVerdict {
         {
             let reason = "the channel's session changed after its reset was approved";
             return ManagedReset::Refused(reason.to_string());
+        }
+        if let Some(reason) = super::commands::control::verified_codex_reset_refusal_for_target(
+            &shared, &provider, channel_id, approved,
+        )
+        .await
+        {
+            return ManagedReset::Refused(reason.to_owned());
         }
         let cleared = super::mailbox_clear_channel(&shared, &provider, channel_id).await;
         if let Some(token) = cleared.removed_token {
@@ -353,3 +503,37 @@ pub(crate) async fn row_unsupported(
 #[cfg(all(test, unix))]
 #[path = "admin_host_guard_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[cfg(unix)]
+#[path = "admin_host_guard_verified_reset_tests.rs"]
+pub(crate) mod verified_reset_tests;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_VERIFIED_CLEAR_RECHECK: std::cell::RefCell<Option<(u64, Box<dyn FnOnce()>)>> =
+        Default::default();
+}
+
+#[cfg(test)]
+pub(crate) fn before_verified_clear_recheck_for_tests(
+    channel: u64,
+    action: impl FnOnce() + 'static,
+) {
+    BEFORE_VERIFIED_CLEAR_RECHECK
+        .with(|cell| *cell.borrow_mut() = Some((channel, Box::new(action))));
+}
+
+#[cfg(test)]
+pub(crate) fn run_before_verified_clear_recheck_for_tests(channel: u64) {
+    let action = BEFORE_VERIFIED_CLEAR_RECHECK.with(|cell| {
+        let mut pending = cell.borrow_mut();
+        pending
+            .as_ref()
+            .is_some_and(|(expected, _)| *expected == channel)
+            .then(|| pending.take().unwrap().1)
+    });
+    if let Some(action) = action {
+        action();
+    }
+}

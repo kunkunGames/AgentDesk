@@ -4,7 +4,9 @@ use super::*;
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::store;
 use super::store::InflightStateFileLock;
+use crate::services::cluster::channel_home_port::RestoreFailure;
 
 fn channel_id_from_path(path: &Path) -> u64 {
     path.file_stem()
@@ -28,6 +30,8 @@ pub(crate) fn log_inflight_remove(
     reason: &'static str,
     path: &Path,
 ) {
+    #[cfg(test)]
+    receipt_test_events::record(provider, channel_id, user_msg_id, reason);
     tracing::warn!(
         target: "agentdesk::inflight_remove",
         provider = %provider.as_str(),
@@ -279,10 +283,15 @@ pub(super) fn invalidate_stale_generation_in_root(
     provider: &ProviderKind,
     current_generation: u64,
 ) -> Vec<(u64, Option<u64>)> {
-    let states = load_inflight_states_from_root(root, provider);
+    let states = load_inflight_states_from_root_excluding(root, provider, |channel| {
+        crate::services::discord::input_runtime::fence::lookup(provider, channel).is_some()
+    });
     let mut removed = Vec::new();
     for state in states {
-        if state.restart_mode.is_some() {
+        // An input-protected channel's row waits for its move or handback.
+        let protected =
+            crate::services::discord::input_runtime::fence::lookup(provider, state.channel_id);
+        if state.restart_mode.is_some() || protected.is_some() {
             continue;
         }
         if state.rebind_origin {
@@ -339,6 +348,9 @@ pub(super) fn invalidate_stale_generation_in_root(
             continue;
         };
         if state.provider_kind().as_ref() != Some(provider) {
+            continue;
+        }
+        if receipt_protected_path(&path) && !receipt_mutant("generation") {
             continue;
         }
         if state.restart_mode.is_some() {
@@ -429,6 +441,9 @@ pub(super) fn stale_removal_reason(
     age_secs: u64,
     current_generation: u64,
 ) -> Option<String> {
+    if state.herdr_before_start_stop.is_some() && !receipt_mutant("age") {
+        return None;
+    }
     match state.restart_mode {
         Some(restart_mode) => {
             // A planned-restart row is intentionally authored by the outgoing
@@ -554,7 +569,13 @@ fn relock(
     let lock = lock_inflight_state_path(path).map_err(|_| Box::new(RowVerdict::Skip(true)))?;
     match fs::read_to_string(path) {
         Ok(locked) => match parse_inflight_state_content(&locked) {
+            Ok(state) if state.herdr_before_start_stop.is_some() && !receipt_mutant("loader") => {
+                Err(Box::new(RowVerdict::Keep(state, false)))
+            }
             Ok(state) => Ok((state, lock)),
+            Err(_) if raw_before_start_receipt(&locked) && !receipt_mutant("malformed") => {
+                Err(Box::new(RowVerdict::Skip(true)))
+            }
             Err(_) => Err(Box::new(RowVerdict::HideMalformed(
                 content.to_string(),
                 locked,
@@ -598,6 +619,15 @@ fn classify_inflight_row(
     provider: &ProviderKind,
     allocation: crate::services::discord::runtime_store::ProcessGenerationAllocation,
 ) -> RowVerdict {
+    classify_inflight_row_for_restore(path, provider, allocation, false)
+}
+
+fn classify_inflight_row_for_restore(
+    path: &Path,
+    provider: &ProviderKind,
+    allocation: crate::services::discord::runtime_store::ProcessGenerationAllocation,
+    retain_for_restore: bool,
+) -> RowVerdict {
     let generation = allocation.generation;
     let verdict = || -> Result<RowVerdict, Box<RowVerdict>> {
         let Ok(content) = fs::read_to_string(path) else {
@@ -613,6 +643,9 @@ fn classify_inflight_row(
                 Ok(parsed) => parsed,
                 Err(_) => (relock(path, &content)?.0, false),
             };
+        if raw_before_start_receipt(&content) && !receipt_mutant("loader") {
+            return Ok(RowVerdict::Keep(state, false));
+        }
         let foreign = |row: &InflightTurnState| row.provider_kind().as_ref() != Some(provider);
         if foreign(&state) {
             let (locked, lock) = relock(path, &content)?;
@@ -622,7 +655,10 @@ fn classify_inflight_row(
             }
             (state, backfill) = (locked, false);
         }
-        if stale_removal_reason_for_path(path, &state, generation).is_none() {
+        let retain = retain_for_restore && state.restart_mode.is_none();
+        #[cfg(test)]
+        let retain = retain || (retain_for_restore && scoped_restore_mutant("stale-planned"));
+        if retain || stale_removal_reason_for_path(path, &state, generation).is_none() {
             return Ok(RowVerdict::Keep(state, backfill));
         }
         let (locked, lock) = relock(path, &content)?;
@@ -632,7 +668,10 @@ fn classify_inflight_row(
         }
         Ok(
             match stale_removal_reason_for_path(path, &locked, generation) {
-                Some(_) if loader_gate_refuses_with_allocation(&locked, allocation) => {
+                Some(_)
+                    if !retain_for_restore
+                        && loader_gate_refuses_with_allocation(&locked, allocation) =>
+                {
                     RowVerdict::KeepGateRefused(locked, lock)
                 }
                 Some(reason) => RowVerdict::HideStale(reason, state, locked, lock),
@@ -646,7 +685,52 @@ fn classify_inflight_row(
 pub(in crate::services::discord) struct InflightProbeLoad {
     pub(in crate::services::discord) states: Vec<InflightTurnState>,
     pub(in crate::services::discord) complete: bool,
+    #[cfg(test)]
+    pub(in crate::services::discord) failure: Option<RestoreFailure>,
 }
+
+#[cfg(test)]
+pub(in crate::services::discord) fn scoped_restore_mutant(name: &str) -> bool {
+    std::env::var("ADK_S3ACT_B1_MUTANT").ok().as_deref() == Some(name)
+}
+
+#[cfg(test)]
+pub(in crate::services::discord) fn load_inflight_probe_scoped(
+    provider: &ProviderKind,
+    channel: u64,
+) -> InflightProbeLoad {
+    let Some(root) = inflight_runtime_root() else {
+        return InflightProbeLoad {
+            states: Vec::new(),
+            complete: false,
+            failure: Some(RestoreFailure::retryable("restore root/scope unavailable")),
+        };
+    };
+    if channel == 0
+        || crate::services::discord::input_runtime::fence::lookup(provider, channel).is_some()
+    {
+        return InflightProbeLoad {
+            states: Vec::new(),
+            complete: false,
+            failure: Some(RestoreFailure::Rejected(
+                "restore scope/input unavailable".into(),
+            )),
+        };
+    }
+    let mut loaded = if scoped_restore_mutant("scope") {
+        load_inflight_probe_with_scope(&root, provider, |_| false, None)
+    } else {
+        load_inflight_probe_with_scope(&root, provider, |id| id != channel, Some(channel))
+    };
+    if scoped_restore_mutant("complete") {
+        loaded.complete = true;
+    }
+    loaded
+}
+
+mod scoped_restore;
+#[cfg(test)]
+pub(in crate::services::discord) use scoped_restore::invalidate_stale_generation_scoped;
 
 pub(super) fn load_inflight_states_from_root(
     root: &Path,
@@ -655,11 +739,52 @@ pub(super) fn load_inflight_states_from_root(
     load_inflight_states_for_probe_from_root(root, provider).states
 }
 
+pub(super) fn load_inflight_states_from_root_excluding(
+    root: &Path,
+    provider: &ProviderKind,
+    exclude_channel: impl Fn(u64) -> bool,
+) -> Vec<InflightTurnState> {
+    load_inflight_probe_from_root_excluding(root, provider, exclude_channel).states
+}
+
+/// The excluding scan with its completeness, for callers that must not read a short scan as empty.
+pub(super) fn load_inflight_probe_from_root_excluding(
+    root: &Path,
+    provider: &ProviderKind,
+    exclude_channel: impl Fn(u64) -> bool,
+) -> InflightProbeLoad {
+    let load = load_inflight_states_for_probe_from_root_excluding(root, provider, exclude_channel);
+    #[cfg(test)]
+    if let Some(hook) = super::AFTER_EXCLUDING_SCAN.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    load
+}
+
 /// Rows the loader's verdict would retire are hidden, never unlinked or
 /// renamed: `boot_reaper` is their only retirement path.
 pub(in crate::services::discord) fn load_inflight_states_for_probe_from_root(
     root: &Path,
     provider: &ProviderKind,
+) -> InflightProbeLoad {
+    load_inflight_states_for_probe_from_root_excluding(root, provider, |_| false)
+}
+
+fn load_inflight_states_for_probe_from_root_excluding(
+    root: &Path,
+    provider: &ProviderKind,
+    exclude_channel: impl Fn(u64) -> bool,
+) -> InflightProbeLoad {
+    load_inflight_probe_with_scope(root, provider, exclude_channel, None)
+}
+
+use scoped_restore::backfill_scoped_restore;
+
+fn load_inflight_probe_with_scope(
+    root: &Path,
+    provider: &ProviderKind,
+    exclude_channel: impl Fn(u64) -> bool,
+    scope: Option<u64>,
 ) -> InflightProbeLoad {
     let dir = inflight_provider_dir(root, provider);
     let entries = match fs::read_dir(dir) {
@@ -668,11 +793,16 @@ pub(in crate::services::discord) fn load_inflight_states_for_probe_from_root(
             return InflightProbeLoad {
                 states: Vec::new(),
                 complete: error.kind() == std::io::ErrorKind::NotFound,
+                #[cfg(test)]
+                failure: (error.kind() != std::io::ErrorKind::NotFound)
+                    .then(|| RestoreFailure::retryable(error)),
             };
         }
     };
     let mut states = Vec::new();
     let mut complete = true;
+    #[cfg(test)]
+    let mut failure = None;
     let mut tmux_owners: HashMap<String, u64> = HashMap::new();
     let allocation = crate::services::discord::runtime_store::process_generation_binding();
     for entry in entries {
@@ -686,23 +816,59 @@ pub(in crate::services::discord) fn load_inflight_states_for_probe_from_root(
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let state = match classify_inflight_row(&path, provider, allocation) {
+        if scope.is_some_and(|channel| channel_id_from_path(&path) != channel) {
+            continue;
+        }
+        // Exclude by canonical filename before classification can lock or backfill an old row.
+        if let Some(channel) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse::<u64>().ok())
+            && exclude_channel(channel)
+        {
+            continue;
+        }
+        let verdict = if scope.is_some() {
+            classify_inflight_row_for_restore(&path, provider, allocation, true)
+        } else {
+            classify_inflight_row(&path, provider, allocation)
+        };
+        let state = match verdict {
             RowVerdict::Keep(state, true) => {
-                let backfilled = backfill_finalizer_turn_id_under_lock(root, &path, provider);
-                complete &= backfilled.is_some();
+                let backfilled = if scope.is_some() {
+                    backfill_scoped_restore(root, &path, provider)
+                } else {
+                    backfill_finalizer_turn_id_under_lock(root, &path, provider).ok_or_else(|| {
+                        RestoreFailure::Rejected("legacy backfill incomplete".into())
+                    })
+                };
+                complete &= backfilled.is_ok();
+                #[cfg(test)]
+                if scope.is_some() {
+                    failure = backfilled.as_ref().err().cloned();
+                }
                 backfilled.unwrap_or(state)
             }
             RowVerdict::Keep(state, false) | RowVerdict::KeepGateRefused(state, _) => state,
             RowVerdict::Skip(incomplete) => {
                 complete &= !incomplete;
+                #[cfg(test)]
+                if incomplete && scope.is_some() {
+                    failure = Some(RestoreFailure::retryable("scoped row read/lock incomplete"));
+                }
                 continue;
             }
             RowVerdict::HideStale(..)
             | RowVerdict::HideForeign(..)
             | RowVerdict::HideMalformed(..) => {
+                complete &= scope.is_none();
                 continue;
             }
         };
+        if scope.is_some_and(|channel| state.channel_id != channel) {
+            complete = false;
+            continue;
+        }
         if let Some(tmux_session_name) = state
             .tmux_session_name
             .as_deref()
@@ -728,7 +894,12 @@ pub(in crate::services::discord) fn load_inflight_states_for_probe_from_root(
         }
         states.push(state);
     }
-    InflightProbeLoad { states, complete }
+    InflightProbeLoad {
+        states,
+        complete,
+        #[cfg(test)]
+        failure,
+    }
 }
 
 mod boot_custody;
@@ -737,12 +908,56 @@ mod custody_notice;
 pub(in crate::services::discord) use boot_reaper::reap_inflight_rows_at_boot_blocking;
 #[cfg(test)]
 use boot_reaper::*;
+#[cfg(all(test, unix))]
+pub(super) fn receipt_boundary_reap(root: &Path, provider: &ProviderKind) -> usize {
+    reap_inflight_rows_at_boot_in_root(root, provider).reaped_stale
+}
+#[cfg(all(test, unix))]
+pub(super) fn receipt_boundary_reap_total(root: &Path, provider: &ProviderKind) -> usize {
+    let report = reap_inflight_rows_at_boot_in_root(root, provider);
+    report.reaped_stale + report.reaped_provider_mismatch + report.reaped_malformed
+}
+#[cfg(test)]
+pub(super) mod receipt_test_events {
+    use std::cell::RefCell;
+    thread_local! { static EVENTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) }; }
+    pub(super) fn record(provider: &super::ProviderKind, channel: u64, user: u64, reason: &str) {
+        EVENTS.with(|events| {
+            events
+                .borrow_mut()
+                .push(format!("{}:{channel}:{user}:{reason}", provider.as_str()))
+        });
+    }
+    pub(in crate::services::discord::inflight) fn take() -> Vec<String> {
+        EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+    }
+    #[cfg(unix)]
+    pub(in crate::services::discord::inflight) fn reap_after_snapshot(
+        root: &std::path::Path,
+        entered: std::sync::mpsc::SyncSender<()>,
+        released: std::sync::mpsc::Receiver<()>,
+    ) -> (usize, usize) {
+        super::BEFORE_ROW_LOCK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |_| {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            }));
+        });
+        let report = super::reap_inflight_rows_at_boot_in_root(root, &super::ProviderKind::Claude);
+        (
+            report.reaped_stale + report.reaped_provider_mismatch + report.reaped_malformed,
+            report.kept,
+        )
+    }
+}
 #[cfg(test)]
 pub(in crate::services::discord) use custody_notice::custody_notice_text;
 #[cfg(test)]
 mod boot_custody_tests;
 #[cfg(test)]
 mod custody_notice_tests;
+#[cfg(test)]
+mod input_fence_reaper_tests;
 
 #[cfg(test)]
 mod loader_gate_observation_tests {
@@ -1016,7 +1231,10 @@ mod loader_gate_observation_tests {
     #[test]
     fn observation_labels_and_allocation_only_evaluation_api_are_exact() {
         let source = include_str!("removal.rs");
-        let production = source.split_once("#[cfg(test)]").unwrap().0;
+        let production = source
+            .split_once("/// Thread-local test seam for `tmux_pane_alive_for_stale_check`.")
+            .unwrap()
+            .0;
         let observation = source
             .split_once("fn loader_gate_refuses_with_allocation(")
             .expect("loader allocation observation must remain present")
@@ -1044,12 +1262,59 @@ mod loader_gate_observation_tests {
             "state: &InflightTurnState,\n    allocation: crate::services::discord::runtime_store::ProcessGenerationAllocation,\n) -> bool {\n    loader_gate_refuses(state, allocation.generation)\n}"
         );
 
-        // Reads decide without side effects; only the reaper retires, and only
-        // after its lock-held revalidation.
+        // Legacy reads decide without retirement effects; scoped restore has
+        // separate checked mutation bodies outside that read-only contract.
         let owned = source
             .split_once("\nmod loader_gate_observation_tests")
             .unwrap()
             .0;
+        let scoped = include_str!("removal/scoped_restore.rs");
+        // Exclude only the two named items; extra items before the next item or EOF are refused.
+        let item = |text: &str, name: &str, sentinel: &str| {
+            assert_eq!(text.matches(name).count(), 1, "unique item {name}");
+            let name_at = text.find(name).expect(name);
+            let start = text[..name_at].rfind('\n').map_or(0, |index| index + 1);
+            let end = name_at + text[name_at..].find("\n}").expect("item closing brace") + 2;
+            let next = if sentinel.is_empty() {
+                text.len()
+            } else {
+                end + text[end..].find(sentinel).expect(sentinel)
+            };
+            assert!(text[end..next].trim().is_empty(), "extra item after {name}");
+            start..end
+        };
+        let ranges = [
+            item(
+                scoped,
+                "async fn invalidate_stale_generation_scoped(",
+                "pub(super) fn backfill_scoped_restore(",
+            ),
+            item(scoped, "fn backfill_scoped_restore(", ""),
+        ];
+        assert!(ranges[0].end < ranges[1].start);
+        let scoped_reads = format!(
+            "{}{}{}",
+            &scoped[..ranges[0].start],
+            &scoped[ranges[0].end..ranges[1].start],
+            &scoped[ranges[1].end..]
+        );
+        for (connection, sentinel) in [
+            (
+                "use scoped_restore::invalidate_stale_generation_scoped;",
+                "pub(super) fn load_inflight_states_from_root(",
+            ),
+            (
+                "use scoped_restore::backfill_scoped_restore;",
+                "fn load_inflight_probe_with_scope(",
+            ),
+        ] {
+            let end = owned.find(connection).expect(connection) + connection.len();
+            let next = end + owned[end..].find(sentinel).expect(sentinel);
+            assert!(
+                owned[end..next].trim().is_empty(),
+                "extra item after {connection}"
+            );
+        }
         let reads = owned.split_once("fn classify_inflight_row(").unwrap().1;
         let reads = reads.split_once("\nmod boot_reaper;").unwrap().0;
         let effects = [
@@ -1065,6 +1330,7 @@ mod loader_gate_observation_tests {
         ];
         for effect in effects.iter().chain(&events) {
             assert!(!reads.contains(effect), "{effect}");
+            assert!(!scoped_reads.contains(effect), "scoped {effect}");
         }
         assert_eq!(
             reads

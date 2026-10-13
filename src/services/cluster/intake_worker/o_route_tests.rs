@@ -17,6 +17,7 @@ async fn seed(pool: &PgPool, channel: u64, message: u64) -> i64 {
         attachment_refs: serde_json::json!([]),
         channel_id: channel.to_string(),
         user_msg_id: message.to_string(),
+        replay_source_message_ids: None,
         request_owner_id: "100".into(),
         request_owner_name: Some("Tester".into()),
         user_text: "hello".into(),
@@ -31,6 +32,7 @@ async fn seed(pool: &PgPool, channel: u64, message: u64) -> i64 {
         preserve_on_cancel: false,
         agent_id: "agent-o".into(),
         provider: "claude".into(),
+        home_epoch: None,
     };
     let id = insert_pending(pool, &payload, 1, None).await.unwrap();
     // Claims go oldest first; keep creation times apart.
@@ -217,6 +219,7 @@ async fn routed_locally(pool: &PgPool, channel: u64) -> bool {
         channel_id: &channel,
         policy_channel_id: &channel,
         user_msg_id: "9999",
+        replay_source_message_ids: None,
         request_owner_id: "100",
         request_owner_name: Some("Tester"),
         user_text: "hello",
@@ -230,6 +233,8 @@ async fn routed_locally(pool: &PgPool, channel: u64) -> bool {
         wait_for_completion: false,
         preserve_on_cancel: false,
         node_override_instance_id: None,
+        owner_authority:
+            crate::services::cluster::intake_routing_config::OwnerAuthorityChannelOptIn::NotOptedIn,
         has_nonportable_uploads: false,
         attachment_refs: &[],
     };

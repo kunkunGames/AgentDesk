@@ -27,6 +27,10 @@ pub(crate) struct BindingContext {
     pub expected_native_session_id: Option<String>,
     pub launch_mode: String,
     pub provider_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_policy: Option<String>,
 }
 
 #[derive(Debug)]
@@ -145,21 +149,7 @@ impl HookBindingEnvelope {
     ) -> Self {
         let capture = || {
             let path = env(CONTEXT_ENV).ok_or(AbsentReason::EnvUnset)?;
-            let path = Path::new(&path);
-            let ctx = read_hook_context(path).map_err(|error| match error.kind() {
-                io::ErrorKind::InvalidData => AbsentReason::Corrupt,
-                _ => AbsentReason::Unreadable,
-            })?;
-            if path.file_stem().and_then(|s| s.to_str()) != Some(&ctx.execution_nonce) {
-                return Err(AbsentReason::NonceMismatch);
-            }
-            if ctx.provider != provider {
-                return Err(AbsentReason::ProviderMismatch);
-            }
-            if ctx.schema != 1 {
-                return Err(AbsentReason::SchemaUnsupported);
-            }
-            Ok(ctx)
+            checked_context(Path::new(&path), provider)
         };
         // Overlong observations are unavailable evidence, keeping the encoded header bounded.
         let observed = |key| {
@@ -189,6 +179,71 @@ impl HookBindingEnvelope {
             .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
             .map_err(|e| e.to_string())
     }
+}
+
+/// The context file a provider's environment names, as a hook trusts it: readable, named
+/// after its own nonce, for `provider`, schema 1.
+fn checked_context(path: &Path, provider: &str) -> Result<BindingContext, AbsentReason> {
+    let ctx = read_hook_context(path).map_err(|error| match error.kind() {
+        io::ErrorKind::InvalidData => AbsentReason::Corrupt,
+        _ => AbsentReason::Unreadable,
+    })?;
+    if path.file_stem().and_then(|s| s.to_str()) != Some(&ctx.execution_nonce) {
+        return Err(AbsentReason::NonceMismatch);
+    }
+    if ctx.provider != provider {
+        return Err(AbsentReason::ProviderMismatch);
+    }
+    if ctx.schema != 1 {
+        return Err(AbsentReason::SchemaUnsupported);
+    }
+    Ok(ctx)
+}
+
+/// Execution `nonce`'s own context, read from its own path under the hook's rules.
+pub(crate) fn execution_context(provider: &str, nonce: &str) -> Result<BindingContext, String> {
+    let own = context_path(provider, nonce).map_err(|error| error.to_string())?;
+    let ctx = checked_context(&own, provider).map_err(|reason| format!("{reason:?}"))?;
+    if ctx.execution_nonce != nonce {
+        return Err(format!("context names execution {}", ctx.execution_nonce));
+    }
+    Ok(ctx)
+}
+
+/// Execution `nonce`'s context when `env_path`, as a provider's environment holds it, is
+/// exactly that execution's own context path.
+pub(crate) fn context_names_execution(
+    provider: &str,
+    nonce: &str,
+    env_path: &Path,
+) -> Result<BindingContext, String> {
+    let own = context_path(provider, nonce).map_err(|error| error.to_string())?;
+    if env_path != own {
+        return Err(format!(
+            "{} is not this execution's context",
+            env_path.display()
+        ));
+    }
+    execution_context(provider, nonce)
+}
+
+/// A candidate must retain both the canonical launch snapshot and its current nonce.
+#[allow(dead_code)]
+pub(crate) fn codex_context_candidate(
+    captured: &BindingContext,
+    prepared: &BindingContext,
+    current_nonce: Option<&str>,
+) -> Result<(), String> {
+    let canonical = execution_context("codex", &prepared.execution_nonce)?;
+    if captured != prepared
+        || canonical != *prepared
+        || current_nonce != Some(prepared.execution_nonce.as_str())
+        || prepared.channel_id.is_none()
+        || prepared.provider_root.is_none()
+    {
+        return Err("Codex launch context does not name the current execution".into());
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -241,6 +296,27 @@ impl PreparedIncarnation {
         resume: bool,
         provider_root: Option<PathBuf>,
     ) -> Result<Self, String> {
+        Self::prepare_pinned(
+            provider,
+            tmux,
+            channel_id,
+            expected,
+            resume,
+            provider_root,
+            (None, None),
+        )
+    }
+
+    /// Pins the exact argv digest and source policy before immutable publication.
+    pub(crate) fn prepare_pinned(
+        provider: &str,
+        tmux: &str,
+        channel_id: Option<u64>,
+        expected: Option<&str>,
+        resume: bool,
+        provider_root: Option<PathBuf>,
+        pinned: (Option<String>, Option<String>),
+    ) -> Result<Self, String> {
         let context = BindingContext {
             schema: 1,
             provider: provider.to_owned(),
@@ -253,6 +329,8 @@ impl PreparedIncarnation {
             expected_native_session_id: expected.map(str::to_owned),
             launch_mode: if resume { "resume" } else { "fresh" }.to_owned(),
             provider_root,
+            first_prompt_digest: pinned.0,
+            source_policy: pinned.1,
         };
         sweep(
             provider,
@@ -337,6 +415,10 @@ pub(crate) fn launch_mode(provider: &str, nonce: &str) -> Option<String> {
     (context.execution_nonce == nonce).then_some(context.launch_mode)
 }
 
+pub(crate) fn input_context(provider: &str, nonce: &str) -> Option<BindingContext> {
+    read_hook_context(&context_path(provider, nonce).ok()?).ok()
+}
+
 pub(super) fn pane_context(tmux: &str, nonce: &str) -> Option<BindingContext> {
     let ctx = read_hook_context(&context_path("claude", nonce).ok()?).ok()?;
     (ctx.schema == 1
@@ -412,6 +494,10 @@ fn sweep(
         {
             continue;
         }
+        // Retirement cannot dispose verified delivery evidence before explicit disposition.
+        if ctx.provider == "codex" && ctx.source_policy.as_deref() == Some("verified") {
+            continue;
+        }
         let presence = probe(&ctx.tmux_session);
         tc::with_tmux_source_authority(&ctx.tmux_session, |_| {
             let retired = match observe_spawn_nonce_marker(&ctx.tmux_session) {
@@ -453,9 +539,44 @@ pub(crate) mod tests {
     /// `fixture` for a caller that already holds the shared env lock, so it can
     /// take that lock before `TEST_LOCK` (the env -> dedupe order).
     pub(crate) fn fixture_after_shared_test_env_lock() -> (tempfile::TempDir, [Guard; 2]) {
+        crate::config::test_env_lock::assert_shared_test_env_lock_held();
         let root = tempfile::tempdir().unwrap();
         let env = Guard::set_path_after_shared_test_env_lock("AGENTDESK_ROOT_DIR", root.path());
         with_config(root, env)
+    }
+    #[test]
+    fn the_after_lock_fixture_needs_the_env_lock_and_restores_on_drop() {
+        use crate::config::test_env_lock::acquire_shared_test_env_lock as lock;
+        let before = {
+            let _lock = lock();
+            std::env::var_os("AGENTDESK_ROOT_DIR")
+        };
+        // The refusal panics before touching the env, and leaves that thread free to lock.
+        let refused = std::thread::spawn(|| {
+            let refused = std::panic::catch_unwind(fixture_after_shared_test_env_lock).is_err();
+            let _lock = lock();
+            (refused, std::env::var_os("AGENTDESK_ROOT_DIR"))
+        });
+        assert_eq!(
+            refused.join().unwrap(),
+            (true, before.clone()),
+            "a thread without the lock is refused"
+        );
+        {
+            let _lock = lock();
+            let (root, _env) = fixture_after_shared_test_env_lock();
+            assert_eq!(
+                std::env::var_os("AGENTDESK_ROOT_DIR"),
+                Some(root.path().into())
+            );
+        }
+        // Dropping the guard released the lock flag, or this would panic as a re-entry.
+        let _lock = lock();
+        assert_eq!(
+            std::env::var_os("AGENTDESK_ROOT_DIR"),
+            before,
+            "env restored"
+        );
     }
     fn with_config(root: tempfile::TempDir, env: Guard) -> (tempfile::TempDir, [Guard; 2]) {
         let config = root.path().join("config.yaml");
@@ -628,6 +749,86 @@ pub(crate) mod tests {
         }
         assert!(kept.path.exists());
         assert!(!retired.path.exists());
+    }
+    #[test]
+    fn binding_context_retired_verified_sweep_preserves_launch_evidence() {
+        let (root, _env) = fixture();
+        let _tmux = fake_tmux(root.path());
+        let template = prepared().context;
+        for (provider, policy) in [
+            ("codex", Some("verified")),
+            ("codex", Some("legacy")),
+            ("codex", None),
+            ("claude", Some("verified")),
+        ] {
+            for marker in ["same", "other", "absent", "unreadable"] {
+                for presence in [Present, Missing, ProbeFailed] {
+                    let mut context = template.clone();
+                    context.provider = provider.into();
+                    context.execution_nonce = uuid::Uuid::new_v4().simple().to_string();
+                    context.tmux_session = format!("binding-{}", context.execution_nonce);
+                    context.source_policy = policy.map(str::to_owned);
+                    context.created_at = Utc::now() - chrono::Duration::days(8);
+                    let p = PreparedIncarnation::create(context).unwrap();
+                    let bytes = fs::read(&p.path).unwrap();
+                    let marker_path = tc::session_temp_path(&p.context.tmux_session, "spawn_nonce");
+                    match marker {
+                        "same" => fs::write(marker_path, &p.context.execution_nonce).unwrap(),
+                        "other" => fs::write(marker_path, "replacement").unwrap(),
+                        "unreadable" => fs::create_dir(marker_path).unwrap(),
+                        _ => (),
+                    }
+                    sweep(provider, Utc::now(), 128, |_| presence);
+                    let retired = marker == "other" || (marker == "absent" && presence == Missing);
+                    let protected = provider == "codex" && policy == Some("verified");
+                    assert_eq!(p.path.exists(), protected || !retired);
+                    if p.path.exists() {
+                        assert_eq!(fs::read(&p.path).unwrap(), bytes);
+                        fs::remove_file(p.path).unwrap();
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn binding_context_new_launch_preserves_retired_verified_and_temp_evidence() {
+        let (root, _env) = fixture();
+        let _tmux = fake_tmux(root.path());
+        let mut context = prepared().context;
+        context.provider = "codex".into();
+        context.execution_nonce = uuid::Uuid::new_v4().simple().to_string();
+        context.created_at = Utc::now() - chrono::Duration::days(8);
+        context.source_policy = Some("verified".into());
+        let verified = PreparedIncarnation::create(context.clone()).unwrap();
+        fs::write(
+            tc::session_temp_path(&context.tmux_session, "spawn_nonce"),
+            "replacement",
+        )
+        .unwrap();
+        let bytes = fs::read(&verified.path).unwrap();
+        let temp = verified
+            .path
+            .parent()
+            .unwrap()
+            .join(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+        fs::write(&temp, &bytes).unwrap();
+        context.execution_nonce = uuid::Uuid::new_v4().simple().to_string();
+        context.source_policy = Some("legacy".into());
+        let legacy = PreparedIncarnation::create(context).unwrap();
+        let next = PreparedIncarnation::prepare_pinned(
+            "codex",
+            "binding-next-launch",
+            Some(42),
+            None,
+            false,
+            Some(root.path().join("codex")),
+            (None, Some("legacy".into())),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&verified.path).unwrap(), bytes);
+        assert_eq!(fs::read(&temp).unwrap(), bytes);
+        assert!(!legacy.path.exists());
+        assert!(next.path.exists());
     }
     #[test]
     fn binding_context_capture_errors_and_header_codec_are_bounded() {

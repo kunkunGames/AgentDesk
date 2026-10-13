@@ -15,31 +15,182 @@ static FAILED_PANES: LazyLock<Mutex<HashMap<Pane, UnreadyPane>>> = LazyLock::new
 #[cfg(test)]
 thread_local! { pub(crate) static BLOCK_ALIAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
+thread_local! { pub(crate) static BEFORE_JUDGED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
 thread_local! { pub(crate) static BEFORE_COMPLETE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
 
+// The rehydrate pass registers through `register_judged_claude_pane`; these unjudged forms are for tests.
+#[cfg(test)]
 pub(crate) fn register_claude_pane(tmux: &str, channel: u64, binding: TuiRuntimeBinding) {
     register_claude_pane_with(tmux, channel, binding, Record::Stat);
 }
 
+/// A launch registration without a judged binding, for tests that drive it directly.
+#[cfg(test)]
+pub(crate) fn register_launched_claude_pane(
+    tmux: &str,
+    channel: u64,
+    binding: TuiRuntimeBinding,
+    context_path: Option<&std::path::Path>,
+) -> bool {
+    register_claude_pane_with_cause(tmux, channel, binding, Record::Stat, context_path)
+        .is_some_and(Persisted::published)
+}
+
+/// A rehydrate pass's registration of `binding`, decided from the pane's binding `judged`. It is
+/// given up when a hook moved the binding since, so a stale source never replaces a newer one.
+pub(crate) fn register_judged_claude_pane(
+    tmux: &str,
+    channel: u64,
+    binding: TuiRuntimeBinding,
+    context_path: Option<&std::path::Path>,
+    judged: Option<&TuiRuntimeBinding>,
+) -> bool {
+    #[cfg(test)]
+    if let Some(seam) = BEFORE_JUDGED.with_borrow_mut(Option::take) {
+        seam();
+    }
+    // Offsets move under a live relay; only the source a pass judged from is compared.
+    let source =
+        |b: &TuiRuntimeBinding| (b.runtime_kind, b.session_id.clone(), b.output_path.clone());
+    let unmoved = |authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>| {
+        runtime_binding_for_tmux_session_under_source_authority(authority)
+            .as_ref()
+            .map(source)
+            == judged.map(source)
+    };
+    register_claude_pane_judged(tmux, channel, binding, Record::Stat, context_path, unmoved)
+        .is_some_and(Persisted::published)
+}
+
+pub(crate) fn register_rehydrated_tmux_runtime_binding_under_source_authority(
+    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
+    provider: &str,
+    channel_id: u64,
+    binding: TuiRuntimeBinding,
+) -> bool {
+    let record = Record::Stat;
+    register_rehydrated_under_source_authority(
+        authority,
+        provider,
+        channel_id,
+        binding,
+        record,
+        CauseSource::Observed,
+    )
+    .is_some_and(Persisted::published)
+}
+
 /// A restore names how the pane's binding is logged; see `Record`. `None` when nothing was published;
 /// an unpublished `Persisted` when the pane's pin refused it.
+#[cfg(test)]
 pub(crate) fn register_claude_pane_with(
     tmux: &str,
     channel: u64,
     binding: TuiRuntimeBinding,
     record: Record,
 ) -> Option<Persisted> {
+    register_claude_pane_with_cause(tmux, channel, binding, record, None)
+}
+
+/// `register_judged_claude_pane` of the pane's own binding, given up if a hook moved it since.
+pub(crate) fn register_unmoved_claude_pane(
+    tmux: &str,
+    channel: u64,
+    binding: TuiRuntimeBinding,
+) -> bool {
+    let judged = binding.clone();
+    register_judged_claude_pane(tmux, channel, binding, None, Some(&judged))
+}
+
+#[cfg(test)]
+fn register_claude_pane_with_cause(
+    tmux: &str,
+    channel: u64,
+    binding: TuiRuntimeBinding,
+    record: Record,
+    context_path: Option<&std::path::Path>,
+) -> Option<Persisted> {
+    register_claude_pane_judged(tmux, channel, binding, record, context_path, |_| true)
+}
+
+fn register_claude_pane_judged(
+    tmux: &str,
+    channel: u64,
+    binding: TuiRuntimeBinding,
+    record: Record,
+    context_path: Option<&std::path::Path>,
+    unmoved: impl FnOnce(&crate::services::tmux_common::TmuxSourceAuthority<'_>) -> bool,
+) -> Option<Persisted> {
     let key = pane_key(tmux);
     begin_pane_registration(&key, &binding);
+    let mut moved = false;
     let registered = crate::services::tmux_common::with_tmux_source_authority(tmux, |authority| {
-        register_rehydrated_under_source_authority(authority, "claude", channel, binding, record)
+        if !unmoved(authority) {
+            moved = true;
+            return None;
+        }
+        let cause = launch_cause(authority, channel, &binding, context_path)?;
+        register_rehydrated_under_source_authority(
+            authority, "claude", channel, binding, record, cause,
+        )
     });
     #[cfg(test)]
     if let Some(complete) = BEFORE_COMPLETE.with_borrow_mut(Option::take) {
         complete();
     }
-    finish_registration(&key, registered.is_some_and(Persisted::published));
+    // A binding a hook moved meanwhile completes the registration if it is ready, as an adoption does.
+    finish_registration(&key, moved || registered.is_some_and(Persisted::published));
     registered
+}
+
+// The selector and context path come from the same launch script observation.
+// Refuse replaced executions while keeping same-execution continuations observed.
+fn launch_cause(
+    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
+    channel: u64,
+    binding: &TuiRuntimeBinding,
+    context_path: Option<&std::path::Path>,
+) -> Option<CauseSource> {
+    let Some(path) = context_path else {
+        return Some(CauseSource::Observed);
+    };
+    let CapturedContext::Captured(context) =
+        HookBindingEnvelope::capture_from_env("claude", |name| {
+            (name == "AGENTDESK_BINDING_CONTEXT").then(|| path.as_os_str().to_owned())
+        })
+        .context
+    else {
+        return None;
+    };
+    let tmux = authority.session();
+    let nonce = match binding_context::observe_spawn_nonce_marker(tmux) {
+        SpawnNonceMarker::Known(nonce) => nonce,
+        _ => return None,
+    };
+    if context.execution_nonce != nonce
+        || binding_context::pane_context(tmux, &nonce).as_ref() != Some(&context)
+        || binding.runtime_kind != RuntimeHandoffKind::ClaudeTui
+        || context.channel_id != Some(channel)
+        || context.owner_runtime_root != crate::services::tmux_common::current_tmux_owner_marker()
+    {
+        return None;
+    }
+    let cause = if binding.session_id.as_deref().is_some_and(|session| {
+        !session.trim().is_empty() && context.expected_native_session_id.as_deref() == Some(session)
+    }) && matches!(context.launch_mode.as_str(), "fresh" | "resume")
+    {
+        CauseSource::Launch
+    } else {
+        CauseSource::Observed
+    };
+    #[cfg(test)]
+    if matches!(cause, CauseSource::Launch)
+        && crate::services::claude_tui::source_verify::n2b_mutant("clear-launch-observed")
+    {
+        return Some(CauseSource::Observed);
+    }
+    Some(cause)
 }
 
 /// `register_claude_pane_with` for a caller that holds the pane's source authority across its
@@ -52,10 +203,29 @@ pub(crate) fn register_claude_pane_under_source_authority(
 ) -> Option<Persisted> {
     let key = pane_key(authority.session());
     begin_pane_registration(&key, &binding);
-    let registered =
-        register_rehydrated_under_source_authority(authority, "claude", channel, binding, record);
+    let registered = register_rehydrated_under_source_authority(
+        authority,
+        "claude",
+        channel,
+        binding,
+        record,
+        CauseSource::Observed,
+    );
     finish_under_authority(&key, registered.is_some_and(Persisted::published));
     registered
+}
+
+/// A restart's restore of a Codex pane's logged `source`, for a caller holding its source
+/// authority: published only while the path still names that file, and nothing new is logged.
+pub(crate) fn register_restored_codex_pane_under_source_authority(
+    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
+    channel: u64,
+    binding: TuiRuntimeBinding,
+    source: binding_events::SourceId,
+) -> Option<Persisted> {
+    let record = Record::Exact(source);
+    let cause = CauseSource::Observed;
+    register_rehydrated_under_source_authority(authority, "codex", channel, binding, record, cause)
 }
 
 fn begin_pane_registration(key: &Pane, binding: &TuiRuntimeBinding) {

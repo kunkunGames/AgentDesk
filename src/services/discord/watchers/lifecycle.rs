@@ -1,4 +1,5 @@
 use super::*;
+use crate::services::discord::input_runtime::fence::{BootTarget, boot_skip};
 
 #[path = "lifecycle/activity.rs"]
 mod activity;
@@ -11,6 +12,10 @@ pub(in crate::services::discord) use self::activity::{
 
 #[path = "codex_tui_restore.rs"]
 mod codex_restore;
+#[cfg(all(test, unix))]
+pub(crate) use codex_restore::commit_codex_watcher_restore_for_tests;
+#[cfg(all(test, unix))]
+pub(crate) use codex_restore::commit_codex_watcher_restore_to_empty_registry_for_tests;
 #[path = "dispatched_origin_ghost.rs"]
 mod dispatched_origin_ghost;
 use dispatched_origin_ghost::consume_dispatched_origin_ghost_if_current;
@@ -53,7 +58,7 @@ pub(super) use self::liveness::*;
 
 #[path = "lifecycle/watch_host.rs"]
 mod watch_host;
-pub(super) use self::watch_host::{HostSnapshot, WatchHost};
+pub(in crate::services::discord) use self::watch_host::{HostSnapshot, WatchHost, watch_host_of};
 
 #[path = "lifecycle/restore_support.rs"]
 mod restore_support;
@@ -82,21 +87,42 @@ pub(super) use self::output_policy::*;
 mod claims;
 #[rustfmt::skip]
 #[cfg(test)]
-pub(in crate::services::discord) use self::claims::{claim_cross_channel_tmux_watcher_for_test, evict_claim_before_adoption_for_test};
+pub(in crate::services::discord) use self::claims::{CLAIM_PAUSE, claim_cross_channel_tmux_watcher_for_test, claim_or_replace_watcher, claim_or_reuse_watcher, evict_claim_before_adoption_for_test};
 pub(super) use self::claims::*;
 pub(in crate::services::discord) use self::claims::{
-    ThreadFollowUpParent, WatcherClaimIncarnation, claim_or_replace_watcher,
-    claim_or_replace_watcher_with_thread_parent, claim_or_reuse_watcher,
-    claim_or_reuse_watcher_with_thread_parent, thread_follow_up_parent_channel_id,
-    thread_follow_up_parent_from_live, try_claim_watcher_with_thread_parent,
+    ThreadFollowUpParent, WatchWithheld, WatcherClaimIncarnation,
+    claim_or_replace_watcher_for_host, claim_or_reuse_watcher_for_host,
+    thread_follow_up_parent_channel_id, thread_follow_up_parent_from_live,
 };
+
+#[path = "lifecycle/o_only_install.rs"]
+mod o_only_install;
+#[cfg(test)]
+pub(in crate::services::discord) use o_only_install::tests::InstallFixture;
+#[cfg(test)]
+pub(in crate::services::discord) use o_only_install::tests::pause_host as n4d2_pause_install_after_host;
+pub use o_only_install::{
+    OOnlyInstallOutcome, OOnlyInstallReason, OOnlyInstallRequest, install_retired_o_watcher,
+};
+
+#[path = "lifecycle/o_only_restore.rs"]
+mod o_only_restore;
+pub use o_only_restore::{RetiredOWatcherRestore, restore_retired_o_watchers};
+
+#[cfg(test)]
+#[path = "lifecycle/n4d2_boundary_tests.rs"]
+mod n4d2_boundary_tests;
+#[cfg(test)]
+#[path = "lifecycle/n4d2_entry_test.rs"]
+pub(in crate::services::discord) mod n4d2_entry_support;
 
 #[path = "lifecycle/restore.rs"]
 mod restore;
-pub(super) use self::restore::*;
-pub(in crate::services::discord) use self::restore::{
-    restore_tmux_watchers, session_belongs_to_current_runtime,
-};
+pub(in crate::services::discord) use self::restore::restore_tmux_watchers;
+#[path = "lifecycle/restore_mapping.rs"]
+mod restore_mapping;
+use self::restore_mapping::add_configured_channel_bindings;
+pub(in crate::services::discord) use self::restore_mapping::session_belongs_to_current_runtime;
 
 #[path = "lifecycle/restore_tests.rs"]
 mod restore_tests;

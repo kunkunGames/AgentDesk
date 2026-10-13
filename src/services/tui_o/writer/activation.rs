@@ -12,6 +12,7 @@ use super::binding::BindingEvents;
 use crate::services::tui_o::channel_policy::{Adoption, Candidate};
 use crate::services::tui_o::shadow::SourceId;
 use crate::services::tui_o::shadow::binding_reader::source_id_for;
+use crate::services::tui_o::shadow::capture::same_file;
 use crate::services::tui_o::store::{InitSource, Initialized, OStore};
 
 /// What the gateway reports about a channel before its first activation.
@@ -79,6 +80,7 @@ pub fn activate_with(
     let mut spent = Spent::default();
     let result = adopt(
         &mut adoption,
+        candidate,
         store,
         (channel, facts),
         local_custody,
@@ -110,8 +112,14 @@ fn since(at: Instant) -> u64 {
     at.elapsed().as_micros() as u64
 }
 
+/// A body admitted by Legacy must finish before O publishes its first init.
+pub(super) fn body_in_flight((started, finished): (u64, u64)) -> bool {
+    started != finished
+}
+
 fn adopt(
     adoption: &mut Adoption,
+    candidate: &Candidate,
     store: &OStore,
     (channel, facts): (u64, Result<ActivationFacts, String>),
     local_custody: impl FnOnce() -> Result<bool, String>,
@@ -120,6 +128,9 @@ fn adopt(
 ) -> Result<(), String> {
     if !matches!(*adoption, Adoption::Pending | Adoption::Deferred) {
         return Err(format!("adoption is already {adoption:?}"));
+    }
+    if body_in_flight(candidate.sends()) {
+        return Err("Legacy body send in flight".into());
     }
     let at = Instant::now();
     let checked = facts
@@ -224,6 +235,7 @@ fn create(store: &OStore, channel: u64, sources: Vec<InitSource>) -> Result<(), 
 fn empty_sources<B: BindingEvents>(bindings: &B, channel: u64) -> Result<Vec<InitSource>, String> {
     let events = bindings.binding_events_since(channel, 0);
     let events = events.map_err(|error| format!("binding log: {error}"))?;
+    let events = super::renumbered::first_named(events);
     let (bound, named) = logged(&events).map_err(|refused| refused.to_string())?;
     for source in bound.iter().chain(&named) {
         still_empty(source)?;
@@ -246,7 +258,8 @@ pub(super) fn still_empty(source: &SourceId) -> Result<(), String> {
     let path = source.path.display();
     let current = source_id_for(&source.session_id, &source.path);
     let current = current.map_err(|error| format!("source {path}: {error}"))?;
-    if current != *source {
+    // An empty file needs no bytes to prove it is the same after a renumbered dev.
+    if !same_file(&current, source) {
         return Err(format!("source {path} was replaced"));
     }
     let len = std::fs::metadata(&source.path).map_err(|error| format!("source {path}: {error}"));
@@ -263,8 +276,15 @@ pub(crate) mod test_hook {
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Step {
+        BeforeLegacyStarted,
         /// As an adoption starts pinning the sources of a channel that already holds output.
         Snapshot,
+        /// Deferred retry entry; the clocks start at this instant.
+        DeferredStarted,
+        /// Before the next retry sleep, after the preceding cycle finished.
+        DeferredTick,
+        BeforeFence,
+        AfterFence,
         /// Before the serial and adoption locks are taken.
         BeforeLock,
         BeforeWrite,
@@ -282,7 +302,7 @@ pub(crate) mod test_hook {
         HOOKS.lock().unwrap().push((channel, step, Box::new(hook)));
     }
 
-    pub(in crate::services::tui_o::writer) fn run(channel: u64, step: Step) -> Result<(), String> {
+    pub(in crate::services::tui_o) fn run(channel: u64, step: Step) -> Result<(), String> {
         let mut hooks = HOOKS.lock().unwrap();
         let Some(at) = hooks
             .iter()

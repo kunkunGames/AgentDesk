@@ -311,13 +311,13 @@ fn assert_scoped_dispatches_have_no_wildcard_arms() {
     let provider_source = include_str!("../provider.rs");
     let provider_exec_source = include_str!("../provider_exec.rs");
 
-    for function_name in [
-        "compact_env_vars",
-        "compact_cli_config",
-        "tmux_capture_indicates_ready_for_input",
-    ] {
+    for function_name in ["compact_env_vars", "compact_cli_config"] {
         assert_function_has_no_wildcard_arm(provider_source, function_name);
     }
+    assert_function_has_no_wildcard_arm(
+        include_str!("readiness.rs"),
+        "tmux_capture_indicates_ready_for_input",
+    );
     for function_name in [
         "execute_simple_blocking_inner",
         "execute_structured_with_context",

@@ -21,6 +21,7 @@ use crate::services::provider::ProviderKind;
 //   * `outbound::{send_target,send_gate,manual_delivery,send_api}` — manual
 //     send-to-agent/outbound dispatch, re-exported here for compatibility
 mod headless_turn;
+pub(in crate::services::discord) mod legacy_supervision;
 pub(in crate::services::discord) mod liveness_authority;
 pub(in crate::services::discord) mod mailbox;
 mod provider_probe;
@@ -41,6 +42,16 @@ mod rebind_request;
 mod recovery;
 mod redaction;
 mod relay_auto_heal;
+// Await the existing periodic pass without spawning an unowned test task.
+#[cfg(test)]
+#[cfg(unix)]
+pub(crate) async fn run_orphan_token_auto_heal_pass_for_tests(
+    registry: &HealthRegistry,
+    provider: &ProviderKind,
+    runtimes: &[Arc<SharedData>],
+) -> usize {
+    relay_auto_heal::run_orphan_token_auto_heal_pass(registry, provider, runtimes).await
+}
 pub(in crate::services::discord) use relay_auto_heal::relay_recovery_retry_delay_secs;
 mod relay_dead_reattach;
 mod relay_progress;
@@ -51,14 +62,32 @@ mod stall_liveness;
 mod stall_verdict;
 // #5188 (R5/R6): a delivery binding pointed at a transcript Claude abandoned.
 mod transcript_binding_stall;
+// Dormant until the input supervisor publishes views for channels it retires.
+#[allow(dead_code)]
+pub(in crate::services::discord) mod transcript_turn;
 mod turn_deliver;
 mod unpaired_active_token;
-mod watcher_respawn;
+pub(in crate::services::discord) mod watcher_respawn;
 pub(in crate::services::discord) use watcher_respawn::reclaim_watcherless_session_bound_relay;
+#[cfg(all(test, unix))]
+pub(in crate::services::discord) use watcher_respawn::{
+    lock_watcher_absence_for_test, n4d2_absence, n4d2_arm_absence, retry_pending_watcher_respawn,
+};
+#[cfg(unix)]
+pub(in crate::services::discord) use watcher_respawn::{
+    record_retired_o_install_outcome, retired_o_install_due,
+};
 
 // `HeadlessAgentTurnReservation` has no external referent today (callers
 // destructure the reserve/start tuple); kept re-exported for the reserve→start
 // API surface, same convention as the recovery/snapshot blocks below.
+#[cfg(all(test, unix))]
+pub(crate) use super::turn_presence::activity::tests::{
+    BindingRoot, ReadyPane, bind_turn_mode_transcript, settled_reason,
+};
+pub(crate) use super::turn_presence::supervisor::status as turn_presence_status;
+#[cfg(test)]
+pub(crate) use super::turn_presence::supervisor::tests::seed_presence_for_tests;
 pub(crate) use crate::services::discord::outbound::manual_delivery::ManualOutboundDeliveryId;
 pub use crate::services::discord::outbound::send_api::{handle_send, handle_senddm};
 use crate::services::discord::outbound::send_gate::dm_default_agent_authorizes_unmapped_private_channel;
@@ -79,10 +108,21 @@ pub use headless_turn::{
     start_reserved_headless_agent_turn_with_owner_channel,
 };
 pub use mailbox::purge_idle_channel_mailbox_registry_entry;
-#[cfg(test)]
-pub(crate) use turn_deliver::register_bot_auth_for_tests;
+#[cfg(all(test, unix))]
+pub(crate) use turn_deliver::inject_tests::{
+    InjectPane, claim_kinded, end_turn, inject_hook, queue_texts, register_inject_runtime,
+    send_meanwhile, start_without_gateway,
+};
+pub(crate) use turn_deliver::preflight_human_input;
 pub use turn_deliver::{
-    HumanInputDelivery, HumanInputError, HumanInputRequest, deliver_human_input,
+    ExternalHold, HumanInputDelivery, HumanInputError, HumanInputRequest, deliver_human_input,
+    external_turn_hold_for_start,
+};
+pub(crate) use turn_deliver::{InjectAttempt, InjectOrigin, SOURCE_OWNED, inject_human_input};
+#[cfg(test)]
+pub(crate) use turn_deliver::{
+    inflight_rows_for_tests, register_bot_auth_for_tests, seed_external_turn_row_for_tests,
+    set_human_input_auth_for_tests,
 };
 // #5147: re-exported as a module (not as loose constants) so a consumer reads
 // `self_watchdog::TCP_TIMEOUT` — a name that says which timeout — rather than a
@@ -91,6 +131,12 @@ pub use turn_deliver::{
 pub(crate) use recovery::StaleSweepWarrantFixture;
 #[allow(unused_imports)]
 pub(crate) use recovery::self_watchdog;
+#[cfg(test)]
+pub(crate) use recovery::stop_provider_channel_runtime_with_policy;
+pub(crate) use recovery::{
+    FINISH_UNOBSERVED_PATH, InflightDisposition, TOKEN_SUPERSEDED_PATH,
+    judge_provider_channel_stop, stop_judged_provider_channel,
+};
 #[allow(unused_imports)]
 pub use recovery::{
     HardStopRuntimeResult, IdleTmuxStaleTurnRepairResult, PendingQueueSnapshot,
@@ -107,7 +153,6 @@ pub(crate) use recovery::{
     STALL_WATCHDOG_INTERVAL_SECS, channel_has_active_turn, clear_resume_runtime_owner_after_death,
     rebind_channel_provider_session, release_zombie_foreground_turn_by_tmux_name,
     resume_runtime_for_channel, retain_resume_runtime_owner_before_teardown, stop_channel_runtime,
-    stop_provider_channel_runtime_with_policy,
 };
 #[cfg(test)]
 pub(crate) use runtime_resolve::owner_runtime_for_tests;
@@ -382,6 +427,14 @@ impl HealthRegistry {
         *self.utility_bot(role).http.lock().await = Some(http);
     }
 
+    /// Test-only: resolves a utility bot to `id` for its current token without a Discord lookup.
+    #[cfg(test)]
+    pub(crate) async fn set_utility_bot_user_id_for_tests(&self, role: UtilityBotRole, id: u64) {
+        let runtime = self.utility_bot(role);
+        let generation = runtime.token_generation.load(Ordering::SeqCst);
+        *runtime.user_id.lock().await = Some((id, generation));
+    }
+
     /// Snapshot the announce-role HTTP client. This role is where `Manage
     /// Messages` permissions are concentrated, so pin/unpin lifecycle code
     /// prefers it over per-provider HTTP clients.
@@ -405,6 +458,12 @@ impl HealthRegistry {
             && providers
                 .iter()
                 .all(|entry| entry.role == ProviderRuntimeRole::Standby)
+    }
+
+    pub(in crate::services::discord) async fn provider_entries_guard(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, Vec<ProviderEntry>> {
+        self.providers.lock().await
     }
 
     pub(in crate::services::discord) async fn provider_runtimes(&self) -> Vec<Arc<SharedData>> {

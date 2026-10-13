@@ -169,12 +169,9 @@ pub(super) const CLAUDE_IDLE_TICK_PHASES: [ClaudeIdleTickPhase; 2] = [
 /// and their order is expressible as data. Panes with a live inflight row are
 /// skipped here, which is what makes the preceding settle phase load-bearing.
 #[cfg(unix)]
-async fn relay_idle_claude_bindings(shared_ref: &Arc<SharedData>) {
-    // Rebound to an owned `Arc` so the moved body's `&shared` call sites stay
-    // byte-identical to what they were inside the `async move` block.
-    let shared = shared_ref.clone();
+pub(super) async fn relay_idle_claude_bindings(shared: &Arc<SharedData>) {
     for (tmux_session_name, binding) in
-        crate::services::tui_prompt_dedupe::runtime_bindings_for_kind(RuntimeHandoffKind::ClaudeTui)
+        super::background_child_completion::claude_bindings_after_child_completions(shared).await
     {
         let Some(channel_id) = owner_channel_for_tmux_session(
             &shared,
@@ -185,8 +182,11 @@ async fn relay_idle_claude_bindings(shared_ref: &Arc<SharedData>) {
             // #3018/#3306/#3656: registry miss ⇒ drop; chokepoint repairs.
             continue;
         };
+        let transcript_turns =
+            crate::services::tui_o::turn_mode::transcript_turns(channel_id.get());
         if let Some(row) =
             super::super::inflight::load_inflight_state(&ProviderKind::Claude, channel_id.get())
+            && (!transcript_turns || !super::super::inflight::is_synthetic_create_state(&row))
         {
             let source = Path::new(&binding.output_path);
             if let Some(lease) =
@@ -364,9 +364,16 @@ async fn relay_idle_claude_bindings(shared_ref: &Arc<SharedData>) {
                 prompt_id,
                 ..
             } => {
+                advance_claude_tmux_runtime_binding_offset(
+                    &tmux_session_name,
+                    &transcript_path,
+                    line_end_offset,
+                );
+                if transcript_turns {
+                    continue;
+                }
                 let observed_at = chrono::Utc::now();
-                // Row uuid and `promptId` suppress a re-scanned or hook-relayed
-                // prompt by identity; without them only the 30s content window applies.
+                // Row uuid and `promptId` suppress replay; otherwise use the content window.
                 let observation =
                     crate::services::tui_prompt_dedupe::observe_prompt_by_tmux_with_row_ids_at(
                         ProviderKind::Claude.as_str(),
@@ -383,11 +390,6 @@ async fn relay_idle_claude_bindings(shared_ref: &Arc<SharedData>) {
                     entry_id = entry_id.as_deref().unwrap_or(""),
                     prompt_id = prompt_id.as_deref().unwrap_or(""),
                     "Claude idle transcript relay observed prompt"
-                );
-                advance_claude_tmux_runtime_binding_offset(
-                    &tmux_session_name,
-                    &transcript_path,
-                    line_end_offset,
                 );
                 if !claude_idle_prompt_observation_should_tail_response(observation) {
                     continue;

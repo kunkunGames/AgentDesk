@@ -17,12 +17,52 @@ repository is already clippy-clean.
 
 ## Current Staging
 
-The hard clippy gate currently denies `dbg_macro`, `todo`, and `unimplemented`
-through the root `Cargo.toml` `[lints.clippy]` table. `just lint` also passes
-`-W clippy::all` so CI exposes the remaining warning debt, but those warnings
-are informational until the zero-warning cleanup lands. This gives CI a passing
-Rust-native lint gate while the larger zero-warning cleanup is split into
-reviewable follow-ups.
+`Cargo.toml` configures eight Clippy denies: `dbg_macro`, `todo`,
+`unimplemented`, `await_holding_lock`, `large_enum_variant`, `result_large_err`,
+`too_many_arguments` and `type_complexity`. The authoritative staged command is
+`cargo clippy --workspace --all-targets --all-features -- -W clippy::all`.
+The trailing group level overrides the five group-member denies to warnings;
+only `dbg_macro`, `todo` and `unimplemented` remain denied. Configured deny
+entries must not be mistaken for effective hard gates under this argv.
+
+Main and PR lint run this same invocation once, adding only Cargo's JSON output
+format. `check_clippy_warning_count.py` counts compiler warning diagnostics
+(including Rust warnings), requires successful `build-finished`, and records
+SHA, runner, actual rustc/Clippy versions, host, source and the protected argv.
+Compilation still fails the step through pipefail. Invalid observations fail
+the gate, never producing a valid zero. Main uploads the observation. The count
+is compiler-emitted diagnostics, not source occurrences or a deduplicated
+cross-target debt estimate.
+
+The warning-total gate uses `scripts/clippy_warning_baseline.json`: **952**
+diagnostics, measured by Ubuntu main CI at
+`1e9603a630ff9ec6d654ad69945a4229d4ae9ee0` and reproduced in the two preceding
+main observations. The file records the run URL, artifact ID and diagnostics
+digest. The environment is Rust 1.94.1, x86_64 Linux and the staged argv above;
+local Mac totals cannot substitute for it. Both workflows reject warning growth
+and invalid or mismatched observations. The existing required `Lint` mirror
+owns PR enforcement; no required context is added.
+
+Lower the baseline with a valid observation when warning debt decreases.
+Admission compares the committed PR base (main uses its first parent) and
+rejects baseline increases or environment changes. A toolchain/environment
+upgrade requires a separately reviewed rollout. Existing suppression-occurrence
+ratchets remain separate from warning totals. B3 (`lint-strict` required CI) remains
+deferred until warning debt is zero under the authoritative environment.
+
+The dead-code suppression ratchet freezes the observed per-file counts in
+`src/**/*.rs`, including tests: 389 suppression bodies across 179 files.
+It catches `allow`/`expect`, conditional attributes and broader `unused`/
+`warnings` groups using the existing Rust lexical scanner. New paths and
+per-file increases fail. Inner attributes have a separately measured 34-body
+baseline, so replacing an outer suppression with an inner one cannot broaden
+its scope under an unchanged total. Decreases require lowering the matching
+allocation; admission rejects baseline increases against the committed base.
+This is not permission to add more suppression or proof that dead code was
+removed. Relocations to a new path require a separately reviewed admission
+change that removes the old allocation; the default gate rejects new allocations.
+No automatic baseline
+rewrite is exposed. The baseline is suppression debt, not B2 warning debt.
 
 `unwrap`, `expect`, and `panic` lint gates are intentionally deferred. The
 current tree has many uses in tests, fixtures, and some existing runtime paths,

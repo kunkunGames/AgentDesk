@@ -262,7 +262,7 @@ pub(super) fn persist_queue_or_restore(
     previous_queue: Vec<Intervention>,
     operation: &str,
 ) -> Result<(), String> {
-    match persist_queue(channel_id, &state.intervention_queue, persistence) {
+    match persist_queue(state, channel_id, persistence) {
         Ok(()) => Ok(()),
         Err(error) => {
             state.intervention_queue = previous_queue;
@@ -281,6 +281,71 @@ pub(super) fn matching_cancel_token(
         .cancel_token
         .clone()
         .filter(|token| Arc::ptr_eq(token, expected))
+}
+
+/// A finish keyed to a judged turn: its token, or `None` for a judged empty slot.
+pub(crate) enum TokenFinish {
+    /// The judged turn was the channel's and is finished.
+    Finished(FinishTurnResult),
+    /// No turn held the channel; the channel finish ran as it does with none.
+    NoActiveTurn(FinishTurnResult),
+    /// Another turn holds the channel; nothing was written.
+    TokenMismatch { has_pending: bool },
+    /// The actor did not answer.
+    Unavailable,
+    /// The runtime registers no actor for the channel.
+    NoMailbox,
+}
+
+impl ChannelMailboxHandle {
+    pub(crate) async fn finish_turn_if_token(
+        &self,
+        expected: Option<Arc<CancelToken>>,
+        persistence: QueuePersistenceContext,
+    ) -> TokenFinish {
+        let request = |reply| ChannelMailboxMsg::FinishTurnIfToken {
+            expected,
+            persistence,
+            reply,
+        };
+        self.request(request)
+            .await
+            .unwrap_or(TokenFinish::Unavailable)
+    }
+}
+
+/// Finishes as `FinishTurn` does only while `expected` still keys the slot; a mismatch returns
+/// before any write, so the successor's queue, latches and marker stay as they are.
+pub(super) fn finish_turn_if_token(
+    state: &mut ChannelMailboxState,
+    channel_id: ChannelId,
+    expected: Option<Arc<CancelToken>>,
+    persistence: QueuePersistenceContext,
+    reply: oneshot::Sender<TokenFinish>,
+) {
+    let same = match (&expected, &state.cancel_token) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(expected), Some(_)) => matching_cancel_token(state, expected).is_some(),
+    };
+    if !same {
+        let queue = &state.intervention_queue;
+        let has_pending = queue.iter().any(|item| item.mode == InterventionMode::Soft);
+        let _ = reply.send(TokenFinish::TokenMismatch { has_pending });
+        return;
+    }
+    state.last_persistence = Some(persistence.clone());
+    let finished_user_message_id = state.active_user_message_id;
+    let finished = finalize_turn_state(state, channel_id, Some(&persistence), false);
+    let _ = reply.send(match finished.removed_token {
+        Some(_) => TokenFinish::Finished(finished),
+        None => TokenFinish::NoActiveTurn(finished),
+    });
+    if let Some(user_message_id) = finished_user_message_id {
+        let reason = "finish_turn_if_token";
+        consume_pending_dispatch_marker_if_matches(state, channel_id, user_message_id, reason);
+    }
+    mark_turn_finished_signal_done(channel_id);
 }
 
 impl ChannelMailboxState {

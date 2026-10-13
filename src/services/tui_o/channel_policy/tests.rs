@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use super::*;
 
 #[test]
@@ -97,6 +99,81 @@ fn writer_config(channels: &[u64], cluster: serde_json::Value) -> Config {
         "agents": [{"id": "w", "name": "W", "channels": {"claude": {"id": "41", "runtime": "tui"}}}],
     }))
     .unwrap()
+}
+
+#[test]
+fn readers_s1b_boot_equality_includes_normalized_dormant_membership() {
+    let config = |dormant: serde_json::Value| {
+        let mut value = serde_json::to_value(writer_config(&[41], serde_json::json!({}))).unwrap();
+        value["tui_o"]["writer"]["dormant_channels"] = dormant;
+        serde_json::from_value::<Config>(value).unwrap()
+    };
+    let off = BootChannels::validate(&config(serde_json::json!([]))).unwrap();
+    let on = BootChannels::validate(&config(serde_json::json!([41]))).unwrap();
+    let duplicate = BootChannels::validate(&config(serde_json::json!([41, 41]))).unwrap();
+    assert_eq!(
+        off.selected(),
+        on.selected(),
+        "dormancy grants no ownership"
+    );
+    assert_ne!(off, on, "a dormant policy change requires a fresh BOOT");
+    assert_eq!(
+        on, duplicate,
+        "repeated IDs do not change the installed policy"
+    );
+}
+
+#[test]
+fn readers_s1b_boot_dormant_selection_requires_install_restart() {
+    const CHILD: &str = "ADK_TEST_READERS_S1B_INSTALL_CHILD";
+    let Some(initial) = std::env::var_os(CHILD) else {
+        for initial in ["off", "on"] {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "services::tui_o::channel_policy::tests::readers_s1b_boot_dormant_selection_requires_install_restart",
+                    "--nocapture",
+                ])
+                .env(CHILD, initial)
+                .env("AGENTDESK_ROOT_DIR", root.path())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{initial}: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(stdout.contains("1 passed; 0 failed; 0 ignored"), "{stdout}");
+        }
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("agentdesk.yaml");
+    let write = |on: bool| {
+        let dormant = if on { "[41]" } else { "[]" };
+        std::fs::write(
+            &path,
+            format!(
+                "server: {{}}\nagents:\n  - id: fixture\n    name: Fixture\n    channels:\n      claude: {{id: '41', runtime: tui}}\ntui_o:\n  writer:\n    channels: [41]\n    dormant_channels: {dormant}\n"
+            ),
+        )
+        .unwrap();
+        crate::config::load_from_path(&path).unwrap()
+    };
+    let on = initial == "on";
+    let original = write(on);
+    install(&original).unwrap();
+    let installed = BootChannels::validate(&original).unwrap();
+    let candidate = write(!on);
+    assert!(
+        install(&candidate).is_err(),
+        "an opposite dormant setting cannot replace installed BOOT"
+    );
+    assert_eq!(boot().unwrap(), &installed);
+    install(&write(on)).expect("returning to installed policy requires no restart");
+    assert_eq!(boot().unwrap(), &installed);
 }
 
 #[test]
@@ -356,6 +433,34 @@ fn a_deferred_adoption_survives_legacy_bodies_and_placements_until_its_host_rele
     assert!(
         !candidate.defer(41),
         "a released adoption is never deferred again"
+    );
+}
+
+/// A placement carries no body: it ends a pending adoption or leaves a deferred one without
+/// counting a Legacy send, so it never reads as delivery progress.
+#[test]
+fn a_placement_ends_or_leaves_an_adoption_without_counting_a_legacy_send() {
+    use crate::services::tui_o::cutover::intake_route::{self, IntakeRoute};
+    use crate::services::tui_o::cutover::test_override;
+    use RuntimeHandoffKind::ClaudeTui;
+    let _candidates = test_override::force_candidates(&[(41, ClaudeTui), (42, ClaudeTui)]);
+    let candidate =
+        |channel| test_override::with_channels(|boot| boot?.candidate(channel).cloned()).unwrap();
+    let (pending, deferred) = (candidate(41), candidate(42));
+    assert!(deferred.defer(42));
+    for _ in 0..3 {
+        for channel in [41, 42] {
+            let placed = intake_route::route_for_placement("claude", channel);
+            assert_eq!(placed, IntakeRoute::Unselected);
+        }
+    }
+    assert_eq!(
+        (pending.peek(), pending.sends()),
+        (Adoption::Released, (0, 0))
+    );
+    assert_eq!(
+        (deferred.peek(), deferred.sends()),
+        (Adoption::Deferred, (0, 0))
     );
 }
 

@@ -1,19 +1,23 @@
 use super::super::super::mailbox_finish::unwind_unstarted_turn;
 use super::*;
+use crate::services::discord::live_bridge::register_without_requeue;
 
 mod routine_metadata;
+#[cfg(test)]
+use routine_metadata::routine_metadata_role_binding;
 use routine_metadata::{
-    fresh_routine_turn, routine_metadata_agent_id, routine_metadata_role_binding,
-    scheduled_snapshot_session_label, session_key_basis_override, valid_routine_metadata,
+    fresh_routine_turn, routine_metadata_agent_id, scheduled_snapshot_session_label,
+    session_key_basis_override, valid_routine_metadata,
 };
 
 use routine_metadata::persist_boundary_before_provider_clear;
 
 mod entrypoints;
+mod target;
 pub(in crate::services::discord) use entrypoints::*;
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owner(
+async fn start_reserved_headless_turn_admitted(
     ctx: &serenity::Context,
     channel_id: ChannelId,
     prompt: &str,
@@ -47,46 +51,20 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owne
         let settings = shared.settings.read().await;
         (settings.provider.clone(), settings.allowed_tools.clone())
     };
-    let routine_role_binding = routine_metadata_role_binding(metadata.as_ref(), &settings_provider);
-    let (early_stale_session_id, early_channel_name) = {
-        let data = shared.core.lock().await;
-        data.sessions
-            .get(&channel_id)
-            .map(|session| (session.session_id.clone(), session.channel_name.clone()))
-            .unwrap_or_default()
-    };
-    let early_thread_parent =
-        super::super::super::resolve_thread_parent(&ctx.http, channel_id).await;
-    let early_resolved_channel_name = if early_channel_name.is_none() && channel_name_hint.is_none()
-    {
-        let (channel_name, _) = resolve_channel_category(&ctx.http, None, channel_id).await;
-        channel_name
-    } else {
-        None
-    };
-    let mut resolved_role_binding = if let Some(binding) = routine_role_binding {
-        ResolvedThreadRoleBinding::direct(Some(binding))
-    } else {
-        resolve_thread_role_binding(
-            channel_id,
-            early_channel_name
-                .as_deref()
-                .or(channel_name_hint.as_deref())
-                .or(early_resolved_channel_name.as_deref())
-                .or(
-                    super::super::super::adk_session::registered_channel_fallback_name(
-                        channel_id,
-                        &settings_provider,
-                    )
-                    .as_deref(),
-                ),
-            early_thread_parent.as_ref(),
-        )
-    };
-    if resolved_role_binding.role_binding.is_none() && early_thread_parent.is_none() {
-        resolved_role_binding.role_binding = metadata_parent_channel_id(metadata.as_ref())
-            .and_then(|parent_id| resolve_role_binding(parent_id, None));
-    }
+    let target::HeadlessTarget {
+        early_stale_session_id,
+        early_thread_parent,
+        early_resolved_channel_name,
+        mut resolved_role_binding,
+    } = target::resolve_headless_target(
+        ctx,
+        channel_id,
+        shared,
+        metadata.as_ref(),
+        channel_name_hint.as_deref(),
+        &settings_provider,
+    )
+    .await;
     let memory_scope_channel_id = resolved_role_binding.memory_channel_id(channel_id);
     let role_binding = resolved_role_binding.role_binding.take();
     let provider = role_binding
@@ -99,6 +77,22 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owne
             shared.provider.as_str(),
             provider.as_str()
         )));
+    }
+    // A Herdr-configured channel is refused before this turn claims, resets or clears anything.
+    let session_key = || {
+        let basis = session_key_basis_override(
+            scheduled_snapshot_session_label(metadata.as_ref()).as_deref(),
+            metadata.as_ref(),
+            tmux_session_label.as_deref(),
+        )
+        .map(str::to_owned);
+        let provider = &provider;
+        async move { build_adk_session_key(shared, channel_id, provider, basis.as_deref()).await }
+    };
+    let pool = shared.pg_pool.as_ref();
+    let host = crate::services::turn_host::refusal_before_turn;
+    if let Some(refusal) = host(pool, &provider, channel_id.get(), session_key).await {
+        return Err(HeadlessTurnStartError::InvalidTarget(refusal.to_string()));
     }
     shared.record_channel_speaker(
         channel_id,
@@ -139,35 +133,13 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owne
             status: HeadlessTurnStartStatus::Consumed,
         });
     }
-    let session_transition_guard = shared
-        .acquire_session_transition(channel_id)
-        .await
-        .map_err(|_| {
-            HeadlessTurnStartError::Conflict(format!(
-                "session transition stayed busy for {} seconds on channel {}",
-                super::super::super::SESSION_TRANSITION_LOCK_WAIT_TIMEOUT.as_secs(),
-                channel_id.get()
-            ))
-        })?;
-    let cancel_token = Arc::new(CancelToken::new());
-    let started = crate::services::agent_recovery::admission::with_turn_identity(
+    let identity = (
         provider.clone(),
-        role_binding.as_ref().map(|binding| binding.role_id.clone()),
-        super::super::super::mailbox_try_start_turn(
-            shared,
-            channel_id,
-            cancel_token.clone(),
-            request_owner,
-            user_msg_id,
-        ),
-    )
-    .await;
-    if !started {
-        return Err(HeadlessTurnStartError::Conflict(format!(
-            "agent mailbox is busy for channel {}",
-            channel_id.get()
-        )));
-    }
+        role_binding.as_ref().map(|b| b.role_id.clone()),
+    );
+    let claim = super::super::turn_start::claim_reserved_headless_turn;
+    let (session_transition_guard, cancel_token) =
+        claim(shared, channel_id, request_owner, &reservation, identity).await?;
     crate::services::discord::increment_global_active(shared, "headless_turn_start");
     // Compute the routine continuity policy once at the turn-start boundary.
     // The shared `/goal fresh` machinery below clears every provider restore path
@@ -890,11 +862,38 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owne
     inflight_state.delivery_bot = metadata_delivery_bot(metadata.as_ref());
     inflight_state.silent_turn = metadata_silent_flag(metadata.as_ref());
     inflight_state.source = metadata_turn_source(source, metadata.as_ref());
-    super::intake_turn::inflight_create_log::log_create_new_inflight_outcome(
-        crate::services::discord::inflight::save_inflight_state_create_new(&inflight_state),
+    // Headless starts have no protected start path yet; an active channel refuses before any effect.
+    let admission = super::super::intake_dispatch::replay_admission::dormant_start;
+    let Some(replay_start) = admission(&channel_id.get().to_string()) else {
+        crate::services::discord::mailbox_finish::unwind_unstarted_turn(
+            shared,
+            channel_id,
+            &cancel_token,
+        )
+        .await;
+        return Err(HeadlessTurnStartError::Internal(
+            "headless start has no replay start".into(),
+        ));
+    };
+    let turn_host = crate::services::turn_host::for_turn(
+        shared.pg_pool.as_ref(),
         &provider,
-        &inflight_state,
+        channel_id.get(),
+        adk_session_key.as_deref(),
+    )
+    .await;
+    let submission = crate::services::discord::inflight::install_managed_submission_boundary(
+        &mut inflight_state,
+        &turn_host,
     );
+    let original_registration =
+        register_headless_original(shared, &provider, &inflight_state, &cancel_token)
+            .await
+            .map_err(|_| HeadlessTurnStartError::original_start_deferred())?;
+    let created =
+        crate::services::discord::inflight::save_inflight_state_create_new(&inflight_state);
+    super::foreign_row::admit_headless(shared, &provider, &inflight_state, &cancel_token, created)
+        .await?;
 
     let _ = attach_paused_turn_watcher_for_inflight(
         shared,
@@ -907,7 +906,8 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owne
         "turn_start_headless",
         early_thread_parent.map(|(parent_channel_id, _)| parent_channel_id),
         &mut inflight_state,
-    );
+    )
+    .await;
     let (tx, rx) = mpsc::channel();
     let session_id_clone = session_id.clone();
     let current_path_clone = current_path.clone();
@@ -982,6 +982,7 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owne
     let prompt_owned = prompt.to_string();
     let provider_for_blocking = provider.clone();
     let execution_pool = shared.pg_pool.clone();
+    let producer_registration = original_registration.clone();
     let teardown_clearance = super::super::super::turn_teardown_clearance::for_turn(
         shared.pg_pool.as_ref(),
         &provider,
@@ -990,71 +991,86 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owne
         tmux_session_name.as_deref(),
     )
     .await;
-    tokio::task::spawn_blocking(move || {
-        let _upload_lifetime = materialized_uploads;
-        let result = crate::services::platform::with_provider_execution_context(
-            provider_execution_context,
-            || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    super::provider_dispatch::execute(
-                        super::provider_dispatch::StreamingTurn {
-                            pool: execution_pool.as_ref(),
-                            provider: &provider_for_blocking,
-                            prompt: &context_prompt,
-                            session_id: session_id_clone.as_deref(),
-                            working_dir: &current_path_clone,
-                            system_prompt: Some(&system_prompt_owned),
-                            allowed_tools: &allowed_tools,
-                            cancel: cancel_token_clone,
-                            remote_profile: remote_profile.as_ref(),
-                            tmux_session_name: tmux_session_name.as_deref(),
-                            teardown: teardown_clearance.as_ref(),
-                            channel_id: channel_id.get(),
-                            model: model_for_turn.as_deref(),
-                            native_fast_mode: native_fast_mode_override,
-                            codex_goals: codex_goals_override,
-                            compact_percent: compact_percent_for_claude,
-                            compact_lower_bound_tokens,
-                            compact_token_limit: compact_token_limit_for_codex,
-                            cache_ttl_minutes,
-                            dispatch_type: None,
-                            force_fresh: force_fresh_provider_session,
-                        },
-                        tx.clone(),
-                    )
-                }))
-            },
-        );
+    let provider_permit = crate::services::discord::input_runtime::fence::effect::current();
+    let _provider_task = tokio::task::spawn_blocking(move || {
+        crate::services::discord::input_runtime::fence::blocking(|| {
+            let _input_scope = crate::services::discord::input_runtime::fence::effect::worker_scope(
+                provider_permit,
+            );
+            let _original_registration = producer_registration;
+            let _upload_lifetime = materialized_uploads;
+            let result = crate::services::platform::with_provider_execution_context(
+                provider_execution_context,
+                || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        super::provider_dispatch::execute(
+                            super::provider_dispatch::StreamingTurn {
+                                pool: execution_pool.as_ref(),
+                                provider: &provider_for_blocking,
+                                prompt: &context_prompt,
+                                session_id: session_id_clone.as_deref(),
+                                working_dir: &current_path_clone,
+                                system_prompt: Some(&system_prompt_owned),
+                                allowed_tools: &allowed_tools,
+                                cancel: cancel_token_clone,
+                                remote_profile: remote_profile.as_ref(),
+                                tmux_session_name: tmux_session_name.as_deref(),
+                                teardown: teardown_clearance.as_ref(),
+                                host: &turn_host,
+                                channel_id: channel_id.get(),
+                                model: model_for_turn.as_deref(),
+                                native_fast_mode: native_fast_mode_override,
+                                codex_goals: codex_goals_override,
+                                compact_percent: compact_percent_for_claude,
+                                compact_lower_bound_tokens,
+                                compact_token_limit: compact_token_limit_for_codex,
+                                cache_ttl_minutes,
+                                dispatch_type: None,
+                                force_fresh: force_fresh_provider_session,
+                                submission: submission.as_ref(),
+                            },
+                            replay_start,
+                            tx.clone(),
+                        )
+                    }))
+                },
+            );
 
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!("  [headless streaming] Error: {}", error);
-                let _ = tx.send(StreamMessage::Error {
-                    message: error,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: None,
-                });
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!("  [headless streaming] Error: {}", error);
+                    let message = super::provider_dispatch::producer_error(
+                        submission.as_ref(),
+                        channel_id.get(),
+                        error,
+                    );
+                    if let Some(message) = message {
+                        let _ = tx.send(message);
+                    }
+                }
+                Err(panic_info) => {
+                    let msg = if let Some(value) = panic_info.downcast_ref::<String>() {
+                        value.clone()
+                    } else if let Some(value) = panic_info.downcast_ref::<&str>() {
+                        value.to_string()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    tracing::error!("  [headless streaming] PANIC: {}", msg);
+                    let _ = tx.send(StreamMessage::Error {
+                        message: format!("Internal error (panic): {}", msg),
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        exit_code: None,
+                    });
+                }
             }
-            Err(panic_info) => {
-                let msg = if let Some(value) = panic_info.downcast_ref::<String>() {
-                    value.clone()
-                } else if let Some(value) = panic_info.downcast_ref::<&str>() {
-                    value.to_string()
-                } else {
-                    "unknown panic".to_string()
-                };
-                tracing::error!("  [headless streaming] PANIC: {}", msg);
-                let _ = tx.send(StreamMessage::Error {
-                    message: format!("Internal error (panic): {}", msg),
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    exit_code: None,
-                });
-            }
-        }
+        })
     });
+
+    #[cfg(test)]
+    super::provider_dispatch::observe_input_effect_completion(channel_id.get(), _provider_task);
 
     if !inflight_state.silent_turn {
         super::typing_indicator::spawn_native_typing_indicator(
@@ -1104,6 +1120,94 @@ pub(in crate::services::discord) async fn start_reserved_headless_turn_with_owne
     })
 }
 
+async fn register_headless_original(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    state: &InflightTurnState,
+    cancel: &Arc<CancelToken>,
+) -> Result<Option<Arc<crate::services::discord::live_bridge::OriginalRegistration>>, bool> {
+    register_without_requeue(shared, provider, state, cancel).await
+}
+
+#[cfg(test)]
+mod foreign_row_refusal_tests {
+    use super::*;
+    use crate::services::discord::{inflight, mailbox_snapshot, mailbox_try_start_turn};
+    use poise::serenity_prelude::{MessageId, UserId};
+
+    fn row(provider: &ProviderKind, channel: ChannelId, user_msg_id: u64) -> InflightTurnState {
+        let prompt = "status?".to_string();
+        InflightTurnState::new(
+            provider.clone(),
+            channel.get(),
+            None,
+            7,
+            user_msg_id,
+            0,
+            prompt,
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_foreign_durable_row_refuses_the_start_and_unwinds_only_this_turn() {
+        let _root = crate::config::TestRuntimeRootGuard::new();
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let provider = shared.provider.clone();
+        let (free, held) = (ChannelId::new(6_245_201), ChannelId::new(6_245_202));
+        let mut external = row(&provider, held, 0);
+        external.turn_source = inflight::TurnSource::ExternalInput;
+        inflight::save_inflight_state_create_new(&external).expect("external row");
+        for (channel, refused) in [(free, false), (held, true)] {
+            let token = Arc::new(CancelToken::new());
+            let owner = (UserId::new(7), MessageId::new(11));
+            assert!(
+                mailbox_try_start_turn(&shared, channel, token.clone(), owner.0, owner.1).await
+            );
+            let mut mine = row(&provider, channel, 11);
+            mine.turn_nonce = token.turn_nonce().map(str::to_owned);
+            let created = inflight::save_inflight_state_create_new(&mine);
+            let result = super::super::foreign_row::admit_headless(
+                &shared, &provider, &mine, &token, created,
+            )
+            .await;
+            let observed = (
+                matches!(result, Err(HeadlessTurnStartError::Conflict(_))),
+                mailbox_snapshot(&shared, channel)
+                    .await
+                    .cancel_token
+                    .is_none(),
+                token.cancelled.load(std::sync::atomic::Ordering::Relaxed),
+                inflight::load_inflight_state_read_only(&provider, channel.get())
+                    .map(|r| r.user_msg_id),
+            );
+            // Refused: Conflict, mailbox released, token cancelled, the other turn's row kept.
+            let expected = if refused {
+                (true, true, true, Some(0))
+            } else {
+                (false, false, false, Some(11))
+            };
+            assert_eq!(observed, expected, "channel {channel}");
+        }
+    }
+
+    #[test]
+    fn the_row_refusal_returns_before_any_provider_or_bridge_spawn() {
+        let src = include_str!("headless_turn.rs");
+        let call = "foreign_row::admit_headless(shared, &provider, &inflight_state, &cancel_token, created)\n        .await?;";
+        let (refusal, spawn) = (src.find(call), src.find("tokio::task::spawn_blocking"));
+        assert!(
+            refusal
+                .zip(spawn)
+                .is_some_and(|(refusal, spawn)| refusal < spawn)
+        );
+    }
+}
+
 #[cfg(test)]
 mod recovery_context_take_order_tests {
     use super::super::super::super::prompt_builder::{
@@ -1111,6 +1215,75 @@ mod recovery_context_take_order_tests {
     };
     use super::super::super::super::settings::RoleBinding;
     use poise::serenity_prelude::ChannelId;
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_headless_start_leaves_metadata_with_caller_and_no_foreground_queue() {
+        use crate::services::discord::{self, inflight::InflightTurnState, live_bridge};
+        use crate::services::provider::{CancelToken, ProviderKind};
+        use poise::serenity_prelude::{MessageId, UserId};
+        use std::sync::Arc;
+
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::config::set_agentdesk_root_for_test(root.path());
+        let channel = ChannelId::new(655_212_001);
+        let mut shared = discord::make_shared_data_for_tests();
+        Arc::get_mut(&mut shared).unwrap().provider = ProviderKind::Codex;
+        let token = Arc::new(CancelToken::new());
+        let mut state = InflightTurnState::new(
+            ProviderKind::Codex,
+            channel.get(),
+            None,
+            7,
+            11,
+            12,
+            "headless routine".into(),
+            None,
+            None,
+            None,
+            None,
+            0,
+        );
+        state.turn_nonce = token.turn_nonce().map(str::to_owned);
+        state.silent_turn = true;
+        state.delivery_bot = Some("routine-bot".into());
+        state.source = crate::dispatch::Source::Voice;
+        assert!(
+            discord::mailbox_try_start_turn(
+                &shared,
+                channel,
+                token.clone(),
+                UserId::new(7),
+                MessageId::new(11),
+            )
+            .await
+        );
+        discord::increment_global_active(&shared, "fixture");
+        let recovery = live_bridge::try_recovery(&ProviderKind::Codex, channel.get()).unwrap();
+        let start = tokio::time::Instant::now();
+        assert!(
+            matches!(
+                super::register_headless_original(&shared, &ProviderKind::Codex, &state, &token)
+                    .await,
+                Err(false)
+            ),
+            "headless must return retryable start failure instead of consuming a user requeue"
+        );
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
+        let snapshot = shared.mailbox(channel).snapshot().await;
+        assert!(snapshot.cancel_token.is_none());
+        assert!(
+            snapshot.intervention_queue.is_empty(),
+            "no foreground turn can consume headless input"
+        );
+        assert!(
+            discord::inflight::load_inflight_state(&ProviderKind::Codex, channel.get()).is_none()
+        );
+        assert!(state.silent_turn);
+        assert_eq!(state.delivery_bot.as_deref(), Some("routine-bot"));
+        assert_eq!(state.source, crate::dispatch::Source::Voice);
+        assert!(!live_bridge::is_live(&ProviderKind::Codex, channel.get()));
+        drop(recovery);
+    }
 
     fn recovery_context_take_call() -> String {
         format!(

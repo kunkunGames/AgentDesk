@@ -3,36 +3,19 @@ use poise::serenity_prelude::{CreateAttachment, CreateMessage};
 use std::sync::Arc;
 
 use super::super::router::{IntakeDeps, IntakeOrigin, LocalAdmissionPermit, dispatch_skill_intake};
+use super::super::turn_bridge::CommandStop;
 use super::super::*;
 use super::build_provider_skill_prompt;
 use super::command_policy::{TextCommandId, TextCommandSelection, select_text_command};
-use crate::services::provider::CancelToken;
 
-enum TextStopLookup {
-    NoActiveTurn,
-    AlreadyStopping,
-    Stop(Arc<CancelToken>),
-}
-
+/// A text stop judges the turn, by its inflight row when the token has no name, before any write.
 async fn cancel_text_stop_token_mailbox(
     shared: &Arc<SharedData>,
     provider: &crate::services::provider::ProviderKind,
     channel_id: serenity::ChannelId,
-) -> TextStopLookup {
-    let result = mailbox_cancel_active_turn(shared, channel_id).await;
-    match result.token {
-        Some(_) if result.already_stopping => TextStopLookup::AlreadyStopping,
-        Some(token) => {
-            ensure_cancel_token_bound_from_inflight(
-                provider,
-                channel_id,
-                &token,
-                "text command stop mailbox lookup",
-            );
-            TextStopLookup::Stop(token)
-        }
-        None => TextStopLookup::NoActiveTurn,
-    }
+    reason: &str,
+) -> CommandStop {
+    super::super::turn_bridge::begin_user_stop(shared, provider, channel_id, true, reason).await
 }
 
 /// #1672: After a `!stop`/`!cc stop` completes, kick the deferred
@@ -51,34 +34,41 @@ fn schedule_text_stop_pending_queue_drain(
 ) {
     let shared = shared.clone();
     let provider = provider.clone();
-    tokio::spawn(async move {
-        if let Some(registry) = shared.health_registry() {
-            let _ = super::super::health::schedule_pending_queue_drain_after_cancel(
-                registry.as_ref(),
-                provider.as_str(),
+    let permit = crate::services::cluster::channel_home::current_command(
+        &channel_id.get().to_string(),
+        provider.as_str(),
+    );
+    tokio::spawn(crate::services::cluster::channel_home::command_scope(
+        permit,
+        async move {
+            if let Some(registry) = shared.health_registry() {
+                let _ = super::super::health::schedule_pending_queue_drain_after_cancel(
+                    registry.as_ref(),
+                    provider.as_str(),
+                    channel_id,
+                    stop_source,
+                )
+                .await;
+                return;
+            }
+
+            let snapshot = shared
+                .mailbox(channel_id)
+                .snapshot()
+                .await
+                .intervention_queue
+                .len();
+            if snapshot == 0 {
+                return;
+            }
+            super::super::schedule_deferred_idle_queue_kickoff(
+                shared,
+                provider,
                 channel_id,
                 stop_source,
-            )
-            .await;
-            return;
-        }
-
-        let snapshot = shared
-            .mailbox(channel_id)
-            .snapshot()
-            .await
-            .intervention_queue
-            .len();
-        if snapshot == 0 {
-            return;
-        }
-        super::super::schedule_deferred_idle_queue_kickoff(
-            shared,
-            provider,
-            channel_id,
-            stop_source,
-        );
-    });
+            );
+        },
+    ));
 }
 
 async fn fetch_escalation_settings_via_api()
@@ -396,19 +386,24 @@ pub(in crate::services::discord) async fn handle_text_command_with_uploads(
         }
 
         TextCommandId::Stop => {
+            let permit = crate::services::cluster::channel_home::admit_command(
+                &channel_id.get().to_string(),
+                data.provider.as_str(),
+            )?;
+            return crate::services::cluster::channel_home::command_scope(permit, async {
             let stop_lookup =
-                cancel_text_stop_token_mailbox(&data.shared, &data.provider, channel_id).await;
+                cancel_text_stop_token_mailbox(&data.shared, &data.provider, channel_id, "!stop")
+                    .await;
             match stop_lookup {
-                TextStopLookup::Stop(token) => {
+                CommandStop::Session(stop) => {
+                    stop.interrupt("!stop").await;
+                }
+                CommandStop::Stop(stop) => {
                     // #1218: send abort key first, then SIGKILL — see
                     // `stop_active_turn` doc comment.
-                    let termination_recorded = super::super::turn_bridge::stop_active_turn(
-                        &data.provider,
-                        &token,
-                        super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
-                        "!stop",
-                    )
-                    .await;
+                    let policy = super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession;
+                    let termination_recorded =
+                        stop.stop(policy, "!stop").await.termination_recorded;
                     crate::services::turn_cancel_finalizer::finalize_turn_cancel(
                         crate::services::turn_cancel_finalizer::FinalizeTurnCancelRequest::from_text_stop(
                             data.provider.clone(),
@@ -430,14 +425,25 @@ pub(in crate::services::discord) async fn handle_text_command_with_uploads(
                         "!stop",
                     );
                 }
-                TextStopLookup::AlreadyStopping => {
+                CommandStop::AlreadyStopping => {
                     let _ = msg.reply(&ctx.http, super::ALREADY_STOPPING_RESPONSE).await;
                 }
-                TextStopLookup::NoActiveTurn => {
+                CommandStop::HostRefused => {
+                    let _ = msg
+                        .reply(&ctx.http, super::HOST_REFUSED_STOP_RESPONSE)
+                        .await;
+                }
+                CommandStop::NoActiveTurn => {
                     let _ = msg.reply(&ctx.http, super::NO_ACTIVE_TURN_RESPONSE).await;
                 }
+                // The turn stays with its provider: no cancel finalize and no queue drain.
+                #[cfg(unix)]
+                CommandStop::Herdr(stop) => {
+                    let _ = msg.reply(&ctx.http, stop.reply()).await;
+                }
             }
-            return Ok(true);
+            Ok(true)
+            }).await;
         }
 
         TextCommandId::Clear => {
@@ -1291,18 +1297,28 @@ pub(in crate::services::discord) async fn handle_text_command_with_uploads(
                         let _ = msg.reply(&ctx.http, reply).await;
                         return Ok(true);
                     }
-                    let stop_lookup =
-                        cancel_text_stop_token_mailbox(&data.shared, &data.provider, channel_id)
-                            .await;
+                    let permit = crate::services::cluster::channel_home::admit_command(
+                        &channel_id.get().to_string(),
+                        data.provider.as_str(),
+                    )?;
+                    return crate::services::cluster::channel_home::command_scope(permit, async {
+                    let stop_lookup = cancel_text_stop_token_mailbox(
+                        &data.shared,
+                        &data.provider,
+                        channel_id,
+                        stop_reason,
+                    )
+                    .await;
                     match stop_lookup {
-                        TextStopLookup::Stop(token) => {
-                            let termination_recorded = super::super::turn_bridge::stop_active_turn(
-                                &data.provider,
-                                &token,
-                                super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
-                                &stop_reason,
-                            )
-                            .await;
+                        CommandStop::Session(stop) => {
+                            stop.interrupt(&stop_reason).await;
+                            let _ = msg.reply(&ctx.http, super::STOPPING_RESPONSE).await;
+                        }
+                        CommandStop::Stop(stop) => {
+                            let policy =
+                                super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession;
+                            let stopped = stop.stop(policy, &stop_reason).await;
+                            let termination_recorded = stopped.termination_recorded;
                             crate::services::turn_cancel_finalizer::finalize_turn_cancel(
                                 crate::services::turn_cancel_finalizer::FinalizeTurnCancelRequest::from_text_stop(
                                     data.provider.clone(),
@@ -1323,14 +1339,24 @@ pub(in crate::services::discord) async fn handle_text_command_with_uploads(
                             );
                             let _ = msg.reply(&ctx.http, super::STOPPING_RESPONSE).await;
                         }
-                        TextStopLookup::AlreadyStopping => {
+                        CommandStop::AlreadyStopping => {
                             let _ = msg.reply(&ctx.http, super::ALREADY_STOPPING_RESPONSE).await;
                         }
-                        TextStopLookup::NoActiveTurn => {
+                        CommandStop::HostRefused => {
+                            let _ = msg
+                                .reply(&ctx.http, super::HOST_REFUSED_STOP_RESPONSE)
+                                .await;
+                        }
+                        CommandStop::NoActiveTurn => {
                             let _ = msg.reply(&ctx.http, super::NO_ACTIVE_TURN_RESPONSE).await;
                         }
+                        #[cfg(unix)]
+                        CommandStop::Herdr(stop) => {
+                            let _ = msg.reply(&ctx.http, stop.reply()).await;
+                        }
                     }
-                    return Ok(true);
+                    Ok(true)
+                    }).await;
                 }
                 "pwd" => {
                     return Box::pin(handle_text_command(ctx, msg, data, channel_id, "!pwd")).await;
@@ -1405,7 +1431,7 @@ pub(in crate::services::discord) async fn handle_text_command_with_uploads(
             };
 
             rate_limit_wait(&data.shared, channel_id).await;
-            let confirm = channel_id
+            let confirmation = channel_id
                 .send_message(
                     &ctx.http,
                     CreateMessage::new().content(format!("Running skill: `/{skill}`")),
@@ -1423,7 +1449,7 @@ pub(in crate::services::discord) async fn handle_text_command_with_uploads(
                 &deps,
                 data.provider.clone(),
                 channel_id,
-                confirm.id,
+                confirmation.id,
                 msg.author.id,
                 msg.author.name.clone(),
                 skill_prompt,
@@ -1536,5 +1562,135 @@ mod command_dispatch_contract_tests {
                 "handle_text_command(ctx, msg, data, channel_id, \"!{name}\")"
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod home_command_tests {
+    use super::*;
+    use crate::db::o_channel_homes::HomeState;
+    use crate::services::cluster::channel_home;
+    async fn text_context(
+        http: Arc<serenity::Http>,
+    ) -> (serenity::Context, tokio::task::JoinHandle<()>) {
+        use self::serenity::gateway::{
+            Shard, ShardManager, ShardManagerOptions, ShardMessenger, ShardRunner,
+            ShardRunnerOptions,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(|ws: axum::extract::ws::WebSocketUpgrade| async {
+                ws.on_upgrade(|mut socket| async move { while socket.recv().await.is_some() {} })
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let ws_url = Arc::new(tokio::sync::Mutex::new(format!("ws://{address}")));
+        let data = Arc::new(tokio::sync::RwLock::new(serenity::prelude::TypeMap::new()));
+        let cache = Arc::new(serenity::Cache::default());
+        let intents = serenity::GatewayIntents::empty();
+        let (manager, _) = ShardManager::new(ShardManagerOptions {
+            data: data.clone(),
+            event_handlers: vec![],
+            raw_event_handlers: vec![],
+            framework: Arc::new(std::sync::OnceLock::new()),
+            shard_index: 0,
+            shard_init: 0,
+            shard_total: 1,
+            voice_manager: None,
+            ws_url: ws_url.clone(),
+            cache: cache.clone(),
+            http: http.clone(),
+            intents,
+            presence: None,
+        });
+        let shard = Shard::new(
+            ws_url,
+            "test-token",
+            serenity::ShardInfo {
+                id: serenity::ShardId(0),
+                total: 1,
+            },
+            intents,
+            None,
+        )
+        .await
+        .unwrap();
+        let runner = ShardRunner::new(ShardRunnerOptions {
+            data: data.clone(),
+            event_handlers: vec![],
+            raw_event_handlers: vec![],
+            framework: None,
+            manager,
+            shard,
+            voice_manager: None,
+            cache: cache.clone(),
+            http: http.clone(),
+        });
+        let context = serenity::Context {
+            data,
+            shard: ShardMessenger::new(&runner),
+            shard_id: serenity::ShardId(0),
+            http,
+            cache,
+        };
+        (context, server)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_text_and_alias_dispatch_refuse_before_stop_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let _env = crate::config::TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", root.path());
+        let channel = serenity::ChannelId::new(9200000000000107);
+        let shared = make_shared_data_for_tests();
+        shared.settings.write().await.owner_user_id = Some(1);
+        let token = crate::services::discord::host_teardown_gate::test_support::nameless_turn(
+            &shared, channel,
+        )
+        .await;
+        let home = channel_home::register_for_test(channel.get(), Some(HomeState::Releasing));
+        let http = Arc::new(
+            serenity::HttpBuilder::new("test-token")
+                .proxy("http://127.0.0.1:1")
+                .ratelimiter_disabled(true)
+                .build(),
+        );
+        let (ctx, server) = text_context(http).await;
+        let mut voice_config = crate::voice::VoiceConfig::default();
+        voice_config.audio.recordings_dir = root.path().join("recordings");
+        voice_config.keep_recordings = true;
+        let data = Data {
+            shared: shared.clone(),
+            token: "home-text-test".into(),
+            provider: crate::services::provider::ProviderKind::Claude,
+            voice_receiver: crate::voice::VoiceReceiver::from_voice_config(&voice_config),
+            voice_config,
+        };
+        let mut msg = serenity::Message::default();
+        msg.id = serenity::MessageId::new(channel.get() + 2);
+        msg.channel_id = channel;
+        msg.author.id = serenity::UserId::new(1);
+        for text in ["!stop", "!cc stop", "!skill stop"] {
+            msg.content = text.into();
+            let result = handle_text_command(&ctx, &msg, &data, channel, text).await;
+            assert!(
+                result.unwrap_err().to_string().contains("home_draining"),
+                "{text}"
+            );
+            assert!(!token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+            assert!(
+                crate::services::discord::host_teardown_gate::test_support::mailbox_turn_active(
+                    &shared, channel
+                )
+                .await
+            );
+            assert_eq!(home.commands_in_flight(), 0);
+        }
+        channel_home::unregister(home.channel_id());
+        server.abort();
+        let _ = server.await;
     }
 }

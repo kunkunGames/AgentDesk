@@ -21,6 +21,7 @@ static TMUX_SOURCE_AUTHORITY_LOCKS: LazyLock<Mutex<HashMap<String, Weak<Mutex<()
 #[cfg(test)]
 thread_local! {
     static SOURCE_AUTHORITY_CONTENTION_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static SOURCE_AUTHORITY_CONTENDED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -66,6 +67,9 @@ fn lock_source_authority<'a>(lock: &'a Mutex<()>, key: &str) -> std::sync::Mutex
         Ok(guard) => return guard,
         Err(std::sync::TryLockError::Poisoned(poison)) => return poison.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
+            if let Some(contended) = SOURCE_AUTHORITY_CONTENDED.with_borrow_mut(Option::take) {
+                contended();
+            }
             SOURCE_AUTHORITY_CONTENTION_ARMED.with(|armed| {
                 if armed.replace(false) {
                     std::panic::resume_unwind(Box::new(SourceAuthorityContention(key.to_string())))
@@ -1228,6 +1232,18 @@ pub(crate) fn cleanup_cleared_session_temp_files(
     session: &crate::services::session_host::ClearedHostSession,
 ) {
     cleanup_session_temp_files(session.name());
+}
+
+// The caller already holds the source fence; never acquire it a second time.
+pub(crate) fn cleanup_native_clear_fallback_under_source_authority(
+    authority: &TmuxSourceAuthority<'_>,
+    session: &crate::services::session_host::ClearedHostSession,
+) -> bool {
+    if authority.session() != session.name() {
+        return false;
+    }
+    cleanup_session_temp_files_under_source_authority(authority.session());
+    true
 }
 
 fn cleanup_session_temp_files_under_source_authority(session_name: &str) {

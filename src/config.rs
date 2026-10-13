@@ -15,8 +15,15 @@ pub(crate) mod runtime_profile;
 pub use runtime_profile::{ClusterConfig, ClusterIntakeRoutingConfig, RuntimeProfile};
 mod cluster_role;
 pub use cluster_role::ClusterRole;
+pub(crate) mod session_hosts;
+pub use session_hosts::SessionHostsConfig;
+pub(crate) mod disk_write;
+mod peer_filter;
+pub(crate) use disk_write::render_config_for_path;
+pub use disk_write::save_to_path;
+pub use peer_filter::PeerFilterMode;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
@@ -70,6 +77,9 @@ pub struct Config {
     pub prompt_manifest_retention: PromptManifestRetentionConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui_o: Option<crate::services::tui_o::shadow::tap::TuiOConfig>,
+    /// Channels run on a Herdr endpoint; restart-required, empty by default.
+    #[serde(default, skip_serializing_if = "SessionHostsConfig::is_empty")]
+    pub session_hosts: SessionHostsConfig,
     /// When true (default), the server watches the on-disk config file and
     /// hot-reloads the hot-swappable settings (routine tunables, thresholds)
     /// without a restart, mirroring the policies watcher: the candidate file is
@@ -120,7 +130,7 @@ fn default_credential_notify_dedupe_secs() -> u64 {
     300
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
 pub struct ServerConfig {
     #[serde(default = "default_port")]
     pub port: u16,
@@ -139,6 +149,9 @@ pub struct ServerConfig {
     /// the recommended path is to set `auth_token` instead.
     #[serde(default)]
     pub allow_insecure_nonloopback_bind: bool,
+    /// Socket-peer source filter for every HTTP route (see `web_surface::peer_filter`).
+    #[serde(default, skip_serializing_if = "PeerFilterMode::is_default")]
+    pub peer_filter: PeerFilterMode,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -154,11 +167,12 @@ impl std::fmt::Debug for ServerConfig {
                 "allow_insecure_nonloopback_bind",
                 &self.allow_insecure_nonloopback_bind,
             )
+            .field("peer_filter", &self.peer_filter)
             .finish()
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct DiscordConfig {
     #[serde(default)]
     pub bots: std::collections::HashMap<String, BotConfig>,
@@ -238,7 +252,7 @@ impl Config {
     }
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct BotConfig {
     // Issue #2047 Finding 6 — bot token must never leave the process via
@@ -351,7 +365,7 @@ where
     )
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct AgentDef {
     pub id: String,
     pub name: String,
@@ -735,7 +749,7 @@ impl AgentChannelConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct MeetingSettings {
     pub channel_name: String,
     #[serde(default)]
@@ -752,7 +766,7 @@ pub struct MeetingSettings {
     pub available_agents: Vec<MeetingAgentEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum MeetingSummaryAgentDef {
     Static(String),
@@ -763,21 +777,21 @@ pub enum MeetingSummaryAgentDef {
     },
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct MeetingSummaryRuleDef {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keywords: Vec<String>,
     pub agent: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum MeetingAgentEntry {
     RoleId(String),
     Detailed(MeetingAgentDef),
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct MeetingAgentDef {
     pub role_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -806,7 +820,7 @@ pub struct MeetingAgentDef {
     pub provider_hint: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct GitHubConfig {
     #[serde(default)]
     pub repos: Vec<String>,
@@ -826,7 +840,7 @@ impl Default for GitHubConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct PoliciesConfig {
     #[serde(default = "default_policies_dir")]
     pub dir: PathBuf,
@@ -842,7 +856,7 @@ pub struct PoliciesConfig {
     pub hook_timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct DataConfig {
     #[serde(default = "default_data_dir")]
     pub dir: PathBuf,
@@ -2413,6 +2427,7 @@ impl Default for ServerConfig {
             host: default_host(),
             auth_token: None,
             allow_insecure_nonloopback_bind: false,
+            peer_filter: PeerFilterMode::default(),
         }
     }
 }
@@ -2524,6 +2539,14 @@ pub struct RoutinesConfig {
     /// Defaults to 0 (disabled). Set to e.g. 3600 (1 hour) to enable.
     #[serde(default)]
     pub failure_pause_auto_resume_secs: u64,
+    /// Seconds after routine-runtime boot during which due routines are not claimed, so
+    /// provider runtimes can register first; slots missed meanwhile run once afterwards.
+    #[serde(default = "default_routines_startup_grace_secs")]
+    pub startup_grace_secs: u64,
+    /// Alert once when a routine's consecutive failed runs reach this count. Independent of
+    /// the pause and stale-paused knobs; 0 disables the alert.
+    #[serde(default = "default_routines_max_consecutive_failures")]
+    pub max_consecutive_failures: u32,
 }
 
 impl Default for RoutinesConfig {
@@ -2542,6 +2565,8 @@ impl Default for RoutinesConfig {
             stale_paused_alert_secs: 0,
             stale_paused_alert_ttl_secs: default_routines_stale_paused_alert_ttl_secs(),
             failure_pause_auto_resume_secs: 0,
+            startup_grace_secs: default_routines_startup_grace_secs(),
+            max_consecutive_failures: default_routines_max_consecutive_failures(),
         }
     }
 }
@@ -2592,6 +2617,14 @@ fn default_routines_max_checkpoint_bytes() -> usize {
 
 fn default_routines_stale_paused_alert_ttl_secs() -> u64 {
     24 * 60 * 60
+}
+
+fn default_routines_startup_grace_secs() -> u64 {
+    120
+}
+
+fn default_routines_max_consecutive_failures() -> u32 {
+    3
 }
 
 #[cfg(test)]
@@ -2787,6 +2820,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             prompt_manifest_retention: PromptManifestRetentionConfig::default(),
             tui_o: None,
+            session_hosts: SessionHostsConfig::default(),
             config_hot_reload: default_true(),
         }
         .apply_runtime_defaults()
@@ -2859,6 +2893,7 @@ pub fn load_from_path(path: &Path) -> Result<Config> {
 pub(crate) fn validate_config(config: &Config) -> Result<()> {
     crate::services::tui_o::channel_policy::BootChannels::validate(config)?;
     config.cluster.runtime_profile.validate(&config.cluster)?;
+    session_hosts::validate(config)?;
     config.onboarding.warn_invalid_rules();
     validate_escalation_schedule(&config.escalation.schedule)?;
     validate_scheduled_message_required_mentions(
@@ -2965,22 +3000,6 @@ fn audit_config_file_permissions_if_secret_bearing(path: &Path, config: &Config)
     if config_contains_file_secrets(config) {
         crate::utils::secret_file::audit_or_harden_secret_file(path, "agentdesk-config");
     }
-}
-
-pub fn save_to_path(path: &Path, config: &Config) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let rendered = serde_yaml::to_string(config)
-        .with_context(|| format!("Failed to serialize config for {}", path.display()))?;
-    if config_contains_file_secrets(config) {
-        crate::utils::secret_file::write_secret_file(path, rendered)
-            .with_context(|| format!("Failed to write config {}", path.display()))?;
-    } else {
-        std::fs::write(path, rendered)
-            .with_context(|| format!("Failed to write config {}", path.display()))?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -3333,6 +3352,15 @@ pub(crate) mod test_env_lock {
         }
     }
 
+    /// Panics unless this thread took the lock through `acquire_shared_test_env_lock`.
+    pub(crate) fn assert_shared_test_env_lock_held() {
+        let held = SHARED_TEST_ENV_LOCK_HELD.with(|held| held.get());
+        assert!(
+            held,
+            "an *_after_shared_test_env_lock helper needs acquire_shared_test_env_lock first"
+        );
+    }
+
     pub(crate) fn acquire_shared_test_env_lock() -> SharedTestEnvLockGuard {
         // Resolve the mutex first: the accessor carries the `E`-after-`P`
         // ordering tripwire, and running it before the re-entry flag is armed
@@ -3444,17 +3472,23 @@ mod remote_settings_tests {
 mod shared_test_env_lock_tests {
     #[test]
     fn acquire_shared_test_env_lock_panics_on_same_thread_reentry_before_deadlock() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
             let _lock = super::test_env_lock::acquire_shared_test_env_lock();
+            ready_tx.send(()).expect("signal first lock acquisition");
+            start_rx.recv().expect("start reentry proof");
             let reentry = std::panic::catch_unwind(|| {
                 let _nested = super::test_env_lock::acquire_shared_test_env_lock();
             });
             tx.send(reentry.is_err()).expect("send reentry result");
         });
 
+        ready_rx.recv().expect("first lock must be acquired");
+        start_tx.send(()).expect("trigger same-thread reentry");
         let panicked = rx
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(std::time::Duration::from_secs(30))
             .expect("same-thread reentry must panic before waiting on the mutex");
         assert!(
             panicked,

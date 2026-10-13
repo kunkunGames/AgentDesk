@@ -7,11 +7,18 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 pub(crate) mod cancel_token_claude_interrupt;
 pub(crate) mod cancel_token_cleanup;
+mod cancel_token_codex_owed;
 mod cancel_watchdog;
 pub(crate) mod channel_rules;
+pub(crate) mod herdr_before_start;
 mod output_reader;
+mod readiness;
 mod registry;
+#[cfg(all(test, unix))]
+use readiness::tmux_capture_contains_wrapper_ready_marker;
+pub(crate) use readiness::tmux_capture_indicates_ready_for_input;
 pub(crate) mod session_probe;
+pub(crate) use output_reader::herdr_provider_terminal_only;
 pub use output_reader::{fold_read_output_result, poll_output_file_until_result};
 #[cfg(test)]
 pub(crate) mod read_fault;
@@ -712,11 +719,20 @@ pub struct CancelToken {
     /// Wrapper prompt handoff completed before its JSONL user envelope appeared.
     /// The stop path must treat this window as submitted, not as prior-turn idle.
     claude_interrupt_submit_pending: AtomicBool,
+    /// Herdr-only input observation and user-stop intent; absent on all existing paths.
+    herdr_interrupt:
+        Mutex<Option<std::sync::Arc<cancel_token_claude_interrupt::HerdrInterruptState>>>,
+    /// The protected request attempt this turn's executor started; absent on every legacy turn.
+    replay_attempt: std::sync::OnceLock<
+        std::sync::Arc<crate::services::discord::replay_policy::live::LiveAttempt>,
+    >,
     /// Lifecycle-aware restart/handoff mode for inflight preservation.
     pub restart_mode: AtomicU8,
     /// Independent destructive claims prevent a PID-only cleanup from suppressing tmux cleanup.
     pub(crate) pid_kill_claim: AtomicU8,
     pub(crate) name_kill_claim: AtomicU8,
+    /// The exact Codex episode record owed delivery checks; unset on every current path.
+    codex_owed: std::sync::OnceLock<std::sync::Arc<cancel_token_codex_owed::Record>>,
 }
 
 impl CancelToken {
@@ -747,14 +763,31 @@ impl CancelToken {
                 .fetch_add(1, Ordering::Relaxed),
             turn_nonce,
             claude_interrupt_submit_pending: AtomicBool::new(false),
+            herdr_interrupt: Mutex::new(None),
+            replay_attempt: std::sync::OnceLock::new(),
             restart_mode: AtomicU8::new(0),
             pid_kill_claim: AtomicU8::new(0),
             name_kill_claim: AtomicU8::new(0),
+            codex_owed: std::sync::OnceLock::new(),
         }
     }
 
     pub fn turn_nonce(&self) -> Option<&str> {
         self.turn_nonce.as_deref()
+    }
+
+    pub(crate) fn replay_attempt(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::services::discord::replay_policy::live::LiveAttempt>> {
+        self.replay_attempt.get()
+    }
+
+    /// Binds the attempt whose start permit this turn's executor spent; at most once per token.
+    pub(crate) fn attach_replay_attempt(
+        &self,
+        live: std::sync::Arc<crate::services::discord::replay_policy::live::LiveAttempt>,
+    ) -> bool {
+        self.replay_attempt.set(live).is_ok()
     }
 
     pub fn mark_completion_cleanup(&self) {
@@ -931,6 +964,7 @@ impl CancelToken {
             e.into_inner()
         });
         self.set_cancel_source_locked(source);
+        let _record = self.codex_owed_publication();
         self.cancelled.store(true, Ordering::Release);
     }
 
@@ -940,6 +974,7 @@ impl CancelToken {
             e.into_inner()
         });
         self.set_cancel_source_if_absent_locked(source);
+        let _record = self.codex_owed_publication();
         self.cancelled.store(true, Ordering::Release);
     }
 
@@ -1065,68 +1100,9 @@ pub fn tmux_followup_fallback_after_read_error(
     })
 }
 
-pub(crate) fn tmux_capture_indicates_ready_for_input(
-    capture: &str,
-    provider: &ProviderKind,
-) -> bool {
-    if let ProviderKind::Unsupported(_) = provider {
-        return crate::services::tmux_common::tmux_capture_indicates_generic_ready_banner(capture)
-            || tmux_capture_contains_wrapper_ready_marker(capture, provider);
-    }
-    let Some(adapter) = provider.readiness_adapter() else {
-        return false;
-    };
-    match adapter {
-        ProviderReadinessAdapter::Claude => {
-            crate::services::tmux_common::tmux_capture_indicates_claude_tui_ready_for_input(capture)
-        }
-        ProviderReadinessAdapter::Codex => {
-            crate::services::codex_tui::input::pane_looks_ready_for_codex_prompt(capture)
-                || crate::services::tmux_common::tmux_capture_indicates_generic_ready_banner(
-                    capture,
-                )
-                || tmux_capture_contains_wrapper_ready_marker(capture, provider)
-        }
-        ProviderReadinessAdapter::Qwen => {
-            crate::services::tmux_common::tmux_capture_indicates_generic_ready_banner(capture)
-                || tmux_capture_contains_wrapper_ready_marker(capture, provider)
-        }
-        ProviderReadinessAdapter::Gemini => {
-            crate::services::tmux_common::tmux_capture_indicates_generic_ready_banner(capture)
-                || tmux_capture_contains_wrapper_ready_marker(capture, provider)
-        }
-        ProviderReadinessAdapter::OpenCode => {
-            crate::services::tmux_common::tmux_capture_indicates_generic_ready_banner(capture)
-                || tmux_capture_contains_wrapper_ready_marker(capture, provider)
-        }
-        ProviderReadinessAdapter::GenericBanner(_) => {
-            crate::services::tmux_common::tmux_capture_indicates_generic_ready_banner(capture)
-                || tmux_capture_contains_wrapper_ready_marker(capture, provider)
-        }
-    }
-}
-
 #[cfg(test)]
 #[path = "provider/provider_conformance_invariant_tests.rs"]
 mod provider_conformance_invariant_tests;
-
-fn tmux_capture_contains_wrapper_ready_marker(capture: &str, provider: &ProviderKind) -> bool {
-    capture
-        .lines()
-        .rev()
-        .filter(|line| !line.trim().is_empty())
-        .take(12)
-        .any(|line| wrapper_ready_marker_matches_provider(line, provider))
-}
-
-fn wrapper_ready_marker_matches_provider(line: &str, provider: &ProviderKind) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
-        return false;
-    };
-    value.get("type").and_then(|field| field.as_str())
-        == Some(crate::services::tmux_common::WRAPPER_READY_FOR_INPUT_EVENT)
-        && value.get("provider").and_then(|field| field.as_str()) == Some(provider.as_str())
-}
 
 #[cfg(all(test, unix))]
 mod ready_input_prompt_tests {

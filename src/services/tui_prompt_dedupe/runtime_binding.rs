@@ -5,12 +5,49 @@ mod claude_source;
 #[cfg(test)]
 pub(crate) use claude_source::{AFTER_CHECK, BEFORE_AUTHORITY, after_check, before_authority};
 pub(crate) use claude_source::{Persisted, Record, reclaim_with_current_prompt};
+mod binding_access;
+mod codex_cursor;
+mod codex_policy;
+pub(crate) use codex_cursor::{
+    advance_tmux_runtime_binding_offset_under_source_authority,
+    preservable_marker as codex_verified_preservable_marker,
+};
+pub(crate) use codex_policy::{
+    codex_verified_channel_delivery_allowed, codex_verified_channel_requires_proof,
+    codex_verified_event_allowed, codex_verified_hold_reason, codex_verified_input_blocked,
+    codex_verified_o_source_allowed, codex_verified_requires_proof,
+    codex_verified_requires_proof_under_source_authority, codex_verified_source_allowed,
+    codex_verified_source_allowed_under_source_authority,
+};
 mod codex_hook;
+pub use binding_access::register_provider_session;
+pub(crate) use binding_access::{
+    codex_verified_marker_metadata, codex_verified_publication_allowed,
+    runtime_binding_for_tmux_session, runtime_binding_for_tmux_session_under_source_authority,
+    runtime_bindings_for_kind,
+};
+pub(crate) mod codex_verified;
+#[cfg(test)]
+pub(crate) use codex_hook::SHADOW_IO_CALLS;
 pub(crate) use codex_hook::{
-    codex_tail_source_retired, observe_codex_hook, publish_unless_codex_tail_retired,
+    codex_tail_source_retired, codex_tui_binding_is_subagent, observe_codex_hook,
+    observe_codex_shadow, publish_unless_codex_tail_retired, register_codex_herdr_placeholder,
+    register_launched_tmux_runtime_binding,
+    register_launched_tmux_runtime_binding_under_source_authority,
+};
+#[cfg(test)]
+pub(crate) use codex_verified::{
+    DeliveryPermission as CodexDeliveryPermissionForTests,
+    set_permission_for_tests as set_codex_delivery_permission_for_tests,
+};
+pub(crate) use codex_verified::{
+    channel_allowed_under_source_authority as codex_verified_channel_allowed_under_source_authority,
+    codex_verified_discovered_channel, observe_verified_codex_hook,
+    recover_discovered_codex_binding, resolve_registered_claims as resolve_codex_claims,
 };
 pub(crate) mod pane_registration;
 pub(crate) use adopt_skip::*;
+pub(crate) use pane_registration::register_rehydrated_tmux_runtime_binding_under_source_authority;
 
 fn with_runtime_binding_state_under_source_authority<R>(
     authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
@@ -34,29 +71,6 @@ fn with_runtime_binding_authority<R>(
 
 pub fn subscribe_observed_prompts() -> broadcast::Receiver<ObservedTuiPrompt> {
     OBSERVED_PROMPTS.subscribe()
-}
-
-pub fn register_provider_session(
-    provider: &str,
-    provider_session_id: &str,
-    tmux_session_name: &str,
-) {
-    let provider_session_id = provider_session_id.trim();
-    let tmux_session_name = tmux_session_name.trim();
-    if provider_session_id.is_empty() || tmux_session_name.is_empty() {
-        return;
-    }
-    {
-        let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
-        state.purge_expired();
-        state.tmux_by_provider_session.insert(
-            PromptKey::new(provider, provider_session_id),
-            TimedValue {
-                value: tmux_session_name.to_string(),
-                recorded_at: Instant::now(),
-            },
-        );
-    }
 }
 
 /// Reverse lookup: resolve the provider session id that maps to `tmux_session_name`
@@ -102,6 +116,19 @@ pub fn register_tmux_channel(tmux_session_name: &str, channel_id: u64) {
     if tmux_session_name.is_empty() || channel_id == 0 {
         return;
     }
+    crate::services::tmux_common::with_tmux_source_authority(tmux_session_name, |authority| {
+        register_tmux_channel_under_source_authority(authority, channel_id);
+    });
+}
+
+pub(crate) fn register_tmux_channel_under_source_authority(
+    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
+    channel_id: u64,
+) {
+    let tmux_session_name = authority.session();
+    if tmux_session_name.is_empty() || channel_id == 0 {
+        return;
+    }
     if tmux_session_name.contains("-dm-") {
         if let Err(error) =
             crate::services::tmux_common::write_tmux_channel_binding(tmux_session_name, channel_id)
@@ -140,24 +167,6 @@ pub(crate) fn register_tmux_runtime_binding_under_source_authority(
         .is_some_and(Persisted::published)
 }
 
-/// Launch paths let the execution's context name the cause of a new source.
-pub(crate) fn register_launched_tmux_runtime_binding(
-    tmux_session_name: &str,
-    binding: TuiRuntimeBinding,
-) {
-    crate::services::tmux_common::with_tmux_source_authority(tmux_session_name, |authority| {
-        register_launched_tmux_runtime_binding_under_source_authority(authority, binding)
-    });
-}
-
-pub(crate) fn register_launched_tmux_runtime_binding_under_source_authority(
-    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
-    binding: TuiRuntimeBinding,
-) -> bool {
-    publish_runtime_binding(authority, binding, None, CauseSource::Launch, Record::Stat)
-        .is_some_and(Persisted::published)
-}
-
 /// Persists the binding event first; nothing is published on failure (`None`) or when a pin refuses.
 fn publish_runtime_binding(
     authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
@@ -172,6 +181,35 @@ fn publish_runtime_binding(
     }
     if binding.relay_output_path().trim().is_empty() {
         return None;
+    }
+    if codex_tui_binding_is_subagent(tmux_session_name, &binding) {
+        return None;
+    }
+    if binding.runtime_kind == RuntimeHandoffKind::CodexTui {
+        if !codex_verified::publication_allowed(authority, &binding) {
+            return None;
+        }
+        match codex_verified::current_context(authority) {
+            Ok(Some(_)) => {
+                if !codex_verified::consumer_allowed(authority, &binding) {
+                    return None;
+                }
+                let binding = codex_cursor::restore(authority, binding).ok()?;
+                codex_cursor::persist_after_restore(authority, &binding).ok()?;
+                with_runtime_binding_state_under_source_authority(authority, |state| {
+                    state.runtime_by_tmux.insert(
+                        tmux_session_name.to_owned(),
+                        TimedValue {
+                            value: binding,
+                            recorded_at: Instant::now(),
+                        },
+                    );
+                });
+                return Some(Persisted::Logged);
+            }
+            Err(_) => return None,
+            Ok(None) => {}
+        }
     }
     with_runtime_binding_state_under_source_authority(authority, |state| {
         let channel_id = channel_id.or_else(|| {
@@ -222,17 +260,6 @@ pub(crate) fn register_rehydrated_tmux_runtime_binding(
     registered
 }
 
-pub(crate) fn register_rehydrated_tmux_runtime_binding_under_source_authority(
-    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
-    provider: &str,
-    channel_id: u64,
-    binding: TuiRuntimeBinding,
-) -> bool {
-    let record = Record::Stat;
-    register_rehydrated_under_source_authority(authority, provider, channel_id, binding, record)
-        .is_some_and(Persisted::published)
-}
-
 /// `None` when nothing was published; otherwise what the record left, published only if it says so.
 fn register_rehydrated_under_source_authority(
     authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
@@ -240,6 +267,7 @@ fn register_rehydrated_under_source_authority(
     channel_id: u64,
     binding: TuiRuntimeBinding,
     record: Record,
+    cause: CauseSource,
 ) -> Option<Persisted> {
     let provider = normalize_provider(provider);
     let tmux_session_name = authority.session();
@@ -251,9 +279,11 @@ fn register_rehydrated_under_source_authority(
     {
         return None;
     }
+    if !codex_verified::publication_allowed(authority, &binding) {
+        return None;
+    }
     let binding = codex_hook::restored_source(authority, &provider, channel_id, binding)?;
     let session_id = binding.session_id.clone();
-    let cause = CauseSource::Observed;
     let persisted = publish_runtime_binding(authority, binding, Some(channel_id), cause, record)?;
     if !persisted.published() {
         return Some(persisted);
@@ -290,8 +320,20 @@ pub(crate) fn reconcile_rehydrated_tmux_runtime_binding(
     observe_before_replace: impl FnOnce(),
     decide: impl FnOnce(Option<TuiRuntimeBinding>) -> Option<(TuiRuntimeBinding, bool)>,
 ) -> Option<TuiRuntimeBinding> {
+    reconcile_rehydrated_tmux_runtime_binding_with_authority(
+        provider, tmux_session_name, channel_id, observe_before_replace,
+        |_, existing| decide(existing),
+    )
+}
+
+#[rustfmt::skip]
+pub(crate) fn reconcile_rehydrated_tmux_runtime_binding_with_authority(
+    provider: &str, tmux_session_name: &str, channel_id: u64,
+    observe_before_replace: impl FnOnce(),
+    decide: impl FnOnce(&crate::services::tmux_common::TmuxSourceAuthority<'_>, Option<TuiRuntimeBinding>) -> Option<(TuiRuntimeBinding, bool)>,
+) -> Option<TuiRuntimeBinding> {
     crate::services::tmux_common::with_tmux_source_authority(tmux_session_name, |authority| {
-        let (binding, replace) = decide(runtime_binding_for_tmux_session_under_source_authority(authority))?;
+        let (binding, replace) = decide(authority, runtime_binding_for_tmux_session_under_source_authority(authority))?;
         if replace {
             observe_before_replace();
             // An unpublished binding reports none; a published one reports what restore stored.
@@ -300,7 +342,7 @@ pub(crate) fn reconcile_rehydrated_tmux_runtime_binding(
             }
             return runtime_binding_for_tmux_session_under_source_authority(authority);
         }
-        Some(binding)
+        codex_verified::consumer_allowed(authority, &binding).then_some(binding)
     })
 }
 
@@ -333,6 +375,7 @@ pub fn owner_channel_for_tmux_session(tmux_session_name: &str) -> Option<u64> {
 pub(crate) fn reset_state_for_tests() {
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
     *state = TuiPromptDedupeState::default();
+    Instant::reset();
 }
 
 /// Test-only: when the runtime binding for `tmux_session_name` was last written.
@@ -345,12 +388,7 @@ pub(crate) fn runtime_binding_recorded_at_for_tests(tmux_session_name: &str) -> 
         .map(|entry| entry.recorded_at)
 }
 
-/// Test-only: record a prompt anchor whose `recorded_at` is backdated by `age`,
-/// so a test can simulate an anchor stamped at submit time for a turn that has
-/// been streaming for `age`. Crate-visible so sibling modules (e.g. the
-/// `turn_bridge` same-input correlation tests) can pin that a long streaming
-/// turn's anchor still resolves past the legacy 30min purge under
-/// `PROMPT_ANCHOR_SUBMIT_TTL`.
+/// Records an aged anchor using a forward-moving test clock, preserving other records' ages.
 #[cfg(test)]
 pub(crate) fn record_prompt_anchor_aged_for_tests(
     provider: &str,
@@ -365,6 +403,7 @@ pub(crate) fn record_prompt_anchor_aged_for_tests(
         return;
     }
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    let recorded_at = state.aged_stamp_for_tests(age);
     state.prompt_anchor_by_tmux.insert(
         PromptKey::new(&provider, tmux_session_name),
         TimedValue {
@@ -372,7 +411,7 @@ pub(crate) fn record_prompt_anchor_aged_for_tests(
                 channel_id,
                 message_id,
             },
-            recorded_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
+            recorded_at,
         },
     );
 }
@@ -640,33 +679,6 @@ pub(crate) fn take_deferred_anchor_completion(
     matches
 }
 
-pub(crate) fn runtime_binding_for_tmux_session(
-    tmux_session_name: &str,
-) -> Option<TuiRuntimeBinding> {
-    let tmux_session_name = tmux_session_name.trim();
-    if tmux_session_name.is_empty() {
-        return None;
-    }
-    with_runtime_binding_authority(tmux_session_name, |state| {
-        state
-            .runtime_by_tmux
-            .get(tmux_session_name)
-            .map(|entry| entry.value.clone())
-    })
-}
-
-pub(crate) fn runtime_binding_for_tmux_session_under_source_authority(
-    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
-) -> Option<TuiRuntimeBinding> {
-    let tmux_session_name = authority.session();
-    with_runtime_binding_state_under_source_authority(authority, |state| {
-        state
-            .runtime_by_tmux
-            .get(tmux_session_name)
-            .map(|entry| entry.value.clone())
-    })
-}
-
 /// Adopt the actual Claude session UUID reported inside a hook payload while
 /// retaining the launch-time UUID as a stable hook-routing alias (#4423).
 ///
@@ -911,21 +923,10 @@ pub(crate) fn evict_dead_tmux_mirror(tmux_session_name: &str) -> bool {
     removed
 }
 
-pub(crate) fn runtime_bindings_for_kind(
-    runtime_kind: RuntimeHandoffKind,
-) -> Vec<(String, TuiRuntimeBinding)> {
-    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
-    state.purge_expired();
-    state
-        .runtime_by_tmux
-        .iter()
-        .filter(|(_, entry)| {
-            entry.value.runtime_kind == runtime_kind
-                && entry.recorded_at.elapsed() <= SESSION_MAPPING_TTL
-        })
-        .map(|(tmux_session_name, entry)| (tmux_session_name.clone(), entry.value.clone()))
-        .collect()
-}
+#[cfg(test)]
+mod codex_legacy_lock_tests;
+#[cfg(test)]
+mod codex_verified_tests;
 
 /// Live sessions of `kinds` with their cached owner channel, copied without purging relay state;
 /// `None` when the lock is busy.
@@ -964,33 +965,6 @@ pub(crate) fn advance_tmux_runtime_binding_offset(
             output_path,
             last_offset,
         )
-    })
-}
-
-pub(crate) fn advance_tmux_runtime_binding_offset_under_source_authority(
-    authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
-    output_path: &str,
-    last_offset: u64,
-) -> bool {
-    let tmux_session_name = authority.session();
-    with_runtime_binding_state_under_source_authority(authority, |state| {
-        let Some(entry) = state.runtime_by_tmux.get_mut(tmux_session_name) else {
-            return false;
-        };
-        if entry.value.output_path == output_path {
-            entry.value.last_offset = last_offset;
-            if entry.value.relay_output_path.is_none() {
-                entry.value.relay_last_offset = Some(last_offset);
-            }
-            entry.recorded_at = Instant::now();
-            return true;
-        }
-        if entry.value.relay_output_path.as_deref() != Some(output_path) {
-            return false;
-        }
-        entry.value.relay_last_offset = Some(last_offset);
-        entry.recorded_at = Instant::now();
-        true
     })
 }
 
@@ -1034,7 +1008,10 @@ mod shadow_session_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         reset_state_for_tests();
-        let expired = Instant::now() - SESSION_MAPPING_TTL - Duration::from_secs(1);
+        let expired = {
+            let mut state = STATE.lock().unwrap_or_else(|p| p.into_inner());
+            state.aged_stamp_for_tests(SESSION_MAPPING_TTL + Duration::from_secs(1))
+        };
         let binding = |runtime_kind| TuiRuntimeBinding {
             runtime_kind,
             output_path: "/t/s.jsonl".into(),

@@ -63,7 +63,7 @@ async fn claim_tui_direct_synthetic_turn_prepared(
         prompt_text,
         anchor_message_id,
         lease,
-        register_deferred_start: _,
+        ..
     } = identity;
 
     let (cancel_token, pg_pin, class) = match bridge_handoff::prepare_admission(
@@ -292,6 +292,7 @@ async fn claim_tui_direct_synthetic_turn_prepared(
         relay_owner_kind,
     );
     inflight_state.turn_nonce = active_turn_nonce;
+    inflight_state.native_turn_id = identity.native_turn.map(str::to_string);
     // #4002/#4082: lower-level safety. Normal wiring gates neutral continuation
     // records before this point; if a suppressing class reaches the raw claim API,
     // keep it relay-ownership-only so watcher completion Path B skips it.
@@ -748,6 +749,7 @@ mod tests {
             state: crate::services::discord::tui_direct_pending_start::PendingStartState::Waiting,
             attempt_count: 0,
             captured_source: None,
+            native_turn_id: None,
         };
         assert!(pending_start_claim_fn()(shared, &record).await);
         let stale_token = crate::services::discord::mailbox_snapshot(shared, channel_id)
@@ -2321,6 +2323,7 @@ pub(super) fn defer_synthetic_turn_start(
         state: super::super::tui_direct_pending_start::PendingStartState::Waiting,
         attempt_count: 0,
         captured_source,
+        native_turn_id: prompt.native_turn_id.clone(),
     };
     if let Err(error) = super::super::tui_direct_pending_start::persist(&record) {
         tracing::warn!(
@@ -2343,6 +2346,10 @@ pub(super) fn defer_synthetic_turn_start(
 
 /// The worker's per-poll view builder (see [`synthetic_start_prior_turn_view`]).
 pub(super) fn pending_start_view_fn() -> super::super::tui_direct_pending_start::ViewFn {
+    #[cfg(test)]
+    if let Some(view) = RESTORE_VIEW_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
+        return view;
+    }
     Box::new(|shared, record| {
         Box::pin(async move {
             let provider = ProviderKind::from_str(&record.provider)?;
@@ -2366,6 +2373,10 @@ pub(super) fn pending_start_view_fn() -> super::super::tui_direct_pending_start:
 /// reads the runtime binding FRESH and seeds `turn_start_offset = relay_last_offset()`
 /// (post-drain == EOF) with `response_sent_offset = 0`.
 pub(super) fn pending_start_claim_fn() -> super::super::tui_direct_pending_start::ClaimFn {
+    #[cfg(test)]
+    if let Some(claim) = RESTORE_CLAIM_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
+        return claim;
+    }
     Box::new(|shared, record| {
         Box::pin(async move {
             let Some(provider) = ProviderKind::from_str(&record.provider) else {
@@ -2410,6 +2421,7 @@ pub(super) fn pending_start_claim_fn() -> super::super::tui_direct_pending_start
                 anchor_message_id,
                 &lease,
                 record.captured_source.as_ref(),
+                record.native_turn_id.as_deref(),
             )
             .await
             .0;
@@ -2468,12 +2480,8 @@ pub(super) fn pending_start_claim_fn() -> super::super::tui_direct_pending_start
                     )
                     .unwrap_or_else(|| lease.clone());
                 tail_lease.relay_owner = claim.relay_owner;
-                // #3154 P1 (timestamp-anchor output loss): `observed_at` is NO LONGER
-                // used to anchor the tail's start offset for this deferred path — we
-                // pass the claim's post-drain EOF `turn_start_offset` explicitly below
-                // (see `explicit_start_offset`). It remains on the struct only for the
-                // tail's tracing/lease bookkeeping; a `Utc::now()` timestamp scan here
-                // would skip bytes written during the deferred-claim wait window.
+                // `observed_at` is bookkeeping only: the tail starts at the claim's post-drain EOF
+                // offset below, because a timestamp scan would skip bytes written while deferred.
                 let observed = ObservedTuiPrompt {
                     provider: record.provider.clone(),
                     tmux_session_name: record.tmux_session_name.clone(),
@@ -2485,6 +2493,9 @@ pub(super) fn pending_start_claim_fn() -> super::super::tui_direct_pending_start
                     ssh_direct_observation_generation:
                         crate::services::tui_prompt_dedupe::SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
                     hook_prompt_id: None,
+                    row_prompt_id: None,
+                    native_turn_id: None,
+                    steer_echo: false,
                 };
                 let spawned = maybe_spawn_claude_idle_response_tail(
                     shared.clone(),
@@ -2579,13 +2590,25 @@ pub(super) fn pending_start_abort_cleanup_fn()
     })
 }
 
-/// #3154 restart durability: restore durable pending-start records during
-/// provider relay startup. Rehydrates the in-memory presence index (so the
-/// watcher / idle-queue gates hold immediately) and respawns the worker for each
-/// record whose provider matches.
-pub(super) fn restore_pending_starts(shared: &Arc<SharedData>, provider: &ProviderKind) {
+#[cfg(test)]
+thread_local! {
+    pub(in crate::services::discord) static RESTORE_VIEW_FOR_TEST: std::cell::RefCell<Option<super::super::tui_direct_pending_start::ViewFn>> = const { std::cell::RefCell::new(None) };
+    pub(in crate::services::discord) static RESTORE_CLAIM_FOR_TEST: std::cell::RefCell<Option<super::super::tui_direct_pending_start::ClaimFn>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Restore matching pending starts only for channels without an input-fence gate.
+/// Protected records stay durable instead of spawning a second boot consumer.
+pub(in crate::services::discord) fn restore_pending_starts(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+) {
     for record in super::super::tui_direct_pending_start::load_all() {
         if !record.provider.eq_ignore_ascii_case(provider.as_str()) {
+            continue;
+        }
+        if crate::services::discord::input_runtime::fence::lookup(provider, record.channel_id)
+            .is_some()
+        {
             continue;
         }
         // Re-mark present (load_all does not touch the index) so the gates hold
@@ -2639,16 +2662,16 @@ pub(super) fn tui_direct_watcher_can_own_output(
 }
 
 /// Owner stamped on a new TUI-direct synthetic row. The sink only gets a session-bound
-/// turn's frames from a live tmux watcher, so without one the bridge tail must deliver.
+/// turn's frames from a live tmux watcher reading this output, else the bridge tail delivers.
 pub(super) fn tui_direct_synthetic_relay_owner(
     watcher_can_own: bool,
     session_bound_discord_delivery_enabled: bool,
     live_producer_present: bool,
-    tmux_watcher_live: bool,
+    covers_output: bool,
 ) -> ExternalInputRelayOwner {
     if watcher_can_own {
         ExternalInputRelayOwner::TmuxWatcher
-    } else if session_bound_discord_delivery_enabled && live_producer_present && tmux_watcher_live {
+    } else if session_bound_discord_delivery_enabled && live_producer_present && covers_output {
         ExternalInputRelayOwner::SessionBoundRelay
     } else {
         ExternalInputRelayOwner::BridgeAdapter
@@ -2757,14 +2780,19 @@ pub(super) async fn wait_for_tui_direct_synthetic_non_bridge_claim(
 ) -> bool {
     let deadline = tokio::time::Instant::now() + TUI_DIRECT_SYNTHETIC_CLAIM_WAIT;
     loop {
-        // The sink only hears frames a live tmux watcher forwards to the producer.
+        let state = super::super::inflight::load_inflight_state(provider, channel_id.get());
+        let output = state
+            .as_ref()
+            .and_then(|row| row.output_path.as_deref())
+            .map(Path::new);
+        // The sink only hears frames a live tmux watcher reading the row's output forwards.
         let session_bound_relay_has_live_producer =
             crate::services::cluster::relay_producer_registry::global_relay_producer_registry()
                 .get_live_producer(tmux_session_name)
                 .is_some()
-                && watchers.tmux_session_live_for_relay(tmux_session_name) == Some(true);
+                && claim::tui_direct_watcher_covers_output(watchers, tmux_session_name, output);
         if tui_direct_synthetic_non_bridge_owner_matches(
-            super::super::inflight::load_inflight_state(provider, channel_id.get()).as_ref(),
+            state.as_ref(),
             tmux_session_name,
             session_bound_relay_has_live_producer,
         ) {

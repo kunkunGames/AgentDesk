@@ -170,7 +170,8 @@ pub async fn clear_slot_sessions_pg(
              tokens = 0,
              last_heartbeat = NOW()
          WHERE thread_channel_id = ANY($2::TEXT[])
-           AND status = ANY($3::TEXT[])",
+           AND status = ANY($3::TEXT[])
+           AND NOT replay_session_held(current_replay_receipt_id, active_dispatch_id)",
     )
     .bind(SLOT_THREAD_RESET_SESSION_INFO)
     .bind(&thread_channel_ids)
@@ -191,6 +192,12 @@ pub async fn clear_slot_threads_for_slot_pg(
     let registry = health_registry.as_deref();
     let (safe_to_clear_thread_ids, verdicts) =
         filter_safe_slot_thread_reset_targets(pool, registry, &target).await?;
+    #[cfg(test)]
+    for channel in &safe_to_clear_thread_ids {
+        crate::services::discord::admin_host_guard::run_before_verified_clear_recheck_for_tests(
+            *channel,
+        );
+    }
     let cleared = clear_slot_sessions_pg(pool, &safe_to_clear_thread_ids).await?;
 
     if health_registry.is_some() {
@@ -415,7 +422,13 @@ async fn filter_safe_slot_thread_reset_targets(
             .selected_rows
             .iter()
             .find(|row| row.thread_channel_id == *thread_channel_id);
-        if let Some(reason) = slot_thread_host_refusal(pool, &thread_id, selected).await {
+        // A Herdr-configured thread is kept whatever its rows say, with or without a registry.
+        let configured = crate::services::discord::admin_host_guard::configured_refusal;
+        let host = match configured(*thread_channel_id) {
+            Some(reason) => Some(reason),
+            None => slot_thread_host_refusal(pool, &thread_id, selected).await,
+        };
+        if let Some(reason) = host {
             tracing::warn!(
                 "[auto-queue] skipping slot thread reset for {thread_channel_id}: {reason}"
             );
@@ -465,8 +478,9 @@ async fn slot_thread_host_refusal(
     thread_id: &str,
     selected: Option<&SlotThreadRow>,
 ) -> Option<String> {
-    let rows = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-        "SELECT provider, session_key
+    let rows = sqlx::query_as::<_, (Option<String>, Option<String>, bool)>(
+        "SELECT provider, session_key,
+                replay_session_held(current_replay_receipt_id, active_dispatch_id)
          FROM sessions
          WHERE thread_channel_id = $1
            AND status = ANY($2::TEXT[])",
@@ -479,8 +493,13 @@ async fn slot_thread_host_refusal(
         Ok(rows) => rows,
         Err(error) => return Some(format!("read the thread's sessions: {error}")),
     };
+    // A session whose started attempt is held keeps its provider session and runtime.
+    if rows.iter().any(|(_, _, held)| *held) {
+        return Some("a session holds a started attempt whose replay is held".to_string());
+    }
+    let rows = rows.into_iter().map(|(provider, key, _)| (provider, key));
     let selected = selected.map(|row| (row.provider.clone(), row.session_key.clone()));
-    for (provider, session_key) in rows.into_iter().chain(selected) {
+    for (provider, session_key) in rows.chain(selected) {
         let Some(key) = session_key else {
             return Some("a session row holds no session key".to_string());
         };
@@ -517,3 +536,8 @@ mod clear_slot_sessions_pg_tests;
 #[cfg(test)]
 #[path = "runtime/slot_reset_host_pg_tests.rs"]
 pub(crate) mod slot_reset_host_pg_tests;
+
+#[cfg(test)]
+#[cfg(unix)]
+#[path = "runtime/verified_reset_pg_tests.rs"]
+pub(crate) mod verified_reset_pg_tests;

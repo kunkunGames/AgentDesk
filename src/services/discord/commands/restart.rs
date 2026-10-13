@@ -144,12 +144,14 @@ async fn start_restart_seed_turn(ctx: &Context<'_>) -> RestartSeedStatus {
 
     for attempt in 0..MAX_ATTEMPTS {
         match super::super::router::start_headless_turn(
-            ctx.serenity_context(),
+            (
+                ctx.serenity_context(),
+                &ctx.data().shared,
+                &ctx.data().token,
+            ),
             channel_id,
             RESTART_SEED_PROMPT,
             "/restart",
-            &ctx.data().shared,
-            &ctx.data().token,
             Some("/restart"),
             Some(metadata.clone()),
             channel_name_hint.clone(),
@@ -191,44 +193,55 @@ where
     Warn: FnOnce() -> WarnFut,
     WarnFut: std::future::Future<Output = Result<(), Error>>,
 {
-    // Refused before the in-flight turn is cancelled: the session is not a legacy tmux one.
-    let refusal = super::super::admin_host_guard::managed_reset_refusal;
-    if let Some(reason) = refusal(shared, provider, channel_id, true, true, None).await {
-        return Ok(Err(reason));
-    }
-
-    // Warn if a turn is in flight, then cancel it via the same path /stop uses.
-    if mailbox_has_active_turn(shared, channel_id).await {
-        warn_in_flight().await?;
-        let cancel = mailbox_cancel_active_turn(shared, channel_id).await;
-        if let Some(token) = cancel.token {
-            super::super::turn_bridge::stop_active_turn(
-                provider,
-                &token,
-                super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
-                command_name,
-            )
-            .await;
+    let permit = match crate::services::cluster::channel_home::admit_command(
+        &channel_id.get().to_string(),
+        provider.as_str(),
+    ) {
+        Ok(permit) => permit,
+        Err(reason) => return Ok(Err(reason.to_string())),
+    };
+    crate::services::cluster::channel_home::command_scope(permit, async {
+        // Refused before the in-flight turn is cancelled: the session is not a legacy tmux one.
+        let refusal = super::super::admin_host_guard::managed_reset_refusal;
+        if let Some(reason) = refusal(shared, provider, channel_id, true, true, None).await {
+            return Ok(Err(reason));
         }
-    }
+        super::super::turn_presence::entrypoints::withdraw(channel_id.get(), "restart");
 
-    // Kill the managed tmux/process session without clearing session_id when the
-    // provider can resume. The seed turn below immediately respawns the provider.
-    let reset = super::control::reset_channel_provider_state(
-        http,
-        shared,
-        provider,
-        channel_id,
-        command_name,
-        !provider_supports_resume(provider),
-        false, // do NOT clear history
-        true,  // recreate (kill) the tmux session so the seed turn fully respawns provider
-    )
-    .await;
-    Ok(match reset {
-        ManagedReset::Applied(tmux_name) => Ok(tmux_name),
-        ManagedReset::Refused(reason) => Err(reason),
+        // Warn if a turn is in flight, then cancel it via the same path /stop uses.
+        if mailbox_has_active_turn(shared, channel_id).await {
+            warn_in_flight().await?;
+            let cancel = mailbox_cancel_active_turn(shared, channel_id).await;
+            if let Some(token) = cancel.token {
+                super::super::turn_bridge::stop_active_turn(
+                    provider,
+                    &token,
+                    super::super::turn_bridge::TmuxCleanupPolicy::PreserveSession,
+                    command_name,
+                )
+                .await;
+            }
+        }
+
+        // Kill the managed tmux/process session without clearing session_id when the
+        // provider can resume. The seed turn below immediately respawns the provider.
+        let reset = super::control::reset_channel_provider_state(
+            http,
+            shared,
+            provider,
+            channel_id,
+            command_name,
+            !provider_supports_resume(provider),
+            false, // do NOT clear history
+            true,  // recreate (kill) the tmux session so the seed turn fully respawns provider
+        )
+        .await;
+        Ok(match reset {
+            ManagedReset::Applied(tmux_name) => Ok(tmux_name),
+            ManagedReset::Refused(reason) => Err(reason),
+        })
     })
+    .await
 }
 
 async fn run_restart(ctx: Context<'_>, command_name: &'static str) -> Result<(), Error> {
@@ -241,47 +254,54 @@ async fn run_restart(ctx: Context<'_>, command_name: &'static str) -> Result<(),
         return Ok(());
     }
 
-    log_command_received!(ctx.channel_id().get(), user_name, command_name);
-    ctx.say("♻ 세션 재시작 중...").await?;
+    let permit = crate::services::cluster::channel_home::admit_command(
+        &ctx.channel_id().get().to_string(),
+        ctx.data().provider.as_str(),
+    )?;
+    crate::services::cluster::channel_home::command_scope(permit, async {
+        log_command_received!(ctx.channel_id().get(), user_name, command_name);
+        ctx.say("♻ 세션 재시작 중...").await?;
 
-    let channel_id = ctx.channel_id();
-    let action = resolve_restart_action(&ctx.data().shared, channel_id).await;
-    let http = ctx.serenity_context().http.clone();
-    let (shared, provider) = (&ctx.data().shared, &ctx.data().provider);
-    let warn = || async {
-        ctx.say("⚠ 진행 중 턴 1회 손실 가능 — 안전하게 중단합니다.")
-            .await
-            .map(|_| ())
-            .map_err(Error::from)
-    };
-    let restarted =
-        restart_managed_session(&http, shared, provider, channel_id, command_name, warn);
-    let tmux_name = match restarted.await? {
-        Ok(tmux_name) => tmux_name,
-        Err(reason) => {
-            ctx.say(format!("♻ 세션을 재시작하지 않았어요: {reason}"))
-                .await?;
-            return Ok(());
-        }
-    };
+        let channel_id = ctx.channel_id();
+        let action = resolve_restart_action(&ctx.data().shared, channel_id).await;
+        let http = ctx.serenity_context().http.clone();
+        let (shared, provider) = (&ctx.data().shared, &ctx.data().provider);
+        let warn = || async {
+            ctx.say("⚠ 진행 중 턴 1회 손실 가능 — 안전하게 중단합니다.")
+                .await
+                .map(|_| ())
+                .map_err(Error::from)
+        };
+        let restarted =
+            restart_managed_session(&http, shared, provider, channel_id, command_name, warn);
+        let tmux_name = match restarted.await? {
+            Ok(tmux_name) => tmux_name,
+            Err(reason) => {
+                ctx.say(format!("♻ 세션을 재시작하지 않았어요: {reason}"))
+                    .await?;
+                return Ok(());
+            }
+        };
 
-    let seed_status = start_restart_seed_turn(&ctx).await;
-    ctx.say(build_restart_response(
-        &ctx.data().provider,
-        &action,
-        tmux_name.as_deref(),
-        &seed_status,
-    ))
-    .await?;
-    log_info_event!(
-        "discord_restart_triggered",
-        channel_id = channel_id.get(),
-        user_name = %user_name,
-        command = %command_name,
-        provider = ctx.data().provider.as_str(),
-        status = ?seed_status,
-    );
-    Ok(())
+        let seed_status = start_restart_seed_turn(&ctx).await;
+        ctx.say(build_restart_response(
+            &ctx.data().provider,
+            &action,
+            tmux_name.as_deref(),
+            &seed_status,
+        ))
+        .await?;
+        log_info_event!(
+            "discord_restart_triggered",
+            channel_id = channel_id.get(),
+            user_name = %user_name,
+            command = %command_name,
+            provider = ctx.data().provider.as_str(),
+            status = ?seed_status,
+        );
+        Ok(())
+    })
+    .await
 }
 
 /// Restart the current provider session immediately.
@@ -304,14 +324,16 @@ mod host_guard_tests {
         busy_turn, channel_key, shared_on, turn_kept,
     };
 
-    // `/restart` on a session the host guard keeps leaves its in-flight turn, process and tmux
-    // as they are and says why; a legacy row, or no row yet, cancels and kills as in main.
+    // `/restart` on a session the host guard keeps, or on a Herdr-configured channel, leaves its
+    // turn, process and tmux as they are and says why; otherwise it cancels and kills as in main.
     #[tokio::test]
     async fn restart_keeps_the_turn_and_process_of_a_refused_session_pg() {
         let _root = crate::config::TestRuntimeRootGuard::new();
         let tmux = ScriptedTmux::install();
         let (db, pool) = postgres().await;
         let shared = shared_on(&pool).await;
+        let probe =
+            crate::services::discord::turn_presence::entrypoints::tests::Probe::install(&shared);
         let (provider, http) = (ProviderKind::Claude, Arc::new(serenity::Http::new("")));
         for (n, case) in Case::ALL.into_iter().enumerate() {
             let channel = serenity::ChannelId::new(1_479_671_302_387_071_000 + n as u64);
@@ -323,9 +345,16 @@ mod host_guard_tests {
             let token = busy_turn(&shared, channel, &name).await;
             let alive = process(&name, n as u32 + 68_000);
             tmux.take_calls();
+            let ticket = probe.arm(channel.get());
 
             let warned = AtomicBool::new(false);
             let warn = || {
+                // An admitted restart withdraws the approval before it cancels the turn.
+                assert!(
+                    !crate::services::discord::turn_presence::entrypoints::tests::Probe::current(
+                        &ticket
+                    )
+                );
                 warned.store(true, Ordering::SeqCst);
                 async { Ok(()) }
             };
@@ -341,6 +370,11 @@ mod host_guard_tests {
                 let calls = tmux.take_calls();
                 let recreated = calls.iter().any(|call| call.contains(&name));
                 assert!(recreated, "{case:?}: main recreates tmux: {calls:?}");
+                assert!(
+                    !crate::services::discord::turn_presence::entrypoints::tests::Probe::current(
+                        &ticket
+                    )
+                );
                 crate::services::session_backend::remove_process_session(&name);
                 continue;
             }
@@ -353,8 +387,95 @@ mod host_guard_tests {
             );
             assert!(alive.load(Ordering::SeqCst), "{case:?}: process kept");
             assert_eq!(tmux.take_calls(), Vec::<String>::new(), "{case:?}: no tmux");
+            let current =
+                crate::services::discord::turn_presence::entrypoints::tests::Probe::current;
+            assert!(
+                current(&ticket),
+                "{case:?}: a refused restart withdraws nothing"
+            );
             crate::services::session_backend::remove_process_session(&name);
         }
+
+        // A legacy row the guard admits, on a configured channel with admission stopped.
+        use crate::services::discord::host_teardown_gate::test_support::Stored;
+        use crate::services::herdr_admission::{Admission, force_for_test};
+        let channel = serenity::ChannelId::new(1_479_671_302_387_071_900);
+        let name = provider.build_tmux_session_name("p9b1-restart");
+        map_channel(&shared, channel, "p9b1-restart").await;
+        Case::Stored(Stored::Legacy)
+            .seed(&pool, &channel_key(&shared, &name), &name, channel.get())
+            .await;
+        let token = busy_turn(&shared, channel, &name).await;
+        let alive = process(&name, 68_900);
+        let configured = [(channel.get(), "mac-mini")];
+        let _hosts = crate::config::session_hosts::force_for_test(Some("mac-mini"), &configured);
+        let _off = force_for_test(Admission::new(Some("off".as_ref()), None));
+        tmux.take_calls();
+        let warned = AtomicBool::new(false);
+        let warn = || {
+            warned.store(true, Ordering::SeqCst);
+            async { Ok(()) }
+        };
+        let restart = restart_managed_session(&http, &shared, &provider, channel, "/restart", warn);
+        let restarted = restart.await.expect("restart");
+        assert!(
+            turn_kept(&shared, channel, &token).await,
+            "configured: turn kept"
+        );
+        assert!(alive.load(Ordering::SeqCst), "configured: process kept");
+        assert_eq!(
+            tmux.take_calls(),
+            Vec::<String>::new(),
+            "configured: no tmux"
+        );
+        assert!(
+            !warned.load(Ordering::SeqCst),
+            "configured: no in-flight warning"
+        );
+        let reason = restarted.expect_err("a configured channel refuses the restart");
+        assert!(reason.contains("Herdr"), "{reason}");
+        crate::services::session_backend::remove_process_session(&name);
         db.drop().await;
+    }
+}
+
+#[cfg(test)]
+mod home_command_tests {
+    use super::*;
+    use crate::db::o_channel_homes::HomeState;
+    use crate::services::cluster::channel_home;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn command_restart_refuses_before_warn_or_mailbox_cancel() {
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let channel = serenity::ChannelId::new(9200000000000108);
+        let token = crate::services::discord::host_teardown_gate::test_support::nameless_turn(
+            &shared, channel,
+        )
+        .await;
+        let home = channel_home::register_for_test(channel.get(), Some(HomeState::Releasing));
+        let http = Arc::new(serenity::Http::new(""));
+        let result = restart_managed_session(
+            &http,
+            &shared,
+            &ProviderKind::Claude,
+            channel,
+            "/restart",
+            || async {
+                panic!("home refusal must precede the warning");
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("home_draining"));
+        assert!(!token.cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            crate::services::discord::host_teardown_gate::test_support::mailbox_turn_active(
+                &shared, channel
+            )
+            .await
+        );
+        assert_eq!(home.commands_in_flight(), 0);
+        channel_home::unregister(home.channel_id());
     }
 }

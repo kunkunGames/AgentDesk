@@ -1,4 +1,7 @@
+use super::super::codex_adoption_runtime::ObservationRuntimeId;
+use super::super::codex_adoption_runtime::boot::DiscoveryPass;
 use super::super::{inflight, task_supervisor};
+use super::idle_transcript_scan::CodexTurnPrompt;
 use super::*;
 #[cfg(unix)]
 fn advance_codex_tui_runtime_binding_and_marker_offset(
@@ -13,32 +16,79 @@ fn advance_codex_tui_runtime_binding_and_marker_offset(
     );
 }
 
+/// Runs one discovery pass off the async runtime. Only the adoption runtime installed when it
+/// began gets its result, after it returned; a failed join is recorded as a failed pass.
+#[cfg(unix)]
+pub(super) async fn codex_discovery_pass(
+    shared: &Arc<SharedData>,
+    pass: impl FnOnce(Option<ObservationRuntimeId>) -> DiscoveryPass + Send + 'static,
+) {
+    let adoption = super::super::codex_adoption_runtime::installed(shared);
+    let observer = adoption
+        .as_ref()
+        .map(|adoption| adoption.observation_runtime_id());
+    let pass = tokio::task::spawn_blocking(move || pass(observer))
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                error = %error,
+                "Codex TUI binding rehydrate task panicked or was cancelled"
+            );
+            Err(format!("rehydrate task: {error}"))
+        });
+    if let Some(adoption) = adoption {
+        adoption.record_discovery(pass);
+    }
+}
+
+/// The runtime the one Codex relay serves: the latest to start it, held weakly so a replaced
+/// runtime is not kept alive by the relay.
+#[cfg(unix)]
+static CODEX_RELAY_TARGET: Mutex<std::sync::Weak<SharedData>> = Mutex::new(std::sync::Weak::new());
+
+#[cfg(unix)]
+fn codex_relay_target() -> Option<Arc<SharedData>> {
+    let target = CODEX_RELAY_TARGET.lock();
+    target
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .upgrade()
+}
+
 #[cfg(unix)]
 pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
+    // Retargeted before the started check, so a later runtime takes over the one running relay.
+    *CODEX_RELAY_TARGET
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&shared);
+    drop(shared);
     if CODEX_IDLE_ROLLOUT_RELAY_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
+    #[cfg(test)]
+    RELAY_SPAWNS.fetch_add(1, Ordering::AcqRel);
     task_supervisor::spawn_observed("codex_idle_rollout_relay", async move {
         let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut active_tails: HashSet<String> = HashSet::new();
         let mut next_rehydrate = tokio::time::Instant::now();
 
         loop {
+            // Each cycle serves the current target; tails already started keep their own runtime.
+            let Some(shared) = codex_relay_target() else {
+                tokio::time::sleep(CODEX_IDLE_ROLLOUT_POLL_INTERVAL).await;
+                continue;
+            };
             // #3711: direct Codex TUI tmux sessions survive dcserver restarts,
             // but their in-memory rollout binding does not.
             let now = tokio::time::Instant::now();
             if now >= next_rehydrate {
                 let shared_for_rehydrate = shared.clone();
-                let rehydrate_result = tokio::task::spawn_blocking(move || {
-                    rehydrate_existing_codex_tui_bindings(&shared_for_rehydrate);
+                codex_discovery_pass(&shared, move |observer| {
+                    #[cfg(test)]
+                    note_relay_target(RelayUse::Discovery, &shared_for_rehydrate);
+                    crate::services::tui_prompt_dedupe::resolve_codex_claims();
+                    rehydrate_existing_codex_tui_bindings(&shared_for_rehydrate, observer)
                 })
                 .await;
-                if let Err(error) = rehydrate_result {
-                    tracing::warn!(
-                        error = %error,
-                        "Codex TUI binding rehydrate task panicked or was cancelled"
-                    );
-                }
                 next_rehydrate = now + CLAUDE_IDLE_REHYDRATE_POLL_INTERVAL;
             }
 
@@ -51,13 +101,20 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                     RuntimeHandoffKind::CodexTui,
                 )
             {
+                #[cfg(test)]
+                note_poll(&tmux_session_name, PollNote::Visit);
                 if active_tails.contains(&tmux_session_name) {
                     continue;
                 }
+                #[cfg(test)]
+                note_relay_target(RelayUse::Owner, &shared);
                 let Some(channel_id) =
                     owner_channel_for_tmux_session(&shared, &ProviderKind::Codex, &tmux_session_name, RelayEmissionKind::Poll)
                 else {
                     // #3018/#3306/#3656: registry miss ⇒ drop; Codex repair-ineligible.
+                    continue;
+                };
+                let Ok(_recovery) = super::super::live_bridge::try_recovery(&ProviderKind::Codex, channel_id.get()) else {
                     continue;
                 };
                 let Some(binding) =
@@ -89,15 +146,56 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                         &inflight,
                         &tmux_session_name,
                     ) {
-                        match scan_codex_idle_rollout_for_latest_prompt_matching(
-                            &rollout_path,
-                            &inflight.user_text,
-                        ) {
+                        // A row naming its native turn resumes only from that turn's record; a
+                        // rollout naming no turns keeps the text search.
+                        let resolved = match inflight.native_turn_id.as_deref() {
+                            Some(turn) => super::idle_transcript_scan::resolve_codex_turn_prompt_end(
+                                &rollout_path,
+                                turn,
+                                &inflight.user_text,
+                            ),
+                            None => Ok(CodexTurnPrompt::Unsupported),
+                        };
+                        let own_turn = matches!(resolved, Ok(CodexTurnPrompt::Found(_)))
+                            .then(|| inflight.native_turn_id.clone())
+                            .flatten();
+                        let selected = match resolved {
+                            Ok(CodexTurnPrompt::Found(line_end_offset)) => {
+                                Ok(Some(CodexIdleRolloutScan::Prompt {
+                                    prompt: inflight.user_text.clone(),
+                                    line_end_offset,
+                                    entry_id: None,
+                                }))
+                            }
+                            Ok(CodexTurnPrompt::NotYet) => Ok(None),
+                            Ok(CodexTurnPrompt::Unsupported) => {
+                                scan_codex_idle_rollout_for_latest_prompt_matching(
+                                    &rollout_path,
+                                    &inflight.user_text,
+                                )
+                            }
+                            Err(error) => Err(error),
+                        };
+                        match selected {
                             Ok(Some(CodexIdleRolloutScan::Prompt {
                                 prompt,
                                 line_end_offset,
                                 ..
                             })) => {
+                                let same_path = inflight.output_path.as_deref().map(Path::new)
+                                    == Some(rollout_path.as_path());
+                                // A same-rollout text match before the claim's start is an earlier
+                                // turn's prompt; wait for this turn's prompt and leave the row untouched.
+                                if same_path
+                                    && own_turn.is_none()
+                                    && inflight
+                                        .turn_start_offset
+                                        .is_some_and(|start| line_end_offset < start)
+                                {
+                                    #[cfg(test)]
+                                    note_poll(&tmux_session_name, PollNote::EarlierPrompt);
+                                    continue;
+                                }
                                 if let Some(anchor_id) = inflight.injected_prompt_message_id {
                                     crate::services::tui_prompt_dedupe::record_prompt_anchor(
                                         ProviderKind::Codex.as_str(),
@@ -118,10 +216,18 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                                 );
                                 let expected = inflight::InflightTurnIdentity::from_state(&inflight);
                                 let mut repaired = inflight;
-                                repaired.output_path =
-                                    rollout_path.to_str().map(ToString::to_string);
+                                // A claim on this rollout keeps its start: the bridge witness pins it,
+                                // and the tail below resumes from the prompt end on its own cursor.
+                                let same_source = same_path
+                                    && repaired
+                                        .turn_start_offset
+                                        .is_some_and(|start| start <= line_end_offset);
+                                if !same_source {
+                                    repaired.output_path =
+                                        rollout_path.to_str().map(ToString::to_string);
+                                    repaired.turn_start_offset = Some(line_end_offset);
+                                }
                                 repaired.last_offset = line_end_offset;
-                                repaired.turn_start_offset = Some(line_end_offset);
                                 repaired.restamp_external_turn_lease(&lease);
                                 repaired.set_relay_owner_kind(RelayOwnerKind::None);
                                 let outcome = inflight::save_inflight_state_if_identity_matches_allow_output_restamp(
@@ -182,6 +288,7 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                                             line_end_offset,
                                             prompt,
                                             tail_lease,
+                                            own_turn,
                                         )
                                         .await;
                                     }
@@ -251,12 +358,16 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                         entry_id,
                     } => {
                         let observed_at = chrono::Utc::now();
+                        let own_turn = super::idle_transcript_scan::codex_native_turn_at(
+                            &rollout_path,
+                            line_end_offset,
+                        );
                         let observation =
-                            crate::services::tui_prompt_dedupe::observe_prompt_by_tmux_with_entry_id_at(
-                                ProviderKind::Codex.as_str(),
+                            crate::services::tui_prompt_dedupe::observe_codex_prompt_in_turn_at(
                                 &tmux_session_name,
                                 &prompt,
                                 entry_id.as_deref(),
+                                own_turn.as_deref(),
                                 observed_at,
                             );
                         tracing::info!(
@@ -368,6 +479,7 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                                     line_end_offset,
                                     prompt,
                                     tail_lease,
+                                    own_turn,
                                 )
                                 .await;
                             }
@@ -377,6 +489,7 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
                 }
             }
 
+            drop(shared);
             tokio::time::sleep(CODEX_IDLE_ROLLOUT_POLL_INTERVAL).await;
         }
     }
@@ -385,6 +498,52 @@ pub(super) fn spawn_codex_idle_rollout_relay(shared: Arc<SharedData>) {
         provider = ProviderKind::Codex.as_str(),
         runtime_kind = RuntimeHandoffKind::CodexTui.as_str(),
     )));
+}
+
+/// Test hooks: relay tasks actually spawned, and which runtime each relay use served.
+#[cfg(test)]
+pub(super) static RELAY_SPAWNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RelayUse {
+    Discovery,
+    Owner,
+}
+#[cfg(test)]
+pub(super) static RELAY_TARGETS: Mutex<Vec<(RelayUse, usize)>> = Mutex::new(Vec::new());
+#[cfg(test)]
+fn note_relay_target(used: RelayUse, shared: &Arc<SharedData>) {
+    RELAY_TARGETS
+        .lock()
+        .unwrap()
+        .push((used, Arc::as_ptr(shared) as usize));
+}
+
+/// Test hooks: channels whose response tail started, and a one-shot pause before bridge capture.
+#[cfg(test)]
+pub(super) static TAIL_STARTS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+#[cfg(test)]
+type TestPause = Option<(u64, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>;
+#[cfg(test)]
+pub(super) static CAPTURE_PAUSE: Mutex<TestPause> = Mutex::new(None);
+/// Test hook: per tmux session, how often a poll reached each checkpoint.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum PollNote {
+    Visit,
+    EarlierPrompt,
+}
+#[cfg(test)]
+pub(super) static POLL_NOTES: Mutex<std::collections::BTreeMap<(String, PollNote), usize>> =
+    Mutex::new(std::collections::BTreeMap::new());
+#[cfg(test)]
+fn note_poll(tmux_session_name: &str, note: PollNote) {
+    *POLL_NOTES
+        .lock()
+        .unwrap()
+        .entry((tmux_session_name.to_string(), note))
+        .or_default() += 1;
 }
 
 #[cfg(unix)]
@@ -396,7 +555,10 @@ async fn run_codex_idle_response_tail(
     start_offset: u64,
     prompt_text: String,
     lease: ExternalInputRelayLease,
+    own_turn: Option<String>,
 ) {
+    #[cfg(test)]
+    TAIL_STARTS.lock().unwrap().push(channel_id.get());
     let _lease_guard = TuiDirectExternalInputLeaseGuard::new(
         ProviderKind::Codex,
         &tmux_session_name,
@@ -420,6 +582,7 @@ async fn run_codex_idle_response_tail(
                 None,
                 || crate::services::tmux_diagnostics::tmux_session_has_live_pane(&tmux_for_reader),
                 &tmux_for_reader,
+                own_turn,
             );
             failed_for_reader.store(read_result.is_err(), Ordering::Release);
             let _ = offset_tx.send(read_result);
@@ -485,6 +648,8 @@ async fn run_codex_idle_response_tail(
         .await;
         return;
     }
+    #[cfg(test)]
+    super::synthetic_start::bridge_handoff::pause_for_test(&CAPTURE_PAUSE, channel_id).await;
     let delivery_result = stream_tui_idle_response_through_bridge(
         &shared,
         ProviderKind::Codex,
@@ -538,6 +703,7 @@ pub(super) fn read_codex_idle_completion(
     cancel: Option<Arc<CancelToken>>,
     is_alive: impl FnMut() -> bool,
     tmux: &str,
+    own_turn: Option<String>,
 ) -> Result<claude_idle_bridge::IdleReaderCompletion, String> {
     let generation = crate::services::discord::turn_bridge::tmux_generation_file_mtime_ns(tmux);
     let binding = crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(tmux)
@@ -554,6 +720,7 @@ pub(super) fn read_codex_idle_completion(
         cancel,
         is_alive,
         tmux,
+        own_turn,
     )
     .map(|(result, outcome)| {
         claude_idle_bridge::IdleReaderCompletion::from_harvest(result, outcome.harvest, generation)

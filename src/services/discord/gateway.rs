@@ -193,6 +193,24 @@ pub(super) trait TurnGateway: Send + Sync {
         })
     }
 
+    /// Hands a protected request's exact retry to its next start and reports whether that start
+    /// took it; a gateway without a start path refuses, and the request stays held.
+    fn schedule_exact_retry_with_history<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        retry: crate::services::discord::replay_policy::ExactRetry,
+    ) -> GatewayFuture<'a, crate::services::discord::replay_policy::ExactHandoff> {
+        Box::pin(async move {
+            tracing::warn!(
+                channel_id = channel_id.get(),
+                user_message_id = retry.user_message_id.get(),
+                receipt = retry.permit.receipt_id(),
+                "exact replay retry has no start path to re-enter; the request stays held"
+            );
+            crate::services::discord::replay_policy::ExactHandoff::Refused
+        })
+    }
+
     fn dispatch_queued_turn<'a>(
         &'a self,
         channel_id: ChannelId,
@@ -701,6 +719,19 @@ impl TurnGateway for DiscordGateway {
         })
     }
 
+    fn schedule_exact_retry_with_history<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        retry: crate::services::discord::replay_policy::ExactRetry,
+    ) -> GatewayFuture<'a, crate::services::discord::replay_policy::ExactHandoff> {
+        Box::pin(router::start_exact_retry(
+            &self.http,
+            &self.shared,
+            channel_id,
+            retry,
+        ))
+    }
+
     fn dispatch_queued_turn<'a>(
         &'a self,
         channel_id: ChannelId,
@@ -759,7 +790,8 @@ impl TurnGateway for DiscordGateway {
             {
                 router::QueuedAdmissionDisposition::Admitted(admitted) => admitted,
                 router::QueuedAdmissionDisposition::Deferred
-                | router::QueuedAdmissionDisposition::RejectedNonPortableAttachment => {
+                | router::QueuedAdmissionDisposition::RejectedNonPortableAttachment
+                | router::QueuedAdmissionDisposition::ConsumedToHold => {
                     return Ok(());
                 }
                 router::QueuedAdmissionDisposition::RejectedRestore => {
@@ -767,53 +799,56 @@ impl TurnGateway for DiscordGateway {
                 }
             };
 
-            let source_message_generations = intervention.source_message_queued_generations();
-            queue_marker::drain_dispatched_queue_markers(
-                &self.shared,
-                &self.http,
-                channel_id,
-                intervention.message_id,
-                &source_message_generations,
-            )
-            .await;
+            let late_settlement = router::checkpoint_waits_for_admission(channel_id);
+            if !late_settlement {
+                let source_message_generations = intervention.source_message_queued_generations();
+                queue_marker::drain_dispatched_queue_markers(
+                    &self.shared,
+                    &self.http,
+                    channel_id,
+                    intervention.message_id,
+                    &source_message_generations,
+                )
+                .await;
 
-            // codex review P2 (#1332 follow-up): merged interventions can carry
-            // several `source_message_ids`, each of which had registered its own
-            // `📬 메시지 대기 중` placeholder when it lost the start-turn race.
-            // `handle_text_message` only consumes `queued_placeholders` for the
-            // intervention's HEAD message id (the last merged id, used as the
-            // Active card). The remaining source ids would otherwise leak both
-            // a `queued_placeholders` mapping and a stale `📬` Discord card for
-            // a turn that is now actively running. Drain them here, before
-            // dispatch enters `handle_text_message`. The head id is excluded
-            // because the dispatch hand-off path will own its transition.
-            let drained = drain_merged_queued_placeholders(
-                &self.shared,
-                channel_id,
-                intervention.message_id,
-                &intervention.source_message_ids,
-            )
-            .await;
-            for teardown in drained {
-                let placeholder_msg_id = teardown.card();
-                let result =
-                    queued_card_gate::teardown_delete(&self.http, &self.shared, teardown).await;
-                // #3607: observe the merged-queued-placeholder drain delete.
-                crate::services::observability::emit_relay_delete_result(
-                    self.provider.as_str(),
-                    channel_id.get(),
-                    placeholder_msg_id.get(),
-                    "gateway_queued_placeholder_drain",
-                    "delete_nonterminal",
-                    &result,
-                );
+                // Dormant queued dispatch keeps the legacy marker/card handoff order.
+                let drained = drain_merged_queued_placeholders(
+                    &self.shared,
+                    channel_id,
+                    intervention.message_id,
+                    &intervention.source_message_ids,
+                )
+                .await;
+                for teardown in drained {
+                    let placeholder_msg_id = teardown.card();
+                    let result =
+                        queued_card_gate::teardown_delete(&self.http, &self.shared, teardown).await;
+                    // #3607: observe the merged-queued-placeholder drain delete.
+                    crate::services::observability::emit_relay_delete_result(
+                        self.provider.as_str(),
+                        channel_id.get(),
+                        placeholder_msg_id.get(),
+                        "gateway_queued_placeholder_drain",
+                        "delete_nonterminal",
+                        &result,
+                    );
+                }
             }
 
-            router::finish_admitted_queued_intake(&deps, admitted, intervention)
+            let result = router::finish_admitted_queued_intake(&deps, admitted, intervention)
                 .await
                 .map_err(|e| e.to_string())?;
-            // Forwarded and duplicate-covered queue items are consumed after
-            // their queued markers/cards are drained; no local body runs.
+            if late_settlement && result == router::IntakeExecution::Executed {
+                super::queue_dispatch::settle_executed_queued_intake(
+                    &self.shared,
+                    &self.http,
+                    &self.provider,
+                    channel_id,
+                    intervention,
+                    "gateway_queued_placeholder_drain",
+                )
+                .await;
+            }
             Ok(())
         })
     }

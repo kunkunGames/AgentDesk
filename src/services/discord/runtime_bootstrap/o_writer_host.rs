@@ -1,5 +1,6 @@
 //! Gateway side of the O writer host: the gateway's own HTTP client and bot id, the shared
-//! delivery lease cells, the process alarm router and the facts a first activation checks.
+//! delivery lease cells, the process alarm router and the facts a first activation checks. Off the
+//! gateway, a delegated channel's writer posts through the bot token's REST client instead.
 
 use super::*;
 
@@ -11,11 +12,12 @@ use crate::services::discord::outbound::o_writer_legacy::LegacyRelay;
 use crate::services::tui_o::alarm::AlarmRouter;
 use crate::services::tui_o::shadow::ShadowProvider;
 use crate::services::tui_o::shadow::tap::TuiOConfig;
+use crate::services::tui_o::turn_mode::TurnConfig;
 use crate::services::tui_o::writer::activation::ActivationFacts;
 use crate::services::tui_o::writer::actor::POLL_INTERVAL;
 use crate::services::tui_o::writer::adoption::LegacyView;
 use crate::services::tui_o::writer::binding::ChannelBindingLog;
-use crate::services::tui_o::writer::host::{self, Custody, HostIo};
+use crate::services::tui_o::writer::host::{self, Custody, FencedFacts, HostIo};
 
 /// How long a first activation waits for the cluster bootstrap to publish this node's id.
 const SELF_ID_WAIT: Duration = Duration::from_secs(10);
@@ -26,6 +28,12 @@ struct GatewayHost {
     self_id_wait: Duration,
     /// `cluster.instance_id` as the home judgement read it; `None` without clustering.
     configured_id: Option<String>,
+    /// The boot turn selection a newly adopted channel is confirmed against.
+    turn: TurnConfig,
+    /// Off the gateway: the bot token's REST client every hosted channel posts through.
+    rest: Option<Arc<serenity::Http>>,
+    /// The boot `tui_o` section; the live config overrides its re-post switch once installed.
+    boot: Option<TuiOConfig>,
 }
 
 /// With clustering, the configured id the home judgement used, refused when bootstrap published
@@ -57,16 +65,34 @@ async fn published_self_id(max_wait: Duration) -> Option<String> {
     }
 }
 
+/// A port over the REST client once it names its bot; a failed lookup is retried.
+async fn rest_port(http: Arc<serenity::Http>) -> Arc<GatewayPort> {
+    loop {
+        match http.get_current_user().await {
+            Ok(user) => return Arc::new(GatewayPort::new(Arc::clone(&http), user.id.get())),
+            Err(error) => {
+                tracing::warn!(%error, "[tui_o] REST writer port: bot user lookup failed")
+            }
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 impl HostIo for GatewayHost {
     type Port = GatewayPort;
     type Lease = ChannelLeases;
     type Alarms = Arc<AlarmRouter>;
     type Bindings = ChannelBindingLog;
 
-    /// Waits for the context the gateway caches on ready, so no token fallback stands in for it.
+    /// Waits for the context the gateway caches on ready, so no token fallback stands in for it;
+    /// off the gateway, for the REST client to name its bot.
     fn port(&self) -> impl Future<Output = Arc<GatewayPort>> + Send {
         let shared = Arc::clone(&self.shared);
+        let rest = self.rest.clone();
         async move {
+            if let Some(http) = rest {
+                return rest_port(http).await;
+            }
             loop {
                 if let Some(ctx) = shared.http.cached_serenity_ctx.get() {
                     let bot_id = ctx.cache.current_user().id.get();
@@ -118,6 +144,36 @@ impl HostIo for GatewayHost {
         }
     }
 
+    /// Reads other pool-backed policy before reserving the intake fence's connection.
+    async fn intake_fence(
+        &self,
+        channel: u64,
+        _provider: ShadowProvider,
+    ) -> Result<FencedFacts, String> {
+        let pool = self.shared.pg_pool.as_ref().ok_or("no PG pool")?;
+        let id = channel.to_string();
+        let local = local_id(self.configured_id.as_deref(), self.self_id_wait).await?;
+        // Finish pool lookups before the fence takes its connection, including a one-slot pool.
+        let agent_node = crate::services::cluster::agent_execution_node::for_channel(pool, &id)
+            .await
+            .map_err(|error| format!("agent node: {error}"))?;
+        let node_override =
+            super::super::commands::channel_node_override(&self.shared, ChannelId::new(channel));
+        let (hold, rows, queued_bodies) =
+            crate::db::o_channel_activation::fenced_activation_rows(pool, &id, &local)
+                .await
+                .map_err(|error| format!("activation fence: {error}"))?;
+        Ok(FencedFacts {
+            hold,
+            facts: ActivationFacts {
+                open_intake: rows.open_intake,
+                runner_sessions: rows.foreign_sessions,
+                node_override: node_override.or(agent_node),
+            },
+            queued_bodies,
+        })
+    }
+
     /// Legacy inflight, delivery custody and pending starts, durable or in memory: all local files.
     fn local_custody(&self, channel: u64, provider: ShadowProvider) -> Result<Custody, String> {
         let kind = match provider {
@@ -160,6 +216,91 @@ impl HostIo for GatewayHost {
         self.shared
             .relay_emission_in_flight(ChannelId::new(channel))
     }
+
+    /// Built for gateway and delegated hosts alike over the port's own client. Off, the turn reads
+    /// nothing, and the transport is built only on the first on turn.
+    fn repost(&self, channel: u64, port: &Arc<GatewayPort>) -> Option<host::RepostTurn<Self>> {
+        use crate::services::tui_o::repost::{
+            config::RepostSwitch, io::probe::evidence::RunScope, runner,
+        };
+        let pool = self.shared.pg_pool.clone()?;
+        let sidecar = crate::config::runtime_root()?
+            .join("tui_o")
+            .join("repost")
+            .join(format!("{channel}.jsonl"));
+        let switch = RepostSwitch::new(self.boot.as_ref(), crate::config_live_reload::subscribe());
+        let holder = self.configured_id.clone();
+        let run = RunScope {
+            holder: holder.unwrap_or_else(|| "o-writer".into()),
+            run: uuid::Uuid::new_v4().to_string(),
+            credentials: port.repost_credentials(),
+            evidence_generation: 1,
+        };
+        let sender = crate::services::tui_o::writer::DiscordPort::bot_id(&**port);
+        let runner = runner::Runner::new(switch, pool, sender, run);
+        let (port, mut warned) = (Arc::clone(port), false);
+        let open = move || match port.repost_http() {
+            Ok(http) => Some(Arc::new(http)),
+            Err(error) => {
+                if !std::mem::replace(&mut warned, true) {
+                    tracing::warn!(
+                        channel,
+                        ?error,
+                        "[tui_o] no re-post transport for this client"
+                    );
+                }
+                None
+            }
+        };
+        let turn = runner::ChannelTurn::new(runner, Box::new(open), channel, sidecar);
+        Some(Box::new(turn))
+    }
+
+    fn adopted(&self, channel: u64, provider: ShadowProvider) {
+        let kind = match provider {
+            ShadowProvider::Claude => ProviderKind::Claude,
+            ShadowProvider::Codex => ProviderKind::Codex,
+        };
+        let confirm =
+            super::super::tui_direct_pending_start::turn_retirement::confirm_turn_channels;
+        let confirmed = confirm(&kind, Some(&self.turn), || vec![channel]);
+        super::super::turn_presence::supervisor::register(&kind, &confirmed);
+    }
+}
+
+fn shadow_of(provider: &ProviderKind) -> Option<ShadowProvider> {
+    match provider.as_str() {
+        "claude" => Some(ShadowProvider::Claude),
+        "codex" => Some(ShadowProvider::Codex),
+        _ => None,
+    }
+}
+
+fn parts(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    config: Option<&TuiOConfig>,
+    rest: Option<Arc<serenity::Http>>,
+) -> host::HostParts<GatewayHost> {
+    let alarms = Arc::new(AlarmRouter::for_process(config, shared.pg_pool.clone()));
+    let boot = crate::services::tui_o::channel_policy::boot();
+    let configured_id = boot
+        .and_then(|boot| boot.configured_id())
+        .map(str::to_owned);
+    host::HostParts {
+        io: Arc::new(GatewayHost {
+            shared: Arc::clone(shared),
+            alarms,
+            self_id_wait: SELF_ID_WAIT,
+            configured_id,
+            turn: config.map(|c| c.turn.clone()).unwrap_or_default(),
+            rest,
+            boot: config.cloned(),
+        }),
+        runtime_root: crate::config::runtime_root(),
+        gate: crate::services::tui_o::ownership::gate(provider.as_str()),
+        readiness: host::process_readiness(),
+    }
 }
 
 /// Starts the writer host for this provider's gateway runtime; it never waits on the gateway.
@@ -169,30 +310,30 @@ pub(super) fn spawn(
     config: Option<&TuiOConfig>,
     pg_gateway: bool,
 ) {
-    let shadow = match provider.as_str() {
-        "claude" => ShadowProvider::Claude,
-        "codex" => ShadowProvider::Codex,
-        _ => return,
+    let Some(shadow) = shadow_of(provider) else {
+        return;
     };
     // Nothing below runs unless this bot may adopt a channel, so an off or empty writer takes no lock.
-    host::start(shadow, pg_gateway, || {
-        let alarms = Arc::new(AlarmRouter::for_process(config, shared.pg_pool.clone()));
-        let boot = crate::services::tui_o::channel_policy::boot();
-        let configured_id = boot
-            .and_then(|boot| boot.configured_id())
-            .map(str::to_owned);
-        host::HostParts {
-            io: Arc::new(GatewayHost {
-                shared: Arc::clone(shared),
-                alarms,
-                self_id_wait: SELF_ID_WAIT,
-                configured_id,
-            }),
-            runtime_root: crate::config::runtime_root(),
-            gate: crate::services::tui_o::ownership::gate(provider.as_str()),
-            readiness: host::process_readiness(),
-        }
-    });
+    host::start(shadow, pg_gateway, || parts(shared, provider, config, None));
+}
+
+/// Starts the writer for each delegated channel whose home gate is registered here and whose Herdr
+/// endpoint runs on this node, off the gateway; with none, nothing is built.
+pub(super) fn spawn_delegated(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    config: Option<&TuiOConfig>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let Some(shadow) = shadow_of(provider) else {
+        return Vec::new();
+    };
+    let delegated = crate::services::cluster::channel_home_boot::delegated_boot_ownership(
+        super::herdr_runs_here,
+    );
+    host::start_delegated(shadow, delegated, || {
+        let rest = shared.serenity_http_or_token_fallback();
+        parts(shared, provider, config, rest)
+    })
 }
 
 #[cfg(test)]
@@ -212,6 +353,185 @@ pub(super) mod test_host {
             alarms,
             self_id_wait,
             configured_id: configured_id.map(str::to_owned),
+            turn: TurnConfig::default(),
+            rest: None,
+            boot: None,
+        }
+    }
+
+    /// The host a standby writer gets: every port posts over `http`.
+    pub(in crate::services::discord::runtime_bootstrap) fn rest(
+        shared: &Arc<SharedData>,
+        http: Arc<serenity::Http>,
+    ) -> Arc<impl HostIo<Port = GatewayPort>> {
+        parts(shared, &ProviderKind::Claude, None, Some(http)).io
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+    use crate::db::auto_queue::test_support::TestPostgresDb;
+    use crate::services::tui_o::shadow::ShadowProvider::Claude;
+
+    /// Delegates host facts while retaining HostIo's fail-closed intake fence default.
+    struct Unfenced<I: HostIo>(Arc<I>);
+
+    impl<I: HostIo> HostIo for Unfenced<I> {
+        type Port = I::Port;
+        type Lease = I::Lease;
+        type Alarms = I::Alarms;
+        type Bindings = I::Bindings;
+
+        fn port(&self) -> impl Future<Output = Arc<Self::Port>> + Send {
+            self.0.port()
+        }
+
+        fn lease(&self) -> Self::Lease {
+            self.0.lease()
+        }
+
+        fn alarms(&self) -> Self::Alarms {
+            self.0.alarms()
+        }
+
+        fn bindings(&self, channel: u64, provider: ShadowProvider) -> Arc<Self::Bindings> {
+            self.0.bindings(channel, provider)
+        }
+
+        fn activation_facts(
+            &self,
+            channel: u64,
+            provider: ShadowProvider,
+        ) -> impl Future<Output = Result<ActivationFacts, String>> + Send {
+            self.0.activation_facts(channel, provider)
+        }
+
+        fn local_custody(&self, channel: u64, provider: ShadowProvider) -> Result<Custody, String> {
+            self.0.local_custody(channel, provider)
+        }
+
+        fn legacy(&self) -> Arc<dyn LegacyView> {
+            self.0.legacy()
+        }
+
+        fn legacy_busy(&self, channel: u64) -> impl Future<Output = bool> + Send {
+            self.0.legacy_busy(channel)
+        }
+
+        fn relaying(&self, channel: u64) -> bool {
+            self.0.relaying(channel)
+        }
+
+        fn adopted(&self, channel: u64, provider: ShadowProvider) {
+            self.0.adopted(channel, provider);
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_intake_fence_keeps_fresh_facts_with_one_pool_connection_pg() {
+        let fixture = TestPostgresDb::create().await;
+        let pool = fixture.connect_and_migrate_with_max_connections(1).await;
+        sqlx::query(
+            "INSERT INTO agents (id, name, discord_channel_id, default_execution_node_id)
+             VALUES ('fence-agent', 'fence', '673702', 'worker-override')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (session_key, provider, status, channel_id, instance_id)
+             VALUES ('fence-foreign', 'claude', 'idle', '673702', 'foreign')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let shared =
+            crate::services::discord::make_shared_data_for_tests_with_storage(Some(pool.clone()));
+        let host = GatewayHost {
+            shared,
+            alarms: Arc::new(AlarmRouter::for_process(None, None)),
+            self_id_wait: Duration::ZERO,
+            configured_id: crate::services::cluster::node_registry::SELF_INSTANCE_ID
+                .get()
+                .cloned()
+                .or_else(|| Some("fence-local".into())),
+            turn: TurnConfig::default(),
+            rest: None,
+            boot: None,
+        };
+        let fenced =
+            tokio::time::timeout(Duration::from_secs(3), host.intake_fence(673702, Claude))
+                .await
+                .expect("a fence must not wait for a second pool connection")
+                .unwrap();
+        assert_eq!(fenced.facts.runner_sessions, 1);
+        assert_eq!(fenced.facts.open_intake, 0);
+        assert_eq!(
+            fenced.facts.node_override.as_deref(),
+            Some("worker-override")
+        );
+        assert_eq!(fenced.queued_bodies, 0);
+        assert_eq!(
+            pool.num_idle(),
+            0,
+            "the returned hold retains its connection"
+        );
+        fenced.hold.release().await.unwrap();
+        assert_eq!(
+            host.activation_facts(673702, Claude)
+                .await
+                .unwrap()
+                .runner_sessions,
+            1
+        );
+        pool.close().await;
+        fixture.drop().await;
+    }
+
+    #[tokio::test]
+    async fn a_host_without_an_intake_fence_refuses_deferred_activation_facts() {
+        let host = crate::services::tui_o::writer::host::test_io::TestHost::new([]);
+        let result = Unfenced(Arc::clone(&host))
+            .intake_fence(673702, Claude)
+            .await;
+        assert!(matches!(result, Err(detail) if detail == "this host has no intake fence"));
+        assert!(host.posts.to(673702).is_empty());
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tui_o/repost/runtime_host_activation_tests.rs"]
+mod activation_tests;
+
+#[cfg(test)]
+mod repost_tests {
+    use super::*;
+
+    /// Gateway and delegated hosts both give each writer a re-post turn over its own port, and
+    /// only with a PostgreSQL pool; without one their writers run as before.
+    #[tokio::test]
+    async fn f6_gateway_and_delegated_hosts_build_a_repost_turn_only_with_a_pool() {
+        let unreachable = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://agentdesk@127.0.0.1:1/none")
+            .unwrap();
+        let http = Arc::new(serenity::Http::new("test-token"));
+        let port = Arc::new(GatewayPort::new(Arc::clone(&http), 42));
+        for pool in [Some(unreachable), None] {
+            let shared =
+                crate::services::discord::make_shared_data_for_tests_with_storage(pool.clone());
+            let gateway = GatewayHost {
+                shared: Arc::clone(&shared),
+                alarms: Arc::new(AlarmRouter::for_process(None, None)),
+                self_id_wait: Duration::ZERO,
+                configured_id: None,
+                turn: TurnConfig::default(),
+                rest: None,
+                boot: None,
+            };
+            let delegated = test_host::rest(&shared, Arc::clone(&http));
+            assert_eq!(gateway.repost(1, &port).is_some(), pool.is_some());
+            assert_eq!(delegated.repost(1, &port).is_some(), pool.is_some());
         }
     }
 }

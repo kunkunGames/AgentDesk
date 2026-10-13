@@ -456,16 +456,29 @@ mod tests {
         assert_eq!(
             callers,
             [
+                "services/discord/live_bridge/guard_tests.rs",
                 "services/discord/recovery_engine/restore_inflight.rs",
                 "services/discord/router/message_handler/headless_turn.rs",
                 "services/discord/router/message_handler/intake_turn.rs",
                 "services/discord/tui_prompt_relay/claude_idle_bridge.rs",
+                "services/discord/turn_bridge/entry_abort_cold_error_tests.rs",
                 "services/discord/turn_bridge/entry_abort_mailbox_tests.rs",
+                "services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/recovery_retry_guard_tests/replay_turn_tests.rs",
+                "services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rowless_receipt_tests/background_child_ordering_tests.rs",
                 "services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rowless_receipt_tests/o_after_done_chain_tests.rs",
+                "services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests/rowless_receipt_tests/pg_tests.rs",
             ],
             "every bridge entry file must declare its mailbox token-registration contract"
         );
 
+        let live_original = include_str!("../../live_bridge/guard_tests.rs");
+        assert_eq!(live_original.matches(&spawn).count(), 2);
+        for call in [
+            "spawn_turn_bridge(shared.clone(), token.clone(), rx, context);",
+            "spawn_turn_bridge(shared, token, rx, context);",
+        ] {
+            assert_eq!(live_original.matches(call).count(), 1);
+        }
         let intake = include_str!("../../router/message_handler/intake_turn.rs");
         let headless = include_str!("../../router/message_handler/headless_turn.rs");
         let recovery = include_str!("../../recovery_engine/restore_inflight.rs");
@@ -481,8 +494,27 @@ mod tests {
         // captured synthetic mailbox actor.
         assert_eq!(tui_direct.matches(&pinned).count(), 1);
         assert!(intake.contains("cancel_token.clone(),\n            request_owner"));
-        assert!(headless.contains("cancel_token.clone(),\n            request_owner"));
-        assert!(recovery.contains("mailbox_recovery_kickoff(\n            shared,\n            channel_id,\n            cancel_token.clone(),"));
+        // The headless start bridges the token its shared claim helper registered with the mailbox.
+        let headless_claim = include_str!("../../router/turn_start.rs");
+        assert!(headless.contains(
+            "let (session_transition_guard, cancel_token) =\n        claim(shared, channel_id, request_owner, &reservation, identity).await?;"
+        ));
+        assert!(
+            headless_claim.contains(
+                "let (token, message) = (cancel_token.clone(), reservation.user_msg_id);"
+            )
+        );
+        assert!(headless_claim.contains("Ok((transition, cancel_token))"));
+        let recovery_tokens: String = recovery.split_whitespace().collect();
+        assert_eq!(
+            recovery_tokens.matches("mailbox_recovery_kickoff(").count(),
+            1
+        );
+        assert!(recovery_tokens.contains(concat!(
+            "mailbox_recovery_kickoff(",
+            "shared,channel_id,cancel_token.clone(),",
+            "kickoff_identity.request_owner,kickoff_identity.user_message_id,)",
+        )));
         assert_eq!(
             tui_direct
                 .matches(concat!(

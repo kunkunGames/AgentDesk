@@ -207,7 +207,33 @@ pub(super) async fn handle_runtime_handoff_loop_message(
             inflight_state.output_path = Some(output_path.clone());
             inflight_state.input_fifo_path = Some(input_fifo_path).filter(|path| !path.is_empty());
             inflight_state.last_offset = last_offset;
-            let _ = inflight_state.set_watcher_owner_channel_id(watcher_owner_channel_id.get());
+            // Read before the stamp: a claim the Herdr admission may withhold stamps only the
+            // runtime locator first, its owner and relay owner wait for the admitted claim.
+            #[cfg(unix)]
+            let host = super::tmux::watch_host_of(
+                &shared_owned,
+                &provider,
+                channel_id.get(),
+                &tmux_session_name,
+            )
+            .await;
+            // No listing lands between this judgement and the claim.
+            #[cfg(unix)]
+            let listing_order =
+                crate::services::tui_prompt_dedupe::herdr_listing_order(&tmux_session_name);
+            #[cfg(unix)]
+            let listing_held = listing_order.lock().unwrap_or_else(|p| p.into_inner());
+            #[cfg(unix)]
+            let owner_after_admission =
+                crate::services::tui_prompt_dedupe::herdr_claim_may_be_withheld(
+                    &tmux_session_name,
+                    host == super::tmux::WatchHost::Herdr,
+                );
+            #[cfg(not(unix))]
+            let owner_after_admission = false;
+            if !owner_after_admission {
+                let _ = inflight_state.set_watcher_owner_channel_id(watcher_owner_channel_id.get());
+            }
             #[cfg(unix)]
             let relay_http_available = shared_owned.serenity_http_or_token_fallback().is_some();
             #[cfg(unix)]
@@ -224,7 +250,9 @@ pub(super) async fn handle_runtime_handoff_loop_message(
             };
             #[cfg(not(unix))]
             let intended_relay_owner = super::inflight::RelayOwnerKind::None;
-            inflight_state.set_relay_owner_kind(intended_relay_owner);
+            if !owner_after_admission {
+                inflight_state.set_relay_owner_kind(intended_relay_owner);
+            }
             tmux_ready_guarded_save_outcome = Some(guarded_runtime_handoff_save(
                 &tmux_ready_baseline,
                 inflight_state,
@@ -273,11 +301,11 @@ pub(super) async fn handle_runtime_handoff_loop_message(
                     watcher_claim_replaced_existing,
                     owner_changed_after_claim,
                     watcher_claim_incarnation,
-                ) = {
+                ) = 'claim: {
                     // #1135: Reuse a live watcher for the same
                     // tmux session; replace only stale or
                     // different-session incumbents.
-                    let claim = super::tmux::claim_or_reuse_watcher_with_thread_parent(
+                    let claim = super::tmux::claim_or_reuse_watcher_for_host(
                         &shared_owned.tmux_watchers,
                         channel_id,
                         handle,
@@ -288,10 +316,20 @@ pub(super) async fn handle_runtime_handoff_loop_message(
                             inflight_state.logical_channel_id,
                             inflight_state.thread_id,
                         ),
+                        host,
                     );
+                    // A withheld Herdr pane gets no watcher, owner or relay, as a failed save.
+                    let Ok(claim) = claim else {
+                        break 'claim (false, false, false, None);
+                    };
                     watcher_owner_channel_id = claim.owner_channel_id();
-                    let owner_changed =
+                    let mut owner_changed =
                         inflight_state.set_watcher_owner_channel_id(watcher_owner_channel_id.get());
+                    if owner_after_admission {
+                        let relay_before = inflight_state.effective_relay_owner_kind();
+                        inflight_state.set_relay_owner_kind(intended_relay_owner);
+                        owner_changed |= relay_before != intended_relay_owner;
+                    }
                     let incarnation = claim.incarnation().clone();
                     (
                         claim.should_spawn(),
@@ -300,6 +338,8 @@ pub(super) async fn handle_runtime_handoff_loop_message(
                         Some(incarnation),
                     )
                 };
+                #[cfg(unix)]
+                drop(listing_held);
                 #[cfg(not(unix))]
                 let (watcher_claimed, watcher_claim_replaced_existing, owner_changed_after_claim) = {
                     let _ = handle;
@@ -318,10 +358,15 @@ pub(super) async fn handle_runtime_handoff_loop_message(
                         "turn_bridge::runtime_handoff_loop::tmux_ready_claim_owner",
                     ));
                 }
-                let claim_persisted = matches!(
-                    tmux_ready_guarded_save_outcome,
-                    Some(crate::services::discord::inflight::GuardedSaveOutcome::Saved)
-                );
+                #[cfg(unix)]
+                let claim_withheld = watcher_claim_incarnation.is_none();
+                #[cfg(not(unix))]
+                let claim_withheld = false;
+                let claim_persisted = !claim_withheld
+                    && matches!(
+                        tmux_ready_guarded_save_outcome,
+                        Some(crate::services::discord::inflight::GuardedSaveOutcome::Saved)
+                    );
                 if !claim_persisted && watcher_claimed {
                     cancel_provisional_watcher_claim_if_matches(
                         shared_owned.as_ref(),
@@ -633,6 +678,27 @@ pub(super) async fn handle_runtime_handoff_loop_message(
         }
         RuntimeHandoffLoopMessage::RuntimeReady { handoff } => {
             terminal_control_ready_observed = true;
+            #[cfg(unix)]
+            let host = match &handoff {
+                RuntimeHandoff::LegacyTmuxWrapper {
+                    tmux_session_name, ..
+                }
+                | RuntimeHandoff::ClaudeTui {
+                    tmux_session_name, ..
+                }
+                | RuntimeHandoff::CodexTui {
+                    tmux_session_name, ..
+                } => {
+                    let read = super::tmux::watch_host_of(
+                        &shared_owned,
+                        &provider,
+                        channel_id.get(),
+                        tmux_session_name,
+                    );
+                    read.await
+                }
+                _ => super::tmux::WatchHost::Legacy,
+            };
             match handoff {
                 RuntimeHandoff::LegacyTmuxWrapper {
                     output_path,
@@ -652,6 +718,8 @@ pub(super) async fn handle_runtime_handoff_loop_message(
                             session_id: None,
                             last_offset,
                             done,
+                            #[cfg(unix)]
+                            host,
                         },
                         WatcherRuntimeHandoffState {
                             inflight_state,
@@ -686,6 +754,8 @@ pub(super) async fn handle_runtime_handoff_loop_message(
                             session_id: None,
                             last_offset,
                             done,
+                            #[cfg(unix)]
+                            host,
                         },
                         WatcherRuntimeHandoffState {
                             inflight_state,
@@ -721,6 +791,8 @@ pub(super) async fn handle_runtime_handoff_loop_message(
                             session_id: thread_id,
                             last_offset,
                             done,
+                            #[cfg(unix)]
+                            host,
                         },
                         WatcherRuntimeHandoffState {
                             inflight_state,

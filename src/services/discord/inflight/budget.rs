@@ -2,7 +2,7 @@
 //! on restart-marked rows.
 //!
 //! The #3293 carrier row is re-marked `DrainRestart` by
-//! `mark_all_inflight_states_restart_mode` on EVERY shutdown, so at recovery
+//! `mark_restart_mode_blocking` on EVERY shutdown, so at recovery
 //! time its on-disk form always has `restart_mode = Some(..)`. The generic
 //! [`super::save_inflight_state_if_matches_identity`] guard refuses any write
 //! to such a row (and to `user_msg_id == 0` TUI-direct rows), which made the
@@ -89,7 +89,9 @@ pub(in crate::services::discord) fn bump_recovery_relay_attempts_if_matches_iden
     on_disk.recovery_relay_attempts = on_disk.recovery_relay_attempts.saturating_add(1);
     on_disk.ensure_finalizer_turn_id();
     on_disk.updated_at = super::now_string();
-    super::bump_save_generation_for_write(&path, &mut on_disk);
+    if super::bump_save_generation_for_write(&path, &mut on_disk).is_err() {
+        return GuardedSaveOutcome::AuthorityPinned;
+    }
     let Ok(json) = serde_json::to_string_pretty(&on_disk) else {
         return GuardedSaveOutcome::IoError;
     };

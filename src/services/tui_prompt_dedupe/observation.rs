@@ -74,6 +74,7 @@ pub fn observe_prompt_by_tmux_at(
         &[prompt.to_string()],
         None,
         None,
+        None,
         PromptObservationEffect::NotifyAndLease,
         observed_at,
     )
@@ -99,6 +100,7 @@ pub fn observe_prompt_by_tmux_with_entry_id_at(
         &[prompt.to_string()],
         entry_id,
         None,
+        None,
         PromptObservationEffect::NotifyAndLease,
         observed_at,
     )
@@ -115,12 +117,49 @@ pub fn observe_prompt_by_provider_session_with_prompt_id_at(
 ) -> PromptObservation {
     let tmux_session_name = resolve_tmux_session_name(provider, provider_session_id)
         .unwrap_or_else(|| provider_session_id.trim().to_string());
-    observe_prompt_candidates_by_tmux_inner(
+    observe_hook_prompt_by_tmux_with_prompt_id_at(
         provider,
         &tmux_session_name,
+        prompt,
+        prompt_id,
+        observed_at,
+    )
+}
+
+/// Codex entry for a hook, scanner or tail that knows the native turn the input belongs to.
+pub(crate) fn observe_codex_prompt_in_turn_at(
+    tmux_session_name: &str,
+    prompt: &str,
+    entry_id: Option<&str>,
+    native_turn: Option<&str>,
+    observed_at: DateTime<Utc>,
+) -> PromptObservation {
+    observe_prompt_candidates_by_tmux_inner(
+        "codex",
+        tmux_session_name,
+        &[prompt.to_string()],
+        entry_id,
+        None,
+        native_turn,
+        PromptObservationEffect::NotifyAndLease,
+        observed_at,
+    )
+}
+
+pub(crate) fn observe_hook_prompt_by_tmux_with_prompt_id_at(
+    provider: &str,
+    tmux_session_name: &str,
+    prompt: &str,
+    prompt_id: Option<&str>,
+    observed_at: DateTime<Utc>,
+) -> PromptObservation {
+    observe_prompt_candidates_by_tmux_inner(
+        provider,
+        tmux_session_name,
         &[prompt.to_string()],
         None,
         prompt_id.map(ClaudePromptId::HookSubmit),
+        None,
         PromptObservationEffect::NotifyAndLease,
         observed_at,
     )
@@ -142,6 +181,7 @@ pub fn observe_prompt_by_tmux_with_row_ids_at(
         &[prompt.to_string()],
         entry_id,
         prompt_id.map(ClaudePromptId::TranscriptRow),
+        None,
         PromptObservationEffect::NotifyAndLease,
         observed_at,
     )
@@ -158,6 +198,7 @@ pub fn observe_prompt_candidates_by_tmux(
         prompts,
         None,
         None,
+        None,
         PromptObservationEffect::NotifyAndLease,
         Utc::now(),
     )
@@ -172,6 +213,7 @@ pub(crate) fn observe_prompt_candidates_by_tmux_for_relay_lease(
         provider,
         tmux_session_name,
         prompts,
+        None,
         None,
         None,
         PromptObservationEffect::RelayLeaseOnly,
@@ -191,6 +233,7 @@ fn observe_prompt_candidates_by_tmux_inner(
     prompts: &[String],
     entry_id: Option<&str>,
     prompt_id: Option<ClaudePromptId<'_>>,
+    native_turn: Option<&str>,
     effect: PromptObservationEffect,
     observed_at: DateTime<Utc>,
 ) -> PromptObservation {
@@ -198,6 +241,7 @@ fn observe_prompt_candidates_by_tmux_inner(
     let tmux_session_name = tmux_session_name.trim();
     let entry_id = entry_id.map(str::trim).filter(|value| !value.is_empty());
     let prompt_id = prompt_id.filter(|id| !id.value().trim().is_empty());
+    let native_turn = native_turn.map(str::trim).filter(|turn| !turn.is_empty());
     let mut candidates = Vec::new();
     for prompt in prompts {
         let prompt = prompt.trim();
@@ -205,11 +249,22 @@ fn observe_prompt_candidates_by_tmux_inner(
         // re-observation (after the discord-originated ledger entry was consumed)
         // never publishes a spurious SSH-direct turn. Treated like other synthetic
         // prompts → candidates stay empty → `PromptObservation::Ignored`.
-        if prompt.is_empty()
-            || is_synthetic_tui_user_prompt_for_provider(&provider, prompt)
-            || (is_discord_relayed_user_prompt(prompt)
-                && !is_user_prefixed_subagent_notification_machine_event(prompt))
+        if prompt.is_empty() || is_synthetic_tui_user_prompt_for_provider(&provider, prompt) {
+            continue;
+        }
+        if is_discord_relayed_user_prompt(prompt)
+            && !is_user_prefixed_subagent_notification_machine_event(prompt)
         {
+            // The Discord turn owns the native turn its injected prompt opened, so a steer joins it.
+            if let Some(turn) = native_turn
+                && take_matching_pending_prompt(&provider, tmux_session_name, prompt)
+            {
+                let owner = (
+                    SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
+                    NativeTurnOwner::Answer,
+                );
+                open_native_turn(&provider, tmux_session_name, turn, owner);
+            }
             continue;
         }
         if !candidates
@@ -221,6 +276,26 @@ fn observe_prompt_candidates_by_tmux_inner(
     }
     if provider.is_empty() || tmux_session_name.is_empty() || candidates.is_empty() {
         return PromptObservation::Ignored;
+    }
+    // An injected input is settled once, by the first observation that names its native turn.
+    match claim_injected_steer(&provider, tmux_session_name, &candidates, native_turn) {
+        Some(Claim::Deferred) => return PromptObservation::InjectedDeferred,
+        Some(Claim::Joined { first }) => {
+            // Every observer's entry id is kept, so a rescan after the ledger expires stays quiet.
+            if let Some(entry_id) = entry_id {
+                record_relayed_entry_id(&provider, tmux_session_name, entry_id);
+            }
+            if first {
+                let _ = take_or_record_recent_observed_prompt(
+                    &provider,
+                    tmux_session_name,
+                    &candidates[0],
+                );
+            }
+            return PromptObservation::InjectedSteer;
+        }
+        Some(Claim::HandedBefore) => return PromptObservation::SuppressedRecentDuplicate,
+        Some(Claim::Handed) | None => {}
     }
     // #4567: structured task lifecycle records are status events, not positive
     // user-input provenance. Publish them for the task-card/status observer, but
@@ -243,18 +318,24 @@ fn observe_prompt_candidates_by_tmux_inner(
             external_input_lease_generation: EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
             ssh_direct_observation_generation: SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
             hook_prompt_id: None,
+            row_prompt_id: None,
+            native_turn_id: None,
+            steer_echo: false,
         };
         let _ = OBSERVED_PROMPTS.send(event);
         return PromptObservation::PublishedTaskNotification;
     }
-    // The prompt_id text check runs before the uuid return so a known row that
-    // pairs the id with other text still marks the id ambiguous.
-    let prompt_id_match = prompt_id.map(|prompt_id| {
-        let prompt_id = prompt_id.value().trim();
-        let found =
-            check_relayed_prompt_id(&provider, tmux_session_name, prompt_id, &candidates[0]);
-        (prompt_id, found)
-    });
+    // Check rows before uuid dedupe so rewritten rows still mark conflicting ids ambiguous.
+    // Hooks skip this check: separate queued submissions share the running prompt's id.
+    let prompt_id_match = match prompt_id {
+        Some(ClaudePromptId::TranscriptRow(prompt_id)) => {
+            let prompt_id = prompt_id.trim();
+            let found =
+                check_relayed_prompt_id(&provider, tmux_session_name, prompt_id, &candidates[0]);
+            Some((prompt_id, found))
+        }
+        _ => None,
+    };
     // #3540 (root cause): suppress by STABLE entry identity BEFORE any pending /
     // recent / lease bookkeeping or synthetic-turn mint. If this JSONL entry
     // `uuid` was already relayed for this `(provider, tmux)` pair it is a
@@ -292,8 +373,46 @@ fn observe_prompt_candidates_by_tmux_inner(
         .first()
         .and_then(|prompt| classify_local_only_slash_control(prompt));
     if local_only_control.is_none() {
+        // A steering input joins before any lease is recorded, so the running turn's ownership
+        // stays; only its text is shown, by the same duplicate rules as an input that opens a turn.
+        if let Some(turn) =
+            native_turn.filter(|turn| native_turn_is_open(&provider, tmux_session_name, turn))
+        {
+            let discord =
+                take_matching_pending_prompt(&provider, tmux_session_name, &candidates[0]);
+            let repeated =
+                take_or_record_recent_observed_prompt(&provider, tmux_session_name, &candidates[0]);
+            if let Some(entry_id) = entry_id {
+                record_relayed_entry_id(&provider, tmux_session_name, entry_id);
+            }
+            if !discord && !repeated {
+                let _ = OBSERVED_PROMPTS.send(ObservedTuiPrompt {
+                    provider: provider.clone(),
+                    tmux_session_name: tmux_session_name.to_string(),
+                    prompt: candidates[0].clone(),
+                    source_event_id: entry_id.map(str::to_string),
+                    observed_at,
+                    external_input_lease_generation:
+                        EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+                    ssh_direct_observation_generation: SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
+                    hook_prompt_id: None,
+                    row_prompt_id: None,
+                    native_turn_id: Some(turn.to_string()),
+                    steer_echo: true,
+                });
+            }
+            return PromptObservation::JoinedNativeTurn;
+        }
         for prompt in &candidates {
             if take_matching_pending_prompt(&provider, tmux_session_name, prompt) {
+                // The Discord turn owns this native turn's answer.
+                if let Some(turn) = native_turn {
+                    let owner = (
+                        SSH_DIRECT_OBSERVATION_GENERATION_UNRECORDED,
+                        NativeTurnOwner::Answer,
+                    );
+                    open_native_turn(&provider, tmux_session_name, turn, owner);
+                }
                 return PromptObservation::SuppressedDiscordDuplicate;
             }
         }
@@ -368,7 +487,19 @@ fn observe_prompt_candidates_by_tmux_inner(
         external_input_lease_generation,
         ssh_direct_observation_generation,
         hook_prompt_id,
+        row_prompt_id: prompt_id_match
+            .filter(|(_, found)| *found == PromptIdMatch::Unannounced)
+            .map(|(prompt_id, _)| prompt_id.to_string()),
+        native_turn_id: native_turn.map(str::to_string),
+        steer_echo: false,
     };
+    // Reserved until the relay adopts it for a row, hands it to a deferred worker, or withdraws it.
+    if let Some(turn) = native_turn
+        && local_only_control.is_none()
+    {
+        let observed_by = (ssh_direct_observation_generation, NativeTurnOwner::Relay);
+        open_native_turn(&event.provider, tmux_session_name, turn, observed_by);
+    }
     let _ = OBSERVED_PROMPTS.send(event);
     PromptObservation::PublishedSshDirect
 }
@@ -661,6 +792,26 @@ pub(super) fn clear_ssh_direct_observation_pending(provider: &str, tmux_session_
     state
         .ssh_direct_observation_by_tmux
         .remove(&PromptKey::new(&provider, tmux_session_name));
+}
+
+/// Whether the hook relay announced this scanner row's prompt after the row was published. When
+/// it did, only the lease and marker this row's own observation recorded are released.
+pub(crate) fn withdraw_row_announced_by_its_hook(
+    prompt: &ObservedTuiPrompt,
+    channel_id: u64,
+) -> bool {
+    let Some(prompt_id) = prompt.row_prompt_id.as_deref() else {
+        return false;
+    };
+    let (provider, tmux) = (prompt.provider.as_str(), prompt.tmux_session_name.as_str());
+    if check_relayed_prompt_id(provider, tmux, prompt_id, &prompt.prompt) != PromptIdMatch::Same {
+        return false;
+    }
+    let lease = prompt.external_input_lease_generation;
+    clear_external_input_relay_lease_if_generation_matches(provider, tmux, channel_id, lease);
+    let marker = prompt.ssh_direct_observation_generation;
+    clear_ssh_direct_observation_pending_if_generation_matches(provider, tmux, marker);
+    true
 }
 
 fn clear_ssh_direct_observation_pending_if_generation_matches(

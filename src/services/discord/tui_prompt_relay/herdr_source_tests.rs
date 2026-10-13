@@ -1,4 +1,5 @@
 //! Herdr source attach: launch and restart through the real launch, reconcile and hook receiver.
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,17 +8,20 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::db::dispatched_sessions::hosted_execution::tests::{expected, owner};
-use crate::db::dispatched_sessions::hosted_execution::{HostedLocation, HostedState, ProcessStamp};
+use crate::db::dispatched_sessions::hosted_execution::{
+    ExpectedExecution, HostedLocation, HostedState,
+};
 use crate::services::claude_tui::hook_server::observation_ingress::tests::{Ingress, events, uuid};
 use crate::services::discord::recovery_engine::host_reconcile::HerdrPaneEvidence;
 use crate::services::discord::tmux::execution_identity::herdr_observation::{
     HerdrMismatch, HerdrUnknown,
 };
 use crate::services::herdr_launch::{
-    HerdrCreateOutcome, HerdrCreateRequest, HerdrLaunch, HerdrLaunchCommand, HerdrLaunchEndpoint,
-    HerdrLaunchHost, HerdrLaunchOutcome, launch_herdr_session, unset_herdr_env_before_exec,
+    EvidenceProbe, HerdrCreateOutcome, HerdrCreateRequest, HerdrLaunch, HerdrLaunchCommand,
+    HerdrLaunchEndpoint, HerdrLaunchHost, HerdrLaunchOutcome, launch_herdr_session,
+    unset_herdr_env_before_exec,
 };
-use crate::services::session_host::RestoreResume;
+use crate::services::session_host::{EvidenceGap, RestoreResume, ServerWitness};
 use crate::services::tui_o::shadow::capture::file_identity;
 use crate::services::tui_prompt_dedupe::binding_context::PreparedIncarnation;
 use crate::services::tui_prompt_dedupe::binding_events::{
@@ -36,7 +40,9 @@ struct Launcher;
 
 impl HerdrLaunchHost for Launcher {
     fn restore_resume(&self, _endpoint: &HerdrLaunchEndpoint) -> RestoreResume {
-        RestoreResume::Off { generation: 1 }
+        RestoreResume::Off {
+            witness: ServerWitness::for_test(1),
+        }
     }
 
     fn create(&self, _request: &HerdrCreateRequest) -> HerdrCreateOutcome {
@@ -45,9 +51,8 @@ impl HerdrLaunchHost for Launcher {
         }
     }
 
-    fn launch_evidence(&self, _location: &HostedLocation) -> Option<(ProcessStamp, ProcessStamp)> {
-        let stamps = expected("unused", 100);
-        Some((stamps.root, stamps.provider_process))
+    fn launch_evidence(&self, probe: &EvidenceProbe) -> Result<ExpectedExecution, EvidenceGap> {
+        Ok(expected(&probe.execution_nonce, 100))
     }
 }
 
@@ -129,7 +134,9 @@ impl Herdr {
     /// Launches `session` through the production Herdr launch, with the Claude TUI's own
     /// settings and script preparation; returns the execution nonce.
     fn launch(&mut self, session: &str) -> String {
-        let dir = self.ingress.path("cwd");
+        // The launch refuses a cwd that is not an existing directory before Pending.
+        let dir = self.ingress.path("cwd").with_extension("");
+        std::fs::create_dir_all(&dir).unwrap();
         let prepare = |prepared: &PreparedIncarnation| -> Result<HerdrLaunchCommand, String> {
             let config = crate::services::claude_tui::session::ClaudeTuiLaunchConfig {
                 tmux_session_name: prepared.context.tmux_session.clone(),
@@ -164,6 +171,7 @@ impl Herdr {
             channel_id: Some(self.channel),
             expected_native_session_id: Some(session.to_owned()),
             resume: false,
+            provider_root: None,
         };
         let host: Arc<dyn HerdrLaunchHost> = Arc::new(Launcher);
         let outcome = self
@@ -172,7 +180,7 @@ impl Herdr {
         let Ok(HerdrLaunchOutcome::Launched {
             execution_nonce,
             location,
-            evidence: true,
+            evidence: Ok(()),
         }) = outcome
         else {
             panic!("{outcome:?}");
@@ -665,6 +673,158 @@ fn a_refused_restart_attach_withholds_hook_switches_until_a_match_pg() {
     }
 }
 
+/// Logs a SessionStart(`source`) Pending of `session` on the pane under `nonce`'s spawn marker.
+fn log_pending(herdr: &Herdr, nonce: &str, session: &str, source: &str) {
+    log_under(herdr, nonce, session, source, |proposal| {
+        binding_events::record_pending(proposal).unwrap();
+    });
+}
+
+/// Logs `session`'s file as a verified Source under `nonce`'s spawn marker.
+fn log_source(herdr: &Herdr, nonce: &str, session: &str) {
+    let path = herdr.ingress.transcript(session);
+    let source = SourceId {
+        session_id: session.into(),
+        path,
+        dev: 1,
+        ino: 1,
+    };
+    log_under(herdr, nonce, session, "startup", |proposal| {
+        binding_events::record_verified(proposal, &source).unwrap();
+    });
+}
+
+/// Records under `nonce`'s spawn marker, then puts back the marker the launch left.
+fn log_under(
+    herdr: &Herdr,
+    nonce: &str,
+    session: &str,
+    source: &str,
+    record: impl FnOnce(&binding_events::Proposal),
+) {
+    let marker = crate::services::tmux_common::session_temp_path(herdr.logical(), "spawn_nonce");
+    let launched = std::fs::read_to_string(&marker).unwrap();
+    std::fs::write(&marker, nonce).unwrap();
+    let hook =
+        binding_events::HookSignal::from_payload("session_start", &json!({"source": source}));
+    let path = herdr.ingress.path(session).display().to_string();
+    let proposal = binding_events::Proposal {
+        channel_id: herdr.channel,
+        provider: "claude",
+        tmux_session: herdr.logical(),
+        session_id: Some(session),
+        path: &path,
+        replaced: None,
+        cause: binding_events::CauseSource::Hook(hook.cause()),
+        hook: Some(&hook),
+    };
+    with_tmux_source_authority(herdr.logical(), |_| record(&proposal));
+    std::fs::write(&marker, launched).unwrap();
+}
+
+fn admitted(herdr: &Herdr) -> bool {
+    crate::services::tui_prompt_dedupe::herdr_claim_admission(herdr.logical(), true).is_ok()
+}
+
+/// The first prompt hook of `session`, naming its own new transcript.
+fn first_prompt(herdr: &Herdr, session: &str) -> u16 {
+    herdr.ingress.transcript(session);
+    let payload = herdr.ingress.payload(session, None);
+    herdr
+        .ingress
+        .claude_hook("UserPromptSubmit", session, &payload, Some(&uuid()))
+}
+
+// T-R4: a restart on the execution's own clear Pending, taken from its own source, admits input
+// and restores no source or cursor; another execution's, or one from another source, admits none.
+#[test]
+fn t_r4_a_restart_on_its_own_clear_pending_admits_input_without_a_source_pg() {
+    for case in ["own", "other nonce", "from another source"] {
+        let herdr = &mut Herdr::new(&format!("clear-{}", case.replace(' ', "-")));
+        let a = uuid();
+        let nonce = herdr.launch(&a);
+        herdr.ingress.transcript(&a);
+        let reader = herdr.pane(&nonce, |_| {});
+        assert!(matches!(
+            herdr.launched(&nonce, &a, &reader),
+            HerdrSourceAttach::Published { bound: true, .. }
+        ));
+        let other = "fedcba9876543210fedcba9876543210";
+        let y = uuid();
+        match case {
+            "own" => log_pending(herdr, &nonce, &y, "clear"),
+            "other nonce" => log_pending(herdr, other, &y, "clear"),
+            _ => {
+                log_source(herdr, other, &uuid());
+                log_pending(herdr, &nonce, &y, "clear");
+            }
+        }
+        let (lines, row) = (herdr.log().len(), herdr.row());
+        herdr.restart();
+        let attached = herdr.restarted(&reader);
+        assert_eq!((herdr.bound(), herdr.log().len()), (None, lines), "{case}");
+        assert_eq!(herdr.row(), row, "{case}");
+
+        // A watcher claim on the pane, which carries its input and relay, is admitted or withheld.
+        let admitted = admitted(herdr);
+        if case == "own" {
+            assert_eq!(
+                (attached, admitted),
+                (HerdrSourceAttach::AwaitingClear, true)
+            );
+        } else {
+            let refused = (HerdrSourceAttach::NoBaseline, false);
+            assert_eq!((attached, admitted), refused, "{case}");
+        }
+    }
+}
+
+// The restart pass leaves an execution this process launched: a re-attach would refuse its
+// waiting compact and withhold the pane, but it stays admitted and takes its next prompt.
+#[test]
+fn the_restart_pass_leaves_an_execution_this_process_launched_pg() {
+    use crate::services::discord::recovery_engine::herdr_reader::{
+        ReconnectCounts, reconnect_counts, reconnect_restarted_herdr_panes,
+    };
+    let herdr = &mut Herdr::new("launched-here");
+    let a = uuid();
+    let nonce = herdr.launch(&a);
+    herdr.ingress.transcript(&a);
+    let reader = herdr.pane(&nonce, |_| {});
+    assert!(matches!(
+        herdr.launched(&nonce, &a, &reader),
+        HerdrSourceAttach::Published { bound: true, .. }
+    ));
+    let y = uuid();
+    log_pending(herdr, &nonce, &y, "compact");
+    let (pool, logical, log_root) = (
+        herdr.pool.clone(),
+        herdr.logical().to_owned(),
+        binding_events::test_root(),
+    );
+    let pass = async move {
+        tokio::task::spawn_blocking(move || {
+            binding_events::set_test_root(log_root.as_deref());
+            let rig = crate::services::session_host::herdr_socket_rig_tests::HerdrRig::start();
+            let _registry = rig.registry_on_this_thread();
+            let _hosts = crate::config::session_hosts::force_for_test(Some("test-node"), &[]);
+            // The listing a launch in this process leaves on the pane.
+            admit_herdr_execution(&logical, &nonce);
+            let _ = reconnect_restarted_herdr_panes(
+                Some(&pool),
+                &crate::services::provider::ProviderKind::Claude,
+                None,
+            );
+            reconnect_counts()
+        })
+        .await
+    };
+    let counts = herdr.rt.block_on(pass).unwrap();
+    assert_eq!(counts, ReconnectCounts::default());
+    assert!(admitted(herdr));
+    assert_eq!(first_prompt(herdr, &y), 202);
+}
+
 // O begins a channel's era only on a binding baseline its log names: a Herdr launch's own source
 // is one, and a refused launch leaves none.
 #[test]
@@ -724,4 +884,197 @@ fn the_o_switch_takes_a_herdr_channel_only_on_the_source_its_launch_logged_pg() 
             false => assert_eq!((era.initial_channels, excluded), (vec![], vec![left])),
         }
     }
+}
+
+/// The gateway side of an O writer host reading the binding log the launch wrote; the posts
+/// survive a restart so each result's posts can be counted.
+struct LaunchedLog {
+    posts: Arc<crate::services::tui_o::writer::host::test_io::Posts>,
+    alarms: crate::services::tui_o::writer::host::test_io::Alarms,
+}
+
+impl crate::services::tui_o::writer::host::HostIo for LaunchedLog {
+    type Port = crate::services::tui_o::writer::host::test_io::Posts;
+    type Lease = crate::services::tui_o::writer::host::test_io::AnyLease;
+    type Alarms = crate::services::tui_o::writer::host::test_io::Alarms;
+    type Bindings = crate::services::tui_o::writer::binding::ChannelBindingLog;
+
+    fn port(&self) -> impl Future<Output = Arc<Self::Port>> + Send {
+        std::future::ready(Arc::clone(&self.posts))
+    }
+
+    fn lease(&self) -> Self::Lease {
+        crate::services::tui_o::writer::host::test_io::AnyLease
+    }
+
+    fn alarms(&self) -> Self::Alarms {
+        self.alarms.clone()
+    }
+
+    fn bindings(
+        &self,
+        channel: u64,
+        provider: crate::services::tui_o::shadow::ShadowProvider,
+    ) -> Arc<Self::Bindings> {
+        Arc::new(crate::services::tui_o::writer::binding::ChannelBindingLog::new(channel, provider))
+    }
+
+    fn activation_facts(
+        &self,
+        _: u64,
+        _: crate::services::tui_o::shadow::ShadowProvider,
+    ) -> impl Future<
+        Output = Result<crate::services::tui_o::writer::activation::ActivationFacts, String>,
+    > + Send {
+        std::future::ready(Ok(Default::default()))
+    }
+
+    fn local_custody(
+        &self,
+        _: u64,
+        _: crate::services::tui_o::shadow::ShadowProvider,
+    ) -> Result<crate::services::tui_o::writer::host::Custody, String> {
+        Ok(crate::services::tui_o::writer::host::Custody::Free)
+    }
+
+    fn legacy(&self) -> Arc<dyn crate::services::tui_o::writer::adoption::LegacyView> {
+        Arc::new(crate::services::tui_o::writer::adoption::NoLegacy)
+    }
+
+    fn legacy_busy(&self, _: u64) -> impl Future<Output = bool> + Send {
+        std::future::ready(false)
+    }
+
+    fn relaying(&self, _: u64) -> bool {
+        false
+    }
+}
+
+// A Herdr launch on a channel O owns: the writer posts its result, and after a stop with the next
+// result unread, the restarted host takes its store back and posts each result once.
+#[test]
+fn a_herdr_launch_then_a_writer_stop_posts_each_result_once_from_the_store_pg() {
+    use crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui;
+    use crate::services::tui_o::shadow::ShadowProvider;
+    use crate::services::tui_o::writer::actor::POLL_INTERVAL;
+    use crate::services::tui_o::writer::host::{HostParts, Readiness, start};
+    let herdr = &mut Herdr::new("o-resume");
+    let (channel, logical) = (herdr.channel, herdr.logical().to_owned());
+    // Legacy's pane started an empty session before O took the channel.
+    let legacy = uuid();
+    let legacy_path = herdr.ingress.path(&legacy);
+    std::fs::write(&legacy_path, b"").unwrap();
+    dedupe::register_tmux_channel(&logical, channel);
+    dedupe::register_launched_tmux_runtime_binding(
+        &logical,
+        TuiRuntimeBinding {
+            runtime_kind: RuntimeHandoffKind::ClaudeTui,
+            output_path: legacy_path.display().to_string(),
+            relay_output_path: None,
+            input_fifo_path: None,
+            session_id: Some(legacy.clone()),
+            last_offset: 0,
+            relay_last_offset: None,
+        },
+    );
+
+    let runtime_root = crate::config::runtime_root().unwrap();
+    let _selected =
+        crate::services::tui_o::cutover::test_override::force_candidates(&[(channel, ClaudeTui)]);
+    let gate = Arc::new(crate::services::tui_o::ownership::OwnershipGate::default());
+    gate.acquired();
+    let posts = Arc::new(crate::services::tui_o::writer::host::test_io::Posts::default());
+    let writer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let polls = |count: u32| {
+        writer.block_on(async { tokio::time::sleep(POLL_INTERVAL * count).await });
+    };
+    let host = || {
+        let io = Arc::new(LaunchedLog {
+            posts: Arc::clone(&posts),
+            alarms: Default::default(),
+        });
+        let parts = || HostParts {
+            io: Arc::clone(&io),
+            runtime_root: Some(runtime_root.clone()),
+            gate: Arc::clone(&gate),
+            readiness: Arc::new(Readiness::default()),
+        };
+        let tasks = writer.block_on(async { start(ShadowProvider::Claude, true, parts) });
+        (io, tasks)
+    };
+    let halted = |io: &LaunchedLog| {
+        let raised = io.alarms.0.lock().unwrap();
+        let halted = raised.iter().filter(|(_, alarm)| {
+            matches!(
+                alarm,
+                crate::services::tui_o::writer::WriterAlarm::Halted { .. }
+            )
+        });
+        halted.cloned().collect::<Vec<_>>()
+    };
+    let (io, tasks) = host();
+    polls(3);
+    assert_eq!(halted(&io), []);
+    // The writer's readiness is this host's own, so the launch gate is told it accepts work.
+    let _launch_gate = crate::services::herdr_launch::force_writer_accepts(Some(true));
+    assert!(
+        crate::services::herdr_launch::o_writer_ready(channel, RuntimeHandoffKind::ClaudeTui),
+        "O owns the channel on a seeded store: {:?}",
+        io.alarms.0.lock().unwrap()
+    );
+
+    let a = uuid();
+    let transcript = herdr.ingress.transcript(&a);
+    let nonce = herdr.launch(&a);
+    let reader = herdr.pane(&nonce, |_| {});
+    let attached = herdr.launched(&nonce, &a, &reader);
+    assert!(
+        matches!(attached, HerdrSourceAttach::Published { bound: true, .. }),
+        "{attached:?}"
+    );
+    let result = |id: &str, text: &str| {
+        let row = json!({
+            "type": "assistant", "uuid": format!("u-{id}"), "apiBlockIndex": 0,
+            "message": {"id": id, "content": [{"type": "text", "text": text}]},
+        });
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        std::io::Write::write_all(&mut file, format!("{row}\n").as_bytes()).unwrap();
+    };
+    polls(3);
+    result("m1", "posted before the stop");
+    polls(3);
+    assert_eq!(
+        posts.to(channel),
+        ["posted before the stop"],
+        "{:?}",
+        io.alarms.0.lock().unwrap()
+    );
+    // Recorded with no poll in between, so the stopped writer never read it.
+    result("m2", "recorded at the stop");
+    tasks.iter().for_each(tokio::task::JoinHandle::abort);
+    polls(2);
+    let store = runtime_root.join("o_store").join(channel.to_string());
+    let written = std::fs::read(store.join("init")).unwrap();
+
+    let (io, tasks) = host();
+    polls(6);
+    assert_eq!(halted(&io), []);
+    assert_eq!(
+        std::fs::read(store.join("init")).unwrap(),
+        written,
+        "the restart takes the store back rather than starting another"
+    );
+    assert_eq!(
+        posts.to(channel),
+        ["posted before the stop", "recorded at the stop"]
+    );
+    tasks.iter().for_each(tokio::task::JoinHandle::abort);
+    polls(2);
 }

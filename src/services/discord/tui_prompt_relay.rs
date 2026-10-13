@@ -14,13 +14,11 @@ use super::outbound::delivery_record as dr; // #3089 B2c
 use super::turn_bridge::TurnBridgeContext;
 use super::turn_view_reconciler::note_tui_anchor_started as started;
 use crate::services::agent_protocol::{RuntimeHandoffKind, StreamMessage};
-use crate::services::claude_tui::hook_server::{HookEvent, HookEventKind, subscribe_hook_events};
+use crate::services::claude_tui::hook_server::subscribe_hook_events;
 use crate::services::memory::TokenUsage;
 use crate::services::provider::{CancelToken, ProviderKind, ReadOutputResult};
 use crate::services::tui_prompt_dedupe::{
     ExternalInputRelayLease, ExternalInputRelayOwner, ObservedTuiPrompt,
-    extract_prompt_from_hook_payload, extract_prompt_id_from_hook_payload,
-    observe_prompt_by_provider_session_with_prompt_id_at, subscribe_observed_prompts,
 };
 use tracing::Instrument;
 
@@ -34,7 +32,13 @@ use self::injected_prompt_policy::{
 use self::injected_prompt_policy::{
     format_subagent_notification_card, is_start_anchored_task_notification,
 };
+mod hook_observer;
 mod task_notification_prompt;
+use self::hook_observer::spawn_tui_prompt_relay_observer;
+#[cfg(test)]
+use self::hook_observer::{
+    HookObserverProbe, hook_observation_target, spawn_tui_prompt_relay_observer_inner,
+};
 
 mod observed_prompt_decision;
 pub(in crate::services::discord) use self::observed_prompt_decision::observed_prompt_starts_external_turn_lifecycle;
@@ -65,6 +69,8 @@ use self::rehydration::{
     codex_tui_rehydrated_binding_from_rollout_path, rehydrate_existing_claude_tui_bindings,
     rehydrate_existing_codex_tui_bindings, rehydrated_claude_tui_binding_for_tmux_session,
 };
+#[cfg(all(unix, test))]
+pub(crate) use rehydration::run_codex_rehydrate_pass_for_tests;
 
 mod anchor_completion;
 mod bridge_completion;
@@ -147,6 +153,8 @@ use self::synthetic_start::{
     release_stale_ownerless_tui_direct_mailbox_if_current, tui_direct_watcher_can_own_output,
 };
 
+#[cfg(unix)]
+pub(in crate::services::discord) mod background_child_completion;
 #[cfg(unix)]
 mod claude_idle_bridge;
 #[cfg(unix)]
@@ -289,81 +297,9 @@ pub(super) fn spawn_tui_prompt_relay(shared: Arc<SharedData>, provider: Provider
     );
 }
 
-/// Hook prompts and observed-prompt relay share one loop; tests pass their own hooks and relay.
-fn spawn_tui_prompt_relay_observer(
-    provider_name: String,
-    mut hook_rx: tokio::sync::broadcast::Receiver<HookEvent>,
-    mut relay: impl FnMut(ObservedTuiPrompt) -> futures::future::BoxFuture<'static, ()> + Send + 'static,
-) {
-    let observer_span = tracing::info_span!(
-        "tui_prompt_relay_observer",
-        provider = %provider_name
-    );
-    // Subscribe before spawning so callers can publish immediately after this
-    // function returns without racing the observer task's first poll.
-    let mut observed_rx = subscribe_observed_prompts();
-    super::task_supervisor::spawn_observed("tui_prompt_relay_observer", async move {
-        loop {
-            tokio::select! {
-                hook_event = hook_rx.recv() => {
-                    match hook_event {
-                        Ok(event) if event.provider == provider_name
-                            && event.kind == HookEventKind::UserPromptSubmit =>
-                        {
-                            if let Some(prompt) = extract_prompt_from_hook_payload(&event.payload) {
-                                let prompt_id = (event.provider == "claude")
-                                    .then(|| extract_prompt_id_from_hook_payload(&event.payload))
-                                    .flatten();
-                                let observation = observe_prompt_by_provider_session_with_prompt_id_at(
-                                    &event.provider,
-                                    &event.session_id,
-                                    &prompt,
-                                    prompt_id.as_deref(),
-                                    event.received_at,
-                                );
-                                tracing::debug!(
-                                    provider = %event.provider,
-                                    session_id = %event.session_id,
-                                    prompt_id = prompt_id.as_deref().unwrap_or(""),
-                                    observation = ?observation,
-                                    "observed TUI UserPromptSubmit hook"
-                                );
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(
-                                provider = %provider_name,
-                                skipped,
-                                "TUI prompt relay lagged hook events"
-                            );
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                    }
-                }
-                observed = observed_rx.recv() => {
-                    match observed {
-                        Ok(prompt) if prompt.provider == provider_name => {
-                            relay(prompt).await;
-                        }
-                        Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(
-                                provider = %provider_name,
-                                skipped,
-                                "TUI prompt relay lagged observed prompt events"
-                            );
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                    }
-                }
-            }
-        }
-    }.instrument(observer_span));
-}
-
 async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiPrompt) {
     let _unannounced_prompt_id = synthetic_start_wiring::UnannouncedPromptIdGuard(&prompt);
+    let _unowned_native_turn = synthetic_start_wiring::UnownedNativeTurnGuard(&prompt);
     // Local-only controls were classified before publication, so this relay path
     // never needs to repair pre-publish lease/SSH state. A missing or lagged
     // receiver therefore cannot strand a local `/compact` relay lease.
@@ -376,6 +312,9 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         );
         return;
     };
+    if prompt.steer_echo {
+        return synthetic_start_wiring::post_steer_echo(shared, &prompt, channel_id).await;
+    }
     if let Some(control) = relay_prompt_decision.local_only_control.as_ref() {
         let provider = ProviderKind::from_str_or_unsupported(&prompt.provider);
         super::queue_io::schedule_deferred_idle_queue_kickoff_immediate(
@@ -430,31 +369,6 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         }
         return;
     }
-    let injected_class = relay_prompt_decision.injected_class;
-    let task_notification =
-        task_notification_prompt::observe(shared, &prompt, channel_id, injected_class);
-    if matches!(injected_class, InjectedPromptClass::TaskNotificationEvent) {
-        // #4567: structured task lifecycle records retain their status-card
-        // authority, but have no positive user-input provenance. Resolve the
-        // card without recording a generic external lease; in particular, do
-        // not let a killed notification mint an anchor, mailbox token, or
-        // synthetic inflight that can fence the next real prompt.
-        let status_only_lease = ExternalInputRelayLease::unassigned(Some(channel_id.get()));
-        let _ = task_notification_prompt::resolve_gate(
-            shared,
-            &prompt,
-            channel_id,
-            injected_class,
-            &status_only_lease,
-            task_notification,
-        )
-        .await;
-        return;
-    }
-    // #3811: TUI-direct is an id-0 synthetic turn — clear any stale interactive 요청 anchor.
-    let live_events = &shared.ui.placeholder_live_events;
-    live_events.set_turn_request_anchor(channel_id, None, None);
-    let recap_provider = ProviderKind::from_str_or_unsupported(&prompt.provider);
     // #3178 (codex P1 lease-overwrite): run the slash-command-control dedupe BEFORE
     // recording ANY external-input lease. The #3153 double-post (raw echo + expanded
     // `<command-*>` wrapper, ~tens-of-ms apart) must not let the SECOND half record a
@@ -484,6 +398,37 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         );
         return;
     }
+    // A scanner row queued behind its hook's open announcement is that announcement once it landed.
+    if crate::services::tui_prompt_dedupe::withdraw_row_announced_by_its_hook(
+        &prompt,
+        channel_id.get(),
+    ) {
+        tracing::info!(
+            provider = %prompt.provider,
+            channel_id = channel_id.get(),
+            tmux_session_name = %prompt.tmux_session_name,
+            "scanner row already announced by its hook; not announced again"
+        );
+        return;
+    }
+    let injected_class = relay_prompt_decision.injected_class;
+    let task_notification =
+        task_notification_prompt::observe(shared, &prompt, channel_id, injected_class);
+    let Some(task_notification) = synthetic_start_wiring::post_passive_prompt_notice(
+        shared,
+        &prompt,
+        channel_id,
+        &relay_prompt_decision,
+        task_notification,
+    )
+    .await
+    else {
+        return;
+    };
+    // #3811: TUI-direct is an id-0 synthetic turn — clear any stale interactive 요청 anchor.
+    let live_events = &shared.ui.placeholder_live_events;
+    live_events.set_turn_request_anchor(channel_id, None, None);
+    let recap_provider = ProviderKind::from_str_or_unsupported(&prompt.provider);
     let mut lease = record_observed_external_turn_lease(shared, &prompt, channel_id);
     // #3041 P1-4 codex: arm an early-return RAII guard the instant the lease is
     // recorded — every failure early-return below would otherwise leave the lease set
@@ -924,6 +869,6 @@ fn slash_command_control_turn_is_duplicate_external_replay(
 #[cfg(all(test, unix))]
 mod local_model_queue_wake_e2e;
 #[cfg(all(test, unix))]
-mod relay_e2e;
+pub(in crate::services::discord) mod relay_e2e;
 #[cfg(test)]
 mod tests;

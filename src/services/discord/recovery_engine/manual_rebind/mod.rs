@@ -26,7 +26,6 @@ mod coordinate_adoption;
 mod coordinate_adoption_tests;
 mod episode_handoff;
 mod test_barriers;
-#[cfg(unix)]
 mod watcher_claim;
 #[cfg(test)]
 use test_barriers::await_post_adoption_claim_barrier;
@@ -160,52 +159,10 @@ impl PendingRebindInflightRollback {
 /// `DiscordSession`; spawns a `tmux_output_watcher` via the single-watcher
 /// claim policy (an existing live owner is reused, `watcher_spawned=false`,
 /// and still picks up the new inflight — not an error).
-pub(crate) async fn rebind_inflight_for_channel(
-    http: &Arc<serenity::Http>,
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    channel_id: u64,
-    tmux_session_override: Option<String>,
-    overrides: ManualRebindOverrides,
-    expected_episode: Option<&super::inflight::InflightEpisodePin>,
-) -> Result<RebindOutcome, RebindError> {
-    rebind_inflight_for_channel_inner(
-        http,
-        shared,
-        provider,
-        channel_id,
-        tmux_session_override,
-        overrides,
-        None,
-        expected_episode,
-    )
-    .await
-}
-
-/// `expected_episode` pins the inflight row the caller observed. Supplying it
-/// keeps the `WatcherReattach` arm on its adopt branch, so a recovery that only
-/// needs a watcher back can never clear the row it was called to serve.
-pub(crate) async fn rebind_inflight_for_channel_with_minimum_start_offset(
-    http: &Arc<serenity::Http>,
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    channel_id: u64,
-    tmux_session_override: Option<String>,
-    minimum_initial_offset: Option<u64>,
-    expected_episode: Option<&super::inflight::InflightEpisodePin>,
-) -> Result<RebindOutcome, RebindError> {
-    rebind_inflight_for_channel_inner(
-        http,
-        shared,
-        provider,
-        channel_id,
-        tmux_session_override,
-        ManualRebindOverrides::default(),
-        minimum_initial_offset,
-        expected_episode,
-    )
-    .await
-}
+mod live_bridge_guard;
+pub(crate) use live_bridge_guard::{
+    rebind_inflight_for_channel, rebind_inflight_for_channel_with_minimum_start_offset,
+};
 
 #[allow(clippy::too_many_arguments)]
 async fn rebind_inflight_for_channel_inner(
@@ -219,7 +176,7 @@ async fn rebind_inflight_for_channel_inner(
     expected_episode: Option<&super::inflight::InflightEpisodePin>,
 ) -> Result<RebindOutcome, RebindError> {
     let discord_channel_id =
-        super::inflight::opt_channel_id(channel_id).ok_or(RebindError::ChannelIdZero)?;
+        watcher_claim::admit_channel(shared, provider, channel_id, &tmux_session_override).await?;
 
     // Preflight existence check — fast 409 before walking the validation /
     // tmux-liveness path. Advisory only; the AUTHORITATIVE guard is the atomic
@@ -668,6 +625,15 @@ async fn rebind_inflight_for_channel_inner(
         existing_offset_rebase_to_output = Some(fence);
     }
 
+    // Resolve the host before adoption acquires the episode lock; adoption revalidates the exact pin.
+    #[cfg(unix)]
+    let host = super::tmux::watch_host_of(
+        shared,
+        provider,
+        discord_channel_id.get(),
+        &tmux_session_name,
+    )
+    .await;
     let mut inflight_rollback_on_relay_setup_failure: Option<PendingRebindInflightRollback>;
     let mut locked_episode_from_adoption: Option<super::inflight::LockedInflightEpisode> = None;
     #[cfg(test)]
@@ -722,6 +688,7 @@ async fn rebind_inflight_for_channel_inner(
             });
         existing
     } else {
+        adoption::ensure_synthetic_rebind_allowed(channel_id)?;
         // Build and persist the new inflight state. No request_owner / msg_ids
         // apply because this recovery has no originating Discord message.
         //
@@ -821,7 +788,7 @@ async fn rebind_inflight_for_channel_inner(
         )
         .await?;
 
-    let (watcher_spawned, watcher_replaced) = {
+    let (watcher_spawned, watcher_replaced, watcher_withheld) = {
         #[cfg(unix)]
         {
             let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -842,7 +809,7 @@ async fn rebind_inflight_for_channel_inner(
                 turn_delivered: turn_delivered.clone(),
                 last_heartbeat_ts_ms: last_heartbeat_ts_ms.clone(),
             };
-            let (watcher_should_spawn, watcher_replaced) = claim_rebind_watcher(
+            let claimed = claim_rebind_watcher(
                 &shared.tmux_watchers,
                 discord_channel_id,
                 handle,
@@ -853,7 +820,9 @@ async fn rebind_inflight_for_channel_inner(
                     recovered_state_for_session.logical_channel_id,
                     recovered_state_for_session.thread_id,
                 ),
+                host,
             );
+            let (watcher_should_spawn, watcher_replaced) = claimed.unwrap_or((false, false));
             if watcher_should_spawn {
                 if let Some(PendingCodexTuiRebindRelay {
                     rollout_path,
@@ -946,11 +915,11 @@ async fn rebind_inflight_for_channel_inner(
                     ),
                 );
             }
-            (watcher_should_spawn, watcher_replaced)
+            (watcher_should_spawn, watcher_replaced, claimed.is_err())
         }
         #[cfg(not(unix))]
         {
-            (false, false)
+            (false, false, false)
         }
     };
     drop(locked_episode);
@@ -965,6 +934,11 @@ async fn rebind_inflight_for_channel_inner(
         );
     }
 
+    if watcher_withheld {
+        return Err(RebindError::WatcherWithheld {
+            tmux_session: tmux_session_name,
+        });
+    }
     Ok(RebindOutcome {
         tmux_session: tmux_session_name,
         channel_id,

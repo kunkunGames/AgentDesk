@@ -1,0 +1,302 @@
+//! Which host runs a provider turn, judged once before spawn. A channel configured for Herdr, or
+//! one whose row still holds a Herdr execution, is never handed to tmux or the process driver.
+
+use sqlx::PgPool;
+
+use crate::config::session_hosts::{self, ChannelEndpoint};
+use crate::db::dispatched_sessions::hosted_execution::{
+    HostedLookup, HostedLookupKey, HostedObservation, HostedRecord, HostedState,
+    load_hosted_execution_pg,
+};
+use crate::services::agent_protocol::RuntimeHandoffKind;
+use crate::services::cluster::channel_home::{self, HomeRefusal};
+use crate::services::cluster::home_availability::{self, Unavailable};
+use crate::services::herdr_admission::{self, StopCause};
+use crate::services::herdr_launch::{HerdrLaunchEndpoint, o_writer_ready};
+use crate::services::provider::ProviderKind;
+
+#[derive(Debug)]
+pub(crate) enum TurnHost {
+    /// The existing path, unchanged.
+    Tmux,
+    Herdr(Box<HerdrTurnPlan>),
+    Refused(HerdrRefusal),
+}
+
+#[derive(Debug)]
+pub(crate) struct HerdrTurnPlan {
+    pub endpoint: HerdrLaunchEndpoint,
+    /// `None` while the channel has no sessions row yet.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub row: Option<HostedObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HerdrRefusal {
+    /// The row holds a Pending or Bound Herdr execution (`None`: an unreadable record) but the
+    /// channel is not configured.
+    HostedHerdrUnconfigured {
+        state: Option<HostedState>,
+    },
+    ProviderUnsupported {
+        provider: String,
+    },
+    EndpointNotLocal {
+        node: String,
+    },
+    HostedRowUnreadable {
+        detail: String,
+    },
+    AdmissionStopped {
+        cause: StopCause,
+    },
+    OWriterNotReady,
+    ExecutorNotWired,
+    /// The channel is delegated and this node does not hold its home.
+    HomeNotHeld,
+    /// This node holds the delegated channel's home while a drain keeps its intake closed.
+    HomeDraining,
+    /// Delegation is switched on but cannot run, so the channel is held instead of falling back.
+    DelegationUnavailable {
+        reason: Unavailable,
+    },
+}
+
+impl std::fmt::Display for HerdrRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("herdr turn refused: ")?;
+        match self {
+            Self::HostedHerdrUnconfigured { state } => {
+                write!(f, "hosted_herdr_unconfigured(state={state:?})")
+            }
+            Self::ProviderUnsupported { provider } => {
+                write!(f, "provider_unsupported({provider})")
+            }
+            Self::EndpointNotLocal { node } => write!(f, "endpoint_not_local({node})"),
+            Self::HostedRowUnreadable { detail } => write!(f, "hosted_row_unreadable({detail})"),
+            Self::AdmissionStopped { cause } => write!(f, "admission_stopped({})", cause.as_str()),
+            Self::OWriterNotReady => f.write_str("o_writer_not_ready"),
+            Self::ExecutorNotWired => f.write_str("executor_not_wired"),
+            Self::HomeNotHeld => f.write_str("home_not_held"),
+            Self::HomeDraining => f.write_str("home_draining"),
+            Self::DelegationUnavailable { reason } => write!(f, "delegation_unavailable({reason})"),
+        }
+    }
+}
+
+/// The sessions row (`None`: no row yet), or why it could not be read; read before any tmux or
+/// Herdr I/O.
+type RowRead = Result<Option<HostedObservation>, String>;
+
+/// The Herdr execution the row still holds: Pending, Bound or an unreadable record.
+fn herdr_trace(row: &RowRead) -> Option<Option<HostedState>> {
+    let Ok(Some(observed)) = row else {
+        return None;
+    };
+    match &observed.record {
+        HostedRecord::Legacy => None,
+        HostedRecord::Known(record) if record.state == HostedState::Retired => None,
+        HostedRecord::Known(record) => Some(Some(record.state)),
+        HostedRecord::Unknown(_) => Some(None),
+    }
+}
+
+async fn read_row(pool: Option<&PgPool>, session_key: Option<&str>) -> RowRead {
+    let (Some(pool), Some(session_key)) = (pool, session_key) else {
+        return Err("no database or session key".into());
+    };
+    match load_hosted_execution_pg(pool, HostedLookupKey::SessionKey(session_key)).await {
+        HostedLookup::Found(observed) => Ok(Some(observed)),
+        HostedLookup::Missing => Ok(None),
+        HostedLookup::Unknown(detail) => Err(detail),
+        HostedLookup::Conflict(kind) => Err(format!("{kind:?}")),
+    }
+}
+
+/// A delegated channel's turn runs only where its home is held with intake open; a channel with
+/// no registered home reads nothing more. A channel held by unavailable delegation runs none.
+fn home_refusal(channel_id: u64) -> Option<HerdrRefusal> {
+    if let Some(reason) = home_availability::refusal(channel_id) {
+        return Some(HerdrRefusal::DelegationUnavailable { reason });
+    }
+    Some(match channel_home::refusal(channel_id)? {
+        HomeRefusal::NotHeld => HerdrRefusal::HomeNotHeld,
+        HomeRefusal::Draining => HerdrRefusal::HomeDraining,
+    })
+}
+
+/// Called again right before spawn, after [`refusal_before_turn`]. Admission and O readiness are
+/// read only for a configured channel.
+pub(crate) async fn for_turn(
+    pool: Option<&PgPool>,
+    provider: &ProviderKind,
+    channel_id: u64,
+    session_key: Option<&str>,
+) -> TurnHost {
+    // Read after the turn took its mailbox, so a drain that closes intake later waits for it.
+    if let Some(refusal) = home_refusal(channel_id) {
+        return TurnHost::Refused(refusal);
+    }
+    let Some(endpoint) = session_hosts::herdr_endpoint(channel_id) else {
+        // An unconfigured channel's unreadable row keeps the existing path; a Herdr row refuses.
+        return match herdr_trace(&read_row(pool, session_key).await) {
+            Some(state) => TurnHost::Refused(HerdrRefusal::HostedHerdrUnconfigured { state }),
+            None => TurnHost::Tmux,
+        };
+    };
+    match configured_turn(pool, provider, channel_id, session_key, endpoint).await {
+        Ok(plan) => TurnHost::Herdr(Box::new(plan)),
+        Err(refusal) => TurnHost::Refused(refusal),
+    }
+}
+
+/// The turn's first judgement, before it resets, reconciles or clears anything: a delegated channel
+/// not held here or a configured one is refused, any other passes without I/O.
+pub(crate) async fn refusal_before_turn<F>(
+    pool: Option<&PgPool>,
+    provider: &ProviderKind,
+    channel_id: u64,
+    session_key: impl FnOnce() -> F,
+) -> Option<HerdrRefusal>
+where
+    F: std::future::Future<Output = Option<String>>,
+{
+    if let Some(refusal) = home_refusal(channel_id) {
+        return Some(refusal);
+    }
+    session_hosts::herdr_endpoint(channel_id)?;
+    let session_key = session_key().await;
+    match for_turn(pool, provider, channel_id, session_key.as_deref()).await {
+        TurnHost::Tmux => None,
+        TurnHost::Refused(refusal) => Some(refusal),
+        TurnHost::Herdr(_) => Some(HerdrRefusal::ExecutorNotWired),
+    }
+}
+
+/// The intake's first judgement: a configured turn only the missing executor refused passes while
+/// its provider's Herdr switch is on.
+pub(crate) async fn intake_refusal_before_turn<F>(
+    pool: Option<&PgPool>,
+    provider: &ProviderKind,
+    channel_id: u64,
+    session_key: impl FnOnce() -> F,
+) -> Option<HerdrRefusal>
+where
+    F: std::future::Future<Output = Option<String>>,
+{
+    match refusal_before_turn(pool, provider, channel_id, session_key).await {
+        Some(HerdrRefusal::ExecutorNotWired) if herdr_turn_switched_on_for(provider) => None,
+        judged => judged,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCED_SWITCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static FORCED_CODEX_SWITCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a configured channel's turn of `provider` runs on Herdr; any other provider never does.
+pub(crate) fn herdr_turn_switched_on_for(provider: &ProviderKind) -> bool {
+    match provider {
+        ProviderKind::Claude => herdr_turn_switched_on(),
+        ProviderKind::Codex => {
+            #[cfg(test)]
+            if let Some(forced) = FORCED_CODEX_SWITCH.with(std::cell::Cell::get) {
+                return forced;
+            }
+            cfg!(unix)
+                && crate::config_live_reload::current()
+                    .and_then(|config| config.runtime.herdr_codex_turn_enabled)
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a configured channel's Claude turn runs on Herdr; unset or false keeps it refused.
+pub(crate) fn herdr_turn_switched_on() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FORCED_SWITCH.with(std::cell::Cell::get) {
+        return forced;
+    }
+    cfg!(unix)
+        && crate::config_live_reload::current()
+            .and_then(|config| config.runtime.herdr_turn_enabled)
+            .unwrap_or(false)
+}
+
+/// Stands in for the live switch on this thread until dropped.
+#[cfg(test)]
+pub(crate) struct ForcedSwitch(Option<bool>);
+
+#[cfg(test)]
+pub(crate) fn force_switch_for_test(on: Option<bool>) -> ForcedSwitch {
+    ForcedSwitch(FORCED_SWITCH.with(|cell| cell.replace(on)))
+}
+
+#[cfg(test)]
+impl Drop for ForcedSwitch {
+    fn drop(&mut self) {
+        FORCED_SWITCH.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Stands in for the live Codex switch on this thread until dropped.
+#[cfg(test)]
+pub(crate) struct ForcedCodexSwitch(Option<bool>);
+
+#[cfg(test)]
+pub(crate) fn force_codex_switch_for_test(on: Option<bool>) -> ForcedCodexSwitch {
+    ForcedCodexSwitch(FORCED_CODEX_SWITCH.with(|cell| cell.replace(on)))
+}
+
+#[cfg(test)]
+impl Drop for ForcedCodexSwitch {
+    fn drop(&mut self) {
+        FORCED_CODEX_SWITCH.with(|cell| cell.set(self.0));
+    }
+}
+
+async fn configured_turn(
+    pool: Option<&PgPool>,
+    provider: &ProviderKind,
+    channel_id: u64,
+    session_key: Option<&str>,
+    endpoint: ChannelEndpoint,
+) -> Result<HerdrTurnPlan, HerdrRefusal> {
+    // Codex is judged by its own switch alone, before any read; off it stays unsupported.
+    let kind = match provider {
+        ProviderKind::Claude => RuntimeHandoffKind::ClaudeTui,
+        ProviderKind::Codex if herdr_turn_switched_on_for(provider) => RuntimeHandoffKind::CodexTui,
+        _ => {
+            let provider = provider.as_str().to_owned();
+            return Err(HerdrRefusal::ProviderUnsupported { provider });
+        }
+    };
+    if session_hosts::local_node().as_deref() != Some(endpoint.execution_node.as_str()) {
+        let node = endpoint.execution_node;
+        return Err(HerdrRefusal::EndpointNotLocal { node });
+    }
+    let read = read_row(pool, session_key).await;
+    if herdr_trace(&read) == Some(None) {
+        let detail = "hosted execution record is unreadable".into();
+        return Err(HerdrRefusal::HostedRowUnreadable { detail });
+    }
+    let row = read.map_err(|detail| HerdrRefusal::HostedRowUnreadable { detail })?;
+    herdr_admission::check().map_err(|cause| HerdrRefusal::AdmissionStopped { cause })?;
+    if !o_writer_ready(channel_id, kind) {
+        return Err(HerdrRefusal::OWriterNotReady);
+    }
+    let endpoint = HerdrLaunchEndpoint {
+        execution_node: endpoint.execution_node,
+        config_key: endpoint.key,
+        socket_addr: endpoint.socket_path.display().to_string(),
+        herdr_session: endpoint.herdr_session,
+    };
+    Ok(HerdrTurnPlan { endpoint, row })
+}
+
+#[cfg(test)]
+#[path = "turn_host_tests.rs"]
+mod tests;

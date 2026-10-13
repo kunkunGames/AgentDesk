@@ -257,7 +257,10 @@ async fn a2_exhausted_rearm_budget_leaves_h_to_the_periodic_backstop() {
         .with_hooks(n, &defers);
     fx.sweep(&api).await;
     let mut retries = 0;
-    while fx.pending(channel_id).is_some() {
+    while fx
+        .pending(channel_id)
+        .is_some_and(|state| !state.is_exhausted_hold())
+    {
         retries += 1;
         assert!(
             retries <= 2 * CATCH_UP_RETRY_DEFERRED_REARM_LIMIT,
@@ -268,6 +271,10 @@ async fn a2_exhausted_rearm_budget_leaves_h_to_the_periodic_backstop() {
         assert_eq!(fx.surfaces(channel_id), held, "retry {retries} leapt H");
     }
     assert!(retries > 1, "the long turn outlived several retries");
+    let hold = fx.pending(channel_id).expect("exhaustion retains a hold");
+    assert!(hold.is_exhausted_hold());
+    assert_eq!(hold.checkpoint, checkpoint.get());
+    assert!(!collect_catch_up_retry_pending_channels(&fx.shared).contains(&channel_id));
     assert!(
         !accepted(&api).contains(&h.get()),
         "H ran twice during its turn"
@@ -285,7 +292,7 @@ async fn a2_exhausted_rearm_budget_leaves_h_to_the_periodic_backstop() {
 }
 
 /// Only the checkpoint reply is on the phase-1 page; `ids` reach phase 2 alone.
-fn phase2_only(fx: &Fixture, channel_id: ChannelId, ids: &[MessageId]) -> StrictApi {
+pub(super) fn phase2_only(fx: &Fixture, channel_id: ChannelId, ids: &[MessageId]) -> StrictApi {
     let checkpoint = MessageId::new(*fx.shared.last_message_ids.get(&channel_id).unwrap());
     let api = StrictApi::new(&fx.shared)
         .with_history(channel_id, vec![own_reply(channel_id, checkpoint)]);

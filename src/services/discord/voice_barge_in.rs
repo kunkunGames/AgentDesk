@@ -1313,6 +1313,7 @@ mod tests {
                 active_meetings: std::collections::HashMap::new(),
             }),
             mailboxes: crate::services::turn_orchestrator::ChannelMailboxRegistry::default(),
+            queue_park_ledger: Default::default(),
             session_transition_locks: dashmap::DashMap::new(),
             settings: tokio::sync::RwLock::new(super::super::DiscordBotSettings::default()),
             api_timestamps: dashmap::DashMap::new(),
@@ -1349,6 +1350,7 @@ mod tests {
             // preserved — the three members hoisted above the spawn calls are
             // side-effect-free constructors; see run_bot_build_shared_data).
             restart: super::super::RestartLifecycle {
+                _home_availability: None,
                 recovering_channels: dashmap::DashMap::new(),
                 shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 intake_worker_lifecycle:
@@ -1392,6 +1394,7 @@ mod tests {
             },
             last_message_ids: dashmap::DashMap::new(),
             catch_up_retry_pending: dashmap::DashMap::new(),
+            catch_up_scan_in_progress: dashmap::DashMap::new(),
             turn_start_times: dashmap::DashMap::new(),
             channel_rosters: dashmap::DashMap::new(),
             http: super::super::RuntimeHttpCache {

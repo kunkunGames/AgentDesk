@@ -450,3 +450,180 @@ async fn backend_exit_removes_home_waiter_until_live_home_takes_handback_pg() {
     drop(backup);
     fixture.close().await;
 }
+
+impl Fixture {
+    fn save_config(&self, edit: impl FnOnce(&mut crate::config::Config)) {
+        let mut config = self.config.clone();
+        edit(&mut config);
+        crate::config::save_to_path(&self._root.path().join("agentdesk.yaml"), &config).unwrap();
+    }
+
+    async fn peer_takes_lease_within(&self, within: Duration) -> postgres::AdvisoryLockLease {
+        tokio::time::timeout(within, async {
+            loop {
+                if let Some(lease) =
+                    try_acquire_discord_gateway_lease(&self.pool, TOKEN, &ProviderKind::Claude)
+                        .await
+                        .unwrap()
+                {
+                    break lease;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the idle holder session expires and frees the lease")
+    }
+}
+
+#[tokio::test]
+async fn preferred_node_takes_the_lease_once_a_silent_holder_session_expires_pg() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    fixture.save_config(|config| {
+        config.cluster.instance_id = Some("home".into());
+        config.cluster.gateway_lease_idle_expiry_secs = 2;
+    });
+    // An earlier process's lease whose client went silent: held, never kept alive.
+    let silent = try_acquire_discord_gateway_lease(&fixture.pool, TOKEN, &ProviderKind::Claude)
+        .await
+        .unwrap()
+        .unwrap();
+    let silent_pid = fixture.holder().await.unwrap();
+    let shared = super::super::make_shared_data_for_tests_with_storage(Some(fixture.pool.clone()));
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(30),
+        fixture.acquire(&shared, &mut fixture.breaker()),
+    )
+    .await
+    .expect("the preferred waiter acquires once the silent session expires");
+    let GatewayLeaseOutcome::Proceed(Some(acquired)) = outcome else {
+        panic!("preferred node must take the freed lease")
+    };
+    assert_ne!(fixture.holder().await, Some(silent_pid));
+    acquired.lease.unlock().await.unwrap();
+    drop(silent);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn configured_idle_expiry_reaches_the_lease_session_and_zero_disables_it_pg() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    for (secs, expected) in [(2, "2s"), (0, "0")] {
+        fixture.save_config(|config| config.cluster.gateway_lease_idle_expiry_secs = secs);
+        let mut lease =
+            try_acquire_discord_gateway_lease(&fixture.pool, TOKEN, &ProviderKind::Claude)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(lease.session_idle_timeout().await.unwrap(), expected);
+        if secs == 0 {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let peer =
+                try_acquire_discord_gateway_lease(&fixture.pool, TOKEN, &ProviderKind::Claude)
+                    .await
+                    .unwrap();
+            assert!(peer.is_none(), "a disabled expiry keeps an idle lease");
+        }
+        lease.unlock().await.unwrap();
+    }
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn idle_expired_holder_loses_the_lease_to_a_peer_and_self_fences_pg() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    fixture.save_config(|config| config.cluster.gateway_lease_idle_expiry_secs = 2);
+    let mut running = fixture.backup().await;
+    // The production keepalive ticks every 15s, so a 2s expiry ends the session between ticks.
+    let mut peer = fixture
+        .peer_takes_lease_within(Duration::from_secs(10))
+        .await;
+    tokio::time::timeout(Duration::from_secs(25), async {
+        while !running.backend.is_finished() {
+            peer.keepalive().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("the holder self-fences on its next keepalive tick");
+    running.ended().await;
+    assert!(!running.shared.bot_connected.load(Ordering::SeqCst));
+    peer.unlock().await.unwrap();
+    drop(running);
+    fixture.close().await;
+}
+
+/// A keepalive loss and a later yield each withdraw the approvals resting on the provider's
+/// Gateway witness; an approval resting elsewhere stays.
+#[cfg(unix)]
+#[tokio::test]
+async fn b2b1_lease_loss_and_yield_withdraw_only_gateway_approvals_pg() {
+    use crate::services::discord::turn_presence::entrypoints::{Fence, tests};
+    use tests::Probe;
+    // Whether the node still reported itself serving at each Gateway withdrawal.
+    struct Serving(Arc<SharedData>, std::sync::Mutex<Vec<bool>>);
+    impl Fence for Serving {
+        fn withdraw(&self, _: u64, _: bool, _: &'static str) {}
+        fn withdraw_gateway(
+            &self,
+            _: &Arc<crate::services::tui_o::ownership::OwnershipGate>,
+            _: &'static str,
+        ) {
+            let serving = self.0.bot_connected.load(Ordering::SeqCst);
+            self.1.lock().unwrap().push(serving);
+        }
+        fn suspend(&self) {}
+        fn resume(&self) {}
+    }
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    // The first session idles out between keepalive ticks; the re-acquired one keeps the default.
+    fixture.save_config(|config| config.cluster.gateway_lease_idle_expiry_secs = 2);
+    let mut running = fixture.backup().await;
+    fixture.save_config(|_| {});
+    let probe = Probe::install(&running.shared);
+    let serving = Arc::new(Serving(running.shared.clone(), Default::default()));
+    let fence = Arc::downgrade(&serving) as std::sync::Weak<dyn Fence>;
+    let _seen = tests::install(&running.shared, fence);
+    let gate = crate::services::tui_o::ownership::gate("claude");
+    let uncertain = probe.arm_gateway(6_325_621, gate.clone());
+    let elsewhere = probe.arm(6_325_622);
+    let pid = fixture.holder().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(25), async {
+        while fixture.holder().await.is_none_or(|holder| holder == pid) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the free lease is re-acquired");
+    assert!(
+        !Probe::current(&uncertain),
+        "the keepalive loss withdrew it"
+    );
+    assert!(!running.backend.is_finished(), "the gateway keeps serving");
+    let yielded = probe.arm_gateway(6_325_623, gate.clone());
+    serving.1.lock().unwrap().clear();
+    fixture.advertise(true).await;
+    fixture.unlock_observation().await;
+    running.ended().await;
+    let first = serving.1.lock().unwrap().first().copied();
+    assert_eq!(
+        first,
+        Some(true),
+        "the yield withdrew before it stopped serving"
+    );
+    assert!(
+        !Probe::current(&yielded),
+        "the yield's self-fence withdrew it"
+    );
+    assert!(Probe::current(&elsewhere));
+    drop(running);
+    fixture.close().await;
+}

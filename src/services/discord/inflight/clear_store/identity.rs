@@ -2,7 +2,9 @@ use super::*;
 
 #[path = "operator_disposition.rs"]
 mod operator_disposition;
-pub(in crate::services::discord) use operator_disposition::operator_disposition_remove_pinned;
+pub(in crate::services::discord) use operator_disposition::{
+    operator_disposition_remove_borrowed, operator_disposition_remove_pinned,
+};
 
 pub(in crate::services::discord) fn clear_inflight_state_if_matches_identity_in_root(
     root: &std::path::Path,
@@ -28,6 +30,11 @@ pub(in crate::services::discord) fn clear_inflight_state_if_matches_identity_ret
     let Ok(data) = fs::read_to_string(&path) else {
         return (GuardedClearOutcome::Missing, None);
     };
+    if super::super::raw_before_start_receipt(&data)
+        && !super::super::receipt_mutant("identity-clear")
+    {
+        return (GuardedClearOutcome::IoError, None);
+    }
     let Ok(state) = serde_json::from_str::<InflightTurnState>(&data) else {
         return (GuardedClearOutcome::Missing, None);
     };
@@ -95,6 +102,20 @@ fn remove_identity_matched_state(
     state: InflightTurnState,
     reason: &'static str,
 ) -> (GuardedClearOutcome, Option<InflightTurnState>) {
+    if receipt_protected_path(path) && !receipt_mutant("identity-clear") {
+        return (GuardedClearOutcome::IoError, None);
+    }
+    remove_identity_matched_state_unchecked(path, provider, channel_id, expected, state, reason)
+}
+
+fn remove_identity_matched_state_unchecked(
+    path: &std::path::Path,
+    provider: &ProviderKind,
+    channel_id: u64,
+    expected: &InflightTurnIdentity,
+    state: InflightTurnState,
+    reason: &'static str,
+) -> (GuardedClearOutcome, Option<InflightTurnState>) {
     log_inflight_remove(provider, channel_id, state.user_msg_id, reason, path);
     match fs::remove_file(path) {
         Ok(()) => (GuardedClearOutcome::Cleared, Some(state)),
@@ -148,6 +169,11 @@ fn clear_inflight_state_if_matches_identity_turn_nonce_impl_in_root(
     let Ok(data) = fs::read_to_string(&path) else {
         return ReconcileClearOutcome::Delegated(GuardedClearOutcome::Missing);
     };
+    if super::super::raw_before_start_receipt(&data)
+        && !super::super::receipt_mutant("identity-clear")
+    {
+        return ReconcileClearOutcome::Delegated(GuardedClearOutcome::IoError);
+    }
     let Ok(state) = serde_json::from_str::<InflightTurnState>(&data) else {
         return ReconcileClearOutcome::Delegated(GuardedClearOutcome::Missing);
     };
@@ -251,6 +277,131 @@ pub(in crate::services::discord) fn clear_inflight_state_for_captured_episode(
     }
 }
 
+/// Clears a restart-settled admitted Herdr row only while the locked fresh row is still that
+/// delivered episode: its nonce, a prior generation, its kind, ack, anchor and save generation.
+#[cfg(unix)]
+pub(in crate::services::discord) fn clear_admitted_restart_terminal(
+    provider: &ProviderKind,
+    snapshot: &InflightTurnState,
+    nonce: &str,
+    current_generation: u64,
+) -> GuardedClearOutcome {
+    let Some(root) = inflight_runtime_root() else {
+        return GuardedClearOutcome::Missing;
+    };
+    let path = inflight_state_path(&root, provider, snapshot.channel_id);
+    let Ok(_lock) = lock_inflight_state_path(&path) else {
+        return GuardedClearOutcome::IoError;
+    };
+    let Ok(data) = fs::read_to_string(&path) else {
+        return GuardedClearOutcome::Missing;
+    };
+    if raw_before_start_receipt(&data) {
+        return GuardedClearOutcome::IoError;
+    }
+    let Ok(fresh) = serde_json::from_str::<InflightTurnState>(&data) else {
+        return GuardedClearOutcome::Missing;
+    };
+    #[cfg(test)]
+    let checked = |name: &str| {
+        !crate::services::provider::cancel_token_claude_interrupt::herdr_interrupt_mutant(name)
+    };
+    #[cfg(not(test))]
+    let checked = |_: &str| true;
+    let pin = crate::services::discord::inflight::InflightEpisodePin::from_state(snapshot);
+    let other_kind =
+        fresh.tui_terminal_kind.is_none() || fresh.tui_terminal_kind != snapshot.tui_terminal_kind;
+    if nonce.is_empty()
+        || fresh.turn_nonce.as_deref() != Some(nonce)
+        || (super::reconcile_gate::row_is_current_generation(&fresh, current_generation)
+            && checked("restart_clear_current_generation_unchecked"))
+        || (other_kind && checked("restart_clear_kind_unchecked"))
+        || !fresh.terminal_delivery_committed
+        || (fresh.save_generation != snapshot.save_generation
+            && checked("restart_clear_generation_unchecked"))
+        || (!pin.matches_state(&fresh) && checked("restart_clear_pin_unchecked"))
+    {
+        return GuardedClearOutcome::UserMsgMismatch;
+    }
+    let expected = InflightTurnIdentity::from_state(snapshot);
+    let outcome = guarded_identity_clear_outcome(&fresh, &expected, Some(nonce));
+    if outcome != GuardedClearOutcome::Cleared {
+        return outcome;
+    }
+    let reason = "clear_admitted_restart_terminal";
+    remove_identity_matched_state(
+        &path,
+        provider,
+        snapshot.channel_id,
+        &expected,
+        fresh,
+        reason,
+    )
+    .0
+}
+
+impl InflightTurnState {
+    /// Clears the row of a restart-settled policy receipt only while the locked fresh row is still
+    /// this snapshot's delivered receipt row of a prior generation.
+    #[cfg(unix)]
+    pub(in crate::services::discord) fn clear_before_start_receipt(
+        &self,
+        current_generation: u64,
+    ) -> GuardedClearOutcome {
+        self.clear_before_start_receipt_matching(|fresh| {
+            self.before_start_receipt_clearable(fresh, current_generation)
+        })
+    }
+
+    /// Clear only the exact live policy receipt returned by the shown notice's ACK.
+    pub(in crate::services::discord) fn clear_before_start_policy_receipt(
+        &self,
+        generation: u64,
+    ) -> GuardedClearOutcome {
+        self.clear_before_start_receipt_matching(|fresh| {
+            crate::services::provider::cancel_token_claude_interrupt::herdr_stop_settlement_available()
+                && self.before_start_policy_receipt_clearable(fresh, generation)
+        })
+    }
+
+    fn clear_before_start_receipt_matching(
+        &self,
+        clearable: impl FnOnce(&InflightTurnState) -> bool,
+    ) -> GuardedClearOutcome {
+        let (Some(root), Some(provider)) = (inflight_runtime_root(), self.provider_kind()) else {
+            return GuardedClearOutcome::Missing;
+        };
+        let path = inflight_state_path(&root, &provider, self.channel_id);
+        let Ok(_lock) = lock_inflight_state_path(&path) else {
+            return GuardedClearOutcome::IoError;
+        };
+        let Some(fresh) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<InflightTurnState>(&data).ok())
+        else {
+            return GuardedClearOutcome::Missing;
+        };
+        if !clearable(&fresh) {
+            return GuardedClearOutcome::UserMsgMismatch;
+        }
+        let expected = InflightTurnIdentity::from_state(self);
+        let outcome = guarded_identity_clear_outcome(&fresh, &expected, self.turn_nonce.as_deref());
+        if outcome != GuardedClearOutcome::Cleared {
+            return outcome;
+        }
+        let reason = "clear_before_start_receipt";
+        remove_identity_matched_state_unchecked(
+            &path,
+            &provider,
+            self.channel_id,
+            &expected,
+            fresh,
+            reason,
+        )
+        .0
+    }
+}
+
 fn clear_rebind_origin_inflight_state_if_matches_identity_impl_in_root(
     root: &std::path::Path,
     provider: &ProviderKind,
@@ -268,6 +419,11 @@ fn clear_rebind_origin_inflight_state_if_matches_identity_impl_in_root(
     let Ok(data) = fs::read_to_string(&path) else {
         return ReconcileClearOutcome::Delegated(GuardedClearOutcome::Missing);
     };
+    if super::super::raw_before_start_receipt(&data)
+        && !super::super::receipt_mutant("identity-clear")
+    {
+        return ReconcileClearOutcome::Delegated(GuardedClearOutcome::IoError);
+    }
     let Ok(state) = serde_json::from_str::<InflightTurnState>(&data) else {
         return ReconcileClearOutcome::Delegated(GuardedClearOutcome::Missing);
     };

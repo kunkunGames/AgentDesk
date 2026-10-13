@@ -18,7 +18,8 @@ use super::relay_receipts::{RELAY_PUBLISHED_AT_HEADER, RelayReceiptLedger, Relay
 use crate::services::tui_prompt_dedupe::AdoptSkip;
 use crate::services::tui_prompt_dedupe::binding_events::HookSignal;
 
-/// Without a listed tmux, unmapped hooks stop being refused this long after the receiver starts.
+/// Without a listed tmux, unmapped hooks of panes this runtime did not launch stop being refused
+/// this long after the receiver starts.
 const DISCOVERY_GRACE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,7 +96,8 @@ pub(crate) fn boot_discovery_done() -> bool {
     DISCOVERY_DONE.load(Ordering::Acquire)
 }
 
-fn discovery_done() -> bool {
+/// `(a rehydrate pass listed tmux, time since the receiver started)`.
+fn discovery_clock() -> (bool, Duration) {
     let clock = (
         DISCOVERY_DONE.load(Ordering::Acquire),
         RECEIVER_STARTED.elapsed(),
@@ -105,12 +107,19 @@ fn discovery_done() -> bool {
         let _ = clock;
         TEST_DISCOVERY_CLOCK.get()
     };
+    clock
+}
+
+fn discovery_done() -> bool {
+    let clock = discovery_clock();
     if clock.0 {
         return true;
     }
     let expired = clock.1 >= DISCOVERY_GRACE;
     if expired && !GRACE_WARNED.swap(true, Ordering::AcqRel) {
-        tracing::warn!("no rehydrate pass listed tmux in time; unmapped Claude hooks are accepted");
+        tracing::warn!(
+            "no rehydrate pass listed tmux in time; unmapped hooks of unlaunched panes are accepted"
+        );
     }
     expired
 }
@@ -137,9 +146,6 @@ pub(crate) fn observe_binding_hook(
     payload: &Value,
     headers: &HeaderMap,
 ) -> IngressOutcome {
-    let (Some(command), Some(payload_session)) = (command_session_id, payload_session_id) else {
-        return IngressOutcome::Proceed(ProceedReason::NoSessionSwitch);
-    };
     let published_at = headers
         .get(RELAY_PUBLISHED_AT_HEADER)
         .and_then(|h| h.to_str().ok());
@@ -147,6 +153,35 @@ pub(crate) fn observe_binding_hook(
     let hook = HookSignal {
         published_at: published_at.map(|t| t.with_timezone(&chrono::Utc)),
         ..HookSignal::from_payload(HookEventKind::from_path(event).as_str(), payload)
+    };
+    let envelope = headers
+        .get(BINDING_HEADER)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| decode_binding_header(h).ok());
+    if provider == "codex"
+        && let Some(outcome) = crate::services::tui_prompt_dedupe::observe_verified_codex_hook(
+            payload_session_id,
+            payload,
+            &hook,
+            envelope.as_ref(),
+        )
+    {
+        return outcome;
+    }
+    if provider == "codex"
+        && crate::services::codex::codex_source_mode_snapshot()
+            == crate::services::codex::CodexSourceMode::Shadow
+    {
+        crate::services::tui_prompt_dedupe::observe_codex_shadow(
+            command_session_id,
+            payload_session_id,
+            payload,
+            &hook,
+            envelope.as_ref(),
+        );
+    }
+    let (Some(command), Some(payload_session)) = (command_session_id, payload_session_id) else {
+        return IngressOutcome::Proceed(ProceedReason::NoSessionSwitch);
     };
     if command == payload_session
         && !(provider == "codex"
@@ -158,15 +193,23 @@ pub(crate) fn observe_binding_hook(
         #[cfg(test)]
         let prompt = prompt
             && !crate::services::claude_tui::source_verify::n2b_mutant("r5-reclaim-ingress-off");
-        if provider == "claude" && prompt {
-            adoption_retry::reclaim_from_prompt(command, &hook);
+        if provider == "claude"
+            && let Err(reason) =
+                adoption_retry::observe_launch_hook(command, &hook, envelope.as_ref(), prompt)
+        {
+            return IngressOutcome::NotDurable(reason);
         }
         #[cfg(test)]
         if provider == "claude"
             && !prompt
             && crate::services::claude_tui::source_verify::n2b_mutant("r5-ingress-start")
         {
-            return match adoption_retry::adopt_from_hook(command, payload_session, &hook) {
+            return match adoption_retry::adopt_from_enveloped_hook(
+                command,
+                payload_session,
+                &hook,
+                envelope.as_ref(),
+            ) {
                 AdoptionHttp::Durable(kind) => IngressOutcome::Durable(kind),
                 AdoptionHttp::NotDurable(reason) => IngressOutcome::NotDurable(reason),
                 AdoptionHttp::Skipped(skip) => classify_skip(skip, command, None),
@@ -174,10 +217,6 @@ pub(crate) fn observe_binding_hook(
         }
         return IngressOutcome::Proceed(ProceedReason::NoSessionSwitch);
     }
-    let envelope = headers
-        .get(BINDING_HEADER)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| decode_binding_header(h).ok());
     match provider {
         "claude" => {}
         "codex" => {
@@ -195,7 +234,12 @@ pub(crate) fn observe_binding_hook(
     }
     #[cfg(test)]
     crate::services::tui_prompt_dedupe::before_authority(command);
-    match adoption_retry::adopt_from_hook(command, payload_session, &hook) {
+    match adoption_retry::adopt_from_enveloped_hook(
+        command,
+        payload_session,
+        &hook,
+        envelope.as_ref(),
+    ) {
         AdoptionHttp::Durable(kind) => IngressOutcome::Durable(kind),
         AdoptionHttp::NotDurable(reason) => IngressOutcome::NotDurable(reason),
         AdoptionHttp::Skipped(skip) => classify_skip(skip, command, envelope.as_ref()),
@@ -215,7 +259,9 @@ fn classify_skip(
         {
             Unavailable(UnavailableReason::PaneRegistrationFailed)
         }
-        AdoptSkip::UnmappedCommandSession if !discovery_done() => {
+        AdoptSkip::UnmappedCommandSession
+            if !discovery_done() || (!discovery_clock().0 && managed_here(envelope)) =>
+        {
             Unavailable(UnavailableReason::RestoreNotReady)
         }
         AdoptSkip::UnmappedCommandSession => {
@@ -236,6 +282,18 @@ fn classify_skip(
         AdoptSkip::SourceUnreadable => Unavailable(UnavailableReason::SourceUnreadable),
         AdoptSkip::HostNotAdmitted => Unavailable(UnavailableReason::HostNotAdmitted),
     }
+}
+
+/// A hook from a Claude pane this runtime launched; the grace expiry never gives up on it, only
+/// a pass that listed tmux does. Its captured nonce already passed the adoption's execution fence.
+fn managed_here(
+    envelope: Option<&crate::services::tui_prompt_dedupe::binding_context::HookBindingEnvelope>,
+) -> bool {
+    use crate::services::tui_prompt_dedupe::binding_context::CapturedContext;
+    matches!(envelope.map(|e| &e.context), Some(CapturedContext::Captured(ctx))
+        if ctx.schema == 1
+            && ctx.provider == "claude"
+            && ctx.owner_runtime_root == crate::services::tmux_common::current_tmux_owner_marker())
 }
 
 /// 425 for a refused outcome; the in-flight receipt is dropped so the same request id retries.
@@ -278,3 +336,67 @@ pub(crate) fn refusal(
 #[cfg(test)]
 #[path = "observation_ingress_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_tests {
+    use crate::services::claude_tui::source_verify::{
+        ClaudeHookSource, SourceHistory, SourceRejection, SourceVerdict, observe_transcript,
+        verify_claude_source,
+    };
+    use crate::services::codex_tui::session::source_observation::{
+        CodexHookSourceClaim, CodexHookSourceRejection, CodexRolloutSource,
+        verify_codex_hook_source,
+    };
+
+    #[test]
+    fn a_claude_transcript_without_supported_file_identity_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let path = project.join(format!("{id}.jsonl"));
+        let first = serde_json::json!({"type": "mode", "sessionId": id});
+        std::fs::write(&path, format!("{first}\n")).unwrap();
+        let source = ClaudeHookSource {
+            event: "session-start".into(),
+            session_id: id.clone(),
+            transcript_path: path.clone(),
+            start_source: Some("startup".into()),
+            published_at: None,
+        };
+        let opened = observe_transcript(&path).unwrap();
+        assert_eq!(
+            verify_claude_source(
+                &source,
+                root.path(),
+                Ok(&opened),
+                &id,
+                None,
+                &SourceHistory::default(),
+            ),
+            SourceVerdict::Rejected(SourceRejection::IdentityUnavailable)
+        );
+    }
+
+    #[test]
+    fn a_rollout_without_supported_file_identity_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let path = root.path().join(format!("rollout-{id}.jsonl"));
+        let meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": id, "cwd": root.path(), "source": "cli", "originator": "codex_cli_rs"}
+        });
+        std::fs::write(&path, format!("{meta}\n")).unwrap();
+        let claim = CodexHookSourceClaim {
+            session_id: &id,
+            transcript_path: Some(&path),
+            expected_source: CodexRolloutSource::Cli,
+        };
+        assert_eq!(
+            verify_codex_hook_source(root.path(), &claim),
+            Err(CodexHookSourceRejection::RolloutUnavailable)
+        );
+    }
+}

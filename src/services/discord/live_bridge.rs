@@ -1,0 +1,468 @@
+use std::collections::HashMap;
+use std::future::Future;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::Duration;
+
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+
+use super::SharedData;
+use super::inflight::InflightTurnState;
+use crate::services::provider::{CancelToken, ProviderKind};
+use poise::serenity_prelude::ChannelId;
+
+type Key = (PathBuf, String, u64);
+static SLOTS: LazyLock<Mutex<HashMap<Key, Weak<Slot>>>> = LazyLock::new(Mutex::default);
+const START_WAIT: Duration = Duration::from_secs(5);
+
+struct Slot {
+    gate: Arc<RwLock<()>>,
+    originals: Mutex<Vec<Weak<OriginalRegistration>>>,
+}
+
+pub(super) struct OriginalRegistration {
+    _permit: OwnedRwLockReadGuard<()>,
+    _slot: Arc<Slot>,
+    cancel: Weak<CancelToken>,
+    waited_for_recovery: bool,
+}
+
+#[derive(Clone)]
+pub(super) struct RecoveryRegistration {
+    slot: Option<Arc<Slot>>,
+    _permit: Option<Arc<OwnedRwLockWriteGuard<()>>>,
+}
+
+tokio::task_local! {
+    static RECOVERY: RecoveryRegistration;
+}
+
+fn enabled() -> bool {
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(configured_enabled)
+    }
+    #[cfg(test)]
+    configured_enabled()
+}
+
+fn configured_enabled() -> bool {
+    std::env::var("AGENTDESK_CODEX_LIVE_BRIDGE_GUARD").as_deref() != Ok("0")
+}
+
+fn claude_enabled() -> bool {
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(configured_claude_enabled)
+    }
+    #[cfg(test)]
+    configured_claude_enabled()
+}
+
+fn configured_claude_enabled() -> bool {
+    // `0` lets watcher respawn take over a live Claude original again.
+    std::env::var("AGENTDESK_CLAUDE_LIVE_BRIDGE_GUARD").as_deref() != Ok("0")
+}
+
+/// Claude originals register too, but only watcher respawn waits for them (see `try_respawn_recovery`).
+fn registers(provider: &ProviderKind) -> bool {
+    match provider {
+        ProviderKind::Codex => enabled(),
+        ProviderKind::Claude => claude_enabled(),
+        _ => false,
+    }
+}
+
+fn key(provider: &ProviderKind, channel_id: u64) -> Key {
+    let root = super::inflight::inflight_runtime_root().unwrap_or_default();
+    let mut ancestor = root.as_path();
+    let mut missing = Vec::new();
+    let root = loop {
+        if let Ok(mut canonical) = ancestor.canonicalize() {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            break canonical;
+        }
+        let Some(component) = ancestor.file_name() else {
+            break root.clone();
+        };
+        missing.push(component.to_owned());
+        let Some(parent) = ancestor.parent() else {
+            break root.clone();
+        };
+        ancestor = parent;
+    };
+    (root, provider.as_str().to_owned(), channel_id)
+}
+
+fn slot(provider: &ProviderKind, channel_id: u64) -> Arc<Slot> {
+    let key = key(provider, channel_id);
+    let mut slots = SLOTS.lock().unwrap_or_else(|error| error.into_inner());
+    slots.retain(|_, slot| slot.strong_count() > 0);
+    let slot = slots.entry(key).or_default();
+    if let Some(slot) = slot.upgrade() {
+        return slot;
+    }
+    let new = Arc::new(Slot {
+        gate: Arc::new(RwLock::new(())),
+        originals: Mutex::default(),
+    });
+    *slot = Arc::downgrade(&new);
+    new
+}
+
+pub(super) fn is_live(provider: &ProviderKind, channel_id: u64) -> bool {
+    if !registers(provider) {
+        return false;
+    }
+    let slot = slot(provider, channel_id);
+    let mut originals = slot
+        .originals
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    originals.retain(|original| original.strong_count() > 0);
+    !originals.is_empty()
+}
+
+pub(super) fn retain_original(
+    provider: &ProviderKind,
+    channel_id: u64,
+    cancel: &Arc<CancelToken>,
+) -> Option<Arc<OriginalRegistration>> {
+    if !registers(provider) {
+        return None;
+    }
+    let slot = slot(provider, channel_id);
+    let originals = slot
+        .originals
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    originals.iter().filter_map(Weak::upgrade).find(|original| {
+        original
+            .cancel
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, cancel))
+    })
+}
+
+async fn register_original(
+    provider: &ProviderKind,
+    channel_id: u64,
+    cancel: &Arc<CancelToken>,
+) -> Result<Option<Arc<OriginalRegistration>>, ()> {
+    if !registers(provider) {
+        return Ok(None);
+    }
+    let slot = slot(provider, channel_id);
+    let (permit, waited_for_recovery) = match slot.gate.clone().try_read_owned() {
+        Ok(permit) => (permit, false),
+        Err(_) => (
+            tokio::time::timeout(START_WAIT, slot.gate.clone().read_owned())
+                .await
+                .map_err(|_| ())?,
+            true,
+        ),
+    };
+    let original = Arc::new(OriginalRegistration {
+        _permit: permit,
+        _slot: slot.clone(),
+        cancel: Arc::downgrade(cancel),
+        waited_for_recovery,
+    });
+    slot.originals
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(Arc::downgrade(&original));
+    Ok(Some(original))
+}
+
+// Register before exposing the row; a recovery already in progress gets a bounded wait.
+pub(super) async fn register_or_requeue(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    state: &InflightTurnState,
+    cancel: &Arc<CancelToken>,
+) -> Result<Option<Arc<OriginalRegistration>>, bool> {
+    register_for_turn(shared, provider, state, cancel, true).await
+}
+
+pub(super) async fn register_without_requeue(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    state: &InflightTurnState,
+    cancel: &Arc<CancelToken>,
+) -> Result<Option<Arc<OriginalRegistration>>, bool> {
+    register_for_turn(shared, provider, state, cancel, false).await
+}
+
+async fn register_for_turn(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    state: &InflightTurnState,
+    cancel: &Arc<CancelToken>,
+    requeue_on_deferral: bool,
+) -> Result<Option<Arc<OriginalRegistration>>, bool> {
+    let registration = register_original(provider, state.channel_id, cancel).await;
+    let registration = match registration {
+        Ok(Some(original)) if original.waited_for_recovery => {
+            let snapshot = super::mailbox_snapshot(shared, ChannelId::new(state.channel_id)).await;
+            if snapshot
+                .cancel_token
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, cancel))
+                && snapshot.active_user_message_id.map(|id| id.get()) == Some(state.user_msg_id)
+                && super::inflight::load_inflight_state(provider, state.channel_id).is_none_or(
+                    |current| {
+                        current.user_msg_id == state.user_msg_id
+                            && current.turn_nonce == state.turn_nonce
+                    },
+                )
+            {
+                Ok(Some(original))
+            } else {
+                Err(())
+            }
+        }
+        other => other,
+    };
+    match registration {
+        Ok(registration) => Ok(registration),
+        Err(()) => Err(defer_unstarted_turn(
+            shared,
+            provider,
+            state,
+            cancel,
+            requeue_on_deferral,
+            "original_bridge_start_deferred",
+        )
+        .await),
+    }
+}
+
+/// Releases an unstarted turn's mailbox claim and, when asked, front-requeues its prompt
+/// behind the slow backstop only; returns whether the prompt is queued for a retry.
+pub(super) async fn defer_unstarted_turn(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    state: &InflightTurnState,
+    cancel: &Arc<CancelToken>,
+    requeue: bool,
+    reason: &'static str,
+) -> bool {
+    let channel = ChannelId::new(state.channel_id);
+    // A busy-turn injection must see the claim or the requeued prompt, never the gap between.
+    let transition = if requeue {
+        fence_handback(shared, channel).await
+    } else {
+        None
+    };
+    let finish = super::mailbox_finish::mailbox_finish_turn_if_matches_episode_started_before_with_actor_without_completion(
+        shared, provider, channel, poise::serenity_prelude::MessageId::new(state.user_msg_id),
+        state.turn_nonce.clone(), std::time::Instant::now(), Some(cancel.clone()),
+    ).await;
+    if let Some(removed) = finish.removed_token {
+        removed.mark_completion_cleanup();
+        removed
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        super::saturating_decrement_global_active(shared);
+    }
+    if !requeue {
+        tracing::warn!(
+            channel_id = state.channel_id,
+            provider = provider.as_str(),
+            accepted = false,
+            "{reason}"
+        );
+        return false;
+    }
+    #[cfg(test)]
+    handback_gap::pause(channel).await;
+    let queued =
+        super::mailbox_requeue_inflight_for_followup_retry(shared, provider, channel, state).await;
+    #[cfg(test)]
+    let queued = {
+        let mut queued = queued;
+        handback_gap::memory_ack_on_persistence_failure(channel, &mut queued);
+        queued
+    };
+    drop(transition);
+    tracing::warn!(
+        channel_id = state.channel_id,
+        provider = provider.as_str(),
+        accepted = queued.enqueued,
+        "{reason}"
+    );
+    let accepted = if super::router::checkpoint_waits_for_admission(channel) {
+        queued.persistence_error.is_none() && queued.enqueued
+    } else {
+        queued.enqueued
+            || queued.merged
+            || matches!(
+                queued.refusal_reason,
+                Some(
+                    crate::services::turn_orchestrator::EnqueueRefusalReason::SourceIdAlreadyQueued
+                        | crate::services::turn_orchestrator::EnqueueRefusalReason::LastItemDedup
+                )
+            )
+    };
+    if accepted {
+        super::arm_slow_idle_queue_backstop_if_queue_nonempty(shared, provider, channel, reason)
+            .await;
+    }
+    accepted
+}
+
+pub(super) fn try_recovery(
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> Result<RecoveryRegistration, ()> {
+    admit_recovery(
+        provider,
+        channel_id,
+        matches!(provider, ProviderKind::Codex) && enabled(),
+    )
+}
+
+/// Watcher respawn yields to every registered original, Claude included.
+pub(super) fn try_respawn_recovery(
+    provider: &ProviderKind,
+    channel_id: u64,
+) -> Result<RecoveryRegistration, ()> {
+    admit_recovery(provider, channel_id, registers(provider))
+}
+
+/// The calling task's recovery admission, for blocking work that must finish inside it.
+pub(super) fn held_recovery() -> Option<RecoveryRegistration> {
+    RECOVERY.try_with(Clone::clone).ok()
+}
+
+fn admit_recovery(
+    provider: &ProviderKind,
+    channel_id: u64,
+    gated: bool,
+) -> Result<RecoveryRegistration, ()> {
+    if !gated {
+        return Ok(RecoveryRegistration {
+            slot: None,
+            _permit: None,
+        });
+    }
+    let slot = slot(provider, channel_id);
+    if let Ok(Some(registration)) = RECOVERY.try_with(|held| {
+        held.slot
+            .as_ref()
+            .filter(|held_slot| Arc::ptr_eq(held_slot, &slot))
+            .map(|_| held.clone())
+    }) {
+        return Ok(registration);
+    }
+    let permit = slot.gate.clone().try_write_owned().map_err(|_| {
+        tracing::info!(
+            channel_id,
+            provider = provider.as_str(),
+            "live_original_bridge_deferred"
+        );
+    })?;
+    Ok(RecoveryRegistration {
+        slot: Some(slot),
+        _permit: Some(Arc::new(permit)),
+    })
+}
+
+impl RecoveryRegistration {
+    pub(super) fn is_guarded(&self) -> bool {
+        self.slot.is_some()
+    }
+
+    // Allocate before entering the scope so nested recovery futures do not grow caller stacks.
+    pub(super) fn run<T>(&self, future: impl Future<Output = T>) -> impl Future<Output = T> {
+        let future = Box::pin(future);
+        let registration = self.clone();
+        async move {
+            if registration.slot.is_none() {
+                future.await
+            } else {
+                RECOVERY.scope(registration, future).await
+            }
+        }
+    }
+}
+
+/// The bounded wait fails open: a handback that cannot take the transition keeps its old order.
+async fn fence_handback(
+    shared: &SharedData,
+    channel: ChannelId,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    let guard = shared.acquire_session_transition(channel).await.ok();
+    if guard.is_none() {
+        tracing::warn!(
+            channel_id = channel.get(),
+            "session transition stayed busy; claim handback runs unfenced"
+        );
+    }
+    guard
+}
+
+/// Stops one channel's handback between its claim release and its front requeue.
+#[cfg(test)]
+pub(crate) mod handback_gap {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+
+    use poise::serenity_prelude::ChannelId;
+    use tokio::sync::Notify;
+
+    type Gap = (Arc<Notify>, Arc<Notify>);
+    static GAPS: Mutex<Option<HashMap<u64, Gap>>> = Mutex::new(None);
+    static MEMORY_ACKS: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+    pub(crate) fn arm_memory_ack_on_persistence_failure(channel: u64) {
+        MEMORY_ACKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashSet::new)
+            .insert(channel);
+    }
+
+    pub(super) fn memory_ack_on_persistence_failure(
+        channel: ChannelId,
+        queued: &mut super::super::MailboxEnqueueOutcome,
+    ) {
+        let armed = MEMORY_ACKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .is_some_and(|channels| channels.remove(&channel.get()));
+        if armed && queued.persistence_error.is_some() {
+            queued.enqueued = true;
+        }
+    }
+
+    /// Returns (reached, resume) for the channel's next handback.
+    pub(crate) fn arm(channel: u64) -> Gap {
+        let gap = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let mut gaps = GAPS.lock().unwrap_or_else(|e| e.into_inner());
+        gaps.get_or_insert_with(HashMap::new)
+            .insert(channel, gap.clone());
+        gap
+    }
+
+    pub(super) async fn pause(channel: ChannelId) {
+        let gap = {
+            let mut gaps = GAPS.lock().unwrap_or_else(|e| e.into_inner());
+            gaps.as_mut().and_then(|gaps| gaps.remove(&channel.get()))
+        };
+        if let Some((reached, resume)) = gap {
+            reached.notify_one();
+            resume.notified().await;
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "live_bridge/guard_tests.rs"]
+mod tests;

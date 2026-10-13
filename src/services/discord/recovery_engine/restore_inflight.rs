@@ -28,16 +28,8 @@ fn build_tmux_death_diagnostic(_name: &str, _output_path: Option<&str>) -> Optio
     None
 }
 
-fn recovery_output_path_with_tmux_fallback(
-    state: &inflight::InflightTurnState,
-    fallback_output: String,
-) -> Option<String> {
-    state
-        .output_path
-        .clone()
-        .filter(|path| !path.is_empty())
-        .or_else(|| (!fallback_output.is_empty()).then_some(fallback_output))
-}
+#[cfg(unix)]
+use super::herdr_before_start_restart::herdr_turn_held;
 
 #[path = "restore_inflight/kickoff_identity.rs"]
 mod kickoff_identity;
@@ -46,28 +38,21 @@ pub(in crate::services::discord) use kickoff_identity::finish_recovered_turn_mai
 mod output_paths;
 #[cfg(unix)]
 pub(super) use output_paths::detect_live_tmux_output_path;
-
-fn observe_restore_inflight_snapshot(
-    provider: &ProviderKind,
-    states: &[inflight::InflightTurnState],
-    boot_elapsed: std::time::Duration,
-) {
-    let current_generation = super::runtime_store::process_generation();
-    tracing::info!(provider = %provider.as_str(), snapshot_rows = states.len(), boot_elapsed_ms = boot_elapsed.as_millis(), "restore_inflight snapshot loaded");
-    for state in states
-        .iter()
-        .filter(|state| state.born_generation != 0 && state.born_generation == current_generation)
-    {
-        tracing::warn!(provider = %provider.as_str(), channel_id = state.channel_id, user_msg_id = state.user_msg_id, born_generation = state.born_generation, current_generation, boot_elapsed_ms = boot_elapsed.as_millis(), "restore_inflight snapshot contains a row authored by the running process");
-    }
-}
+use output_paths::recovery_output_path_with_tmux_fallback;
+#[path = "restore_inflight/diagnostics.rs"]
+mod diagnostics;
+#[path = "restore_inflight/replay_hold.rs"]
+mod replay_hold;
+use diagnostics::observe_restore_inflight_snapshot;
 
 pub(in crate::services::discord) async fn restore_inflight_turns(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
 ) {
-    let states = load_inflight_states(provider);
+    let states = inflight::load_inflight_states_excluding(provider, |channel| {
+        crate::services::discord::input_runtime::fence::lookup(provider, channel).is_some()
+    });
     observe_restore_inflight_snapshot(
         provider,
         &states,
@@ -77,6 +62,19 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
         return;
     }
 
+    Box::pin(restore_inflight_states(
+        http, shared, provider, states, false,
+    ))
+    .await;
+}
+
+async fn restore_inflight_states(
+    http: &Arc<serenity::Http>,
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    states: Vec<inflight::InflightTurnState>,
+    resume_installed: bool,
+) {
     let settings_snapshot = shared.settings.read().await.clone();
 
     // Reconcile wrappers preserve planned-restart rows via `PlannedRestartSkipped`; the
@@ -88,6 +86,31 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
     // its bound is the next boot that successfully advances the epoch. An allocation-
     // provenance witness belongs to #5482.
     for mut state in states {
+        // An input-protected channel's row waits for its move or handback.
+        if crate::services::discord::input_runtime::fence::lookup(provider, state.channel_id)
+            .is_some()
+        {
+            continue;
+        }
+        #[cfg(unix)]
+        if super::herdr_before_start_restart::settle_receipt(http, shared, provider, &state).await {
+            continue;
+        }
+        #[cfg(not(unix))]
+        if !inflight::receipt_mutant("all-early")
+            && (state.herdr_before_start_stop.is_some()
+                || inflight::before_start_receipt_present(provider, state.channel_id))
+        {
+            continue;
+        }
+        // An unverified projected receipt waits for another pass without persisting a read error.
+        if !replay_hold::hydrate_replay_hold(shared.pg_pool.as_ref(), &mut state).await {
+            continue;
+        }
+        if state.replay_rerun_blocked() {
+            replay_hold::deliver_held_debt(http, shared, provider, &mut state).await;
+            continue;
+        }
         if matches!(
             crate::services::agent_recovery::channel_recovery_intake(
                 provider,
@@ -126,6 +149,27 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
             );
             continue;
         };
+        // A policy receipt settles or stays before the marker hold; without one nothing changes.
+        #[cfg(unix)]
+        if let Some(r) = super::herdr_before_start_restart::decode(shared, provider, &state) {
+            r.settle(http, shared, &state).await;
+            continue;
+        }
+        // A held Herdr turn ends only on its admitted terminal, never on a transcript read here.
+        #[cfg(unix)]
+        if herdr_turn_held(provider, &state) {
+            tracing::info!(
+                channel_id = state.channel_id,
+                "recovery kept a held Herdr turn"
+            );
+            continue;
+        }
+        // An admitted Herdr terminal settles from its persisted kind, never from a transcript read.
+        #[cfg(unix)]
+        if let Some(terminal) = super::herdr_admitted_restart::admitted(provider, &state) {
+            terminal.settle(http, shared, &state).await;
+            continue;
+        }
 
         // #2235: silent-skip rows whose on-disk `runtime_kind` was a
         // present-but-unknown variant string. `load_inflight_states_from_root`
@@ -168,36 +212,16 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
         // observability events back-trace to a specific agent/turn. `turn_id`
         // matches the recovered-transcript key (joins turn_started/turn_finished
         // for message-bearing turns); `agent_id` is the role bound to the channel.
-        let recovery_turn_id = super::analytics_transcript::recovered_transcript_turn_id(
-            state.channel_id,
-            state.user_msg_id,
-            state.session_key.as_deref(),
-            state.turn_start_offset,
-            &state.started_at,
-        );
-        let recovery_agent_id =
-            resolve_role_binding(channel_id, state.channel_name.as_deref()).map(|b| b.role_id);
         let recovery_reason = if restart_report_exists {
             "restart_report"
         } else {
             "restore_inflight"
         };
-        crate::services::observability::emit_recovery_fired(
-            provider.as_str(),
-            state.channel_id,
-            state.dispatch_id.as_deref(),
-            state.session_key.as_deref(),
-            Some(recovery_turn_id.as_str()),
-            recovery_agent_id.as_deref(),
-            recovery_reason,
-        );
-        emit_recovery_quality_event(
+        diagnostics::emit_recovery_fired(
             provider,
-            state.channel_id,
+            &state,
+            channel_id,
             state.dispatch_id.as_deref(),
-            state.session_key.as_deref(),
-            Some(recovery_turn_id.as_str()),
-            recovery_agent_id.as_deref(),
             recovery_reason,
         );
 
@@ -715,7 +739,14 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                         let watcher_claimed = {
                             #[cfg(unix)]
                             {
-                                let claim = super::tmux::claim_or_reuse_watcher_with_thread_parent(
+                                let host = super::tmux::watch_host_of(
+                                    shared,
+                                    provider,
+                                    channel_id.get(),
+                                    tmux_session_name,
+                                )
+                                .await;
+                                let claim = super::tmux::claim_or_reuse_watcher_for_host(
                                     &shared.tmux_watchers,
                                     channel_id,
                                     handle,
@@ -726,8 +757,9 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                                         state.logical_channel_id,
                                         state.thread_id,
                                     ),
+                                    host,
                                 );
-                                claim.should_spawn()
+                                claim.is_ok_and(|claim| claim.should_spawn())
                             }
                             #[cfg(not(unix))]
                             {
@@ -1724,33 +1756,11 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         tracing::error!("  [{ts}] {error}; main-workspace fallback blocked");
                         // #3562: back-trace the recovery to a specific agent/turn.
-                        let recovery_turn_id =
-                            super::analytics_transcript::recovered_transcript_turn_id(
-                                state.channel_id,
-                                state.user_msg_id,
-                                state.session_key.as_deref(),
-                                state.turn_start_offset,
-                                &state.started_at,
-                            );
-                        let recovery_agent_id =
-                            resolve_role_binding(channel_id, state.channel_name.as_deref())
-                                .map(|b| b.role_id);
-                        crate::services::observability::emit_recovery_fired(
-                            provider.as_str(),
-                            state.channel_id,
-                            dispatch_id.as_deref(),
-                            state.session_key.as_deref(),
-                            Some(recovery_turn_id.as_str()),
-                            recovery_agent_id.as_deref(),
-                            "worktree_missing_main_fallback_blocked",
-                        );
-                        emit_recovery_quality_event(
+                        diagnostics::emit_recovery_fired(
                             provider,
-                            state.channel_id,
+                            &state,
+                            channel_id,
                             dispatch_id.as_deref(),
-                            state.session_key.as_deref(),
-                            Some(recovery_turn_id.as_str()),
-                            recovery_agent_id.as_deref(),
                             "worktree_missing_main_fallback_blocked",
                         );
                         let recovery_context = RecoveryDeliveryContext::from_state(
@@ -1867,7 +1877,14 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 let watcher_claimed = {
                     #[cfg(unix)]
                     {
-                        let claim = super::tmux::claim_or_reuse_watcher_with_thread_parent(
+                        let host = super::tmux::watch_host_of(
+                            shared,
+                            provider,
+                            channel_id.get(),
+                            &tmux_session_name,
+                        )
+                        .await;
+                        let claim = super::tmux::claim_or_reuse_watcher_for_host(
                             &shared.tmux_watchers,
                             channel_id,
                             handle,
@@ -1878,8 +1895,9 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                                 state.logical_channel_id,
                                 state.thread_id,
                             ),
+                            host,
                         );
-                        claim.should_spawn()
+                        claim.is_ok_and(|claim| claim.should_spawn())
                     }
                     #[cfg(not(unix))]
                     {
@@ -1978,32 +1996,11 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::error!("  [{ts}] {error}; main-workspace fallback blocked");
                 // #3562: back-trace the recovery to a specific agent/turn.
-                let recovery_turn_id = super::analytics_transcript::recovered_transcript_turn_id(
-                    state.channel_id,
-                    state.user_msg_id,
-                    state.session_key.as_deref(),
-                    state.turn_start_offset,
-                    &state.started_at,
-                );
-                let recovery_agent_id =
-                    resolve_role_binding(channel_id, state.channel_name.as_deref())
-                        .map(|b| b.role_id);
-                crate::services::observability::emit_recovery_fired(
-                    provider.as_str(),
-                    state.channel_id,
-                    dispatch_id.as_deref(),
-                    state.session_key.as_deref(),
-                    Some(recovery_turn_id.as_str()),
-                    recovery_agent_id.as_deref(),
-                    "worktree_missing_main_fallback_blocked",
-                );
-                emit_recovery_quality_event(
+                diagnostics::emit_recovery_fired(
                     provider,
-                    state.channel_id,
+                    &state,
+                    channel_id,
                     dispatch_id.as_deref(),
-                    state.session_key.as_deref(),
-                    Some(recovery_turn_id.as_str()),
-                    recovery_agent_id.as_deref(),
                     "worktree_missing_main_fallback_blocked",
                 );
                 let recovery_context = RecoveryDeliveryContext::from_state(
@@ -2041,9 +2038,14 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
                 continue;
             }
         };
-        let cancel_token = Arc::new(CancelToken::from_persisted_turn_nonce(
+        let candidate = Arc::new(CancelToken::from_persisted_turn_nonce(
             state.turn_nonce.clone(),
         ));
+        let cancel_token = if resume_installed {
+            scoped_restore::installed_token(shared, channel_id, &state, candidate).await
+        } else {
+            candidate
+        };
         super::turn_bridge::bind_cancel_token_tmux_runtime(
             provider,
             &cancel_token,
@@ -2085,16 +2087,29 @@ pub(in crate::services::discord) async fn restore_inflight_turns(
             restore_recovered_session_worktree(session, &state);
         }
 
-        let kickoff = mailbox_recovery_kickoff(
-            shared,
-            channel_id,
-            cancel_token.clone(),
-            kickoff_identity.request_owner,
-            kickoff_identity.user_message_id,
-        )
-        .await;
+        let kickoff = if resume_installed {
+            scoped_restore::checked_kickoff(
+                shared,
+                provider,
+                channel_id,
+                cancel_token.clone(),
+                &state,
+            )
+            .await
+        } else {
+            mailbox_recovery_kickoff(
+                shared,
+                channel_id,
+                cancel_token.clone(),
+                kickoff_identity.request_owner,
+                kickoff_identity.user_message_id,
+            )
+            .await
+        };
 
-        if !kickoff.activated_turn() {
+        let resumed_same_episode = resume_installed
+            && kickoff == crate::services::turn_orchestrator::RecoveryKickoffResult::AlreadyActiveSameEpisode;
+        if !kickoff.activated_turn() && !resumed_same_episode {
             continue;
         }
         // Consume outgoing planned-restart authority (identity-guarded readoption)
@@ -2676,3 +2691,13 @@ mod kickoff_identity_tests;
 #[cfg(test)]
 #[path = "restore_inflight/ready_without_output_tests.rs"]
 mod ready_without_output_tests;
+#[cfg(all(test, unix))]
+#[path = "restore_inflight/replay_hold_tests.rs"]
+mod replay_hold_tests;
+
+#[path = "restore_inflight/scoped_restore.rs"]
+mod scoped_restore;
+#[cfg(all(test, unix))]
+pub(in crate::services::discord) use scoped_restore::{
+    install_inflight_scoped, resume_inflight_scoped,
+};

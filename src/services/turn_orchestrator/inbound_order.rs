@@ -45,9 +45,18 @@ pub(super) fn claim_yields(
     user_message_id: MessageId,
     admission_order: TurnAdmissionOrder,
 ) -> bool {
+    // An injection owns this message; yield before the helpers below count or clear anything.
+    // The provider is the one this actor last persisted for, or any while it has none.
+    let provider = super::injected_inputs::actor_provider(state);
+    if super::injected_inputs::owns(state, provider, user_message_id) {
+        return true;
+    }
     let background = background_defers_claim(state, turn_kind);
     let order = inbound_order_defers_claim(state, user_message_id, admission_order);
-    background || order
+    // An injection reservation is held outside the fail-open and dequeued-head exceptions above.
+    let behind = admission_order == TurnAdmissionOrder::BehindQueue;
+    let injection = behind && super::injected_inputs::holds_order(state);
+    background || order || injection
 }
 
 /// #3167 BLOCKER-2 — a background cycle that wins the freed slot ahead of the

@@ -3,20 +3,33 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::ops::Range;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{StoreError, damage, durable};
+use super::{StoreError, damage};
 use crate::services::discord::runtime_store::fsync_parent_dir;
 use crate::services::tui_o::shadow::{SourceId, UnitKey};
+
+/// This build includes both the ledger reader and the guarded writer consumer.
+pub const OPERATOR_RESUME_SUPPORTED: bool = true;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LedgerEntry {
+    ExactEvidence {
+        metadata: Box<crate::services::tui_o::exact_episode::EpisodeMetadata>,
+    },
+    OperatorResume {
+        rejected_serial: u64,
+        approval_id: uuid::Uuid,
+        operator: String,
+        reason: String,
+        at: DateTime<Utc>,
+    },
     /// Written before the POST; `epoch` is the gateway ownership the POST was admitted under.
     Prepared {
         serial: u64,
@@ -35,6 +48,10 @@ pub enum LedgerEntry {
         status: u16,
     },
     NotFound {
+        serial: u64,
+    },
+    /// Re-post was certainly not sent; closes Prepared without any history finding.
+    NotSent {
         serial: u64,
     },
     Ambiguous {
@@ -77,6 +94,7 @@ pub enum PieceOutcome {
     Posted(u64),
     Rejected(u16),
     NotFound,
+    NotSent,
     Ambiguous(Vec<u64>),
     Unresolved(String),
 }
@@ -92,6 +110,26 @@ pub struct PieceRecord {
     pub outcome: Option<PieceOutcome>,
 }
 
+/// The UUID follows the approval across homes; `(channel, rejected_serial)` is local audit identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeApproval {
+    pub rejected_serial: u64,
+    pub approval_id: uuid::Uuid,
+    pub operator: String,
+    pub reason: String,
+    pub at: DateTime<Utc>,
+    pub consumed_serial: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PieceDisposition {
+    Fresh,
+    Blocked { serial: u64, status: u16 },
+    Authorized { rejected_serial: u64 },
+    Open { serial: u64 },
+    Settled,
+}
+
 /// Replayed ledger. `anchor` moves only on Posted; the first invariant break pauses the channel.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LedgerState {
@@ -104,6 +142,8 @@ pub struct LedgerState {
     gc: HashMap<SourceId, Vec<(u64, u64)>>,
     resolved: HashMap<SourceId, u64>,
     violation: Option<String>,
+    exact_evidence: Vec<crate::services::tui_o::exact_episode::EpisodeMetadata>,
+    approvals: BTreeMap<u64, ResumeApproval>,
 }
 
 impl LedgerState {
@@ -139,6 +179,73 @@ impl LedgerState {
         self.excluded.get(unit_key).map(String::as_str)
     }
 
+    pub fn approval(&self, rejected_serial: u64) -> Option<&ResumeApproval> {
+        self.approvals.get(&rejected_serial)
+    }
+
+    pub fn disposition(&self, key: &UnitKey, index: u32) -> PieceDisposition {
+        let Some((serial, piece)) = self.latest_piece(key, index) else {
+            return PieceDisposition::Fresh;
+        };
+        match piece.outcome {
+            Some(PieceOutcome::Rejected(status)) => {
+                if self
+                    .approval(serial)
+                    .is_some_and(|approval| approval.consumed_serial.is_none())
+                {
+                    PieceDisposition::Authorized {
+                        rejected_serial: serial,
+                    }
+                } else {
+                    PieceDisposition::Blocked { serial, status }
+                }
+            }
+            None => PieceDisposition::Open { serial },
+            Some(_) => PieceDisposition::Settled,
+        }
+    }
+
+    pub fn blocked(&self) -> Option<(u64, u16)> {
+        self.pieces.values().find_map(|piece| {
+            match self.disposition(&piece.unit_key, piece.piece_index) {
+                PieceDisposition::Blocked { serial, status } => Some((serial, status)),
+                _ => None,
+            }
+        })
+    }
+
+    /// Unconsumed approvals and their still-open first attempts belong in the ordinary owed queue.
+    pub fn resume_pieces(&self) -> impl Iterator<Item = (u64, &PieceRecord)> {
+        self.approvals.iter().filter_map(|(&rejected, approval)| {
+            let original = self.piece(rejected)?;
+            let (serial, latest) = self.latest_piece(&original.unit_key, original.piece_index)?;
+            if self.excluded(&original.unit_key).is_some() {
+                return None;
+            }
+            let pending = matches!(self.disposition(&original.unit_key, original.piece_index),
+                PieceDisposition::Authorized { rejected_serial } if rejected_serial == rejected);
+            let open = approval.consumed_serial == Some(serial) && latest.outcome.is_none();
+            (pending || open).then_some((rejected, latest))
+        })
+    }
+
+    pub(super) fn can_resume(&self, serial: u64) -> bool {
+        let Some(piece) = self.piece(serial) else {
+            return false;
+        };
+        self.violation.is_none()
+            && self.open_serial.is_none()
+            && matches!(piece.outcome, Some(PieceOutcome::Rejected(400 | 403 | 404)))
+            && self
+                .latest_piece(&piece.unit_key, piece.piece_index)
+                .is_some_and(|(latest, _)| latest == serial)
+            && !self.pieces.values().any(|other| {
+                other.unit_key == piece.unit_key
+                    && other.piece_index == piece.piece_index
+                    && matches!(other.outcome, Some(PieceOutcome::Posted(_)))
+            })
+    }
+
     pub fn gc_through(&self, source: &SourceId) -> Option<u64> {
         self.gc_segments(source).last().map(|&(_, through)| through)
     }
@@ -165,6 +272,47 @@ impl LedgerState {
 
     pub(super) fn apply(&mut self, at: DateTime<Utc>, entry: LedgerEntry) {
         match entry {
+            LedgerEntry::OperatorResume {
+                rejected_serial,
+                approval_id,
+                operator,
+                reason,
+                at,
+            } => {
+                if self.approvals.contains_key(&rejected_serial) {
+                    tracing::warn!(
+                        rejected_serial,
+                        "[tui_o] duplicate approval ignored; first record stands"
+                    );
+                } else if !self.can_resume(rejected_serial)
+                    || approval_id.is_nil()
+                    || operator.trim().is_empty()
+                    || reason.trim().is_empty()
+                {
+                    tracing::warn!(
+                        rejected_serial,
+                        "[tui_o] invalid approval ignored; no sending authority"
+                    );
+                } else {
+                    self.approvals.insert(
+                        rejected_serial,
+                        ResumeApproval {
+                            rejected_serial,
+                            approval_id,
+                            operator,
+                            reason,
+                            at,
+                            consumed_serial: None,
+                        },
+                    );
+                }
+            }
+            LedgerEntry::ExactEvidence { metadata } => {
+                if !metadata.supported() {
+                    self.violate("unsupported exact ledger evidence".into());
+                }
+                self.exact_evidence.push(*metadata);
+            }
             LedgerEntry::Prepared {
                 serial,
                 unit_key,
@@ -182,6 +330,15 @@ impl LedgerState {
                 }
                 self.next_serial = self.next_serial.max(serial.saturating_add(1));
                 self.open_serial = Some(serial);
+                for (&rejected, approval) in &mut self.approvals {
+                    if approval.consumed_serial.is_none()
+                        && self.pieces.get(&rejected).is_some_and(|piece| {
+                            piece.unit_key == unit_key && piece.piece_index == piece_index
+                        })
+                    {
+                        approval.consumed_serial = Some(serial);
+                    }
+                }
                 self.latest.insert((unit_key.clone(), piece_index), serial);
                 let piece = PieceRecord {
                     unit_key,
@@ -206,6 +363,7 @@ impl LedgerState {
                 self.resolve(serial, PieceOutcome::Rejected(status))
             }
             LedgerEntry::NotFound { serial } => self.resolve(serial, PieceOutcome::NotFound),
+            LedgerEntry::NotSent { serial } => self.resolve(serial, PieceOutcome::NotSent),
             LedgerEntry::Ambiguous { serial, candidates } => {
                 self.resolve(serial, PieceOutcome::Ambiguous(candidates))
             }
@@ -268,16 +426,61 @@ pub(super) fn append(
     at: DateTime<Utc>,
     entry: &LedgerEntry,
 ) -> Result<(), StoreError> {
+    Ok(super::durable::append_synced(path, &line(at, entry)?)?)
+}
+
+pub(super) fn append_to(
+    file: &mut File,
+    at: DateTime<Utc>,
+    entry: &LedgerEntry,
+) -> Result<(), StoreError> {
+    file.write_all(&line(at, entry)?)?;
+    Ok(file.sync_data()?)
+}
+
+fn line(at: DateTime<Utc>, entry: &LedgerEntry) -> Result<Vec<u8>, StoreError> {
     let entry = entry.clone();
     let mut line = serde_json::to_vec(&LedgerLine { at, entry })?;
     line.push(b'\n');
-    Ok(durable::append_synced(path, &line)?)
+    Ok(line)
 }
+
+/// Operator snapshots use the same reducer without sweeping, cutting a tail or withdrawing a POST.
+pub(super) fn read_only(file: &mut File, initial_anchor: u64) -> Result<LedgerState, StoreError> {
+    let mut state = LedgerState {
+        anchor: initial_anchor,
+        ..LedgerState::default()
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut offset = 0;
+    loop {
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            return Ok(state);
+        }
+        if line.last() != Some(&b'\n') {
+            return Err(StoreError::Rejected(
+                "unfinished ledger entry; start the writer to recover it".into(),
+            ));
+        }
+        let parsed: LedgerLine = serde_json::from_slice(&line)
+            .map_err(|error| damage(format!("ledger byte {offset}: {error}")))?;
+        state.apply(parsed.at, parsed.entry);
+        offset += read;
+    }
+}
+
+#[cfg(test)]
+#[path = "operator_resume_ledger_tests.rs"]
+mod operator_resume_tests;
 
 /// The `from` of a durable `BoundaryResolved` for `source`, read without recovering the ledger.
 /// An unfinished last line is refused: a line appended after it would become mid-file damage.
-pub(super) fn resolution(path: &Path, source: &SourceId) -> Result<Option<u64>, StoreError> {
-    let bytes = std::fs::read(path)?;
+pub(super) fn resolution(file: &mut File, source: &SourceId) -> Result<Option<u64>, StoreError> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
     if bytes.last().is_some_and(|byte| *byte != b'\n') {
         let detail = "the ledger ends in an unfinished entry; start the writer to recover it";
         return Err(StoreError::Rejected(detail.into()));
@@ -297,27 +500,110 @@ pub(super) fn resolution(path: &Path, source: &SourceId) -> Result<Option<u64>, 
     Ok(None)
 }
 
+/// A `Prepared` whose append returned an error before its POST was created, so nothing posted it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unsent {
+    serial: u64,
+    entry: LedgerEntry,
+}
+
+impl Unsent {
+    /// Only a `Prepared` can be unsent.
+    pub(crate) fn new(entry: LedgerEntry) -> Option<Self> {
+        match entry {
+            LedgerEntry::Prepared { serial, .. } => Some(Self { serial, entry }),
+            _ => None,
+        }
+    }
+
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+}
+
 /// Replays the ledger from `initial_anchor`; an unfinished last line is cut, any other bad line is damage.
 pub(super) fn recover(path: &Path, initial_anchor: u64) -> Result<LedgerState, StoreError> {
+    recover_with_tail(path, initial_anchor, || {})
+}
+
+/// Recovers as `recover` does, and also cuts `unsent` when it is the whole last line and the
+/// next piece to prepare; returns whether it was cut.
+pub(super) fn recover_withdrawing(
+    path: &Path,
+    initial_anchor: u64,
+    unsent: Option<&Unsent>,
+) -> Result<(LedgerState, bool), StoreError> {
+    replay(path, initial_anchor, unsent, || {})
+}
+
+/// The last complete line is the one `unsent` names and nothing it follows is still open.
+fn withdrawable(state: &LedgerState, entry: &LedgerEntry, unsent: Option<&Unsent>) -> bool {
+    let next =
+        matches!(entry, LedgerEntry::Prepared { serial, .. } if *serial == state.next_serial);
+    unsent.is_some_and(|unsent| unsent.entry == *entry) && next && state.open_serial.is_none()
+}
+
+fn recover_with_tail(
+    path: &Path,
+    initial_anchor: u64,
+    before_truncate: impl FnMut(),
+) -> Result<LedgerState, StoreError> {
+    replay(path, initial_anchor, None, before_truncate).map(|(state, _)| state)
+}
+
+fn replay(
+    path: &Path,
+    initial_anchor: u64,
+    unsent: Option<&Unsent>,
+    mut before_truncate: impl FnMut(),
+) -> Result<(LedgerState, bool), StoreError> {
     let mut state = LedgerState {
         anchor: initial_anchor,
         ..LedgerState::default()
     };
-    let mut reader = BufReader::new(File::open(path)?);
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    // Refuse recovery while an operator is writing; replay, the withdraw check and every cut share
+    // this handle.
+    let file = super::durable::LockedFile::try_lock(file)?;
+    let mut reader = BufReader::new(&*file);
     let (mut offset, mut line) = (0u64, Vec::new());
+    // The last complete line waits here until the next read shows whether it ends the file.
+    let mut held: Option<(u64, LedgerLine)> = None;
     loop {
         line.clear();
         let read = reader.read_until(b'\n', &mut line)?;
         if read == 0 {
-            return Ok(state);
+            let Some((start, last)) = held else {
+                return Ok((state, false));
+            };
+            if withdrawable(&state, &last.entry, unsent) {
+                #[cfg(test)]
+                super::durable::fault::strike(path, super::durable::fault::Step::Cut)?;
+                reader.get_ref().set_len(start)?;
+                #[cfg(test)]
+                super::durable::fault::strike(path, super::durable::fault::Step::CutSync)?;
+                reader.get_ref().sync_all()?;
+                #[cfg(test)]
+                super::durable::fault::note_withdrawn(path);
+                return Ok((state, true));
+            }
+            state.apply(last.at, last.entry);
+            return Ok((state, false));
         }
         if line.last() != Some(&b'\n') {
-            durable::truncate_synced(path, offset)?;
-            return Ok(state);
+            if let Some((_, last)) = held {
+                state.apply(last.at, last.entry);
+            }
+            before_truncate();
+            reader.get_ref().set_len(offset)?;
+            reader.get_ref().sync_all()?;
+            return Ok((state, false));
         }
         let parsed: LedgerLine = serde_json::from_slice(&line)
             .map_err(|error| damage(format!("ledger byte {offset}: {error}")))?;
-        state.apply(parsed.at, parsed.entry);
+        if let Some((_, last)) = held.replace((offset, parsed)) {
+            state.apply(last.at, last.entry);
+        }
         offset += read as u64;
     }
 }
@@ -326,6 +612,30 @@ pub(super) fn recover(path: &Path, initial_anchor: u64) -> Result<LedgerState, S
 mod tests {
     use super::*;
     use crate::services::tui_o::shadow::{ShadowProvider, UnitKind};
+
+    #[test]
+    fn exact_evidence_ledger_replays_without_changing_legacy_frontier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.jsonl");
+        std::fs::File::create(&path).unwrap();
+        let metadata = crate::services::tui_o::exact_episode::tests::fixture().remove(4);
+        let before = LedgerState::default();
+        append(
+            &path,
+            Utc::now(),
+            &LedgerEntry::ExactEvidence {
+                metadata: Box::new(metadata.clone()),
+            },
+        )
+        .unwrap();
+        let replay = recover(&path, 0).unwrap();
+        assert_eq!(replay.exact_evidence, vec![metadata]);
+        assert_eq!(
+            (replay.anchor(), replay.next_serial(), replay.unresolved()),
+            (before.anchor(), before.next_serial(), before.unresolved())
+        );
+        assert_eq!(replay.violation(), None);
+    }
 
     fn prepared(serial: u64, anchor_id: u64) -> LedgerEntry {
         let (provider, kind) = (ShadowProvider::Codex, UnitKind::Body);
@@ -406,4 +716,107 @@ mod tests {
             assert!(state.violation().is_some(), "no violation for {entries:?}");
         }
     }
+
+    /// A ledger file holding `entries`, and its length then.
+    fn written(dir: &Path, name: &str, entries: &[LedgerEntry]) -> (std::path::PathBuf, u64) {
+        let path = dir.join(name);
+        create_empty(&path).unwrap();
+        for entry in entries {
+            append(&path, Utc::now(), entry).unwrap();
+        }
+        let len = std::fs::metadata(&path).unwrap().len();
+        (path, len)
+    }
+
+    #[test]
+    fn recovery_withdraws_only_a_whole_last_prepared_its_evidence_names() {
+        use LedgerEntry::{Excluded, Posted};
+        let dir = tempfile::tempdir().unwrap();
+        let len = |path: &Path| std::fs::metadata(path).unwrap().len();
+        let unsent = |entry: &LedgerEntry| Unsent::new(entry.clone()).unwrap();
+        let (posted, next) = (
+            Posted {
+                serial: 0,
+                msg_id: 20,
+            },
+            prepared(1, 20),
+        );
+        let settled = [prepared(0, 10), posted.clone()];
+
+        let (path, before) = written(dir.path(), "named", &settled);
+        append(&path, Utc::now(), &next).unwrap();
+        let (state, withdrew) = recover_withdrawing(&path, 10, Some(&unsent(&next))).unwrap();
+        assert!(withdrew, "the named last Prepared is taken back");
+        assert_eq!(len(&path), before, "only its own line is cut");
+        assert_eq!(state, recover(&path, 10).unwrap());
+        assert_eq!((state.next_serial(), state.unresolved()), (1, None));
+
+        let mut other_epoch = next.clone();
+        if let LedgerEntry::Prepared { epoch, .. } = &mut other_epoch {
+            *epoch += 1;
+        }
+        let excluded = Excluded {
+            unit_key: match &next {
+                LedgerEntry::Prepared { unit_key, .. } => unit_key.clone(),
+                _ => unreachable!(),
+            },
+            reason: "later".into(),
+        };
+        let (open, open_next) = (prepared(0, 10), prepared(1, 10));
+        let kept: [(&str, Vec<LedgerEntry>, &[u8], LedgerEntry); 6] = [
+            ("another epoch", vec![next.clone()], b"", other_epoch),
+            (
+                "a later line",
+                vec![next.clone(), excluded],
+                b"",
+                next.clone(),
+            ),
+            (
+                "an unfinished tail",
+                vec![next.clone()],
+                br#"{"at""#,
+                next.clone(),
+            ),
+            (
+                "another piece named",
+                vec![next.clone()],
+                b"",
+                prepared(9, 20),
+            ),
+            (
+                "a serial behind",
+                vec![prepared(0, 10)],
+                b"",
+                prepared(0, 10),
+            ),
+            (
+                "an open piece before",
+                vec![open_next.clone()],
+                b"",
+                open_next,
+            ),
+        ];
+        for (case, last, tail, evidence) in kept {
+            let base = match case {
+                "an open piece before" => vec![open.clone()],
+                _ => settled.to_vec(),
+            };
+            let (path, _) = written(dir.path(), case, &[base, last].concat());
+            super::super::durable::append_synced(&path, tail).unwrap();
+            let complete = len(&path) - tail.len() as u64;
+            let (state, withdrew) =
+                recover_withdrawing(&path, 10, Some(&unsent(&evidence))).unwrap();
+            assert!(!withdrew, "{case}: nothing is taken back");
+            assert_eq!(
+                len(&path),
+                complete,
+                "{case}: only an unfinished tail is cut"
+            );
+            assert_eq!(state, recover(&path, 10).unwrap(), "{case}");
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "ledger_lock_tests.rs"]
+mod lock_tests;

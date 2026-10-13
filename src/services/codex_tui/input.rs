@@ -103,10 +103,26 @@ use tokio::sync::Notify;
 // about a visible, still-stranded composer draft without ever double-submitting.
 const DEFAULT_LITERAL_CHUNK_CHARS: usize = 1800;
 
+mod composer_content;
 mod composer_lock;
+mod diagnostics;
+mod prompt_text;
+mod submission;
+use diagnostics::{log_prompt_ready_timeout, prompt_ready_debug_tail};
+use prompt_text::{split_literal_chunks, validate_prompt_not_empty, validate_prompt_text};
+use submission::{prompt_readiness_snapshot_with_pane, submission_snapshot_with_pane};
+pub(crate) use submission::{
+    prompt_submission_fits_pane, submission_busy_in_pane, submission_draft_in_pane,
+    submission_modal_in_pane, submission_readiness_from_ansi_pane,
+};
+mod composer_status;
+mod inline_banner;
+use composer_content::boxed_composer_body;
+pub(crate) use composer_content::{ComposerContent, active_composer_content_in_pane};
 #[allow(unused_imports)]
 pub(crate) use composer_lock::try_with_composer_mutation_lock;
 use composer_lock::with_composer_mutation_lock;
+use composer_status::{line_is_codex_fast_context_status, line_is_codex_model_first_status};
 
 const PROMPT_SUBMIT_INITIAL_SETTLE: Duration = Duration::from_millis(150);
 const PROMPT_SUBMIT_DRAFT_RECHECK_SETTLE: Duration = Duration::from_millis(250);
@@ -409,25 +425,10 @@ pub fn is_prompt_ready_cancelled_error(error: &str) -> bool {
 /// is visible. Returned regardless of timing so callers can log the
 /// state at decision points.
 pub fn prompt_readiness_snapshot(session_name: &str) -> PromptReadinessSnapshot {
-    // ANSI capture is the canonical snapshot. Its deterministic plain-text
-    // projection keeps marker and draft classification tied to the same pane
-    // revision, while retaining the dim-placeholder signal plain capture loses.
-    let (pane_with_escapes, tmux_pane_alive) =
-        host_input::observe_legacy(session_name, PROMPT_READY_CAPTURE_SCROLLBACK);
-    let (composer_marker_detected, prompt_draft_detected, pane_tail) = pane_with_escapes
-        .as_deref()
-        .map(prompt_readiness_from_ansi_pane)
-        .unwrap_or_else(|| (false, false, "<capture unavailable>".to_string()));
-    PromptReadinessSnapshot {
-        composer_marker_detected,
-        prompt_draft_detected,
-        tmux_pane_alive,
-        capture_available: pane_with_escapes.is_some(),
-        pane_tail,
-    }
+    prompt_readiness_snapshot_with_pane(session_name, false).0
 }
 
-fn prompt_readiness_from_ansi_pane(pane_with_escapes: &str) -> (bool, bool, String) {
+pub(crate) fn prompt_readiness_from_ansi_pane(pane_with_escapes: &str) -> (bool, bool, String) {
     let pane = strip_ansi_escape_sequences(pane_with_escapes);
     let composer_marker_detected = pane_looks_ready_for_codex_prompt_with_ansi(pane_with_escapes);
     let dim_placeholder_detected = pane_has_dim_legacy_codex_prompt_in_pane(pane_with_escapes);
@@ -921,7 +922,7 @@ fn active_composer_visible_prompt_draft(snapshot: &PromptReadinessSnapshot) -> O
     active_composer_visible_prompt_draft_in_pane(&snapshot.pane_tail)
 }
 
-fn active_composer_visible_prompt_draft_in_pane(pane: &str) -> Option<&str> {
+pub(crate) fn active_composer_visible_prompt_draft_in_pane(pane: &str) -> Option<&str> {
     let recent: Vec<&str> = pane
         .lines()
         .map(str::trim_end)
@@ -935,27 +936,7 @@ fn active_composer_visible_prompt_draft_in_pane(pane: &str) -> Option<&str> {
             .get(1)
             .and_then(|line| codex_visible_prompt_draft_text(line));
     }
-
-    let footer_idx = recent
-        .iter()
-        .take(FOOTER_HINT_BOTTOM_WINDOW)
-        .position(|line| line_is_codex_footer_hint(line))?;
-    let bottom_edge_idx = recent
-        .iter()
-        .take(COMPOSER_EDGE_BOTTOM_WINDOW)
-        .position(|line| line_is_codex_composer_edge(line))?;
-    if footer_idx > bottom_edge_idx
-        || bottom_edge_idx - footer_idx > COMPOSER_FOOTER_ADJACENCY_LINES
-    {
-        return None;
-    }
-    let body_start = bottom_edge_idx + 1;
-    let top_edge_offset = recent
-        .iter()
-        .skip(body_start)
-        .position(|line| line_is_codex_composer_edge(line))?;
-    let body_end = body_start + top_edge_offset;
-    recent[body_start..body_end]
+    boxed_composer_body(&recent)?
         .iter()
         .find_map(|line| codex_composer_body_draft_text(line))
 }
@@ -1012,28 +993,95 @@ fn classify_prompt_submit_confirmation(
     }
 }
 
-fn snapshot_allows_warm_followup_submit(snapshot: &PromptReadinessSnapshot) -> bool {
+// A submission snapshot already scoped modal and busy evidence to the current composer.
+fn snapshot_allows_guarded_submission(snapshot: &PromptReadinessSnapshot) -> bool {
     snapshot.tmux_pane_alive
         && snapshot.capture_available
         && snapshot.composer_marker_detected
         && !snapshot.prompt_draft_detected
 }
 
+#[cfg(test)]
+fn snapshot_allows_warm_followup_submit(snapshot: &PromptReadinessSnapshot) -> bool {
+    snapshot.tmux_pane_alive
+        && snapshot.capture_available
+        && snapshot.composer_marker_detected
+        && !snapshot.prompt_draft_detected
+        && !CODEX_STARTUP_UPDATE_MODAL_MARKERS
+            .iter()
+            .any(|marker| snapshot.pane_tail.to_ascii_lowercase().contains(marker))
+}
+
+const CODEX_STARTUP_UPDATE_MODAL_MARKERS: &[&str] = &[
+    "update available",
+    "update now (runs",
+    "skip until next version",
+];
+
+const CODEX_INTERACTIVE_MODAL_MARKERS: &[&str] = &[
+    "approval required",
+    "allow command",
+    "allow this action",
+    "confirm to continue",
+    "do you trust",
+    "trust this folder",
+    "sign in",
+    "log in",
+    "authentication required",
+    CODEX_STARTUP_UPDATE_MODAL_MARKERS[0],
+    CODEX_STARTUP_UPDATE_MODAL_MARKERS[1],
+    CODEX_STARTUP_UPDATE_MODAL_MARKERS[2],
+];
+
+fn pane_has_codex_interactive_modal_in_pane(pane: &str) -> bool {
+    // Only the header adjoining a current composer can veto it; answer prose is not a modal.
+    let recent: Vec<&str> = pane
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(6)
+        .collect();
+    if !recent
+        .iter()
+        .take(3)
+        .any(|line| line_is_codex_model_first_status(line))
+    {
+        return false;
+    }
+    let header = recent
+        .iter()
+        .position(|line| line.starts_with('›'))
+        .and_then(|prompt| recent.get(prompt + 1));
+    header.is_some_and(|line| {
+        let lower = line.to_ascii_lowercase();
+        CODEX_INTERACTIVE_MODAL_MARKERS
+            .iter()
+            .any(|marker| lower.starts_with(marker))
+    })
+}
+
+/// Whether the bottom of a pane names a Codex modal (sign-in, trust, approval, update): a screen
+/// that waits on a person rather than one that turns ready by itself.
+pub(crate) fn pane_shows_codex_interactive_modal(pane: &str) -> bool {
+    pane.lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(PROMPT_READY_SCAN_LINES)
+        .any(|line| {
+            let lower = line.to_ascii_lowercase();
+            CODEX_INTERACTIVE_MODAL_MARKERS
+                .iter()
+                .any(|marker| lower.contains(marker))
+        })
+}
+
 fn codex_snapshot_indicates_interactive_modal(snapshot: &PromptReadinessSnapshot) -> bool {
     let lower = snapshot.pane_tail.to_ascii_lowercase();
-    [
-        "approval required",
-        "allow command",
-        "allow this action",
-        "confirm to continue",
-        "do you trust",
-        "trust this folder",
-        "sign in",
-        "log in",
-        "authentication required",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    CODEX_INTERACTIVE_MODAL_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
 }
 
 pub(crate) fn steering_snapshot_decision(
@@ -1051,8 +1099,7 @@ pub(crate) fn steering_snapshot_decision(
     if snapshot.prompt_draft_detected {
         return Err("composer draft");
     }
-    // Codex has no shared modal detector yet. Keep this conservative blacklist
-    // behind the positive canonical composer marker, which is the primary gate.
+    // Steering also rejects modal wording anywhere in the captured tail.
     if codex_snapshot_indicates_interactive_modal(snapshot) {
         return Err("interactive modal");
     }
@@ -1146,14 +1193,50 @@ fn submit_codex_followup_prompt_under_lock(
     // Take one final canonical snapshot immediately before mutating the
     // composer so a just-arrived user draft or active turn is never appended
     // to or submitted as the Discord follow-up.
-    let final_snapshot = prompt_readiness_snapshot(session_name);
-    if !snapshot_allows_warm_followup_submit(&final_snapshot) {
+    let (mut final_snapshot, mut before) = submission_snapshot_with_pane(session_name);
+    if snapshot_allows_guarded_submission(&final_snapshot)
+        && inline_banner::pane_has_dismissible_action_banner(&final_snapshot.pane_tail)
+    {
+        let _ = inline_banner::dismiss_action_banner_once(session_name);
+        (final_snapshot, before) = submission_snapshot_with_pane(session_name);
+    }
+    if !snapshot_allows_guarded_submission(&final_snapshot)
+        || inline_banner::pane_has_dismissible_action_banner(&final_snapshot.pane_tail)
+    {
         return CodexFollowupPromptSubmitOutcome::NotSubmitted {
             error: "Codex TUI warm follow-up final pane snapshot rejected submit".to_string(),
         };
     }
-    let submit = host_input::run_legacy(session_name, &actions, cancel_token);
+    let submit = host_input::run_prompt_submission_legacy(
+        session_name,
+        &actions,
+        before.as_deref(),
+        cancel_token,
+    );
+    if !submit.composer_mutated
+        && !submit.enter_attempted
+        && matches!(
+            &submit.run,
+            crate::services::claude_tui::host_input::InputRun::Refused(
+                crate::services::claude_tui::host_input::InputRefusal::Composer(
+                    crate::services::tui_input::submission::Refusal::UnpredictableRender
+                )
+            )
+        )
+    {
+        return CodexFollowupPromptSubmitOutcome::NotSubmitted {
+            error: "Codex TUI prompt cannot be rendered predictably before submission".to_string(),
+        };
+    }
     if host_input::refused_by_gate(&submit.run) {
+        return CodexFollowupPromptSubmitOutcome::Refused { run: submit.run };
+    }
+    if matches!(
+        submit.run,
+        crate::services::claude_tui::host_input::InputRun::Indeterminate { .. }
+    ) && submit.composer_mutated
+        && !submit.enter_attempted
+    {
         return CodexFollowupPromptSubmitOutcome::Refused { run: submit.run };
     }
     let action_result = host_input::legacy_result(submit.run.clone());
@@ -1177,7 +1260,7 @@ fn submit_codex_followup_prompt_under_lock(
     if cancel_requested(cancel_token) {
         return CodexFollowupPromptSubmitOutcome::Cancelled;
     }
-    let first = prompt_readiness_snapshot(session_name);
+    let first = prompt_readiness_snapshot_with_pane(session_name, true).0;
     let needs_recheck = snapshot_has_retry_safe_prompt_draft(&first)
         || !first.tmux_pane_alive
         || !first.capture_available;
@@ -1186,7 +1269,7 @@ fn submit_codex_followup_prompt_under_lock(
         if cancel_requested(cancel_token) {
             return CodexFollowupPromptSubmitOutcome::Cancelled;
         }
-        prompt_readiness_snapshot(session_name)
+        prompt_readiness_snapshot_with_pane(session_name, true).0
     } else {
         first.clone()
     };
@@ -1245,7 +1328,10 @@ pub(crate) fn pane_looks_ready_for_codex_prompt(pane: &str) -> bool {
         .rev()
         .take(PROMPT_READY_SCAN_LINES)
         .collect();
-    if recent.is_empty() || recent_has_codex_active_turn(&recent) {
+    if recent.is_empty()
+        || recent_has_codex_active_turn(&recent)
+        || pane_has_codex_interactive_modal_in_pane(pane)
+    {
         return false;
     }
     if recent_has_codex_compact_prompt(&recent) {
@@ -1280,7 +1366,9 @@ fn pane_looks_ready_for_codex_prompt_with_ansi(pane: &str) -> bool {
     // ANSI-preserving tmux capture lets us distinguish Codex's dim placeholder
     // suggestions from real user drafts in the compact prompt.
     let plain = strip_ansi_escape_sequences(pane);
-    if pane_has_codex_active_turn_in_pane(&plain) {
+    if pane_has_codex_active_turn_in_pane(&plain)
+        || pane_has_codex_interactive_modal_in_pane(&plain)
+    {
         return false;
     }
     if pane_has_dim_legacy_codex_prompt_in_pane(pane) {
@@ -1289,7 +1377,14 @@ fn pane_looks_ready_for_codex_prompt_with_ansi(pane: &str) -> bool {
     pane_looks_ready_for_codex_prompt(&plain)
 }
 
-fn pane_has_codex_active_turn_in_pane(pane: &str) -> bool {
+/// Running text alone is insufficient when a modal or prompt draft owns the composer.
+pub(crate) fn herdr_turn_in_progress(pane: &str) -> bool {
+    recent_codex_active_turn_marker(pane).is_some()
+        && !pane_has_codex_interactive_modal_in_pane(pane)
+        && active_composer_visible_prompt_draft_in_pane(pane).is_none()
+}
+
+pub(crate) fn pane_has_codex_active_turn_in_pane(pane: &str) -> bool {
     recent_codex_active_turn_marker(pane).is_some()
 }
 
@@ -1482,19 +1577,6 @@ fn line_is_dim_legacy_codex_prompt(line: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn line_is_codex_fast_context_status(line: &str) -> bool {
-    let parts: Vec<&str> = line.split('·').map(str::trim).collect();
-    parts.len() == 3
-        && matches!(parts[0], "Fast on" | "Fast off")
-        && !parts[1].is_empty()
-        && parts[2]
-            .strip_prefix("Context ")
-            .and_then(|value| value.strip_suffix("% left"))
-            .is_some_and(|percent| {
-                !percent.is_empty() && percent.chars().all(|ch| ch.is_ascii_digit())
-            })
-}
-
 fn recent_has_codex_active_turn(recent_bottom_up: &[&str]) -> bool {
     const ACTIVE_TURN_BOTTOM_WINDOW: usize = 6;
 
@@ -1542,7 +1624,7 @@ fn contains_dim_sgr(input: &str) -> bool {
     false
 }
 
-fn strip_ansi_escape_sequences(input: &str) -> String {
+pub(crate) fn strip_ansi_escape_sequences(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -1709,82 +1791,6 @@ fn line_is_codex_composer_edge(line: &str) -> bool {
 fn is_box_drawing_char(ch: char) -> bool {
     // U+2500..U+257F Box Drawing block (covers ─ │ ╭ ╮ ╰ ╯ ┌ ┐ ┘ └ etc.)
     matches!(ch as u32, 0x2500..=0x257F)
-}
-
-fn log_prompt_ready_timeout(
-    session_name: &str,
-    readiness: PromptReadinessKind,
-    timeout: Duration,
-    snapshot: &PromptReadinessSnapshot,
-) {
-    tracing::debug!(
-        tmux_session_name = session_name,
-        readiness = readiness.label(),
-        timeout_secs = timeout.as_secs(),
-        composer_marker_detected = snapshot.composer_marker_detected,
-        prompt_draft_detected = snapshot.prompt_draft_detected,
-        previous_tui_turn_still_running =
-            snapshot.tmux_pane_alive && !snapshot.composer_marker_detected,
-        tmux_pane_alive = snapshot.tmux_pane_alive,
-        capture_available = snapshot.capture_available,
-        pane_tail = %snapshot.pane_tail,
-        "codex_tui prompt readiness timed out"
-    );
-}
-
-fn prompt_ready_debug_tail(pane: &str) -> String {
-    let mut lines = pane
-        .lines()
-        .rev()
-        .take(PROMPT_READY_DEBUG_TAIL_LINES)
-        .map(|line| line.trim_end_matches('\r'))
-        .collect::<Vec<_>>();
-    lines.reverse();
-    let tail = lines.join("\n");
-    crate::utils::format::safe_suffix(tail.trim(), PROMPT_READY_DEBUG_TAIL_BYTES).to_string()
-}
-
-fn validate_prompt_text(input: &str) -> Result<(), String> {
-    // Block terminal control channels such as ESC bracketed-paste markers,
-    // DEL, and C1 controls before either literal send or tmux paste-buffer
-    // delivery can relay them into the hosted Codex TUI. Mirrors
-    // claude_tui::input::validate_prompt_text.
-    if input
-        .chars()
-        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
-    {
-        return Err("prompt contains unsupported terminal control characters".to_string());
-    }
-    Ok(())
-}
-
-fn validate_prompt_not_empty(input: &str) -> Result<(), String> {
-    if input.trim().is_empty() {
-        return Err("prompt must contain non-whitespace text".to_string());
-    }
-    Ok(())
-}
-
-fn split_literal_chunks(input: &str, max_chars: usize) -> Vec<String> {
-    if input.is_empty() {
-        return Vec::new();
-    }
-    let max_chars = max_chars.max(1);
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut current_chars = 0usize;
-    for ch in input.chars() {
-        if current_chars >= max_chars {
-            chunks.push(std::mem::take(&mut current));
-            current_chars = 0;
-        }
-        current.push(ch);
-        current_chars += 1;
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }
 
 #[cfg(test)]
@@ -2197,6 +2203,96 @@ mod tests {
         assert_eq!(executor.calls, vec!["load-buffer:multi\nline"]);
     }
 
+    #[test]
+    fn idle_submission_checks_current_owned_draft_before_enter() {
+        use super::host_input::spy::{SpyGuard, SpyState};
+        use crate::services::claude_tui::host_input::{InputRun, StopCause};
+        let ready = "╭────────────────────╮\n│ ▌                  │\n╰────────────────────╯\n  Esc to interrupt   Ctrl+J newline   ⏎ send";
+        let own = "╭────────────────────╮\n│ hello ▌            │\n╰────────────────────╯\n  Esc to interrupt   Ctrl+J newline   ⏎ send";
+        for after in [
+            Some(format!("Sign in\n{own}")),
+            Some(format!("Approval required: Allow command `foo`\n{own}")),
+            Some(format!("Do you trust this folder?\n{own}")),
+            Some(format!("• Working (1s • esc to interrupt)\n{own}")),
+            Some(own.replace("hello", "foreign")),
+            Some(own.replace("hello", "[Pasted Content 5 chars]")),
+            Some(format!("{own}\nforeign draft")),
+            None,
+        ] {
+            let spy = SpyGuard::install(SpyState {
+                captures: [Some(ready.to_string()), after, Some(ready.to_string())].into(),
+                ..SpyState::default()
+            });
+            let outcome = submit_codex_followup_prompt("idle-submit-veto", "hello", None);
+            assert!(
+                matches!(
+                    outcome,
+                    CodexFollowupPromptSubmitOutcome::Refused {
+                        run: InputRun::Indeterminate {
+                            cause: StopCause::Refused(_),
+                            ..
+                        }
+                    }
+                ),
+                "{outcome:?}"
+            );
+            assert!(
+                !spy.calls()
+                    .iter()
+                    .any(|c| c.starts_with("keys:") || c.starts_with("kill"))
+            );
+            let error = match outcome {
+                CodexFollowupPromptSubmitOutcome::Refused { run } => {
+                    host_input::refusal_error(&run)
+                }
+                _ => unreachable!(),
+            };
+            assert!(!is_prompt_ready_timeout_error(&error));
+            assert!(!crate::services::claude_tui::input::is_prompt_ready_timeout_error(&error));
+        }
+        let spy = SpyGuard::install(SpyState {
+            captures: [ready, own, ready].map(|s| Some(s.to_string())).into(),
+            assert_composer_lock: Some("idle-submit-own".into()),
+            ..SpyState::default()
+        });
+        assert!(matches!(
+            submit_codex_followup_prompt("idle-submit-own", "hello", None),
+            CodexFollowupPromptSubmitOutcome::Submitted
+        ));
+        assert_eq!(spy.calls().iter().filter(|c| *c == "keys:Enter").count(), 1);
+    }
+
+    #[test]
+    fn idle_submission_requires_the_whole_visible_codex_draft() {
+        use super::host_input::spy::{SpyGuard, SpyState};
+        let ready = "› \n\n  gpt-5.4 · Fast off · Context 100% left";
+        let own = "› 첫 줄\n  둘째 줄\n\n  gpt-5.4 · Fast off · Context 100% left";
+        for (after, allowed) in [
+            (own.to_string(), true),
+            (own.replace("둘째 줄", "남의 둘째 줄"), false),
+            (own.replace("  둘째 줄", "둘째 줄"), false),
+            (own.replace("첫 줄", "[Pasted Content 12 chars]"), false),
+            (format!("{own}\nforeign draft"), false),
+        ] {
+            let spy = SpyGuard::install(SpyState {
+                captures: [Some(ready.into()), Some(after), Some(ready.into())].into(),
+                assert_composer_lock: Some("idle-submit-multiline".into()),
+                ..SpyState::default()
+            });
+            let outcome =
+                submit_codex_followup_prompt("idle-submit-multiline", "첫 줄\n둘째 줄", None);
+            assert_eq!(
+                matches!(outcome, CodexFollowupPromptSubmitOutcome::Submitted),
+                allowed,
+                "{outcome:?}"
+            );
+            assert_eq!(
+                spy.calls().iter().filter(|c| *c == "keys:Enter").count(),
+                usize::from(allowed)
+            );
+        }
+    }
+
     fn submit_snapshot(
         pane_alive: bool,
         capture_available: bool,
@@ -2224,18 +2320,7 @@ mod tests {
         snapshot
     }
 
-    #[test]
-    fn steering_snapshot_requires_composer_and_rejects_modal() {
-        let missing_composer = submit_snapshot(true, true, false, false);
-        assert_eq!(
-            steering_snapshot_decision(&missing_composer),
-            Err("composer not present")
-        );
-
-        let mut modal = submit_snapshot(true, true, true, false);
-        modal.pane_tail = "Approval required: allow command?".to_string();
-        assert_eq!(steering_snapshot_decision(&modal), Err("interactive modal"));
-    }
+    mod startup_update_tests;
 
     #[test]
     fn codex_injection_records_before_confirmed_submit() {
@@ -2766,26 +2851,6 @@ then continued with a response.";
     }
 
     #[test]
-    fn final_submit_gate_requires_a_live_empty_canonical_snapshot() {
-        let ready = submit_snapshot(true, true, true, false);
-        assert!(snapshot_allows_warm_followup_submit(&ready));
-
-        for mutate in [
-            |snapshot: &mut PromptReadinessSnapshot| snapshot.tmux_pane_alive = false,
-            |snapshot: &mut PromptReadinessSnapshot| snapshot.capture_available = false,
-            |snapshot: &mut PromptReadinessSnapshot| snapshot.composer_marker_detected = false,
-            |snapshot: &mut PromptReadinessSnapshot| snapshot.prompt_draft_detected = true,
-        ] {
-            let mut rejected = ready.clone();
-            mutate(&mut rejected);
-            assert!(
-                !snapshot_allows_warm_followup_submit(&rejected),
-                "final submit must reject every mutated readiness guard"
-            );
-        }
-    }
-
-    #[test]
     fn compact_codex_non_dim_unlisted_draft_is_not_ready_with_ansi() {
         let pane = "\
 ─ Worked for 3m 08s ────────────────────────────────────────────\n\
@@ -2975,6 +3040,14 @@ The diagram shows ╭ here.\n\
             uuid::Uuid::new_v4().simple()
         );
         record_rollout_composer_ready(&session);
+        // The pane reads as gone here, not through tmux: a fake tmux another test puts on the
+        // process PATH answers every capture.
+        let _dead = super::super::host_input::spy::SpyGuard::install(
+            super::super::host_input::spy::SpyState {
+                dead: true,
+                ..Default::default()
+            },
+        );
 
         let result =
             wait_until_codex_tui_input_ready(&session, PromptReadinessKind::PostTurnHandoff, None);

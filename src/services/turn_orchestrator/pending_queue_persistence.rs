@@ -5,11 +5,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 use poise::serenity_prelude::{ChannelId, MessageId, UserId};
 
+use super::queued_head::{SnapshotMeta, parse_snapshot};
 use super::{
-    Intervention, InterventionMode, QueuePersistenceContext, SourceMessageQueuedGeneration,
-    SourceMessageTextSegment,
+    ChannelMailboxState, Intervention, InterventionMode, QueuePersistenceContext,
+    SourceMessageQueuedGeneration, SourceMessageTextSegment,
 };
 use crate::services::provider::ProviderKind;
+
+mod queued_recovery;
+pub(crate) use queued_recovery::load_pending_queues_checked;
 
 const STALE_PENDING_QUEUE_TMP_AGE: Duration = Duration::from_secs(60);
 
@@ -18,7 +22,7 @@ fn is_false(value: &bool) -> bool {
 }
 
 /// Serializable form of a queued intervention for disk persistence.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingQueueItem {
     pub(crate) author_id: u64,
     #[serde(default)]
@@ -98,7 +102,7 @@ fn pending_queue_root() -> Option<PathBuf> {
     crate::services::discord::runtime_store::discord_pending_queue_root()
 }
 
-fn pending_queue_file_path(
+pub(super) fn pending_queue_file_path(
     provider: &ProviderKind,
     token_hash: &str,
     channel_id: ChannelId,
@@ -359,7 +363,7 @@ fn created_at_instant_from_wall_time_ms(
     }
 }
 
-fn pending_queue_item_from_intervention(
+pub(super) fn pending_queue_item_from_intervention(
     intervention: &Intervention,
     channel_id: ChannelId,
     dispatch_role_override: Option<u64>,
@@ -424,11 +428,33 @@ fn pending_queue_item_from_intervention(
 
 /// Write-through: save a single channel's queue to disk.
 /// If the queue is empty the file is removed.
+#[cfg(test)]
 pub(crate) fn save_channel_queue(
     provider: &ProviderKind,
     token_hash: &str,
     channel_id: ChannelId,
     queue: &[Intervention],
+    dispatch_role_override: Option<u64>,
+) -> Result<(), String> {
+    crate::services::discord::input_runtime::fence::write(provider, channel_id.get(), || {
+        save_channel_queue_locked(
+            provider,
+            token_hash,
+            channel_id,
+            queue,
+            None,
+            dispatch_role_override,
+        )
+    })
+}
+
+/// A set `meta` writes the V1 object, which an empty queue does not remove.
+fn save_channel_queue_locked(
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel_id: ChannelId,
+    queue: &[Intervention],
+    meta: Option<&SnapshotMeta>,
     dispatch_role_override: Option<u64>,
 ) -> Result<(), String> {
     let Some(path) = pending_queue_file_path(provider, token_hash, channel_id) else {
@@ -446,8 +472,22 @@ pub(crate) fn save_channel_queue(
             path.display()
         ));
     }
-    if queue.is_empty() {
+    if queue.is_empty() && meta.is_none() {
         return match fs::remove_file(&path) {
+            Ok(())
+                if crate::services::discord::input_runtime::fence::lookup(
+                    provider,
+                    channel_id.get(),
+                )
+                .is_some() =>
+            {
+                #[cfg(test)]
+                if fsync_fault::take(channel_id) {
+                    return Err(format!("injected parent fsync failure {}", path.display()));
+                }
+                crate::services::discord::runtime_store::fsync_parent_dir(&path)
+                    .map_err(|e| e.to_string())
+            }
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => {
@@ -478,28 +518,62 @@ pub(crate) fn save_channel_queue(
             )
         })
         .collect();
-    let json = serde_json::to_string_pretty(&items)
+    let json = super::queued_head::snapshot_json(items, meta)
         .map_err(|error| format!("serialize pending queue {}: {error}", path.display()))?;
     let context =
         crate::services::discord::runtime_store::AtomicWriteContext::new("discord_pending_queue")
             .provider(provider.as_str())
             .token_hash(token_hash)
             .channel_id(channel_id.get());
-    crate::services::discord::runtime_store::critical_atomic_write(&path, &json, context)
+    crate::services::discord::runtime_store::critical_atomic_write(&path, &json, context)?;
+    #[cfg(test)]
+    if post_save_fault::take(channel_id) {
+        return Err(format!(
+            "injected error after queue publication {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
+#[cfg(test)]
+pub(super) mod post_save_fault {
+    use super::ChannelId;
+    static ARMED: std::sync::Mutex<Vec<ChannelId>> = std::sync::Mutex::new(Vec::new());
+
+    pub(crate) fn fail_next(channel: ChannelId) {
+        ARMED.lock().unwrap().push(channel);
+    }
+
+    pub(super) fn take(channel: ChannelId) -> bool {
+        let mut armed = ARMED.lock().unwrap();
+        if let Some(index) = armed.iter().position(|value| *value == channel) {
+            armed.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// The actor's only queue write: its snapshot, once `prepare_write` accepts it.
 pub(super) fn persist_queue(
+    state: &mut ChannelMailboxState,
     channel_id: ChannelId,
-    queue: &[Intervention],
     persistence: &QueuePersistenceContext,
 ) -> Result<(), String> {
-    save_channel_queue(
-        &persistence.provider,
-        &persistence.token_hash,
-        channel_id,
-        queue,
+    super::queued_head::prepare_write(state, channel_id, persistence)?;
+    let (provider, token_hash) = (&persistence.provider, &persistence.token_hash);
+    let meta = Some(&state.queued_head.meta).filter(|meta| meta.is_set());
+    let (queue, role) = (
+        &state.intervention_queue,
         persistence.dispatch_role_override,
-    )
+    );
+    crate::services::discord::input_runtime::fence::write(provider, channel_id.get(), || {
+        save_channel_queue_locked(provider, token_hash, channel_id, queue, meta, role)
+    })?;
+    super::queued_head::record_write(state);
+    Ok(())
 }
 
 pub(super) fn log_queue_persistence_rollback(
@@ -519,6 +593,24 @@ pub(super) fn log_queue_persistence_rollback(
 }
 
 pub(crate) fn save_channel_pending_dispatch_marker(
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel_id: ChannelId,
+    intervention: &Intervention,
+    dispatch_role_override: Option<u64>,
+) -> Result<(), String> {
+    crate::services::discord::input_runtime::fence::write(provider, channel_id.get(), || {
+        save_channel_pending_dispatch_marker_locked(
+            provider,
+            token_hash,
+            channel_id,
+            intervention,
+            dispatch_role_override,
+        )
+    })
+}
+
+fn save_channel_pending_dispatch_marker_locked(
     provider: &ProviderKind,
     token_hash: &str,
     channel_id: ChannelId,
@@ -558,10 +650,30 @@ pub(super) fn remove_channel_pending_dispatch_marker(
     token_hash: &str,
     channel_id: ChannelId,
 ) -> Result<(), String> {
+    crate::services::discord::input_runtime::fence::write(provider, channel_id.get(), || {
+        remove_channel_pending_dispatch_marker_locked(provider, token_hash, channel_id)
+    })
+}
+
+fn remove_channel_pending_dispatch_marker_locked(
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel_id: ChannelId,
+) -> Result<(), String> {
     let Some(path) = pending_dispatch_marker_file_path(provider, token_hash, channel_id) else {
         return Ok(());
     };
     match fs::remove_file(&path) {
+        Ok(())
+            if crate::services::discord::input_runtime::fence::lookup(
+                provider,
+                channel_id.get(),
+            )
+            .is_some() =>
+        {
+            crate::services::discord::runtime_store::fsync_parent_dir(&path)
+                .map_err(|e| e.to_string())
+        }
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!(
@@ -578,6 +690,10 @@ pub(crate) fn remove_channel_pending_queue_files_all_tokens(
     provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> usize {
+    if crate::services::discord::input_runtime::fence::lookup(provider, channel_id.get()).is_some()
+    {
+        return 0;
+    }
     let Some(root) = pending_queue_root() else {
         return 0;
     };
@@ -592,7 +708,7 @@ pub(crate) fn remove_channel_pending_queue_files_all_tokens(
     let mut removed = 0;
     for entry in entries.flatten() {
         let token_dir = entry.path();
-        if !token_dir.is_dir() {
+        if !token_dir.is_dir() || super::queued_head::purge_keeps(&token_dir.join(&filenames[0])) {
             continue;
         }
         for filename in &filenames {
@@ -614,7 +730,7 @@ pub(crate) fn remove_channel_pending_queue_files_all_tokens(
     removed
 }
 
-fn pending_queue_item_to_intervention(
+pub(super) fn pending_queue_item_to_intervention(
     item: PendingQueueItem,
     reference_wall_time: SystemTime,
     reference_instant: Instant,
@@ -707,20 +823,34 @@ pub(crate) fn load_channel_pending_dispatch_marker(
     token_hash: &str,
     channel_id: ChannelId,
 ) -> Option<(Intervention, Option<ChannelId>)> {
-    let path = pending_dispatch_marker_file_path(provider, token_hash, channel_id)?;
-    let Ok(content) = fs::read_to_string(&path) else {
-        return None;
+    load_channel_pending_dispatch_marker_checked(provider, token_hash, channel_id)
+        .ok()
+        .flatten()
+}
+
+/// Like `load_channel_pending_dispatch_marker`, but only a missing marker reads as none; a root,
+/// read or parse failure is an error.
+pub(crate) fn load_channel_pending_dispatch_marker_checked(
+    provider: &ProviderKind,
+    token_hash: &str,
+    channel_id: ChannelId,
+) -> Result<Option<(Intervention, Option<ChannelId>)>, String> {
+    let path = pending_dispatch_marker_file_path(provider, token_hash, channel_id)
+        .ok_or_else(|| format!("pending queue root unavailable for channel_id={channel_id}"))?;
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("read dispatch marker {}: {error}", path.display())),
     };
-    let Ok(item) = serde_json::from_str::<PendingQueueItem>(&content) else {
-        return None;
-    };
+    let item = serde_json::from_str::<PendingQueueItem>(&content)
+        .map_err(|error| format!("parse dispatch marker {}: {error}", path.display()))?;
     let restored_override = item.override_channel_id.map(ChannelId::new);
     let reference_instant = Instant::now();
     let reference_wall_time = SystemTime::now();
-    Some((
+    Ok(Some((
         pending_queue_item_to_intervention(item, reference_wall_time, reference_instant),
         restored_override,
-    ))
+    )))
 }
 
 fn pending_queue_items_to_interventions(
@@ -745,56 +875,25 @@ pub(crate) fn load_pending_queues(
     HashMap<ChannelId, Vec<Intervention>>,
     HashMap<ChannelId, ChannelId>,
 ) {
-    let Some(root) = pending_queue_root() else {
-        return (HashMap::new(), HashMap::new());
-    };
-    let dir = root.join(provider.as_str()).join(token_hash);
-    let _ = cleanup_stale_pending_queue_tmp_files_in_dir(
-        provider,
-        token_hash,
-        &dir,
-        SystemTime::now(),
-        STALE_PENDING_QUEUE_TMP_AGE,
-    );
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return (HashMap::new(), HashMap::new());
-    };
-    let reference_instant = Instant::now();
-    let reference_wall_time = SystemTime::now();
-    let mut result: HashMap<ChannelId, Vec<Intervention>> = HashMap::new();
-    let mut restored_overrides: HashMap<ChannelId, ChannelId> = HashMap::new();
-    for entry in entries.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if pending_dispatch_marker_channel_id(&path).is_some() {
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let channel_id: u64 = match path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.parse().ok())
-        {
-            Some(id) => id,
-            None => continue,
-        };
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(items) = serde_json::from_str::<Vec<PendingQueueItem>>(&content) else {
-            continue;
-        };
-        if let Some(override_id) = items.iter().find_map(|item| item.override_channel_id) {
-            restored_overrides.insert(ChannelId::new(channel_id), ChannelId::new(override_id));
-        }
-        let interventions =
-            pending_queue_items_to_interventions(items, reference_wall_time, reference_instant);
-        if !interventions.is_empty() {
-            result.insert(ChannelId::new(channel_id), interventions);
+    let loaded = load_pending_queues_checked(provider, token_hash);
+    if !loaded.quarantined.is_empty() {
+        tracing::warn!(
+            provider = provider.as_str(),
+            quarantined_channels = loaded.quarantined.len(),
+            "pending queue recovery kept quarantined channels"
+        );
+        for (channel, error) in &loaded.quarantined {
+            tracing::warn!(channel_id = channel.get(), %error, "pending queue recovery quarantined channel");
         }
     }
-    (result, restored_overrides)
+    (loaded.queues, loaded.overrides)
+}
+
+#[derive(Default)]
+pub(crate) struct PendingQueueRecovery {
+    pub(crate) queues: HashMap<ChannelId, Vec<Intervention>>,
+    pub(crate) overrides: HashMap<ChannelId, ChannelId>,
+    pub(crate) quarantined: Vec<(ChannelId, String)>,
 }
 
 pub(crate) fn load_pending_dispatch_markers(
@@ -833,7 +932,7 @@ pub(super) fn load_channel_pending_queue(
 
 /// Like `load_channel_pending_queue`, but only a missing file reads as empty; a root, read or
 /// parse failure is an error, so a caller never rewrites a queue it could not read.
-pub(super) fn load_channel_pending_queue_checked(
+pub(crate) fn load_channel_pending_queue_checked(
     provider: &ProviderKind,
     token_hash: &str,
     channel_id: ChannelId,
@@ -857,7 +956,7 @@ pub(super) fn load_channel_pending_queue_checked(
             ));
         }
     };
-    let items = serde_json::from_str::<Vec<PendingQueueItem>>(&content)
+    let (items, _) = parse_snapshot(&content)
         .map_err(|error| format!("parse pending queue file {}: {error}", path.display()))?;
     let restored_override = items
         .iter()
@@ -893,6 +992,28 @@ pub(crate) fn warn_legacy_pending_queue_files(provider: &ProviderKind) {
     }
 }
 
+/// Test-only: fail a channel's next parent fsync after its empty queue file was removed, once.
+#[cfg(test)]
+pub(super) mod fsync_fault {
+    use poise::serenity_prelude::ChannelId;
+    use std::sync::Mutex;
+
+    static ARMED: Mutex<Vec<ChannelId>> = Mutex::new(Vec::new());
+
+    pub(in crate::services::turn_orchestrator) fn fail_next(channel_id: ChannelId) {
+        ARMED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(channel_id);
+    }
+
+    pub(super) fn take(channel_id: ChannelId) -> bool {
+        let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
+        let index = armed.iter().position(|armed| *armed == channel_id);
+        index.map(|index| armed.swap_remove(index)).is_some()
+    }
+}
+
 /// Test-only: fail a channel's next queue save before the file is touched, once.
 #[cfg(test)]
 pub(super) mod save_fault {
@@ -912,6 +1033,19 @@ pub(super) mod save_fault {
         let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
         let index = armed.iter().position(|armed| *armed == channel_id);
         index.map(|index| armed.swap_remove(index)).is_some()
+    }
+
+    /// Faults still armed for the channel; disarms them when `clear`.
+    pub(in crate::services::turn_orchestrator) fn armed(
+        channel_id: ChannelId,
+        clear: bool,
+    ) -> usize {
+        let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
+        let count = armed.iter().filter(|armed| **armed == channel_id).count();
+        if clear {
+            armed.retain(|armed| *armed != channel_id);
+        }
+        count
     }
 }
 

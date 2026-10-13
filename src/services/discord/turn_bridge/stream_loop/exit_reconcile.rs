@@ -9,6 +9,57 @@ pub(in crate::services::discord::turn_bridge) enum StreamLoopOutcome {
     AuthorityLost,
 }
 
+/// The managed attempt's fence refused before any payload, so the request stays in its Waiting
+/// row; a user stop still ends the turn as before.
+pub(in crate::services::discord::turn_bridge) fn held_before_submit(
+    creator_state: &crate::services::discord::inflight::InflightTurnState,
+    cancelled: bool,
+) -> bool {
+    !cancelled
+        && creator_state
+            .managed_submission_capability()
+            .is_some_and(|submission| submission.refusal().is_some())
+}
+
+/// A Herdr turn whose input may have been submitted, or that took a user stop, ends only on its
+/// provider's admitted terminal; EOF, a dead pane or a disconnect leave the turn, row and slot held.
+/// The one exception is a sealed before-start proof, which the bridge settles as a policy close.
+pub(in crate::services::discord::turn_bridge) fn herdr_exit_decision(
+    token: &crate::services::provider::CancelToken,
+    cancelled: bool,
+    terminal_admitted: bool,
+) -> crate::services::provider::herdr_before_start::ExitDecision {
+    use crate::services::provider::herdr_before_start::{ExitDecision, seal_exit};
+    let decision = seal_exit(token, cancelled, terminal_admitted);
+    if decision != ExitDecision::Normal
+        && let Some(state) = token.herdr_interrupt_state()
+    {
+        let policy_close = matches!(decision, ExitDecision::PolicyClose(_));
+        tracing::info!(
+            event = "herdr_turn_held",
+            provider = state.owner.provider,
+            channel_id = state.owner.channel_id,
+            logical = state.owner.logical_key,
+            turn_nonce = token.turn_nonce(),
+            runtime_generation = token.claude_interrupt_generation(),
+            hold_kind = "provider_terminal",
+            hold_reason = if policy_close {
+                "before_start_policy_close"
+            } else {
+                "provider_terminal_unconfirmed"
+            },
+            settlement = if policy_close {
+                "policy_close"
+            } else {
+                "host_owned"
+            },
+            terminal_confirmed = false,
+            "Herdr turn remains held"
+        );
+    }
+    decision
+}
+
 pub(super) fn stream_loop_should_continue(
     done: bool,
     terminal_control_drain_until: Option<std::time::Instant>,

@@ -225,7 +225,7 @@ if run_check guards "Writer namespace Windows exact-target runner fixtures (#567
 fi
 
 if run_check guards "Postgres migration checksum guard"; then
-"$PYTHON" scripts/check_postgres_migration_checksums.py
+"$PYTHON" scripts/check_postgres_migration_checksums.py --require-base
 "$PYTHON" -m unittest tests.test_postgres_migration_checksum_guard
 fi
 
@@ -241,6 +241,11 @@ fi
 
 if run_check guards "TUI output shadow write-zero census"; then
 "$PYTHON" scripts/check_o_shadow_write_zero.py
+fi
+
+if run_check guards "N1 observation effect boundary"; then
+"$PYTHON" scripts/check_n1_observation_boundary.py
+"$PYTHON" -m unittest tests.test_n1_observation_boundary
 fi
 
 if run_check guards "Alert dedupe/authority/routing wiring contract (#4448/#4449)"; then
@@ -290,22 +295,8 @@ if run_check guards "Reachability row-independence + change-surface gate (#5071 
 "$PYTHON" -m unittest tests.test_reachability_row_independence
 fi
 
-if run_check guards "Reachability canonical Rust<->Python equivalence gate (#5071 T4-B2a)"; then
-# 4987 blocker B1': the obligation rule has two implementations, and two
-# definitions of "assistant text block" are two oracles of which one is always
-# wrong. Both are compared byte for byte against the golden corpus in
-# tests/fixtures/relay_obligation/ -- this half checks Python, and the Rust half
-# is the obligation lane's corpus test in `just test-non-pg`. The corpus being a
-# THIRD PARTY to both is what stops "we drifted together" from passing.
-#
-# The invocation below also runs the PYTHON half of the mutation runner in
-# process (each declared mutation edits one implementation and must turn its
-# side red) and lints the T4-B2a inactivity invariant: no consumer outside the
-# tree beyond its module declaration, no warn/fail bound inside it. The RUST
-# half of the mutation runner needs a compiler and runs under `--with-rust`
-# (see `just reachability-mutation-runner`); what CI holds instead is the lane,
-# plus the unittest below, which fails if a declared Rust mutation stops
-# anchoring on real source and would therefore be silently skipped.
+if run_check guards "Reachability judgment-authority source lint"; then
+# Keep consumer and threshold ownership independent of the retired Python input.
 "$PYTHON" scripts/check_reachability_canonical_equivalence.py
 "$PYTHON" -m unittest tests.test_reachability_canonical_equivalence
 fi
@@ -348,11 +339,20 @@ if run_check guards "Durable frontier writer per-file call-site allowlist (#5071
 "$PYTHON" -m unittest tests.test_durable_frontier_writer_call_sites
 fi
 
+if run_check guards "Input thread mapping census"; then
+"$PYTHON" scripts/test_input_mapping_census.py
+fi
+
 if run_check guards "TUI O writer census: Legacy send sites and cutover gates"; then
 # Pins every Discord send site's census row and every O cutover gate by exact
 # per-file count; the script docstring declares its lexical limits.
 "$PYTHON" scripts/check_tui_o_writer_census.py
 "$PYTHON" -m unittest tests.test_check_tui_o_writer_census
+fi
+
+if run_check guards "Dormant boot retirement census"; then
+"$PYTHON" scripts/check_legacy_supervision_census.py
+"$PYTHON" -m unittest tests.test_check_legacy_supervision_census
 fi
 
 if run_check guards "Intake-outbox done writer per-file call-site allowlist (#5071 T2)"; then
@@ -376,7 +376,13 @@ if run_check guards "Hotfile LOC ratchet guard (#3565)"; then
 "$PYTHON" scripts/check_hotfile_ratchet.py
 "$PYTHON" -m unittest scripts.test_ratchet_admission
 "$PYTHON" -m unittest scripts.test_pr_cap_check
+"$PYTHON" -m unittest tests.test_pr_cap_ci_wiring tests.test_clippy_warning_count tests.test_rust_quality_gates
 "$PYTHON" -m unittest scripts.test_intervention_log
+fi
+
+if run_check guards "Dead-code suppression ratchet"; then
+"$PYTHON" scripts/check_dead_code_allow_ratchet.py
+"$PYTHON" -m unittest tests.test_dead_code_allow_ratchet
 fi
 
 if run_check guards "Discord log field-key drift guard (#4218)"; then
@@ -414,6 +420,10 @@ bash scripts/main-ci-triage.sh --self-test
 # End nightly notification contract.
 fi
 
+if run_check guards "Lib test build and clippy swap + memory probe contract"; then
+"$PYTHON" -m unittest tests.test_ensure_swap_ci_wiring
+fi
+
 if run_check guards "CI timeout wrapper tests (#4413)"; then
 "$PYTHON" -m unittest tests.test_ci_timeout
 fi
@@ -436,6 +446,8 @@ if run_check guards "TUI relay e2e harness unit tests (#5065/#5997)"; then
 # the same scenario machinery compiled in review and executed nowhere.
 "$PYTHON" -m unittest \
   scripts.e2e.tui_relay.test_assertions \
+  scripts.e2e.tui_relay.test_bulk_assertions \
+  scripts.e2e.tui_relay.test_source_compare \
   scripts.e2e.tui_relay.test_cell_resolution \
   scripts.e2e.tui_relay.test_discord_client \
   scripts.e2e.tui_relay.test_driver_health \
@@ -443,7 +455,8 @@ if run_check guards "TUI relay e2e harness unit tests (#5065/#5997)"; then
   scripts.e2e.tui_relay.test_fixtures \
   scripts.e2e.tui_relay.test_known_gap \
   scripts.e2e.tui_relay.test_matrix_runner \
-  scripts.e2e.tui_relay.test_post_deploy_relay_continuity
+  scripts.e2e.tui_relay.test_post_deploy_relay_continuity \
+  scripts.e2e.tui_relay.test_post_deploy_turn_smoke
 "$PYTHON" -m unittest scripts.e2e.test_voice_live_media_smoke
 "$PYTHON" -m unittest tests.test_e2e_scenario_lane_wiring
 fi
@@ -468,6 +481,7 @@ if [[ -z "${TEST_LANE_BASELINE_REF:-}" ]]; then
 fi
 "$PYTHON" scripts/check_test_lane_coverage.py --baseline-ref "$TEST_LANE_BASELINE_REF"
 "$PYTHON" -m unittest tests.test_test_lane_coverage
+"$PYTHON" -m unittest tests.test_lane_source_parity
 fi
 
 if run_check cargo "Test-target integrity gate (#5003/#5008)"; then
@@ -478,7 +492,7 @@ if run_check cargo "Test-target integrity gate (#5003/#5008)"; then
 "$PYTHON" scripts/check_test_target_integrity.py --enforce
 "$PYTHON" -m unittest tests.test_check_test_target_integrity
 "$PYTHON" -m unittest tests.test_target_empty_identity
-AGENTDESK_CI_TIMEOUT_REPORT=1 "$PYTHON" scripts/ci-timeout.py 900 "$PYTHON" scripts/check_test_target_integrity.py --verify-lib-inventory
+AGENTDESK_CI_TIMEOUT_REPORT=1 bash scripts/ci/mem-measure.sh lib-inventory -- "$PYTHON" scripts/ci-timeout.py 1800 "$PYTHON" scripts/check_test_target_integrity.py --verify-lib-inventory
 "$PYTHON" -m unittest tests.test_non_pg_test_filter
 fi
 
@@ -493,6 +507,11 @@ if run_check contracts "PostgreSQL test-lane membership gate (#4979, enforced)";
 "$PYTHON" scripts/check_pg_test_lane_membership.py --write-pg-db-paths
 git diff --exit-code HEAD -- .github/workflows/ci-pr.yml
 "$PYTHON" -m unittest tests.test_check_pg_test_lane_membership
+fi
+
+if run_check contracts "Shared CI shell lexer tests"; then
+# The test-target and PG lane gates read workflow shell through this one lexer.
+"$PYTHON" -m unittest tests.test_ci_shell_lex
 fi
 
 if run_check contracts "New production file comment-ratio gate"; then
@@ -606,12 +625,9 @@ if run_check contracts "CI macOS Trusted Rust path filter"; then
 "$PYTHON" -m unittest tests.test_macos_trusted_rust_filter
 fi
 
-if run_check contracts "Relay watchdog + PG tunnel supervisor tests (#4381/#4378)"; then
-# The out-of-band relay watchdog is a deployable Python script; it is not
-# covered by shellcheck (only *.sh) nor by cargo, so this unittest run is its
-# ONLY CI gate. It also pins the deploy/plist wiring so the watchdog cannot
-# silently fall out of the deploy again (the 06-29 relay-gap-watch failure).
-"$PYTHON" -m unittest tests.test_relay_watchdog tests.test_pg_tunnel
+if run_check contracts "PG tunnel supervisor and retired relay cleanup tests"; then
+"$PYTHON" -m unittest tests.test_pg_tunnel
+bash tests/test_deploy_retired_relay_watchdog_6597.sh
 fi
 
 if run_check contracts "Session anchor CLI tests"; then
@@ -719,11 +735,13 @@ if run_check contracts "Shell test suites (tests/*.sh)"; then
 SHELL_TESTS_FAILED=0
 required_shell_suites=(
   tests/test_cluster_deploy_peer_verdict_5189.sh
+  tests/test_deploy_e2e_readers_gate_6577.sh
   tests/test_deploy_migration_floor_fail_forward_6090.sh
   tests/test_deploy_o_writer_rollback_guard_6325.sh
   tests/test_deploy_smoke_scope.sh
   tests/test_deploy_smoke_warn_scope_4511.sh
   tests/test_deploy_smoke_wedge_coverage_5244.sh
+  tests/test_deploy_smoke_turn_scenarios_6561.sh
   tests/test_deploy_verdict_health_axis_6092.sh
   tests/test_required_check_mirror.sh
 )

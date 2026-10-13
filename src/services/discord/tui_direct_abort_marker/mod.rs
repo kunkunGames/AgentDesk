@@ -227,6 +227,7 @@ pub(in crate::services::discord) use drain::{
     drain_on_terminal_commit_with_applier_and_offset, drain_on_terminal_commit_with_offset,
     drain_on_terminal_commit_with_offsets, resolve_own_claim_markers_for_visibly_completed_anchor,
 };
+pub(in crate::services::discord) use store::channel_presence;
 use store::reload;
 #[cfg(test)]
 pub(in crate::services::discord) use store::{
@@ -783,6 +784,9 @@ pub(super) fn shared_reaction_applier(shared: Arc<SharedData>) -> ReactionApplie
 fn now_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
 }
+
+#[cfg(test)]
+mod retirement_census_tests;
 
 #[cfg(test)]
 mod warning_tests;

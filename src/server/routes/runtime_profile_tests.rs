@@ -51,25 +51,38 @@ async fn worker_profile_routes_preserve_execution_auth_and_remove_admin_methods(
             ("POST", "/sessions/example/force-kill"),
             ("POST", "/turns/123/cancel"),
             ("POST", "/hook/reset-status"),
+            ("POST", "/hook/skill-usage"),
+            ("DELETE", "/hook/session/example"),
             ("GET", "/channels/123/watcher-state"),
         ] {
-            let is_worker = profile == crate::config::RuntimeProfile::Runner;
-            // The integrations module (/hook/reset-status) is part of admin_api, which is not mounted in the Runner profile.
-            // When a route is unmounted, Axum returns 404 NOT FOUND before auth middleware runs.
-            let is_admin_api_route = path == "/hook/reset-status";
-
             assert_eq!(
                 app.clone()
                     .oneshot(request(method, path, false))
                     .await
                     .unwrap()
                     .status(),
-                if is_worker && is_admin_api_route {
-                    StatusCode::NOT_FOUND
-                } else {
-                    StatusCode::UNAUTHORIZED
-                },
+                StatusCode::UNAUTHORIZED,
                 "{profile:?}: {method} {path}"
+            );
+        }
+        // Local execution hooks stay mounted on Runner and reach their handlers after auth.
+        for (method, path) in [
+            ("POST", "/hook/reset-status"),
+            ("POST", "/hook/skill-usage"),
+            ("DELETE", "/hook/session/example"),
+        ] {
+            let mut authorized = request(method, path, true);
+            if path == "/hook/skill-usage" {
+                authorized.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/json".parse().unwrap(),
+                );
+                *authorized.body_mut() = Body::from(r#"{"skill_id":"profile-test-skill"}"#);
+            }
+            assert_eq!(
+                app.clone().oneshot(authorized).await.unwrap().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{profile:?}: authorized {method} {path} reaches the PG handler"
             );
         }
         // A valid administrator credential cannot mount disabled worker routes.

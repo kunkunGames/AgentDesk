@@ -3,6 +3,36 @@
 use super::*;
 use crate::services::tui_prompt_dedupe::binding_context::PreparedIncarnation;
 
+/// Columns and rows of a guarded Claude session: a full composer stays inside the captured screen.
+#[cfg(unix)]
+const CLAUDE_GUARDED_SIZE: (u16, u16) = (160, 40);
+
+/// Launch evidence left by an earlier guarded launch is cleared only once tmux confirms that
+/// session is gone; a live or unprobeable session keeps it and refuses the relaunch.
+#[cfg(unix)]
+fn refuse_over_unconfirmed_session(tmux_session_name: &str) -> Result<(), String> {
+    use crate::services::platform::tmux::{SessionPresence, session_presence};
+    use crate::services::tmux_common::{self as tc, host_marker};
+    let path = |ext| tc::session_temp_path(tmux_session_name, ext);
+    let files = [
+        tmux_owner_path(tmux_session_name),
+        path(tc::TMUX_RUNTIME_KIND_TEMP_EXT),
+        path(tc::CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT),
+    ];
+    let host = host_marker::read_host_kind_marker(tmux_session_name);
+    let held = files.iter().any(|file| std::path::Path::new(file).exists())
+        || host != host_marker::HostKindMarker::Absent;
+    if !held {
+        return Ok(());
+    }
+    match session_presence(tmux_session_name) {
+        SessionPresence::Missing => Ok(()),
+        presence => Err(format!(
+            "tmux session {tmux_session_name} keeps its launch evidence: presence {presence:?}"
+        )),
+    }
+}
+
 /// Prepare durable launch evidence before creating the hosted tmux session.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
@@ -18,10 +48,15 @@ pub(super) fn prepare_and_create_claude_tui_session(
     auth_env_lines: &str,
     channel_id: Option<u64>,
 ) -> Result<(String, PreparedIncarnation), String> {
-    use crate::services::herdr_launch::{HERDR_NOT_ADMITTED, herdr_admitted_for_claude_launch};
-    // The host is chosen before any launch I/O; only tmux is admitted.
-    if herdr_admitted_for_claude_launch(channel_id) {
+    use crate::services::herdr_launch::{HERDR_NOT_ADMITTED, herdr_configured_for_tui_launch};
+    // The host is chosen before any launch I/O; a Herdr channel never gets a tmux session.
+    if herdr_configured_for_tui_launch(channel_id) {
         return Err(HERDR_NOT_ADMITTED.to_string());
+    }
+    // Only boot-allowlisted channels open at the guarded geometry; every other launch is unchanged.
+    let guarded = crate::config::session_hosts::claude_guarded(channel_id);
+    if guarded {
+        refuse_over_unconfirmed_session(tmux_session_name)?;
     }
     crate::services::tmux_common::cleanup_session_temp_files(tmux_session_name);
     write_tmux_owner_marker(tmux_session_name)?;
@@ -31,6 +66,7 @@ pub(super) fn prepare_and_create_claude_tui_session(
     )?;
     let owner_path = tmux_owner_path(tmux_session_name);
     let mut prepared_session_files = None;
+    let mut sized_cleanup = None;
     let launch_result = (|| -> Result<(_, PreparedIncarnation), String> {
         let prepared = PreparedIncarnation::prepare(
             "claude",
@@ -67,23 +103,51 @@ pub(super) fn prepare_and_create_claude_tui_session(
         );
         std::fs::write(&launch_script_path, script)
             .map_err(|error| format!("update Claude TUI launch script: {error}"))?;
-        let result = crate::services::platform::tmux::create_session(
-            tmux_session_name,
-            Some(working_dir),
-            &format!(
-                "bash {}",
-                shell_escape(&launch_script_path.display().to_string())
-            ),
-        )?;
+        let command = format!(
+            "bash {}",
+            shell_escape(&launch_script_path.display().to_string())
+        );
+        let result = if guarded {
+            let (cols, rows) = CLAUDE_GUARDED_SIZE;
+            crate::services::platform::tmux::create_session_sized(
+                tmux_session_name,
+                Some(working_dir),
+                &command,
+                cols,
+                rows,
+            )
+            .map_err(|failure| {
+                sized_cleanup = Some(failure.cleanup);
+                failure.message
+            })?
+        } else {
+            crate::services::platform::tmux::create_session(
+                tmux_session_name,
+                Some(working_dir),
+                &command,
+            )?
+        };
         Ok((result, prepared))
     })();
     let (tmux_result, incarnation) = match launch_result {
         Ok(result) => result,
         Err(error) => {
+            use crate::services::platform::tmux::SizedCleanup;
+            // A guarded session that may still run keeps every piece of its ownership evidence.
+            if sized_cleanup == Some(SizedCleanup::Unconfirmed) {
+                return Err(error);
+            }
             if let Some(files) = prepared_session_files.as_ref() {
                 files.cleanup_best_effort();
             }
             let _ = std::fs::remove_file(&owner_path);
+            // A guarded session confirmed gone leaves no kind or host marker behind either.
+            if sized_cleanup == Some(SizedCleanup::Removed) {
+                use crate::services::tmux_common::{self as tc, host_marker};
+                let kind = tc::session_temp_path(tmux_session_name, tc::TMUX_RUNTIME_KIND_TEMP_EXT);
+                let _ = std::fs::remove_file(kind);
+                host_marker::remove_tmux_host_marker(tmux_session_name);
+            }
             return Err(error);
         }
     };
@@ -309,19 +373,19 @@ mod herdr_off_tests {
         );
     }
 
-    // The launch entry reads O readiness only for a selected channel, keeps an unready one on
-    // tmux, and leaves tmux only for a channel whose O writer already holds a seeded store.
+    // A channel configured for Herdr gets no tmux session whether or not its O writer is ready, and
+    // the guard reads no readiness; an unconfigured channel launches on tmux as before.
     #[cfg(unix)]
     #[test]
-    fn claude_launch_takes_herdr_only_for_a_selected_channel_with_a_ready_o_store() {
+    fn claude_launch_creates_no_tmux_for_a_herdr_configured_channel_ready_or_not() {
         use super::prepare_and_create_claude_tui_session as launch;
         use crate::config::TestEnvVarGuard as Guard;
         use crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui;
         use crate::services::herdr_launch::{
-            HERDR_NOT_ADMITTED, force_launch_gate, o_store_for_test,
+            HERDR_NOT_ADMITTED, force_writer_accepts, o_store_for_test,
             readiness_reads_on_this_thread as reads,
         };
-        use crate::services::tui_o::cutover::test_override::{force_candidates, force_channels};
+        use crate::services::tui_o::cutover::test_override::force_channels;
         use crate::services::tui_prompt_dedupe::{self as dedupe, binding_context::tests};
         use std::os::unix::fs::PermissionsExt;
         let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
@@ -369,32 +433,23 @@ mod herdr_off_tests {
             calls.contains(&format!("new-session -d -s {tmux}"))
         };
 
-        let _ready_channel = force_channels(&[(46, ClaudeTui), (47, ClaudeTui)]);
-        let _writer = force_launch_gate(false, Some(true));
-        run("AgentDesk-claude-gate-off", 46).expect("an unselected channel stays on tmux");
-        assert!(created("AgentDesk-claude-gate-off"));
-        assert_eq!(
-            reads(),
-            0,
-            "no readiness is read while nothing selects Herdr"
+        let _hosts = crate::config::session_hosts::force_for_test(
+            Some("mac-mini"),
+            &[(46, "mac-mini"), (47, "mac-mini")],
         );
-
-        let _selected = force_launch_gate(true, Some(true));
-        let refused = run("AgentDesk-claude-gate-ready", 46);
-        assert_eq!(refused.err().as_deref(), Some(HERDR_NOT_ADMITTED));
-        assert!(
-            !created("AgentDesk-claude-gate-ready"),
-            "the Herdr branch creates no tmux"
-        );
-        assert_eq!(reads(), 1);
-
-        let _pending = force_candidates(&[(46, ClaudeTui)]);
-        run("AgentDesk-claude-gate-pending", 46).expect("an unadopted channel stays on tmux");
-        assert!(created("AgentDesk-claude-gate-pending"));
-        drop(_pending);
-        run("AgentDesk-claude-gate-no-store", 47).expect("a channel without a store stays on tmux");
-        assert!(created("AgentDesk-claude-gate-no-store"));
-        assert_eq!(reads(), 3);
+        let _ready = force_channels(&[(46, ClaudeTui), (47, ClaudeTui)]);
+        let _writer = force_writer_accepts(Some(true));
+        for (tmux, channel) in [
+            ("AgentDesk-claude-ready", 46),
+            ("AgentDesk-claude-unready", 47),
+        ] {
+            let refused = run(tmux, channel);
+            assert_eq!(refused.err().as_deref(), Some(HERDR_NOT_ADMITTED), "{tmux}");
+            assert!(!created(tmux), "{tmux} must not reach tmux");
+        }
+        assert_eq!(reads(), 0, "the guard reads no O readiness");
+        run("AgentDesk-claude-unconfigured", 48).expect("an unconfigured channel stays on tmux");
+        assert!(created("AgentDesk-claude-unconfigured"));
     }
 }
 
@@ -417,7 +472,6 @@ mod herdr_env_tests {
     fn herdr_launch_child_loses_the_herdr_pane_env_while_tmux_keeps_its_launch_env() {
         use super::{prepare_and_create_claude_tui_session, prepare_claude_herdr_launch};
         use crate::config::TestEnvVarGuard as Guard;
-        use crate::services::herdr_launch::HERDR_PANE_ENV;
         use crate::services::tui_prompt_dedupe::binding_context::{PreparedIncarnation, tests};
         use std::os::unix::fs::PermissionsExt;
         let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
@@ -451,12 +505,21 @@ mod herdr_env_tests {
         );
         let id = "11111111-1111-4111-8111-111111111111";
         let system_prompt = "keep this\nexec rm -rf /tmp/never";
-        // What Herdr hands every process in the pane, the launch command included.
+        // What Herdr 0.9.3 hands every process in the pane, the launch command included.
+        const PANE_ENV: [&str; 7] = [
+            "HERDR_ENV",
+            "HERDR_PANE_ID",
+            "HERDR_BIN_PATH",
+            "HERDR_SOCKET_PATH",
+            "HERDR_TAB_ID",
+            "HERDR_WORKSPACE_ID",
+            "HERDR_CONFIG_PATH",
+        ];
         let run = |tag: &str, command: &str| {
             let status = std::process::Command::new("bash")
                 .args(["-c", command])
                 .current_dir(root.path())
-                .envs(HERDR_PANE_ENV.map(|key| (key, format!("pane-{key}"))))
+                .envs(PANE_ENV.map(|key| (key, format!("pane-{key}"))))
                 .env("CHILD_TAG", tag)
                 .status()
                 .unwrap();
@@ -536,17 +599,17 @@ mod herdr_env_tests {
             crate::services::tmux_common::CLAUDE_TUI_LAUNCH_SCRIPT_TEMP_EXT,
         );
         let (env, _) = run("tmux", &format!("bash {script}"));
-        let kept: Vec<_> = HERDR_PANE_ENV
-            .iter()
-            .filter_map(|key| env.get(*key))
-            .collect();
+        let kept: Vec<_> = PANE_ENV.iter().filter_map(|key| env.get(*key)).collect();
         assert_eq!(
             kept,
             [
                 "pane-HERDR_ENV",
                 "pane-HERDR_PANE_ID",
                 "pane-HERDR_BIN_PATH",
-                "/overlay/herdr.sock"
+                "/overlay/herdr.sock",
+                "pane-HERDR_TAB_ID",
+                "pane-HERDR_WORKSPACE_ID",
+                "pane-HERDR_CONFIG_PATH"
             ],
             "the tmux launch environment is left as it was"
         );
@@ -557,3 +620,7 @@ mod herdr_env_tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "tui_session_launch_geometry_tests.rs"]
+mod guarded_geometry_tests;

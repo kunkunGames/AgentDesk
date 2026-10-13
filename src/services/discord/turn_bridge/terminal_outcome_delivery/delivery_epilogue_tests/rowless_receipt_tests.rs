@@ -425,7 +425,7 @@ async fn exact_receipt_rowless_terminal_survives_newer_frontier_at_another_ancho
 // unrelated transcript/accounting inputs are neutral; projection and inflight
 // settlement run through the production caller.
 #[rustfmt::skip]
-async fn run_postlude(driver: &TerminalDeliveryDriver, output: TerminalOutcomeDeliveryOutput, footer: bool, cancelled: bool) {
+pub(super) async fn run_postlude(driver: &TerminalDeliveryDriver, output: TerminalOutcomeDeliveryOutput, footer: bool, cancelled: bool) {
     run_postlude_for_owner(driver, output, footer, cancelled, None).await;
 }
 
@@ -919,10 +919,11 @@ async fn exact_receipt_rowless_terminal_custody_empty_recovery_stays_inside_sour
                 source_file_dev: dev,
                 source_file_ino: ino,
                 actor: Arc::downgrade(&state.cancel_token),
+                kind: crate::services::agent_protocol::NativeTerminalKind::Completed,
             };
             let mut baseline = state.inflight_state.clone();
             let expected = InflightTurnIdentity::from_state(&baseline);
-            let (_, admitted, _) = state
+            let (_, admitted, _, _) = state
                 .inflight_state
                 .admit_tui_terminal_frame(
                     &mut baseline,

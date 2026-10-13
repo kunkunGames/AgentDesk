@@ -1,5 +1,6 @@
 //! Validated writer membership is fixed for the lifetime of the process; on the O home each
-//! selected or locally committed channel also carries this process's adoption state.
+//! selected or locally committed channel also carries this process's adoption state, and off it
+//! each selected channel keeps its local store state for a delegated home.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -14,7 +15,7 @@ use crate::services::tui_o::alarm::AlarmRouter;
 use crate::services::tui_o::writer::WriterAlarm;
 
 mod adoption;
-pub(crate) use adoption::{Adoption, Candidate, Site};
+pub(crate) use adoption::{Adoption, BodyClaimed, Candidate, LegacySend, Site};
 #[cfg(test)]
 pub(crate) use adoption::{
     body_check::{BodyCheck, SinkOp},
@@ -26,10 +27,14 @@ pub(crate) struct BootChannels {
     /// The selection and, on the home, each committed channel the selection left out.
     channels: BTreeSet<u64>,
     selected: BTreeSet<u64>,
+    dormant_channels: BTreeSet<u64>,
     kinds: BTreeMap<u64, RuntimeHandoffKind>,
     site: Site,
     configured_id: Option<String>,
     candidates: BTreeMap<u64, Candidate>,
+    /// Off the home, each selected channel's local store state, kept so a delegated home can open
+    /// here without a restart. Holding one opens nothing: the channel's home gate decides.
+    standby: BTreeMap<u64, Candidate>,
 }
 
 /// Membership as configured; the adoption states and kept committed channels are process state.
@@ -38,7 +43,13 @@ impl PartialEq for BootChannels {
         fn selected(boot: &BootChannels) -> impl PartialEq + '_ {
             let kinds = boot.kinds.iter().filter(|(c, _)| boot.selected.contains(c));
             let kinds: Vec<_> = kinds.collect();
-            (&boot.selected, kinds, &boot.site, &boot.configured_id)
+            (
+                &boot.selected,
+                &boot.dormant_channels,
+                kinds,
+                &boot.site,
+                &boot.configured_id,
+            )
         }
         selected(self) == selected(other)
     }
@@ -56,6 +67,15 @@ pub(crate) fn configured_channels(config: &Config) -> BTreeSet<u64> {
     }
     all_tui_kinds(config)
         .map(|kinds| kinds.into_keys().collect())
+        .unwrap_or_default()
+}
+
+/// Dormant membership as configured; only validation decides whether these writers are selected.
+pub(crate) fn configured_dormant_channels(config: &Config) -> BTreeSet<u64> {
+    config
+        .tui_o
+        .as_ref()
+        .map(|config| config.writer.dormant_channels.clone())
         .unwrap_or_default()
 }
 
@@ -191,21 +211,32 @@ impl BootChannels {
             listed_kinds(config, "tui_o.writer.channels", &channels)?
         };
         let channels: BTreeSet<u64> = kinds.keys().copied().collect();
+        let dormant_channels = configured_dormant_channels(config);
+        ensure!(
+            !dormant_channels.contains(&0),
+            "tui_o.writer.dormant_channels rejects channel 0"
+        );
+        ensure!(
+            dormant_channels.is_subset(&channels),
+            "tui_o.writer.dormant_channels must be a subset of the selected O writer channels"
+        );
         let (site, configured_id) = site(config, !channels.is_empty())?;
         Ok(Self {
             selected: channels.clone(),
+            dormant_channels,
             channels,
             kinds,
             site,
             configured_id,
             candidates: BTreeMap::new(),
+            standby: BTreeMap::new(),
         })
     }
 
     /// Starts each selected channel's adoption. The store is read only for an enabled writer with
     /// a non-empty selection. The home also keeps every channel its store committed; a non-home
-    /// node adopts nothing and only reports local store state.
-    fn seeded(
+    /// node adopts nothing, reports local store state and keeps it as standby.
+    pub(crate) fn seeded(
         mut self,
         enabled: bool,
         config: &Config,
@@ -244,6 +275,8 @@ impl BootChannels {
                 for (&channel, _) in states.iter().filter(|(_, s)| **s != Adoption::Pending) {
                     alarms.raise_at(channel, &alarm, Instant::now());
                 }
+                let standby = |(channel, state)| (channel, Candidate::new(state));
+                self.standby = states.into_iter().map(standby).collect();
             }
         }
         Ok(self)
@@ -257,6 +290,11 @@ impl BootChannels {
     /// The channels the boot config selected, for restart-required comparison.
     pub(crate) fn selected(&self) -> &BTreeSet<u64> {
         &self.selected
+    }
+
+    /// Installed dormant policy, kept fixed across live config reloads.
+    pub(crate) fn dormant_channels(&self) -> &BTreeSet<u64> {
+        &self.dormant_channels
     }
 
     pub(crate) fn kind(&self, channel: u64) -> Option<RuntimeHandoffKind> {
@@ -277,6 +315,11 @@ impl BootChannels {
         self.candidates.get(&channel)
     }
 
+    /// A selected channel's local store state off the home; only a home gate makes it count.
+    pub(crate) fn standby(&self, channel: u64) -> Option<&Candidate> {
+        self.standby.get(&channel)
+    }
+
     /// Every selected channel starts in `state`, as `seeded` would leave it on the home.
     #[cfg(test)]
     pub(crate) fn adopted(mut self, state: Adoption) -> Self {
@@ -293,6 +336,14 @@ impl BootChannels {
         self.site = Site::Foreign { home: home.into() };
         self.channels = self.selected.clone();
         self.candidates.clear();
+        self
+    }
+
+    /// Every selected channel kept as standby in `state`, as `seeded` would leave it off the home.
+    #[cfg(test)]
+    pub(crate) fn standing_by(mut self, state: Adoption) -> Self {
+        let standby = |&channel: &u64| (channel, Candidate::new(state));
+        self.standby = self.selected.iter().map(standby).collect();
         self
     }
 }
@@ -347,7 +398,7 @@ pub(crate) fn install(config: &Config) -> Result<()> {
     };
     ensure!(
         installed == &candidate,
-        "tui_o.writer.channels requires a process restart"
+        "tui_o.writer.channels or tui_o.writer.dormant_channels requires a process restart"
     );
     Ok(())
 }

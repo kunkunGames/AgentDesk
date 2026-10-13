@@ -1,0 +1,340 @@
+//! The drain's reads of a delegated channel in this process: the channel's turn, what the O actor
+//! last published that it owes and the writer's running POSTs. It keeps no state.
+#![cfg_attr(not(test), allow(dead_code))]
+
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use poise::serenity_prelude::ChannelId;
+
+use super::channel_home_drain::{DrainPort, Owed, ResetRefused};
+use crate::services::tui_o::writer::actor::POLL_INTERVAL;
+use crate::services::tui_o::writer::deliver;
+use crate::services::tui_o::writer::host::{OwedView, Readiness};
+use crate::services::turn_orchestrator::ChannelMailboxRegistry;
+
+/// An owed read waits this long for the actor's next poll; none by then reads as unknown.
+const FRESH_WITHIN: Duration = Duration::from_secs(5 * POLL_INTERVAL.as_secs());
+
+pub(crate) struct ChannelHomePort {
+    channel: u64,
+    readiness: Arc<Readiness>,
+    restored: Arc<AtomicBool>,
+}
+
+impl ChannelHomePort {
+    /// `readiness` is the writer host's map the channel's actor publishes to; `restored` must turn
+    /// true only once this role restored its persisted turns, which not every role's marker means.
+    pub(crate) fn new(channel: u64, readiness: Arc<Readiness>, restored: Arc<AtomicBool>) -> Self {
+        Self {
+            channel,
+            readiness,
+            restored,
+        }
+    }
+}
+
+impl DrainPort for ChannelHomePort {
+    /// A turn running or queued in the channel's mailbox, or one only its inflight row still names;
+    /// unknown until this process restored its persisted turns, since a mailbox may still be missing.
+    fn turn_running(&self) -> impl Future<Output = Option<bool>> + Send {
+        let channel = (self.channel != 0).then(|| ChannelId::new(self.channel));
+        let restored = self.restored.load(Ordering::Acquire);
+        async move {
+            let channel = channel.filter(|_| restored)?;
+            let queued = match ChannelMailboxRegistry::global_handle(channel) {
+                Some(mailbox) => {
+                    let mailbox = mailbox.try_snapshot().await.ok()?;
+                    mailbox.cancel_token.is_some()
+                        || !mailbox.intervention_queue.is_empty()
+                        || mailbox.pending_user_dispatch.is_some()
+                }
+                None => false,
+            };
+            Some(queued || crate::services::discord::has_fresh_inflight_for_channel(channel.get()))
+        }
+    }
+
+    /// What the actor publishes from a poll begun after the read asked, so a check after the final
+    /// close sees a poll that ran after it; an ended, halted or silent actor is `None`.
+    fn owed(&self) -> impl Future<Output = Option<Owed>> + Send {
+        let view = self.readiness.undelivered(self.channel);
+        async move {
+            let OwedView {
+                mut published,
+                demand,
+            } = view?;
+            let wanting = demand.want();
+            published.borrow_and_update();
+            let answer = async {
+                loop {
+                    published.changed().await.ok()?;
+                    let undelivered = *published.borrow_and_update();
+                    // An actor that ended after its last send may have sent it while ending: unknown.
+                    published.has_changed().ok()?;
+                    // A poll begun before this read asked may predate what it waits on.
+                    match undelivered {
+                        Some(stale) if stale.asked < wanting.asked() => continue,
+                        undelivered => return undelivered,
+                    }
+                }
+            };
+            let undelivered = tokio::time::timeout(FRESH_WITHIN, answer).await.ok()??;
+            Some(Owed {
+                owed: undelivered.owed,
+                prepared: undelivered.prepared,
+                unsealed: undelivered.unsealed,
+                uncaptured: undelivered.uncaptured,
+                binding_pending: undelivered.binding_pending,
+            })
+        }
+    }
+
+    fn posts_in_flight(&self) -> impl Future<Output = Option<usize>> + Send {
+        std::future::ready(deliver::posts_in_flight(self.channel))
+    }
+
+    /// The gateway's session reset is reachable only from the Discord runtime, which supplies it
+    /// beside this port at boot; through this port alone a releasing drain waits here.
+    fn reset_legacy_source(&self) -> impl Future<Output = Result<(), ResetRefused>> + Send {
+        std::future::ready(Err(ResetRefused::NotWired))
+    }
+}
+
+#[cfg(test)]
+#[path = "channel_home_port_tests.rs"]
+mod tests;
+
+/// Recovery errors preserve whether a fresh attempt can resolve the failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RestoreFailure {
+    Retryable(String),
+    Rejected(String),
+}
+impl RestoreFailure {
+    pub(crate) fn retryable(reason: impl ToString) -> Self {
+        #[cfg(test)]
+        if std::env::var("ADK_S3ACT_B3A1_MUTANT").ok().as_deref() == Some("retryable") {
+            return Self::Rejected(reason.to_string());
+        }
+        Self::Retryable(reason.to_string())
+    }
+}
+// Escape reserved tags at the String boundary so rejection text cannot become retryable.
+fn encode_restore_failure(failure: &RestoreFailure) -> String {
+    match failure {
+        RestoreFailure::Retryable(reason) => format!("retryable: {reason}"),
+        RestoreFailure::Rejected(reason)
+            if reason.starts_with("retryable: ") || reason.starts_with("rejected: ") =>
+        {
+            format!("rejected: {reason}")
+        }
+        RestoreFailure::Rejected(reason) => reason.clone(),
+    }
+}
+fn decode_restore_failure(reason: String) -> RestoreFailure {
+    if let Some(payload) = reason.strip_prefix("rejected: ") {
+        RestoreFailure::Rejected(payload.into())
+    } else if let Some(payload) = reason.strip_prefix("retryable: ") {
+        RestoreFailure::retryable(payload)
+    } else {
+        RestoreFailure::Rejected(reason)
+    }
+}
+impl std::fmt::Display for RestoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&encode_restore_failure(self))
+    }
+}
+impl From<String> for RestoreFailure {
+    fn from(reason: String) -> Self {
+        decode_restore_failure(reason)
+    }
+}
+impl From<&str> for RestoreFailure {
+    fn from(reason: &str) -> Self {
+        reason.to_string().into()
+    }
+}
+impl From<RestoreFailure> for String {
+    fn from(reason: RestoreFailure) -> Self {
+        reason.to_string()
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod scoped_restore {
+    use super::RestoreFailure;
+    use crate::db::o_channel_homes::{ChannelHome, HomeState};
+    use crate::services::agent_protocol::NativeTerminalKind;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    /// Installation identity, distinct from a live output or intake permit.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct RestoreScope {
+        pub(crate) channel: u64,
+        pub(crate) provider: String,
+        pub(crate) epoch: i64,
+        pub(crate) state: HomeState,
+        pub(crate) holder: Option<String>,
+        pub(crate) target: Option<String>,
+        pub(crate) local: String,
+    }
+    impl RestoreScope {
+        pub(crate) fn new(row: &ChannelHome, provider: &str, local: &str) -> Result<Self, String> {
+            let channel = row
+                .channel_id
+                .parse::<u64>()
+                .ok()
+                .filter(|id| *id != 0)
+                .ok_or("invalid restore channel")?;
+            let held = row.holder.as_deref() == Some(local)
+                && matches!(
+                    row.state,
+                    HomeState::Worker | HomeState::Releasing | HomeState::Reclaiming
+                );
+            let preparing =
+                row.state == HomeState::Released && row.target.as_deref() == Some(local);
+            if local.is_empty()
+                || row.epoch <= 0
+                || row.provider != provider
+                || !(held || preparing)
+            {
+                return Err("restore home identity is not local".into());
+            }
+            Ok(Self {
+                channel,
+                provider: provider.into(),
+                epoch: row.epoch,
+                state: row.state,
+                holder: row.holder.clone(),
+                target: row.target.clone(),
+                local: local.into(),
+            })
+        }
+        pub(crate) fn matches(&self, row: &ChannelHome) -> bool {
+            row.channel_id == self.channel.to_string()
+                && row.provider == self.provider
+                && row.epoch == self.epoch
+                && row.state == self.state
+                && row.holder == self.holder
+                && row.target == self.target
+        }
+        pub(crate) fn held_locally(&self) -> bool {
+            self.state != HomeState::Released && self.holder.as_deref() == Some(self.local.as_str())
+        }
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum RestoreStatus {
+        Pending,
+        Restoring,
+        Restored,
+        Blocked(RestoreFailure),
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum InflightObservation {
+        Empty,
+        Active,
+        ReplayHeld {
+            receipt: Option<i64>,
+            reasons: Vec<String>,
+            delivery: Option<Result<(), String>>,
+        },
+        HerdrHeld,
+        Admitted {
+            kind: NativeTerminalKind,
+        },
+        Retained {
+            kind: NativeTerminalKind,
+            reason: String,
+        },
+        Settled {
+            kind: NativeTerminalKind,
+        },
+        Deferred(String),
+        /// A before-start policy receipt row kept byte for byte; never a native terminal.
+        PolicyReceiptHeld {
+            reason: RestoreFailure,
+        },
+        /// Only a guarded clear of the receipt's exact row, after any notice was shown and acked.
+        PolicyReceiptSettled,
+    }
+    /// Only installation metadata; mailbox and canonical rows remain the busy authorities.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) struct RestoreWitness {
+        pub(crate) scope: Option<RestoreScope>,
+        pub(crate) generation: u64,
+        pub(crate) status: RestoreStatus,
+        pub(crate) inflight: Option<InflightObservation>,
+    }
+    impl Default for RestoreWitness {
+        fn default() -> Self {
+            Self {
+                scope: None,
+                generation: 0,
+                status: RestoreStatus::Pending,
+                inflight: None,
+            }
+        }
+    }
+    pub(crate) struct RestoreContext {
+        pub(crate) scope: RestoreScope,
+        pub(crate) generation: u64,
+        pub(crate) current: Arc<AtomicU64>,
+    }
+    impl RestoreContext {
+        pub(crate) fn check(&self) -> Result<(), String> {
+            if self.generation == 0
+                || (self.current.load(Ordering::Acquire) != self.generation
+                    && !mutant("old-generation"))
+            {
+                Err("restore runtime generation changed".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    pub(crate) fn mutant(name: &str) -> bool {
+        std::env::var("ADK_S3ACT_B2_MUTANT").ok().as_deref() == Some(name)
+    }
+}
+
+#[cfg(test)]
+mod b3a2_failure_tests {
+    use super::RestoreFailure;
+    #[test]
+    fn s3act_b3a2_failure_string_roundtrip_property() {
+        let fragments = [
+            "",
+            "ordinary",
+            "retryable: ",
+            "retryable: X",
+            "rejected: ",
+            "rejected: retryable: X",
+            "한글\n\0\\",
+        ];
+        for a in fragments {
+            for b in fragments {
+                for original in [
+                    RestoreFailure::Retryable(format!("{a}{b}")),
+                    RestoreFailure::Rejected(format!("{a}{b}")),
+                ] {
+                    assert_eq!(
+                        RestoreFailure::from(original.to_string()),
+                        original,
+                        "failure variant and payload must roundtrip"
+                    );
+                    assert_eq!(
+                        RestoreFailure::from(String::from(original.clone())),
+                        original
+                    );
+                }
+            }
+        }
+    }
+}
