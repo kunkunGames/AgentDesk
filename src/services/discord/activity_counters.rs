@@ -19,22 +19,9 @@ pub(in crate::services::discord) fn saturating_decrement_global_active(
     saturating_decrement_counter(shared.restart.global_active.as_ref())
 }
 
-/// Single authoritative writer for the INCREMENT side of `global_active`,
-/// mirroring [`saturating_decrement_global_active`] on the decrement side
-/// (#3019, sub-issue of #3016).
-///
-/// INVARIANT: `global_active` == number of mailbox slots currently in the
-/// started-not-yet-finished state. This helper MUST be called +1 IFF a mailbox
-/// `try_start_turn` / `recovery_kickoff` actually activated a slot
-/// (`started` / `activated_turn()`); the matching -1 happens IFF a
-/// mailbox finish/clear actually removed it (`removed_token.is_some()`). Keeping
-/// increment/decrement 1:1 with the real mailbox state transition — NEVER caller
-/// intent — is what prevents the drift/underflow seen in #2934.
-///
-/// Callers are responsible for the mailbox-activation gate; this helper does NOT
-/// change WHEN the counter moves, only funnels HOW it moves so increment is
-/// single-authority/single-helper exactly like decrement. `reason` is recorded
-/// for observability so every increment is attributable to its activation site.
+/// Increment only when mailbox start or recovery kickoff activates a slot.
+/// Pair this with [`saturating_decrement_global_active`] when finish or clear
+/// removes the token. The reason records the activation site.
 pub(in crate::services::discord) fn increment_global_active(
     shared: &SharedData,
     reason: &str,

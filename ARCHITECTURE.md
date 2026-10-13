@@ -602,6 +602,7 @@ src/
 │   │   ├── herdr_turn.rs
 │   │   ├── host_gate.rs
 │   │   ├── host_gate_tests.rs
+│   │   ├── launch_env.rs
 │   │   ├── process_session_launch.rs
 │   │   ├── stream_result.rs
 │   │   ├── tui_session_launch.rs
@@ -890,6 +891,7 @@ src/
 │   │   │   │   ├── render_session.rs
 │   │   │   │   └── tests.rs
 │   │   │   ├── text_commands/
+│   │   │   │   ├── clear.rs
 │   │   │   │   └── clear_refusal_reply_tests.rs
 │   │   │   ├── voice/
 │   │   │   │   └── alert.rs
@@ -2163,6 +2165,7 @@ src/
 │   │   │   ├── cancel_backstop_test_support.rs
 │   │   │   └── cancel_backstop_tests.rs
 │   │   ├── abandon_request_store.rs
+│   │   ├── activity_counters.rs
 │   │   ├── adk_session.rs
 │   │   ├── adk_session_selector.rs
 │   │   ├── adk_session_selector_checked_tests.rs

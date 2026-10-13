@@ -2,9 +2,10 @@ mod abandon_request_store;
 mod activity_counters;
 mod adk_session;
 pub(crate) mod admin_host_guard;
+#[cfg(test)]
+use activity_counters::{increment_counter, saturating_decrement_counter};
 pub(in crate::services::discord) use activity_counters::{
-    increment_counter, increment_global_active, saturating_decrement_counter,
-    saturating_decrement_global_active,
+    increment_global_active, saturating_decrement_global_active,
 };
 pub(crate) mod agent_handoff;
 pub(crate) mod agentdesk_config;
