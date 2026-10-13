@@ -48,7 +48,6 @@ services::session_host::herdr_host::windows_tests::an_unconfigured_herdr_host_re
 services::session_host::herdr_socket_rig_tests | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::tui_o::exact_submission::commit_barrier | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::tui_o::shadow::capture::renumber | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
-services::tui_o::store::codex_provenance::mutation | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::tui_o::store::durable::fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::tui_o::store::windows_tests::enabling_the_store_is_refused_without_directory_fsync | platform-unavailable | #5082 | expires=2027-10-12 | Windows-only platform test not run on Linux CI runner
 services::tui_o::turn_mode::test_tick | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
@@ -60,4 +59,3 @@ services::turn_orchestrator::pending_queue_persistence::fsync_fault | helper-mod
 services::turn_orchestrator::pending_queue_persistence::post_save_fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::turn_orchestrator::pending_queue_persistence::queued_recovery::scan_fault | helper-module | #6813 | expires=2027-10-12 | injects read_dir and entry failures for queued recovery acceptance tests; owns no test function
 services::turn_orchestrator::policy_close::test_hooks | helper-module | #5340 | expires=2027-10-12 | lets the before-start policy close tests observe and panic at each mailbox step stage; it holds no test of its own
-services::turn_orchestrator::queued_head::claim | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
