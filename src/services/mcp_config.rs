@@ -41,25 +41,7 @@ struct ResolvedMcpServer {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-struct CodexMcpSyncState {
-    #[serde(default)]
-    managed_servers: Vec<String>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct OpenCodeMcpSyncState {
-    #[serde(default)]
-    managed_servers: Vec<String>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct QwenMcpSyncState {
-    #[serde(default)]
-    managed_servers: Vec<String>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct GeminiMcpSyncState {
+struct McpSyncState {
     #[serde(default)]
     managed_servers: Vec<String>,
 }
@@ -116,7 +98,7 @@ pub(crate) fn sync_codex_mcp_servers(config: &Config) -> Result<(), String> {
     let sync_state_path =
         crate::runtime_layout::config_dir(&runtime_root).join(CODEX_SYNC_STATE_FILE);
     let desired = resolved_mcp_servers(config, None);
-    let previous = load_codex_sync_state_from_path(&sync_state_path);
+    let previous = load_sync_state_from_path(&sync_state_path);
     let desired_names = desired.keys().cloned().collect::<BTreeSet<_>>();
     let previous_names = previous
         .managed_servers
@@ -158,7 +140,7 @@ pub(crate) fn sync_codex_mcp_servers(config: &Config) -> Result<(), String> {
         run_codex_command_vec(&codex_bin, &args)?;
     }
 
-    let next_state = CodexMcpSyncState {
+    let next_state = McpSyncState {
         managed_servers: desired_names.into_iter().collect(),
     };
     let serialized = serde_json::to_string_pretty(&next_state)
@@ -173,7 +155,7 @@ pub(crate) fn sync_opencode_mcp_servers(config: &Config) -> Result<(), String> {
     let sync_state_path =
         crate::runtime_layout::config_dir(&runtime_root).join(OPENCODE_SYNC_STATE_FILE);
     let desired = resolved_mcp_servers(config, None);
-    let previous = load_opencode_sync_state_from_path(&sync_state_path);
+    let previous = load_sync_state_from_path(&sync_state_path);
     let desired_names = desired.keys().cloned().collect::<BTreeSet<_>>();
     let previous_names = previous
         .managed_servers
@@ -214,7 +196,7 @@ pub(crate) fn sync_opencode_mcp_servers(config: &Config) -> Result<(), String> {
         .map_err(|error| format!("Failed to serialize OpenCode config: {error}"))?;
     atomic_write(&config_path, &serialized)?;
 
-    let next_state = OpenCodeMcpSyncState {
+    let next_state = McpSyncState {
         managed_servers: desired_names.into_iter().collect(),
     };
     let serialized = serde_json::to_string_pretty(&next_state)
@@ -229,7 +211,7 @@ pub(crate) fn sync_qwen_mcp_servers(config: &Config) -> Result<(), String> {
     let sync_state_path =
         crate::runtime_layout::config_dir(&runtime_root).join(QWEN_SYNC_STATE_FILE);
     let desired = resolved_mcp_servers(config, None);
-    let previous = load_qwen_sync_state_from_path(&sync_state_path);
+    let previous = load_sync_state_from_path(&sync_state_path);
     let desired_names = desired.keys().cloned().collect::<BTreeSet<_>>();
     let previous_names = previous
         .managed_servers
@@ -252,7 +234,7 @@ pub(crate) fn sync_qwen_mcp_servers(config: &Config) -> Result<(), String> {
         "Qwen",
     )?;
 
-    let next_state = QwenMcpSyncState {
+    let next_state = McpSyncState {
         managed_servers: desired_names.into_iter().collect(),
     };
     let serialized = serde_json::to_string_pretty(&next_state)
@@ -267,7 +249,7 @@ pub(crate) fn sync_gemini_mcp_servers(config: &Config) -> Result<(), String> {
     let sync_state_path =
         crate::runtime_layout::config_dir(&runtime_root).join(GEMINI_SYNC_STATE_FILE);
     let desired = resolved_mcp_servers(config, None);
-    let previous = load_gemini_sync_state_from_path(&sync_state_path);
+    let previous = load_sync_state_from_path(&sync_state_path);
     let desired_names = desired.keys().cloned().collect::<BTreeSet<_>>();
     let previous_names = previous
         .managed_servers
@@ -290,7 +272,7 @@ pub(crate) fn sync_gemini_mcp_servers(config: &Config) -> Result<(), String> {
         "Gemini",
     )?;
 
-    let next_state = GeminiMcpSyncState {
+    let next_state = McpSyncState {
         managed_servers: desired_names.into_iter().collect(),
     };
     let serialized = serde_json::to_string_pretty(&next_state)
@@ -636,31 +618,10 @@ fn load_runtime_config() -> Option<Config> {
         .and_then(|path| crate::config::load_from_path(&path).ok())
 }
 
-fn load_codex_sync_state_from_path(path: &Path) -> CodexMcpSyncState {
+fn load_sync_state_from_path(path: &Path) -> McpSyncState {
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|raw| serde_json::from_str::<CodexMcpSyncState>(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn load_opencode_sync_state_from_path(path: &Path) -> OpenCodeMcpSyncState {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<OpenCodeMcpSyncState>(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn load_qwen_sync_state_from_path(path: &Path) -> QwenMcpSyncState {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<QwenMcpSyncState>(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn load_gemini_sync_state_from_path(path: &Path) -> GeminiMcpSyncState {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<GeminiMcpSyncState>(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<McpSyncState>(&raw).ok())
         .unwrap_or_default()
 }
 
