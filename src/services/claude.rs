@@ -1,6 +1,7 @@
 #[cfg(unix)]
 use crate::services::claude_tui::guarded_outcome::{self, OwnedWarmOutcome, SubmissionError};
 mod launch_env;
+#[cfg(any(unix, test))]
 use launch_env::build_tmux_launch_env_lines;
 mod process_session_launch;
 pub(crate) use process_session_launch::execute_streaming_local_process;
