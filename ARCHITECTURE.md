@@ -783,7 +783,8 @@ src/
 │   │   ├── herdr_turn.rs
 │   │   ├── process_session_launch.rs
 │   │   ├── startup_update_tests.rs
-│   │   └── tui_session_launch.rs
+│   │   ├── tui_session_launch.rs
+│   │   └── tui_tail_result.rs
 │   ├── codex_tmux_wrapper/
 │   │   └── input.rs
 │   ├── codex_tui/
