@@ -9,6 +9,9 @@ use super::super::*;
 use super::build_provider_skill_prompt;
 use super::command_policy::{TextCommandId, TextCommandSelection, select_text_command};
 
+#[path = "text_commands/clear.rs"]
+mod clear;
+
 #[cfg(test)]
 #[path = "text_commands/clear_refusal_reply_tests.rs"]
 mod clear_refusal_reply_tests;
@@ -452,33 +455,7 @@ pub(in crate::services::discord) async fn handle_text_command_with_uploads(
         }
 
         TextCommandId::Clear => {
-            let cleared = async {
-                super::clear_channel_session_state(
-                    &ctx.http,
-                    &data.shared,
-                    &data.provider,
-                    channel_id,
-                    "!clear",
-                    super::SoftClearNotifyMode::Suppress,
-                )
-                .await?;
-                let _ = msg.reply(&ctx.http, super::SESSION_CLEARED_RESPONSE).await;
-                anyhow::Ok(())
-            };
-            // A failed clear answers with its reason, as `/clear` does: an error returned from
-            // this handler reaches only the event-handler log, never the channel.
-            if let Err(error) = cleared.await {
-                tracing::warn!(
-                    event = "discord_command_failed",
-                    channel_id = channel_id.get(),
-                    user_id = msg.author.id.get(),
-                    user_name = %msg.author.name,
-                    command = cmd,
-                    reason = %error,
-                    "discord_command_failed"
-                );
-                let _ = msg.reply(&ctx.http, error.to_string()).await;
-            }
+            clear::handle(ctx, msg, data, channel_id, cmd).await;
             return Ok(true);
         }
 

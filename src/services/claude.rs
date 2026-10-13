@@ -1,5 +1,7 @@
 #[cfg(unix)]
 use crate::services::claude_tui::guarded_outcome::{self, OwnedWarmOutcome, SubmissionError};
+mod launch_env;
+use launch_env::build_tmux_launch_env_lines;
 mod process_session_launch;
 pub(crate) use process_session_launch::execute_streaming_local_process;
 
@@ -19,8 +21,8 @@ use std::time::Duration;
 use crate::services::agent_protocol::{RuntimeHandoff, StreamMessage, is_valid_session_id};
 use crate::services::claude_command::ClaudeCommandBuilder;
 use crate::services::claude_compact_context::{
-    append_auto_compact_window_shell_env, apply_auto_compact_window_to_command,
-    claude_model_from_args, launch_auto_compact_window_for_session,
+    apply_auto_compact_window_to_command, claude_model_from_args,
+    launch_auto_compact_window_for_session,
 };
 #[cfg(unix)]
 use crate::services::claude_tui::hosting::{
@@ -188,48 +190,6 @@ pub(crate) fn append_claude_fast_mode_arg(args: &mut Vec<String>, fast_mode_enab
 
     args.push("--settings".to_string());
     args.push(format!(r#"{{"fastMode":{enabled}}}"#));
-}
-
-fn build_tmux_launch_env_lines(
-    exec_path: Option<&str>,
-    report_channel_id: Option<u64>,
-    report_provider: Option<ProviderKind>,
-    auto_compact_window: Option<u64>,
-) -> String {
-    let mut env_lines = String::from("unset CLAUDECODE\nunset AGENTDESK_BINDING_CONTEXT\n");
-    if let Some(exec_path) = exec_path {
-        env_lines.push_str(&format!(
-            "export PATH='{}'\n",
-            exec_path.replace('\'', "'\\''")
-        ));
-    }
-    if let Ok(root_dir) = std::env::var("AGENTDESK_ROOT_DIR") {
-        let trimmed = root_dir.trim();
-        if !trimmed.is_empty() {
-            env_lines.push_str(&format!(
-                "export AGENTDESK_ROOT_DIR='{}'\n",
-                trimmed.replace('\'', "'\\''")
-            ));
-        }
-    }
-    if let Some(channel_id) = report_channel_id {
-        env_lines.push_str(&format!(
-            "export {}={}\n",
-            RESTART_REPORT_CHANNEL_ENV, channel_id
-        ));
-    }
-    if let Some(provider) = report_provider {
-        env_lines.push_str(&format!(
-            "export {}={}\n",
-            RESTART_REPORT_PROVIDER_ENV,
-            provider.as_str()
-        ));
-    }
-    // Compact-window overlay (#4591): fence off any inherited absolute window
-    // and export the freshly resolved one when present.
-    append_auto_compact_window_shell_env(&mut env_lines, auto_compact_window);
-
-    env_lines
 }
 
 #[cfg(test)]

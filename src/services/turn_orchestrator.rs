@@ -49,6 +49,7 @@ pub(crate) use registry_purge::PurgeQueueResult;
 mod remint_fence;
 mod reply_results;
 mod source_generation;
+use source_generation::push_unique_source_message_queued_generations;
 mod source_text;
 use source_text::{
     ensure_source_text_segments, join_source_text_segments, push_unique_source_text_segments,
@@ -204,20 +205,6 @@ fn push_unique_message_ids(
     for message_id in incoming {
         if !existing.contains(&message_id) {
             existing.push(message_id);
-        }
-    }
-}
-
-fn push_unique_source_message_queued_generations(
-    existing: &mut Vec<SourceMessageQueuedGeneration>,
-    incoming: impl IntoIterator<Item = SourceMessageQueuedGeneration>,
-) {
-    for incoming in incoming {
-        if !existing
-            .iter()
-            .any(|owner| owner.message_id == incoming.message_id)
-        {
-            existing.push(incoming);
         }
     }
 }

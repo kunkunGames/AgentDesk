@@ -30,3 +30,18 @@ impl SourceMessageQueuedGeneration {
         }
     }
 }
+
+/// Keep the first queued-generation witness for each source message.
+pub(super) fn push_unique_source_message_queued_generations(
+    existing: &mut Vec<SourceMessageQueuedGeneration>,
+    incoming: impl IntoIterator<Item = SourceMessageQueuedGeneration>,
+) {
+    for incoming in incoming {
+        if !existing
+            .iter()
+            .any(|owner| owner.message_id == incoming.message_id)
+        {
+            existing.push(incoming);
+        }
+    }
+}

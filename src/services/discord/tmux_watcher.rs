@@ -97,10 +97,7 @@ mod task_response_authority;
 #[path = "tmux_watcher/discrete_trigger_marker.rs"]
 mod discrete_trigger_marker;
 
-// #3479 item-2: the watcher-direct orphan status-panel cleanup/completion/refresh
-// cluster extracted to a sibling submodule (pure move, zero logic change). Items
-// are `pub(super)` there and re-imported below so the watcher loop's call sites —
-// and the sibling `single_message_footer.rs` completion call — stay byte-identical.
+// The watcher and footer share the orphan panel cleanup and completion owner.
 #[path = "tmux_watcher/orphan_status_panel_cleanup.rs"]
 mod orphan_status_panel_cleanup;
 
@@ -109,10 +106,7 @@ use self::orphan_status_panel_cleanup::{
     refresh_watcher_session_panel_from_lifecycle,
 };
 
-// #3479 item-2: provider-session selector resolution + persistence cluster
-// extracted to a sibling submodule (pure move, zero logic change). Items are
-// `pub(super)` there and re-imported here so the watcher loop's call sites stay
-// byte-identical.
+// Provider-session resolution and persistence share one owner.
 #[path = "tmux_watcher/provider_session_persistence.rs"]
 mod provider_session_persistence;
 
@@ -131,13 +125,7 @@ mod supervisor_relay;
 #[path = "tmux_watcher/session_bound_ack.rs"]
 mod session_bound_ack;
 
-// #3479 Phase-1 rank-2: two more cohesive PURE clusters extracted to sibling
-// submodules (pure move, zero logic change). `utf8_chunk_decoder` holds the
-// streaming UTF-8 chunk decoder; `terminal_readiness` holds the synchronous
-// terminal-readiness / inflight-classification predicates and the pure
-// buffer/message-id reconcilers. The async `shared`-touching
-// `commit_watcher_direct_terminal_session_idle` now lives in `tmux_watcher/liveness.rs`;
-// items are re-imported here so the watcher loop's call sites stay byte-identical.
+// Pure readiness predicates and UTF-8 decoding stay separate from async liveness effects.
 #[path = "tmux_watcher/terminal_readiness.rs"]
 mod terminal_readiness;
 
@@ -1434,10 +1422,15 @@ pub(in crate::services::discord) async fn tmux_output_watcher_with_restore(
         }
         if relay_ok {
             #[cfg(unix)]
-            #[rustfmt::skip]
-            let c_terminal = async { let candidates = crate::services::discord::replay_policy::injected::pending(channel_id.get(), &tmux_session_name, &output_path, terminal_event_consumed_offset(current_offset, &all_data)); if !candidates.is_empty() && !cancel.load(Ordering::Acquire) { crate::services::discord::replay_policy::injected::consume(&shared, channel_id.get(), candidates).await; } };
-            #[cfg(unix)]
-            c_terminal.await;
+            consume_injected_terminal(
+                &shared,
+                channel_id,
+                &tmux_session_name,
+                &output_path,
+                terminal_event_consumed_offset(current_offset, &all_data),
+                &cancel,
+            )
+            .await;
             cancel_handoff::completion::finish_after_receipt(
                 &shared,
                 channel_id,

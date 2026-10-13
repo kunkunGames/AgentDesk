@@ -27,7 +27,9 @@ pub(crate) use tui_session_launch::emit_codex_tui_post_tail_handoff;
 #[cfg(unix)]
 pub(crate) use tui_session_launch::{CodexTuiLaunchRefused, tui_preflight};
 #[cfg(unix)]
-use tui_session_launch::{prepare_codex_tui_incarnation, publish_codex_tui_launch_script};
+use tui_session_launch::{
+    CodexTuiLaunchScript, prepare_codex_tui_incarnation, publish_codex_tui_launch_script,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde_json::Value;
@@ -1578,17 +1580,6 @@ fn cleanup_existing_codex_tui_session(
     if !pane_already_stopped {
         crate::services::platform::tmux::kill_session(tmux_session_name, reason_text);
     }
-}
-
-/// Paths and timing produced while preparing a Codex Direct TUI launch script.
-#[cfg(unix)]
-struct CodexTuiLaunchScript {
-    prepared: crate::services::tui_prompt_dedupe::binding_context::PreparedIncarnation,
-    script_path: String,
-    owner_path: String,
-    rollout_modified_since: std::time::SystemTime,
-    /// The Discord handoff reserved before launch, held until the tail returns.
-    handoff: crate::services::tui_prompt_dedupe::HandoffGuard,
 }
 
 /// Wire the cancel token to the freshly created tmux session: record the

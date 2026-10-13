@@ -1,5 +1,31 @@
 use super::*;
 
+/// Consume injected terminal receipts before releasing the completed handoff.
+#[cfg(unix)]
+pub(super) async fn consume_injected_terminal(
+    shared: &SharedData,
+    channel_id: ChannelId,
+    tmux_session_name: &str,
+    output_path: &str,
+    consumed_end: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+) {
+    let candidates = crate::services::discord::replay_policy::injected::pending(
+        channel_id.get(),
+        tmux_session_name,
+        output_path,
+        consumed_end,
+    );
+    if !candidates.is_empty() && !cancel.load(Ordering::Acquire) {
+        crate::services::discord::replay_policy::injected::consume(
+            shared,
+            channel_id.get(),
+            candidates,
+        )
+        .await;
+    }
+}
+
 pub(in crate::services::discord) async fn release_restored_watcher_active_turn_before_panel_edit(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
