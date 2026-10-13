@@ -54,6 +54,7 @@ count as a non-writer just because it has no file open right now.
    - the policy verdict from the tmux source authority, with its incarnation
    - session id
    - the opened raw path and its file identity
+   - an explicit boolean `recovery_target` (`true` or `false`); missing or non-boolean values are refused
    - for a row selected for recovery: native turn id, nonce, BODY message id, and proof result
 5. **Run the check:**
 

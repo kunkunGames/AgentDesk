@@ -280,6 +280,25 @@ class ActivationValidatorTests(unittest.TestCase):
         self.assert_refused(lambda s: s["sources"][0].pop("native_turn_id"), "without Legacy policy")
         self.assert_refused(lambda s: s["sources"][0].__setitem__("proof", "held"), "without Legacy policy")
 
+    def test_non_boolean_targets_cannot_bypass_recovery_proof(self):
+        for value in ("true", "false", "", 1, 0, 1.0, 0.0, None, [], {}):
+            with self.subTest(value=value):
+                survey = complete_survey()
+                source = survey["sources"][0]
+                source["recovery_target"] = value
+                for key in ("native_turn_id", "nonce", "body_msg_id", "proof"):
+                    source.pop(key)
+                self.assertTrue(any("recovery_target" in reason for reason in activation.check(survey)))
+        self.assert_refused(lambda s: s["sources"][0].pop("recovery_target"), "recovery_target")
+
+    def test_explicit_non_target_needs_no_recovery_proof(self):
+        survey = complete_survey()
+        source = survey["sources"][0]
+        source["recovery_target"] = False
+        for key in ("native_turn_id", "nonce", "body_msg_id", "proof"):
+            source.pop(key)
+        self.assertEqual(activation.check(survey), [])
+
     def test_cli_exit_codes(self):
         with tempfile.TemporaryDirectory() as tmp:
             good = Path(tmp) / "good.json"
@@ -288,14 +307,24 @@ class ActivationValidatorTests(unittest.TestCase):
             survey = copy.deepcopy(complete_survey())
             survey["sources"][0]["policy"] = "VerifiedUnavailable"
             bad.write_text(json.dumps(survey))
+            malformed = Path(tmp) / "malformed.json"
+            survey = complete_survey()
+            survey["sources"][0]["recovery_target"] = "true"
+            for key in ("native_turn_id", "nonce", "body_msg_id", "proof"):
+                survey["sources"][0].pop(key)
+            malformed.write_text(json.dumps(survey))
             run = lambda path: subprocess.run(
                 [sys.executable, str(SCRIPT), str(path)], capture_output=True, text=True
             )
             ok, refused, unreadable = run(good), run(bad), run(Path(tmp) / "absent.json")
+            malformed_target = run(malformed)
         self.assertEqual((ok.returncode, ok.stdout.strip()), (0, "P5925_ACTIVATION_OK"))
         self.assertEqual(refused.returncode, 1)
         self.assertTrue(refused.stdout.startswith("P5925_ACTIVATION_REFUSED\nREFUSE "))
         self.assertEqual(unreadable.returncode, 2)
+        self.assertEqual(malformed_target.returncode, 1)
+        self.assertIn("P5925_ACTIVATION_REFUSED", malformed_target.stdout)
+        self.assertIn("recovery_target", malformed_target.stdout)
 
 
 if __name__ == "__main__":

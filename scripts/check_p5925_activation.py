@@ -169,7 +169,10 @@ def check(survey):
             or any(type(value) is not int or value < 0 for value in identity)
         ):
             refuse(f"{label}: session or opened raw source unconfirmed")
-        if source.get("recovery_target") is True and (
+        recovery_target = source.get("recovery_target")
+        if type(recovery_target) is not bool:
+            refuse(f"{label}: recovery_target must be an explicit boolean")
+        elif recovery_target and (
             policy != "Legacy"
             or not all(_text(source.get(key)) for key in ("native_turn_id", "nonce", "body_msg_id"))
             or source.get("proof") != "planned"
