@@ -452,7 +452,9 @@ class WorkflowStructure(unittest.TestCase):
         self.assertEqual(self.job["if"], "github.repository == 'itismyfield/AgentDesk' && github.ref == 'refs/heads/main'")
         self.assertEqual(self.job["timeout-minutes"], 5)
         self.assertEqual({s["uses"] for s in self.job["steps"] if "uses" in s},
-                         {"actions/checkout@v4", "actions/setup-python@v5", "actions/upload-artifact@v4"})
+                         {"actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+                          "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+                          "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"})
         self.assertNotIn("secrets.", WORKFLOW.read_text(encoding="utf-8"))
         for step in self.job["steps"]:
             self.assertNotIn("continue-on-error", step)
