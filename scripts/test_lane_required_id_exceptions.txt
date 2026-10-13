@@ -58,4 +58,6 @@ services::tui_prompt_dedupe::binding_events::presence_admission | helper-module 
 services::tui_prompt_dedupe::test_clock | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::turn_orchestrator::pending_queue_persistence::fsync_fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::turn_orchestrator::pending_queue_persistence::post_save_fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
+services::turn_orchestrator::pending_queue_persistence::queued_recovery::scan_fault | helper-module | #6813 | expires=2027-10-12 | injects read_dir and entry failures for queued recovery acceptance tests; owns no test function
+services::turn_orchestrator::policy_close::test_hooks | helper-module | #5340 | expires=2027-10-12 | lets the before-start policy close tests observe and panic at each mailbox step stage; it holds no test of its own
 services::turn_orchestrator::queued_head::claim | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
