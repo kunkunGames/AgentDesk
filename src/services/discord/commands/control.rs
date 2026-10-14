@@ -1205,8 +1205,8 @@ mod clear_persist_failure_tests {
                 "SESSION_CLEARED_RESPONSE",
             ),
             (
-                include_str!("text_commands.rs"),
-                "TextCommandId::Clear =>",
+                include_str!("text_commands/clear.rs"),
+                "pub(super) async fn handle(",
                 "clear_channel_session_state(",
                 "SESSION_CLEARED_RESPONSE",
             ),
