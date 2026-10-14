@@ -1,0 +1,5 @@
+test_cfg_gated_relay_consumers_select_windows (tests.test_fast_check_ci_wiring.FastCheckCiWiringTests.test_cfg_gated_relay_consumers_select_windows)
+cross_os_rust must select every derived cfg-shim consumer (#5832). ... ok
+test_ci_script_checks_runs_lane_coverage_contract (tests.test_fast_check_ci_wiring.FastCheckCiWiringTests.test_ci_script_checks_runs_lane_coverage_contract) ... ok
+test_cross_os_required_context_fails_closed_on_either_runner (tests.test_fast_check_ci_wiring.FastCheckCiWiringTests.test_cross_os_required_context_fails_closed_on_either_runner) ... ok
+test_cross_os_split_rejects_fail_open_mutations (tests.test_fast_check_ci_wiring.FastCheckCiWiringTests.test_cross_os_split_rejects_fail_open_mutations) ...

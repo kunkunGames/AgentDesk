@@ -1,0 +1,101 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.13, pytest-9.1.1, pluggy-1.6.0 -- /home/jules/.pyenv/versions/3.12.13/bin/python3
+cachedir: .pytest_cache
+rootdir: /app
+collecting ... collected 74 items
+
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_cfg_gated_relay_consumers_select_windows
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_cfg_gated_relay_consumers_select_windows PASSED [  1%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_ci_script_checks_runs_lane_coverage_contract PASSED [  2%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_cross_os_required_context_fails_closed_on_either_runner
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_cross_os_required_context_fails_closed_on_either_runner PASSED [  4%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_cross_os_split_rejects_fail_open_mutations
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_cross_os_split_rejects_fail_open_mutations PASSED [  5%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_documented_harmless_surface_edits_are_not_overblocked
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_documented_harmless_surface_edits_are_not_overblocked PASSED [  6%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_duplicate_required_job_id_is_rejected_before_last_wins_resolution PASSED [  8%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_fixed_surfaces_use_raw_github_scalar_values
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_fixed_surfaces_use_raw_github_scalar_values PASSED [  9%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_footer_marker_regressions_run_in_required_test_fast_lane PASSED [ 10%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_giant_file_progress_selector_wiring PASSED [ 12%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_accepts_clean_yaml_workflow PASSED [ 13%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_accepts_every_repository_workflow PASSED [ 14%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_accepts_hosted_labels_and_repository_policy_static_matrices
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_accepts_hosted_labels_and_repository_policy_static_matrices PASSED [ 16%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_accepts_unrelated_matrix_job_name PASSED [ 17%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_distinguishes_retired_variable_reads_from_prose
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_distinguishes_retired_variable_reads_from_prose PASSED [ 18%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_flow_sequence_manual_trigger PASSED [ 20%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_full_expression_script_context PASSED [ 21%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_main_windows_warm_that_misses_pr_cache_key
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_main_windows_warm_that_misses_pr_cache_key PASSED [ 22%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_matrix_name_with_required_static_context PASSED [ 24%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_multiple_job_name_expressions
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_multiple_job_name_expressions PASSED [ 25%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_non_string_yaml_job_keys PASSED [ 27%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_routing_outside_repository_hosted_runner_policy
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_routing_outside_repository_hosted_runner_policy PASSED [ 28%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_split_expression_script_context PASSED [ 29%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_workflow_symlink PASSED [ 31%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_yaml_11_booleanish_plain_job_keys
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_yaml_11_booleanish_plain_job_keys PASSED [ 32%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_yaml_aliases_by_policy PASSED [ 33%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_hardening_rejects_yaml_manual_duplicate_script_context PASSED [ 35%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_helper_content_pin_kills_all_prior_mutation_classes
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_helper_content_pin_kills_all_prior_mutation_classes PASSED [ 36%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_inflight_lock_primitive_triggers_required_native_windows_lane
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_inflight_lock_primitive_triggers_required_native_windows_lane PASSED [ 37%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_large_file_guard_uses_nul_delimited_tracked_paths PASSED [ 39%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_main_and_nightly_retain_non_pg_test_coverage
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_main_and_nightly_retain_non_pg_test_coverage PASSED [ 40%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_module_walk_has_no_unaudited_blind_spots
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_module_walk_has_no_unaudited_blind_spots PASSED [ 41%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_mutation_job_prepares_online_dependencies_before_offline_mutations PASSED [ 43%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_nightly_notification_suite_is_executable_and_failure_is_fatal PASSED [ 44%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_path_filter_mirror_helper_pins_reject_helper_mutations
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_path_filter_mirror_helper_pins_reject_helper_mutations PASSED [ 45%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_path_filter_required_contexts_publish_from_always_mirrors
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_path_filter_required_contexts_publish_from_always_mirrors PASSED [ 47%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_path_filter_required_mirrors_fail_closed_on_upstream_results
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_path_filter_required_mirrors_fail_closed_on_upstream_results PASSED [ 48%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_path_filter_required_mirrors_reject_fail_open_mutations
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_path_filter_required_mirrors_reject_fail_open_mutations PASSED [ 50%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_pr_cross_os_lane_allows_only_targeted_writer_runtime PASSED [ 51%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_pr_fast_check_is_compile_and_policy_only PASSED [ 52%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_provider_and_session_host_trees_select_native_windows_lane
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_provider_and_session_host_trees_select_native_windows_lane PASSED [ 54%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_registered_step_continue_policy_accepts_absent_and_boolean_false
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_registered_step_continue_policy_accepts_absent_and_boolean_false PASSED [ 55%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_registered_step_continue_policy_is_typed_and_exact
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_registered_step_continue_policy_is_typed_and_exact PASSED [ 56%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_relay_authority_contract_job_uses_pinned_recipe PASSED [ 58%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_relay_authority_graph_rejects_fail_open_mutations
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_relay_authority_graph_rejects_fail_open_mutations PASSED [ 59%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_relay_authority_mirror_rejects_unsuccessful_runner_results
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_relay_authority_mirror_rejects_unsuccessful_runner_results PASSED [ 60%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_required_fast_check_context_mirrors_the_same_upstream_job PASSED [ 62%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_required_job_needs_closure_has_role_specific_scheduling_policy
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_required_job_needs_closure_has_role_specific_scheduling_policy PASSED [ 63%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_required_jobs_hash_backstops_reject_helper_and_gate_mutations
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_required_jobs_hash_backstops_reject_helper_and_gate_mutations PASSED [ 64%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_required_pr_steps_cannot_be_silently_disabled
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_required_pr_steps_cannot_be_silently_disabled PASSED [ 66%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_required_relay_job_backstops_mirror_content_hash PASSED [ 67%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_required_script_context_is_pr_only
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_required_script_context_is_pr_only PASSED [ 68%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_required_targeted_context_mirrors_test_fast_pg_db_gate PASSED [ 70%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_aggregate_is_exactly_one_step PASSED [ 71%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_aggregate_must_not_define_if PASSED [ 72%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_aggregate_must_run_exact_command PASSED [ 74%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_effective_execution_contract_covers_all_yaml_scopes
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_effective_execution_contract_covers_all_yaml_scopes PASSED [ 75%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_mirror_fails_closed_on_skipped_upstream_results
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_mirror_fails_closed_on_skipped_upstream_results PASSED [ 77%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_needs_accepts_equivalent_scalar_and_list_forms
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_needs_accepts_equivalent_scalar_and_list_forms PASSED [ 78%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_protected_step_inventory_is_pinned
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_protected_step_inventory_is_pinned PASSED [ 79%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_publisher_rejects_conditional_if
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_publisher_rejects_conditional_if PASSED [ 81%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_publisher_rejects_missing_always_condition PASSED [ 82%]
+tests/test_fast_check_ci_wiring.py::FastCheckCiWiringTests::test_script_checks_required_context_mirror_is_pinned_fail_closed
