@@ -191,12 +191,6 @@ var autoQueue = {
     // so this is an explicit, future-proof early return — no behavior change.)
     if (isSidePathDispatch(dispatch.dispatch_type)) return;
 
-    // # Bolt: avoid parsing context/result if the context string lacks the required
-    // 'phase_gate' signature, eliminating expensive JSON.parse in the hot path.
-    if (typeof dispatch.context === "string" && dispatch.context.indexOf('"phase_gate"') === -1) {
-      return;
-    }
-
     var context = {};
     if (dispatch.context && dispatch.context !== "{}" && dispatch.context !== "[]") {
       try { context = JSON.parse(dispatch.context); } catch (e) { context = {}; }
