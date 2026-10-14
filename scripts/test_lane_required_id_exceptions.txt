@@ -3,6 +3,7 @@
 config::disk_write::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 db::channel_recovery_custody | helper-module | #5340 | expires=2027-10-14 | dormant custody row store (reserve, revision CAS, read) exercised by the recovery_custody PG tests; it holds no test of its own
 db::postgres::advisory_lock::test_seam | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
+server::routes::o_transition::test_hooks | helper-module | #5340 | expires=2027-10-12 | counts the transition route's sends and runs a probe between reply and consumption for the route tests; it holds no test of its own
 services::claude_tui::hook_server::observation_ingress::windows_tests::a_claude_transcript_without_supported_file_identity_is_refused | platform-unavailable | #5082 | expires=2027-10-12 | Windows-only platform test not run on Linux CI runner
 services::claude_tui::hook_server::observation_ingress::windows_tests::a_rollout_without_supported_file_identity_is_refused | platform-unavailable | #5082 | expires=2027-10-12 | Windows-only platform test not run on Linux CI runner
 services::claude_tui::host_input::guarded_submission::test_support | helper-module | #6325 | expires=2026-10-26 | Scoped request and result fixtures used by executor_tests; this helper declares no test id.
@@ -12,6 +13,7 @@ services::discord::catch_up::consumed_commands::test_gate | helper-module | #508
 services::discord::health::legacy_supervision::boot_status | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::health::legacy_supervision::test_owner | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::health::legacy_supervision::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
+services::discord::health::o_transition::test_hooks | helper-module | #5340 | expires=2027-10-12 | counts transition context resolutions for the route admission tests; it holds no test of its own
 services::discord::health::turn_deliver::inject::test_hook | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::herdr_terminate::test_queue | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::herdr_terminate::test_turn | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
@@ -59,6 +61,7 @@ services::tui_o::store::windows_tests::enabling_the_store_is_refused_without_dir
 services::tui_o::turn_mode::test_tick | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::tui_o::writer::actor::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::tui_o::writer::actor::transition::test_hooks | helper-module | #5340 | expires=2027-10-14 | lets the transition actor tests wait for probe workers, count snapshots and look in before a retirement; it holds no test of its own
+services::tui_o::writer::host::transition::test_support | helper-module | #5340 | expires=2027-10-12 | hosts a transition port for the route tests without starting an actor host; it holds no test of its own
 services::tui_o::writer::rotation::probe | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::tui_prompt_dedupe::binding_events::presence_admission | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::tui_prompt_dedupe::test_clock | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
@@ -68,3 +71,4 @@ services::turn_orchestrator::pending_queue_persistence::queue_exit_debt::read_ba
 services::turn_orchestrator::pending_queue_persistence::queued_recovery::scan_fault | helper-module | #6813 | expires=2027-10-12 | injects read_dir and entry failures for queued recovery acceptance tests; owns no test function
 services::turn_orchestrator::policy_close::test_hooks | helper-module | #5340 | expires=2027-10-12 | lets the before-start policy close tests observe and panic at each mailbox step stage; it holds no test of its own
 services::turn_orchestrator::registry_purge::recovery_custody::commit_fault | helper-module | #5340 | expires=2027-10-14 | lets the custody PG tests run a change between a custody write and its commit; it holds no test of its own
+services::turn_orchestrator::registry_purge::recovery_custody::seam | helper-module | #5340 | expires=2027-10-14 | pause points and an effect count on the apply path for the registry PG tests; it holds no test of its own
