@@ -1267,13 +1267,15 @@ jobs:
         run: ./scripts/required-check-mirror.sh
 
   pg_shards:
+    permissions:
+      contents: read
     needs: changes
     if: needs.changes.outputs.pg_db == 'true'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - id: plan
         shell: bash
         run: |
@@ -1281,6 +1283,8 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   test_fast:
+    permissions:
+      contents: read
     name: PostgreSQL tests (shard ${{ matrix.shard }})
     needs: [changes, pg_shards]
     if: needs.changes.outputs.pg_db == 'true'
@@ -2294,7 +2298,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=f3217bdac63b70722ea80e5ffb27a6e29d7598b195471944916b25c29c1019b3
+          expected=87308bbdde993eeb0cff016c753f1a2f7f69ac261da074ceb1718235e38a1272
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
@@ -2527,7 +2531,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=f3217bdac63b70722ea80e5ffb27a6e29d7598b195471944916b25c29c1019b3
+          expected=87308bbdde993eeb0cff016c753f1a2f7f69ac261da074ceb1718235e38a1272
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"

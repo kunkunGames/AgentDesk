@@ -925,7 +925,7 @@ targets = {
     # Re-pinned after adding the ensure-swap step and running the observer under mem-measure.
     # Re-pinned after raising the `just test-postgres` step budget from 40 to 60 minutes.
     # Re-pinned after raising the observer step budget from 20 to 30 minutes.
-    "job_sha256" => "b36ab646405230bf5e93ebcc5a4b7d22735b719e291d042e76b1544e831c5849",
+    "job_sha256" => "89d66a8a5a1a746bc2e96d35ba83aed3a808e109046f176c305db817c18ca81a",
     "cargo_steps" => {
       "Observe curated lane selections" => {
         "commands" => [
@@ -1456,9 +1456,10 @@ job_id = pr ? "test_fast" : "postgres"
 document = YAML.load_file(main_path)
 plan = {
   "runs-on" => "ubuntu-latest",
+  "permissions" => { "contents" => "read" },
   "outputs" => { "matrix" => "${{ steps.plan.outputs.matrix }}" },
   "steps" => [
-    { "uses" => "actions/checkout@v4" },
+    { "uses" => "actions/checkout@11d5960a326750d5838078e36cf38b85af677262" },
     { "id" => "plan", "shell" => "bash", "run" => "matrix=$(python3 scripts/check_pg_test_lane_membership.py --pg-shard-matrix)\necho \"matrix=$matrix\" >> \"$GITHUB_OUTPUT\"\n" },
   ],
 }
@@ -1471,6 +1472,7 @@ end
 errors << "#{main_path}: pg_shards must emit the canonical matrix" unless document.dig("jobs", "pg_shards") == plan
 errors << "job postgres must be named per shard" unless job["name"] == "PostgreSQL tests (shard ${{ matrix.shard }})"
 errors << "job postgres must run on ubuntu-latest" unless job["runs-on"] == "ubuntu-latest"
+errors << "PG job must use read-only contents permissions" unless job["permissions"] == { "contents" => "read" }
 errors << "PG job must retain its exact needs" unless job["needs"] == (pr ? ["changes", "pg_shards"] : "pg_shards")
 errors << "PG job must retain its path condition" unless (pr ? job["if"] == "needs.changes.outputs.pg_db == 'true'" : !job.key?("if"))
 errors << "PG job must not set continue-on-error" if job.key?("continue-on-error")
@@ -2060,6 +2062,18 @@ if [ -f "$trusted_workflow" ] && ! ruby -ryaml -e '
     crons.all? { |entry| entry.is_a?(Hash) && entry["cron"].is_a?(String) } &&
     group["cancel-in-progress"] == false && group["group"].to_s.include?("github.event_name"))' "$trusted_workflow"; then
   error "$trusted_workflow must trigger only on schedule and workflow_dispatch, and no run may cancel another"
+fi
+
+# The requested manual revision cannot influence the first checkout or run
+# before the verifier from protected main has checked its ancestry.
+if [ -f "$trusted_workflow" ] && ! ruby -ryaml -e '
+  doc = YAML.safe_load(File.read(ARGV[0])); steps = doc.dig("jobs", "macos_hosted", "steps")
+  checkout = {"uses" => "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+    "with" => {"ref" => "main", "fetch-depth" => 0, "filter" => "blob:none", "persist-credentials" => false}}
+  verify = {"name" => "Select a revision already in protected main", "shell" => "bash",
+    "env" => {"REQUESTED_REF" => "${{ inputs.ref }}"}, "run" => "bash scripts/ci/checkout-trusted-main-ref.sh"}
+  exit(steps.is_a?(Array) && steps.take(2) == [checkout, verify] ? 0 : 1)' "$trusted_workflow"; then
+  error "$trusted_workflow must verify requested revisions from protected main before any execution or cache access"
 fi
 
 # Superseded PR heads must release hosted runners immediately. Required

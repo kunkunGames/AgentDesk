@@ -192,11 +192,13 @@ jobs:
         run: sccache --show-stats || true
 
   pg_shards:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - id: plan
         shell: bash
         run: |
@@ -204,6 +206,8 @@ jobs:
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   postgres:
+    permissions:
+      contents: read
     name: PostgreSQL tests (shard ${{ matrix.shard }})
     needs: pg_shards
     runs-on: ubuntu-latest

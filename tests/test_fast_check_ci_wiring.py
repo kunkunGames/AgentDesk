@@ -20,7 +20,7 @@ REQUIRED_CHECK_MIRROR_SHA256 = (
     "57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d"
 )
 CI_RUNNER_HARDENING_SHA256 = (
-    "f3217bdac63b70722ea80e5ffb27a6e29d7598b195471944916b25c29c1019b3"
+    "87308bbdde993eeb0cff016c753f1a2f7f69ac261da074ceb1718235e38a1272"
 )
 PR_WORKFLOW = REPO_ROOT / ".github/workflows/ci-pr.yml"
 # Job-level condition of every required-context mirror and its source line.
@@ -113,7 +113,7 @@ UNREACHABLE_RUST_FILES = (
 )
 MAIN_WORKFLOW = REPO_ROOT / ".github/workflows/ci-main.yml"
 NIGHTLY_WORKFLOW = REPO_ROOT / ".github/workflows/ci-nightly.yml"
-MACOS_TRUSTED_WORKFLOW = REPO_ROOT / ".github/workflows/ci-macos-trusted.yml"
+MACOS_WORKFLOW_PATH = REPO_ROOT / ".github/workflows/ci-macos-trusted.yml"
 BUSY_RETRY_4888_TEST_COMMAND = (
     "env -u AGENTDESK_ROOT_DIR cargo test --lib _4888 -- --test-threads=1"
 )
@@ -816,7 +816,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
                 self.assertFalse(selects(survivors, sample))
 
     def test_trusted_macos_hosted_lane_runs_single_message_panel_tests(self) -> None:
-        workflow = MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8")
+        workflow = MACOS_WORKFLOW_PATH.read_text(encoding="utf-8")
         command = (
             "env -u AGENTDESK_ROOT_DIR cargo test --lib "
             "single_message_panel::tests -- --skip _pg --skip pg_ --skip postgres"
@@ -824,7 +824,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertEqual(job_block(workflow, "macos_hosted").count(command), 1)
 
     def test_trusted_macos_hosted_lane_runs_placeholder_live_events_tests(self) -> None:
-        workflow = MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8")
+        workflow = MACOS_WORKFLOW_PATH.read_text(encoding="utf-8")
         command = (
             "env -u AGENTDESK_ROOT_DIR cargo test --lib "
             "placeholder_live_events -- --skip _pg --skip pg_ --skip postgres"
@@ -2364,12 +2364,12 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertIn("must retain exact needs: changes", result.stderr)
 
     def test_trusted_macos_runs_busy_retry_regressions_on_hosted_runner(self) -> None:
-        workflow = MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8")
+        workflow = MACOS_WORKFLOW_PATH.read_text(encoding="utf-8")
         hosted = job_block(workflow, "macos_hosted")
         self.assertEqual(hosted.count(BUSY_RETRY_4888_TEST_COMMAND), 1)
 
     def test_trusted_macos_has_only_an_unconditional_hosted_job(self) -> None:
-        workflow = yaml.safe_load(MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8"))
+        workflow = yaml.safe_load(MACOS_WORKFLOW_PATH.read_text(encoding="utf-8"))
         jobs = workflow["jobs"]
         self.assertNotIn("macos_self_hosted", jobs)
         self.assertNotIn("resolve_macos_runner", jobs)
@@ -2382,7 +2382,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
 
     def assert_filter_gates_exactly(self, job_name: str, gated: set[str]) -> None:
         """`gated` skips only on a successful run=false; other steps never skip."""
-        workflow = yaml.safe_load(MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8"))
+        workflow = yaml.safe_load(MACOS_WORKFLOW_PATH.read_text(encoding="utf-8"))
         steps = workflow["jobs"][job_name]["steps"]
         start = next(i for i, step in enumerate(steps) if step.get("id") == "rust_filter")
         conditions = {step["name"]: step.get("if") for step in steps[start + 1 :]}
@@ -2399,7 +2399,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
                     )
 
     def test_trusted_macos_hosted_job_gates_only_heavy_steps(self) -> None:
-        workflow = MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8")
+        workflow = MACOS_WORKFLOW_PATH.read_text(encoding="utf-8")
         hosted = job_block(workflow, "macos_hosted")
         header, steps = hosted.split("    steps:\n", 1)
         self.assertNotIn("rust_filter", header)
@@ -2457,7 +2457,7 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertEqual(entries.get("SCCACHE_GHA_ENABLED"), "")
 
     def test_trusted_macos_hosted_sccache_reset_writes_both_empty_values(self) -> None:
-        workflow = yaml.safe_load(MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8"))
+        workflow = yaml.safe_load(MACOS_WORKFLOW_PATH.read_text(encoding="utf-8"))
         disable = next(
             step for step in workflow["jobs"]["macos_hosted"]["steps"]
             if step.get("name") == "Disable sccache on hosted macOS"
@@ -2633,7 +2633,7 @@ puts Digest::SHA256.hexdigest(JSON.generate(canonical))
 
     def test_hardening_rejects_routing_outside_repository_hosted_runner_policy(self) -> None:
         pr_workflow = PR_WORKFLOW.read_text(encoding="utf-8")
-        macos_trusted_text = MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8")
+        macos_trusted_text = MACOS_WORKFLOW_PATH.read_text(encoding="utf-8")
         variants = {
             "scalar": "    runs-on: self-hosted\n",
             "list": "    runs-on: [self-hosted, macOS]\n",
@@ -2778,7 +2778,7 @@ puts Digest::SHA256.hexdigest(JSON.generate(canonical))
 
     def test_hardening_keeps_trusted_macos_scheduled_and_uncancelled(self) -> None:
         pr_workflow = PR_WORKFLOW.read_text(encoding="utf-8")
-        trusted = MACOS_TRUSTED_WORKFLOW.read_text(encoding="utf-8")
+        macos_workflow_text = MACOS_WORKFLOW_PATH.read_text(encoding="utf-8")
         mutations = {
             "push": ("  workflow_dispatch:\n", "  push:\n    branches: [main]\n  workflow_dispatch:\n"),
             "no-cron": ("    - cron: ", "    - not-cron: "),
@@ -2787,13 +2787,37 @@ puts Digest::SHA256.hexdigest(JSON.generate(canonical))
         }
         for name, (old, new) in mutations.items():
             with self.subTest(mutation=name):
-                mutated = trusted.replace(old, new, 1)
-                self.assertNotEqual(mutated, trusted)
+                mutated = macos_workflow_text.replace(old, new, 1)
+                self.assertNotEqual(mutated, macos_workflow_text)
                 result = self.run_hardening_fixture(
                     pr_workflow, extra_workflows={"ci-macos-trusted.yml": mutated}
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("no run may cancel another", result.stderr)
+
+    def test_hardening_refuses_unverified_macos_revision_execution(self) -> None:
+        pr_workflow = PR_WORKFLOW.read_text(encoding="utf-8")
+        macos_workflow_text = MACOS_WORKFLOW_PATH.read_text(encoding="utf-8")
+        mutations = {
+            "input-checkout": ("          ref: main\n", "          ref: ${{ inputs.ref }}\n"),
+            "skip-verifier": (
+                "run: bash scripts/ci/checkout-trusted-main-ref.sh",
+                "run: echo skipped revision verification",
+            ),
+            "conditional-verifier": (
+                "      - name: Select a revision already in protected main\n",
+                "      - name: Select a revision already in protected main\n        if: false\n",
+            ),
+        }
+        for name, (old, new) in mutations.items():
+            with self.subTest(mutation=name):
+                mutated = macos_workflow_text.replace(old, new, 1)
+                self.assertNotEqual(mutated, macos_workflow_text)
+                result = self.run_hardening_fixture(
+                    pr_workflow, extra_workflows={"ci-macos-trusted.yml": mutated}
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("verify requested revisions from protected main", result.stderr)
 
     def test_hardening_distinguishes_retired_variable_reads_from_prose(self) -> None:
         variants = {
