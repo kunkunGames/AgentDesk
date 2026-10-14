@@ -13033,6 +13033,7 @@ services::tui_prompt_dedupe::handoff::tests::a_held_input_is_observed_once_when_
 services::tui_prompt_dedupe::handoff::tests::a_held_input_naming_no_turn_waits_for_its_record
 services::tui_prompt_dedupe::handoff::tests::a_partial_input_record_does_not_republish_its_held_hook_on_release
 services::tui_prompt_dedupe::handoff::tests::a_partial_record_ends_the_handoff_without_an_answer_slot
+services::tui_prompt_dedupe::handoff::tests::a_replayed_older_entry_preserves_a_new_same_text_held_input
 services::tui_prompt_dedupe::handoff::tests::a_restored_handoff_keeps_only_its_remaining_ttl
 services::tui_prompt_dedupe::handoff::tests::an_expired_handoff_publishes_its_held_input_once
 services::tui_prompt_dedupe::handoff::tests::an_old_handoff_snapshot_keeps_its_original_expiry

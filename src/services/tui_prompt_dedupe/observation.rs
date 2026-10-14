@@ -362,6 +362,9 @@ fn observe_inner(
     if provider.is_empty() || tmux_session_name.is_empty() || candidates.is_empty() {
         return PromptObservation::Ignored;
     }
+    if let handoff::Evidence::Record(record) = evidence {
+        handoff::annotate_record(&provider, tmux_session_name, &candidates, record);
+    }
     // An injected input is settled once, by the first observation that names its native turn.
     match claim_injected_steer(&provider, tmux_session_name, &candidates, native_turn) {
         Some(Claim::Deferred) => return PromptObservation::InjectedDeferred,

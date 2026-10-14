@@ -72,6 +72,27 @@ pub(super) struct ParkedObservation {
     pub(super) distinct_record: bool,
 }
 
+impl ParkedObservation {
+    /// Complete evidence can distinguish an older or foreign-turn same-text record.
+    fn record_is_distinct(
+        &self,
+        prompt: &str,
+        record: &RecordEvidence,
+        reserved_wall: DateTime<Utc>,
+    ) -> bool {
+        let Some((turn, _)) = record.complete() else {
+            return false;
+        };
+        prompts_match(&self.prompt, prompt)
+            && (!record.created_since(reserved_wall)
+                || !record.created_since(self.observed_at)
+                || self
+                    .native_turn
+                    .as_deref()
+                    .is_some_and(|held_turn| held_turn != turn))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct HandoffReservation {
     generation: u64,
@@ -194,6 +215,38 @@ pub(super) fn bind_matching_origin(
     };
     bind_origin(provider, tmux, prompts, proof)
         .filter(|outcome| !matches!(outcome, BindOutcome::NotOrigin))
+}
+
+/// An entry replay still proves which held copy is distinct; it creates no input or lease.
+pub(super) fn annotate_record(
+    provider: &str,
+    tmux: &str,
+    prompts: &[String],
+    record: &RecordEvidence,
+) {
+    let changed = {
+        let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+        let key = PromptKey::new(provider, tmux);
+        let Some(entry) = state.handoff_by_tmux.get_mut(&key) else {
+            return;
+        };
+        let reserved_wall = entry.value.reserved_wall;
+        let mut changed = false;
+        for held in &mut entry.value.parked {
+            if !held.distinct_record
+                && prompts
+                    .iter()
+                    .any(|prompt| held.record_is_distinct(prompt, record, reserved_wall))
+            {
+                held.distinct_record = true;
+                changed = true;
+            }
+        }
+        changed
+    };
+    if changed {
+        sync_durable(provider, tmux);
+    }
 }
 
 fn bind_origin(
@@ -321,12 +374,13 @@ impl TuiPromptDedupeState {
         let Some(entry) = self.handoff_by_tmux.get_mut(key) else {
             return (false, Vec::new());
         };
-        let Some((turn, _)) = record.complete() else {
+        let reserved_wall = entry.value.reserved_wall;
+        if record.complete().is_none() {
             return (false, Vec::new());
-        };
-        if !record.created_since(entry.value.reserved_wall) {
+        }
+        if !record.created_since(reserved_wall) {
             for held in &mut entry.value.parked {
-                if prompts_match(&held.prompt, prompt) {
+                if held.record_is_distinct(prompt, record, reserved_wall) {
                     held.distinct_record = true;
                 }
             }
@@ -336,13 +390,9 @@ impl TuiPromptDedupeState {
         let mut consumed_entry_ids = Vec::new();
         entry.value.parked.retain_mut(|held| {
             let same_text = prompts_match(&held.prompt, prompt);
-            let matches = same_text
-                && held
-                    .native_turn
-                    .as_deref()
-                    .is_none_or(|held_turn| held_turn == turn)
-                && record.created_since(held.observed_at);
-            if same_text && !matches {
+            let distinct = held.record_is_distinct(prompt, record, reserved_wall);
+            let matches = same_text && !distinct;
+            if distinct {
                 held.distinct_record = true;
             }
             claimed |= matches && held.distinct_record;

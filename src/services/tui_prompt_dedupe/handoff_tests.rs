@@ -255,6 +255,46 @@ fn a_partial_input_record_does_not_republish_its_held_hook_on_release() {
     }
 }
 
+#[test]
+fn a_replayed_older_entry_preserves_a_new_same_text_held_input() {
+    for release_first in [false, true] {
+        let _lock = locked();
+        let mut published = Published::new();
+        let older = record(Some("t0"), Some(Utc::now() - chrono::TimeDelta::minutes(5)));
+        let replay =
+            || observe_codex_record_prompt_at(TMUX, INPUT, Some("old"), None, &older, Utc::now());
+        assert_eq!(replay(), PromptObservation::PublishedSshDirect);
+        let mut guard = Some(reserve_discord_handoff("codex", TMUX, ORIGIN));
+        assert_eq!(hook(INPUT, "t2"), PromptObservation::ParkedForHandoff);
+        assert_eq!(replay(), PromptObservation::SuppressedReplayedEntry);
+        assert_eq!(held_handoff_inputs_for_tests("codex", TMUX), Some(1));
+        assert_eq!(published.of(INPUT).len(), 1, "the replay creates no event");
+        if release_first {
+            drop(guard.take());
+        }
+        let own = record(Some("t2"), Some(Utc::now()));
+        let observe =
+            || observe_codex_record_prompt_at(TMUX, INPUT, Some("new"), None, &own, Utc::now());
+        assert_eq!(
+            observe(),
+            if release_first {
+                PromptObservation::JoinedNativeTurn
+            } else {
+                PromptObservation::PublishedSshDirect
+            }
+        );
+        assert_eq!(slot("t2"), Some(NativeTurnOwner::Relay));
+        drop(guard);
+        assert_eq!(
+            published.of(INPUT).len(),
+            2,
+            "the new input is observed once"
+        );
+        assert_eq!(observe(), PromptObservation::SuppressedReplayedEntry);
+        assert_eq!(published.of(INPUT).len(), 2);
+    }
+}
+
 fn competing_bind(
     reserve: bool,
 ) -> (
