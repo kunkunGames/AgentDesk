@@ -207,22 +207,20 @@ pub(crate) async fn set_terminal_entry_finalize_suppressed_on_pg_tx(
     Ok(())
 }
 
-async fn has_runnable_entries_on_pg_tx(
+async fn remaining_runnable_entry_count_on_pg_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: &str,
-) -> Result<bool, String> {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-             SELECT 1
-             FROM auto_queue_entries
-             WHERE run_id = $1
-               AND status IN ('pending', 'dispatched')
-         )",
+) -> Result<i64, String> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)
+         FROM auto_queue_entries
+         WHERE run_id = $1
+           AND status IN ('pending', 'dispatched')",
     )
     .bind(run_id)
     .fetch_one(&mut **tx)
     .await
-    .map_err(|error| format!("check remaining auto-queue entries for run {run_id}: {error}"))
+    .map_err(|error| format!("count remaining auto-queue entries for run {run_id}: {error}"))
 }
 
 /// A blocking advisory acquisition here would invert the lock order used by
@@ -296,8 +294,8 @@ pub(crate) async fn maybe_finalize_run_if_ready_pg(
         return Ok(false);
     }
 
-    let has_runnable = has_runnable_entries_on_pg_tx(tx, run_id).await?;
-    if has_runnable {
+    let remaining = remaining_runnable_entry_count_on_pg_tx(tx, run_id).await?;
+    if remaining > 0 {
         return Ok(false);
     }
 
@@ -418,11 +416,11 @@ async fn complete_run_on_pg_inner(
     // `user_cancelled` is intentionally not runnable: it is an operator-held
     // state whose dispatch link has already been cleared. The same predicate is
     // used by `maybe_finalize_run_if_ready_pg`.
-    let has_runnable = has_runnable_entries_on_pg_tx(&mut tx, run_id).await?;
-    if has_runnable {
+    let remaining = remaining_runnable_entry_count_on_pg_tx(&mut tx, run_id).await?;
+    if remaining > 0 {
         tracing::info!(
             run_id = %run_id,
-            remaining = 1,
+            remaining,
             "complete_run_refused_live_entries"
         );
         tx.rollback().await.map_err(|error| {
