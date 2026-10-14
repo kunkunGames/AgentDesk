@@ -736,7 +736,7 @@ test("review-automation alerts again for a new create-pr failure generation", ()
 test("review-automation commits a create-pr completion failure in one op with no pre-count upsert", () => {
   const upserts = [];
   const { policy, state } = loadPolicy("policies/review-automation.js", {
-    cards: { "card-cp4": { id: "card-cp4", status: "review", assigned_agent_id: "agent-cp4" } },
+    cards: { "card-cp4": { id: "card-cp4", status: "review", assigned_agent_id: "agent-cp4", repo_id: "o/r", github_issue_url: null } },
     prTracking: {
       load: () => ({ card_id: "card-cp4", repo_id: "o/r", branch: "feat/x", dispatch_generation: "gen-x" }),
       upsert: (...args) => { upserts.push(args); return {}; },
@@ -744,7 +744,6 @@ test("review-automation commits a create-pr completion failure in one op with no
     },
     dbQuery: createSqlRouter([
       { match: "FROM task_dispatches WHERE id = ?", result: [{ id: "d-cp4", kanban_card_id: "card-cp4", dispatch_type: "create-pr", result: null, context: '{"dispatch_generation":"gen-x"}' }] },
-      { match: "SELECT repo_id, github_issue_url", result: [{ repo_id: "o/r", github_issue_url: null }] },
       { match: "AND dispatch_type IN ('implementation', 'rework')", result: [] },
       { match: "SELECT status FROM kanban_cards", result: [{ status: "review" }] }
     ]),
@@ -760,11 +759,10 @@ test("review-automation commits a create-pr completion failure in one op with no
 
 // #5716 r5: the record-only branch stamps no blocked_reason, so a record op that recorded nothing leaves the failure in neither table AND at retry_count 0 — invisible to the sweep. Hand off immediately.
 const buildCreatePrCompletion = (cardId, recordPrCreateFailure) => loadPolicy("policies/review-automation.js", {
-  cards: { [cardId]: { id: cardId, status: "in_progress", assigned_agent_id: "agent-" + cardId } },
+  cards: { [cardId]: { id: cardId, status: "in_progress", assigned_agent_id: "agent-" + cardId, repo_id: "o/r", github_issue_url: null } },
   prTracking: { load: () => ({ card_id: cardId, repo_id: "o/r", branch: "feat/x", dispatch_generation: "gen-y" }), findOpenPrByBranch: () => null },
   dbQuery: createSqlRouter([
     { match: "FROM task_dispatches WHERE id = ?", result: [{ id: "d-" + cardId, kanban_card_id: cardId, dispatch_type: "create-pr", result: null, context: '{"dispatch_generation":"gen-y"}' }] },
-    { match: "SELECT repo_id, github_issue_url", result: [{ repo_id: "o/r", github_issue_url: null }] },
     { match: "AND dispatch_type IN ('implementation', 'rework')", result: [] },
     { match: "SELECT status FROM kanban_cards", result: [{ status: "in_progress" }] }
   ]),
