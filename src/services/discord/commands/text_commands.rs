@@ -9,6 +9,13 @@ use super::super::*;
 use super::build_provider_skill_prompt;
 use super::command_policy::{TextCommandId, TextCommandSelection, select_text_command};
 
+#[path = "text_commands/clear.rs"]
+mod clear;
+
+#[cfg(test)]
+#[path = "text_commands/clear_refusal_reply_tests.rs"]
+mod clear_refusal_reply_tests;
+
 /// A text stop judges the turn, by its inflight row when the token has no name, before any write.
 async fn cancel_text_stop_token_mailbox(
     shared: &Arc<SharedData>,
@@ -448,16 +455,7 @@ pub(in crate::services::discord) async fn handle_text_command_with_uploads(
         }
 
         TextCommandId::Clear => {
-            super::clear_channel_session_state(
-                &ctx.http,
-                &data.shared,
-                &data.provider,
-                channel_id,
-                "!clear",
-                super::SoftClearNotifyMode::Suppress,
-            )
-            .await?;
-            let _ = msg.reply(&ctx.http, super::SESSION_CLEARED_RESPONSE).await;
+            clear::handle(ctx, msg, data, channel_id, cmd).await;
             return Ok(true);
         }
 

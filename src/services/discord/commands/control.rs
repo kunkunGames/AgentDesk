@@ -405,7 +405,7 @@ async fn clear_channel_session_state_body(
     }
     let hosted = native::replan(shared, provider, channel_id, explicit_session_key, hosted).await?;
     // From here the clear changes the turn, so no earlier approval survives success or failure.
-    super::super::turn_presence::entrypoints::withdraw(channel_id.get(), "clear");
+    super::super::turn_presence::entrypoints::withdraw(shared, channel_id.get(), "clear");
     let tmux_name = {
         let data = shared.core.lock().await;
         data.sessions
@@ -1205,8 +1205,8 @@ mod clear_persist_failure_tests {
                 "SESSION_CLEARED_RESPONSE",
             ),
             (
-                include_str!("text_commands.rs"),
-                "TextCommandId::Clear =>",
+                include_str!("text_commands/clear.rs"),
+                "pub(super) async fn handle(",
                 "clear_channel_session_state(",
                 "SESSION_CLEARED_RESPONSE",
             ),

@@ -318,6 +318,12 @@ pub(super) fn publish_codex_tui_launch_script(
             launch_options,
         )?;
     }
+    // The launch's tail holds this until it returns.
+    let handoff = crate::services::tui_prompt_dedupe::reserve_discord_handoff(
+        ProviderKind::Codex.as_str(),
+        tmux_session_name,
+        prompt,
+    );
     crate::services::tui_prompt_dedupe::record_discord_originated_prompt(
         ProviderKind::Codex.as_str(),
         tmux_session_name,
@@ -328,6 +334,7 @@ pub(super) fn publish_codex_tui_launch_script(
         script_path,
         owner_path,
         rollout_modified_since,
+        handoff,
     })
 }
 
@@ -1240,4 +1247,15 @@ mod tests {
         }
         SOURCE_MODE_TEST.with(|m| m.set(None));
     }
+}
+
+/// Paths and timing produced while preparing a Codex Direct TUI launch script.
+#[cfg(unix)]
+pub(super) struct CodexTuiLaunchScript {
+    pub(super) prepared: crate::services::tui_prompt_dedupe::binding_context::PreparedIncarnation,
+    pub(super) script_path: String,
+    pub(super) owner_path: String,
+    pub(super) rollout_modified_since: std::time::SystemTime,
+    /// The Discord handoff reserved before launch, held until the tail returns.
+    pub(super) handoff: crate::services::tui_prompt_dedupe::HandoffGuard,
 }

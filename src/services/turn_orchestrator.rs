@@ -49,6 +49,7 @@ pub(crate) use registry_purge::PurgeQueueResult;
 mod remint_fence;
 mod reply_results;
 mod source_generation;
+use source_generation::push_unique_source_message_queued_generations;
 mod source_text;
 use source_text::{
     ensure_source_text_segments, join_source_text_segments, push_unique_source_text_segments,
@@ -204,20 +205,6 @@ fn push_unique_message_ids(
     for message_id in incoming {
         if !existing.contains(&message_id) {
             existing.push(message_id);
-        }
-    }
-}
-
-fn push_unique_source_message_queued_generations(
-    existing: &mut Vec<SourceMessageQueuedGeneration>,
-    incoming: impl IntoIterator<Item = SourceMessageQueuedGeneration>,
-) {
-    for incoming in incoming {
-        if !existing
-            .iter()
-            .any(|owner| owner.message_id == incoming.message_id)
-        {
-            existing.push(incoming);
         }
     }
 }
@@ -1220,6 +1207,7 @@ impl ChannelMailboxRegistry {
 // Once `CloseIfIdle` sets `state.closed`, the exhaustive `registry_purge::gate_closed_arm` passes
 // reads and refuses every other arm; CommitCapturedReadyDelivery refuses closed actors in its own arm.
 pub(crate) mod installed_actor_handoff;
+mod scoped_claim;
 
 enum ChannelMailboxMsg {
     FreezeInput {
@@ -1330,6 +1318,8 @@ enum ChannelMailboxMsg {
     },
     #[cfg(test)]
     InstalledActorHandoff(installed_actor_handoff::Request),
+    #[cfg(test)]
+    ScopedClaim(scoped_claim::ScopedMsg),
     ClearRecoveryMarker {
         reply: closed_verdict::VerdictReply<()>,
     },
@@ -1597,6 +1587,12 @@ struct ChannelMailboxState {
     policy_witness: Option<policy_close::PolicyWitness>,
     /// The queue snapshot's head reservation and submitted sources; see `queued_head.rs`.
     queued_head: queued_head::HeadLedger,
+    /// What an actor a scoped claim installed still owes; see `scoped_claim.rs`.
+    #[cfg(test)]
+    installed_pending: Option<scoped_claim::InstalledPending>,
+    /// Namespaces whose claim left a file holding neither snapshot; scoped claims refuse them.
+    #[cfg(test)]
+    scoped_undecided: Vec<(ProviderKind, String)>,
 }
 
 #[cfg(test)]
@@ -1999,6 +1995,8 @@ fn input_mailbox_step(
         ChannelMailboxMsg::InstalledActorHandoff(request) => {
             installed_actor_handoff::step(&mut state, channel_id, own_recovery_done, request);
         }
+        #[cfg(test)]
+        ChannelMailboxMsg::ScopedClaim(msg) => scoped_claim::step(&mut state, channel_id, msg),
         ChannelMailboxMsg::ClearRecoveryMarker { reply } => {
             state.recovery_started_at = None;
             let _ = reply.send(());

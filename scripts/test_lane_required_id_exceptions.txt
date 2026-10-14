@@ -17,6 +17,7 @@ services::discord::herdr_terminate::test_turn | helper-module | #5082 | expires=
 services::discord::inflight::managed_submission::fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::inflight::o_seed_observation | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::inflight::removal::receipt_test_events | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
+services::discord::inflight::save_store::coordinate_replay | helper-module | #5925 | expires=2026-11-13 | dormant coordinate RMW and source-witness contract exercised by coordinate_replay_tests and coordinate_merge_tests; no owned test id
 services::discord::inflight::save_store::identity_gate::runtime_stamp::before_start_stop_admission::fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::inflight::save_store::identity_gate::runtime_stamp::herdr_terminal_admission::test_hooks | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::inject_disposition::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
@@ -27,8 +28,10 @@ services::discord::queue_dispatch::kickoff::cancel_backstop_test_support | helpe
 services::discord::queue_io::cancel_backstop_test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::recovery_engine::herdr_admitted_restart::test_hooks | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::recovery_engine::herdr_before_start_restart::test_hooks | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
+services::discord::recovery_engine::legacy_restart_replay | helper-module | #5925 | expires=2026-11-13 | dormant classifier, proof and claim contract exercised by legacy_restart_replay_tests; no owned test id
 services::discord::recovery_engine::rebind_runtime::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::recovery_engine::restore_persist_outcome::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
+services::discord::replay_policy::injected::test_support | helper-module | #6008 | expires=2026-10-27 | Shared actual-PG receipt/projection fixture and callback observations for watcher/bridge acceptance tests; declares no test id.
 services::discord::router::intake_dispatch::replay_admission::test_activation | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::router::intake_gate::busy_inject::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::router::message_handler::provider_dispatch::producer_error_test_support | helper-module | #5340 | expires=2027-10-12 | hands the turn-bridge cold-error tests intake's own producer_error frame; it holds no test of its own
@@ -57,5 +60,6 @@ services::tui_prompt_dedupe::binding_events::presence_admission | helper-module 
 services::tui_prompt_dedupe::test_clock | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::turn_orchestrator::pending_queue_persistence::fsync_fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::turn_orchestrator::pending_queue_persistence::post_save_fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
+services::turn_orchestrator::pending_queue_persistence::queue_exit_debt::read_back_fault | helper-module | #5340 | expires=2027-10-12 | lets the queue-exit commit tests change the file between a failed save and its re-read; it holds no test of its own
 services::turn_orchestrator::pending_queue_persistence::queued_recovery::scan_fault | helper-module | #6813 | expires=2027-10-12 | injects read_dir and entry failures for queued recovery acceptance tests; owns no test function
 services::turn_orchestrator::policy_close::test_hooks | helper-module | #5340 | expires=2027-10-12 | lets the before-start policy close tests observe and panic at each mailbox step stage; it holds no test of its own

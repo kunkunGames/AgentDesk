@@ -1,5 +1,8 @@
 #[cfg(unix)]
 use crate::services::claude_tui::guarded_outcome::{self, OwnedWarmOutcome, SubmissionError};
+mod launch_env;
+#[cfg(any(unix, test))]
+use launch_env::build_tmux_launch_env_lines;
 mod process_session_launch;
 pub(crate) use process_session_launch::execute_streaming_local_process;
 
@@ -19,8 +22,8 @@ use std::time::Duration;
 use crate::services::agent_protocol::{RuntimeHandoff, StreamMessage, is_valid_session_id};
 use crate::services::claude_command::ClaudeCommandBuilder;
 use crate::services::claude_compact_context::{
-    append_auto_compact_window_shell_env, apply_auto_compact_window_to_command,
-    claude_model_from_args, launch_auto_compact_window_for_session,
+    apply_auto_compact_window_to_command, claude_model_from_args,
+    launch_auto_compact_window_for_session,
 };
 #[cfg(unix)]
 use crate::services::claude_tui::hosting::{
@@ -188,48 +191,6 @@ pub(crate) fn append_claude_fast_mode_arg(args: &mut Vec<String>, fast_mode_enab
 
     args.push("--settings".to_string());
     args.push(format!(r#"{{"fastMode":{enabled}}}"#));
-}
-
-fn build_tmux_launch_env_lines(
-    exec_path: Option<&str>,
-    report_channel_id: Option<u64>,
-    report_provider: Option<ProviderKind>,
-    auto_compact_window: Option<u64>,
-) -> String {
-    let mut env_lines = String::from("unset CLAUDECODE\nunset AGENTDESK_BINDING_CONTEXT\n");
-    if let Some(exec_path) = exec_path {
-        env_lines.push_str(&format!(
-            "export PATH='{}'\n",
-            exec_path.replace('\'', "'\\''")
-        ));
-    }
-    if let Ok(root_dir) = std::env::var("AGENTDESK_ROOT_DIR") {
-        let trimmed = root_dir.trim();
-        if !trimmed.is_empty() {
-            env_lines.push_str(&format!(
-                "export AGENTDESK_ROOT_DIR='{}'\n",
-                trimmed.replace('\'', "'\\''")
-            ));
-        }
-    }
-    if let Some(channel_id) = report_channel_id {
-        env_lines.push_str(&format!(
-            "export {}={}\n",
-            RESTART_REPORT_CHANNEL_ENV, channel_id
-        ));
-    }
-    if let Some(provider) = report_provider {
-        env_lines.push_str(&format!(
-            "export {}={}\n",
-            RESTART_REPORT_PROVIDER_ENV,
-            provider.as_str()
-        ));
-    }
-    // Compact-window overlay (#4591): fence off any inherited absolute window
-    // and export the freshly resolved one when present.
-    append_auto_compact_window_shell_env(&mut env_lines, auto_compact_window);
-
-    env_lines
 }
 
 #[cfg(test)]
@@ -645,6 +606,11 @@ pub fn execute_command_streaming(
             report_channel_id,
         );
     session_selection.log_start("claude.execute_command_streaming");
+    crate::services::claude_tui::submit_canary::require_profile(
+        entrypoint_supports_tui_hosting
+            && session_selection.driver
+                == crate::services::provider_hosting::ProviderSessionDriver::TuiHosting,
+    )?;
 
     // Phase 1 of the claude-e rollout: route to the per-turn adapter
     // when the operator picked `runtime: claude-e` and the binary is
@@ -754,7 +720,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 if let Some(hook_endpoint) =
                     crate::services::claude_tui::hook_server::current_hook_endpoint()
                 {
-                    cleanup_process_backend_before_tmux(tmux_name);
+                    if !crate::services::claude_tui::submit_canary::enabled() {
+                        cleanup_process_backend_before_tmux(tmux_name);
+                    }
                     debug_log(&format!("Claude TUI hosting session: {}", tmux_name));
                     return execute_streaming_local_tui_tmux(
                         prompt,
@@ -771,6 +739,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
                         hook_endpoint,
                     );
                 }
+                crate::services::claude_tui::submit_canary::require_profile(false)?;
                 tracing::warn!(
                     tmux_session_name = tmux_name,
                     "claude tui_hosting requested but hook endpoint is unavailable; falling back to legacy prompt driver"
@@ -1741,7 +1710,8 @@ fn execute_streaming_local_tui_tmux(
     system_prompt: Option<&str>,
     hook_endpoint: String,
 ) -> Result<(), String> {
-    host_gate::tmux_turn_admitted(tmux_session_name)?;
+    host_gate::tmux_turn_admitted(tmux_session_name)
+        .map_err(crate::services::claude_tui::submit_canary::hold_error)?;
     debug_log(&format!(
         "=== execute_streaming_local_tui_tmux START: {} ===",
         tmux_session_name
@@ -1749,15 +1719,16 @@ fn execute_streaming_local_tui_tmux(
     let auth_overlay = crate::services::discord::org_schema::overlay_from_tmux_session(
         ProviderKind::Claude,
         tmux_session_name,
-    )?;
+    )
+    .map_err(crate::services::claude_tui::submit_canary::hold_error)?;
     let auth_env_lines =
         crate::services::provider_auth_profile::overlay_shell_env_lines(&auth_overlay);
-    let session_exists = host_gate::session_exists(tmux_session_name)?;
+    let session_exists = host_gate::session_exists(tmux_session_name)
+        .map_err(crate::services::claude_tui::submit_canary::hold_error)?;
     let profile_matches = crate::services::tmux_common::tmux_session_auth_profile_matches(
         tmux_session_name,
         &auth_overlay.profile_id,
     );
-    let session_id = profile_matches.then_some(session_id).flatten();
     if let Some(channel_id) = report_channel_id {
         crate::services::tui_prompt_dedupe::register_tmux_channel(tmux_session_name, channel_id);
     }
@@ -1770,6 +1741,17 @@ fn execute_streaming_local_tui_tmux(
         tmux_session_name
     ));
 
+    let (session_exists, profile_matches) = crate::services::claude_tui::submit_canary::preflight(
+        tmux_session_name,
+        report_channel_id,
+        &auth_overlay.profile_id,
+        (session_exists, profile_matches),
+        || {
+            cleanup_process_backend_before_tmux(tmux_session_name);
+        },
+    )
+    .map_err(SubmissionError::into_legacy)?;
+    let session_id = profile_matches.then_some(session_id).flatten();
     let working_dir_path = std::path::Path::new(working_dir);
     let session_resolution =
         resolve_claude_tui_session_for_launch(working_dir_path, session_id, None)?;
@@ -1805,6 +1787,11 @@ fn execute_streaming_local_tui_tmux(
         resume = recovered.resume;
     }
 
+    crate::services::claude_tui::submit_canary::require_warm(
+        session_exists,
+        has_live_pane,
+        resume,
+    )?;
     if session_exists && has_live_pane && resume {
         match guarded_outcome::warm_owned(|| {
             try_claude_tui_warm_followup(
@@ -4169,6 +4156,152 @@ mod guarded_owner_tests {
     use guarded_submission::executor_tests::{install_shim, renderer, screen};
     use std::rc::Rc;
     use std::sync::Arc;
+
+    #[test]
+    fn cg_d1_upper_driver_hold_precedes_stale_cleanup_with_valid_clearance() {
+        let _root = crate::config::TestRuntimeRootGuard::new();
+        let f = Fixture::after_shared_test_env_lock();
+        install_shim(&f);
+        let config = f.root.path().join("cg-d1-fixture-config.yaml");
+        std::fs::write(&config, "server: {}\n").unwrap();
+        let _config = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_CONFIG",
+            &config,
+        );
+        let _home = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "CLAUDE_CONFIG_DIR",
+            f.root.path(),
+        );
+        let fake = f.root.path().join("claude-fixture");
+        std::fs::write(&fake, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.0 (Claude Code)'; exit 0; fi\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _binary = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_CLAUDE_PATH",
+            &fake,
+        );
+        let name = "cg-d1-held-stale";
+        let pane = renderer(&f, name, "own", &screen(""), &screen("own"), &screen(""));
+        let calls = f.root.path().join("d1-upper-calls");
+        let shim = f.root.path().join("tmux");
+        let script = std::fs::read_to_string(&shim).unwrap();
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{}",
+                calls.display(),
+                script.strip_prefix("#!/bin/sh\n").unwrap()
+            ),
+        )
+        .unwrap();
+        let turn = crate::services::claude_tui::composer_lock::session_turn_lock(name);
+        let turn_guard = turn.lock().unwrap_or_else(|p| p.into_inner());
+        let working_dir = f.root.path().display().to_string();
+        let worker = std::thread::spawn(move || {
+            let (tx, _) = std::sync::mpsc::channel();
+            execute_streaming_local_tui_tmux(
+                "own",
+                None,
+                &working_dir,
+                tx,
+                None,
+                name,
+                Some(&TeardownClearance::Unkeyed),
+                None,
+                None,
+                None,
+                None,
+                "http://127.0.0.1:9".into(),
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read_to_string(&calls)
+            .unwrap_or_default()
+            .contains("has-session")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "upper driver did not reach its pre-lock observation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::write(f.root.path().join("exec-mode"), "drop_payload").unwrap();
+        let ((input, stopped), _) =
+            guarded_submission::test_support::with_request(name, Rc::new(LegacyTmuxGate), || {
+                guarded_outcome::capture(|| {
+                    crate::services::claude_tui::input::send_fresh_prompt(name, "own", None)
+                })
+            });
+        assert!(
+            input.is_err()
+                && matches!(
+                    stopped,
+                    Some(
+                        crate::services::claude_tui::host_input::InputRun::Indeterminate {
+                            confirmed: 0,
+                            ..
+                        }
+                    )
+                )
+        );
+        while f.received(name) != b"own" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hold must follow a real payload"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let previous_payload = f.received(name);
+        drop(turn_guard);
+        let result = worker.join().unwrap();
+        guarded_outcome::forget_test_hold(name);
+        assert!(result.is_err());
+        assert_eq!(
+            crate::services::platform::tmux::session_presence(name),
+            crate::services::platform::tmux::SessionPresence::Present,
+            "a valid teardown clearance must not erase a held session"
+        );
+        assert_eq!(
+            f.tmux(&["display-message", "-p", "-t", &pane, "#{pane_id}"]),
+            pane
+        );
+        assert_eq!(
+            f.received(name),
+            previous_payload,
+            "the next upper entry must not send or clear the held payload"
+        );
+        let held_calls = std::fs::read_to_string(&calls).unwrap();
+        assert!(
+            !held_calls.contains("kill-session") && !held_calls.contains("new-session"),
+            "{held_calls}"
+        );
+        // With the same valid clearance and no hold, stale cleanup and creation really run.
+        let token = std::sync::Arc::new(CancelToken::new());
+        token
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tx, _) = std::sync::mpsc::channel();
+        let _ = execute_streaming_local_tui_tmux(
+            "own",
+            None,
+            f.root.path().to_str().unwrap(),
+            tx,
+            Some(token),
+            name,
+            Some(&TeardownClearance::Unkeyed),
+            None,
+            None,
+            None,
+            None,
+            "http://127.0.0.1:9".into(),
+        );
+        let control_calls = std::fs::read_to_string(calls).unwrap();
+        let control_calls = &control_calls[held_calls.len()..];
+        assert!(
+            control_calls.contains("kill-session") && control_calls.contains("new-session"),
+            "positive control must reach stale cleanup and fresh launch: {control_calls}"
+        );
+    }
 
     struct CancelFence(Arc<CancelToken>);
     impl SubmissionFence for CancelFence {

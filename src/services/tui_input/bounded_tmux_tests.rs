@@ -266,11 +266,27 @@ async fn bounded_tmux_timeout_kills_descendants_before_reaping_live_or_exited_le
     for ending in ["wait", "exit 0"] {
         let fixture = Fixture::new();
         let mut command = fixture.command(&format!(
-            "(sleep 0.3; printf late > \"$2\") & printf '%s\\n' \"$!\" >> \"$1\"; {ending}"
+            "(while [ ! -e \"$3\" ]; do sleep 0.01; done; printf late > \"$2\") & \
+             printf '%s\\n' \"$!\" >> \"$1\"; {ending}"
         ));
+        command.arg(fixture.path("release-effect"));
         let started = Instant::now();
-        let result = run_with_budget(&mut command, Duration::from_millis(75)).await;
+        // Use the production spawn budget and establish both owned processes before testing cleanup.
+        let pending = spawn_bounded(&tokio::runtime::Handle::current(), &mut command).unwrap();
+        let ready_until = started + Duration::from_secs(4);
+        while fs::read_to_string(fixture.path("pids"))
+            .map(|text| text.lines().count() < 2)
+            .unwrap_or(true)
+        {
+            assert!(
+                Instant::now() < ready_until,
+                "controlled descendant did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let result = pending.wait().await;
         let elapsed = started.elapsed();
+        fs::write(fixture.path("release-effect"), b"released").unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(result.as_ref().unwrap_err().may_have_effect());
         assert!(
@@ -283,7 +299,7 @@ async fn bounded_tmux_timeout_kills_descendants_before_reaping_live_or_exited_le
             ),
             "{ending}: {result:?}"
         );
-        assert!(elapsed < Duration::from_millis(2250), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(7250), "{elapsed:?}");
         assert!(
             !fixture.path("effect").exists(),
             "{ending}: descendant escaped"
