@@ -49,6 +49,9 @@ count as a non-writer just because it has no file open right now.
    - Start only approved artifacts.
    - For each restarted writer, record host, role, positive PID/PGID, executable realpath,
      executable SHA-256, start time and root realpath.
+   - A restarted writer must have a different host/PID/start-time incarnation from every stopped
+     writer. A new process group or executable alone does not prove a restart; PID reuse requires
+     a different start time.
 4. **Sources.** For each Codex source, record:
    - channel and tmux name
    - the policy verdict from the tmux source authority, with its incarnation

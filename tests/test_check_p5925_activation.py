@@ -171,6 +171,41 @@ class ActivationValidatorTests(unittest.TestCase):
             "host outside the declared scope",
         )
 
+    def test_the_stopped_process_cannot_be_its_own_restart(self):
+        changes = (
+            {}, {"pgid": 303}, {"role": "worker"},
+            {"executable_realpath": "/approved/new-agentdesk"},
+            {"started_at": "2026-10-13T06:00:00Z"},
+            {"started_at": " 2026-10-13T15:00:00+09:00 "},
+        )
+        for change in changes:
+            with self.subTest(change=change):
+                def mutate(s):
+                    s["writers_restarted"][0] = dict(
+                        s["writers_stopped"][0], executable_sha256=BIN, **change
+                    )
+                self.assert_refused(mutate, "same stopped process incarnation")
+
+    def test_a_reused_pid_with_a_new_start_time_is_approved(self):
+        survey = complete_survey()
+        restarted = survey["writers_restarted"][0]
+        restarted["pid"] = survey["writers_stopped"][0]["pid"]
+        restarted["pgid"] = survey["writers_stopped"][0]["pgid"]
+        self.assertEqual(activation.check(survey), [])
+
+    def test_identical_numeric_process_ids_on_different_hosts_are_distinct(self):
+        survey = complete_survey()
+        survey["declared_hosts"].append("mac-book")
+        survey["hosts"].append({"host": "mac-book", "surveyed": True})
+        survey["writers_stopped"].append(dict(
+            survey["writers_stopped"][0], host="mac-book", pid=303, pgid=303,
+            started_at="2026-10-13T14:00:00+09:00",
+        ))
+        survey["writers_restarted"].append(dict(
+            survey["writers_stopped"][0], host="mac-book", executable_sha256=BIN,
+        ))
+        self.assertEqual(activation.check(survey), [])
+
     def test_a_surveyed_host_without_writer_coverage_is_refused(self):
         def mutate(s):
             s["declared_hosts"].append("mac-book")
@@ -313,11 +348,16 @@ class ActivationValidatorTests(unittest.TestCase):
             for key in ("native_turn_id", "nonce", "body_msg_id", "proof"):
                 survey["sources"][0].pop(key)
             malformed.write_text(json.dumps(survey))
+            same_process = Path(tmp) / "same-process.json"
+            survey = complete_survey()
+            survey["writers_restarted"][0] = dict(survey["writers_stopped"][0], executable_sha256=BIN)
+            same_process.write_text(json.dumps(survey))
             run = lambda path: subprocess.run(
                 [sys.executable, str(SCRIPT), str(path)], capture_output=True, text=True
             )
             ok, refused, unreadable = run(good), run(bad), run(Path(tmp) / "absent.json")
             malformed_target = run(malformed)
+            duplicate_process = run(same_process)
         self.assertEqual((ok.returncode, ok.stdout.strip()), (0, "P5925_ACTIVATION_OK"))
         self.assertEqual(refused.returncode, 1)
         self.assertTrue(refused.stdout.startswith("P5925_ACTIVATION_REFUSED\nREFUSE "))
@@ -325,6 +365,8 @@ class ActivationValidatorTests(unittest.TestCase):
         self.assertEqual(malformed_target.returncode, 1)
         self.assertIn("P5925_ACTIVATION_REFUSED", malformed_target.stdout)
         self.assertIn("recovery_target", malformed_target.stdout)
+        self.assertEqual(duplicate_process.returncode, 1)
+        self.assertIn("same stopped process incarnation", duplicate_process.stdout)
 
 
 if __name__ == "__main__":

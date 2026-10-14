@@ -13,6 +13,7 @@ the survey records that verdict and never derives one from environment variables
 import json
 import re
 import sys
+from datetime import datetime, timezone
 
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -57,6 +58,22 @@ def _writer_identity(writer, label, hosts, roots, refuse):
         refuse(f"{label}: root identity not recorded")
     elif writer["root_realpath"] not in roots:
         refuse(f"{label}: runs against an unresolved root")
+
+
+def _process_incarnation(writer):
+    host, pid, started = (writer.get(key) for key in ("host", "pid", "started_at"))
+    if not _text(host) or type(pid) is not int or pid <= 0 or not _text(started):
+        return None
+    started = started.strip()
+    try:
+        timestamp = datetime.fromisoformat(started)
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone(timezone.utc)
+        started = timestamp.isoformat()
+    except (ValueError, OverflowError):
+        pass
+    # A new executable or process group cannot revive an incarnation already recorded dead.
+    return host, pid, started
 
 
 def _coverage(label, record, key, identity, phases, refuse):
@@ -141,9 +158,14 @@ def check(survey):
         if writer.get("alive") is not False or writer.get("restartable") is not False:
             refuse(f"{label}: still alive or restartable after the stop")
 
+    stopped_incarnations = {
+        identity for writer in stopped if (identity := _process_incarnation(writer)) is not None
+    }
     for writer in restarted:
         label = f"restarted writer {writer.get('host')}:{writer.get('pid')}"
         _writer_identity(writer, label, declared_hosts, root_paths, refuse)
+        if _process_incarnation(writer) in stopped_incarnations:
+            refuse(f"{label}: same stopped process incarnation")
         if not _text(writer.get("executable_sha256")) or writer["executable_sha256"] not in approved_hashes:
             refuse(f"{label}: running executable is not an approved artifact")
     for name, host in hosts.items():
