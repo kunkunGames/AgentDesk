@@ -1063,7 +1063,7 @@ jobs:
         timeout-minutes: 10
         run: |
           helper_path=scripts/required-check-mirror.sh
-          expected=57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d
+          expected=7d76ac9422e656ca2ab53981565c04e00541976f725f4ec119ddbcf2bdc937c0
           actual="$(sha256sum "$helper_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$helper_path::content hash mismatch: expected $expected, found $actual; review the helper and update every #5321 helper pin together"
@@ -1389,7 +1389,7 @@ jobs:
         timeout-minutes: 10
         run: |
           helper_path=scripts/required-check-mirror.sh
-          expected=57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d
+          expected=7d76ac9422e656ca2ab53981565c04e00541976f725f4ec119ddbcf2bdc937c0
           actual="$(sha256sum "$helper_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$helper_path::content hash mismatch: expected $expected, found $actual; review the helper and update every #5321 helper pin together"
@@ -1743,7 +1743,7 @@ jobs:
         timeout-minutes: 10
         run: |
           helper_path=scripts/required-check-mirror.sh
-          expected=57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d
+          expected=7d76ac9422e656ca2ab53981565c04e00541976f725f4ec119ddbcf2bdc937c0
           actual="$(sha256sum "$helper_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$helper_path::content hash mismatch: expected $expected, found $actual; review the helper and update every #5321 helper pin together"
@@ -2044,14 +2044,14 @@ jobs:
         timeout-minutes: 10
         run: |
           helper_path=scripts/required-check-mirror.sh
-          expected=57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d
+          expected=7d76ac9422e656ca2ab53981565c04e00541976f725f4ec119ddbcf2bdc937c0
           actual="$(sha256sum "$helper_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$helper_path::content hash mismatch: expected $expected, found $actual; review the helper and update all three #5321 pins together"
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=db97c35d7ae81d568ee8c2ee2bd00496d5f7fbc1fdd288602e7b642d179b5bce
+          expected=145043afe8e60254e88a73614d0319495427d8db0aeeaa6154aa38152736afe0
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
@@ -2270,14 +2270,14 @@ jobs:
         timeout-minutes: 10
         run: |
           helper_path=scripts/required-check-mirror.sh
-          expected=57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d
+          expected=7d76ac9422e656ca2ab53981565c04e00541976f725f4ec119ddbcf2bdc937c0
           actual="$(sha256sum "$helper_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$helper_path::content hash mismatch: expected $expected, found $actual; review the helper and update all three #5321 pins together"
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=db97c35d7ae81d568ee8c2ee2bd00496d5f7fbc1fdd288602e7b642d179b5bce
+          expected=145043afe8e60254e88a73614d0319495427d8db0aeeaa6154aa38152736afe0
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"

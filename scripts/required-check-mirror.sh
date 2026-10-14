@@ -22,7 +22,7 @@ require_env UPSTREAM_RESULT
 case "$CHANGED_PATHS_RESULT" in
   success)
     ;;
-  failure|cancelled|skipped)
+  failure|cancelled|skipped|abandoned)
     fail "Changed paths result is '${CHANGED_PATHS_RESULT}'; failing closed instead of treating ${UPSTREAM_JOB_NAME} result '${UPSTREAM_RESULT}' as pass"
     ;;
   *)
