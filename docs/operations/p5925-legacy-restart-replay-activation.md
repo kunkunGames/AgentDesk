@@ -52,6 +52,9 @@ count as a non-writer just because it has no file open right now.
    - A restarted writer must have a different host/PID/start-time incarnation from every stopped
      writer. A new process group or executable alone does not prove a restart; PID reuse requires
      a different start time.
+   - Record each start time as an ISO 8601 timestamp with a UTC offset, for example
+     `2026-10-13T16:00:00+09:00`. Invalid, date-only, timezone-free or unrepresentable timestamps
+     are refused; equivalent offsets identify the same process start.
 4. **Sources.** For each Codex source, record:
    - channel and tmux name
    - the policy verdict from the tmux source authority, with its incarnation

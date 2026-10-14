@@ -193,6 +193,22 @@ class ActivationValidatorTests(unittest.TestCase):
         restarted["pgid"] = survey["writers_stopped"][0]["pgid"]
         self.assertEqual(activation.check(survey), [])
 
+    def test_malformed_or_ambiguous_process_start_times_are_refused(self):
+        for section in ("writers_stopped", "writers_restarted"):
+            for value in (
+                "not-a-time", "still-not-a-time", "2026-13-14T00:00:00Z",
+                "2026-10-13", "2026-10-13T15:00:00", "0001-01-01T00:00:00+14:00",
+            ):
+                with self.subTest(section=section, value=value):
+                    self.assert_refused(
+                        lambda s, section=section, value=value: s[section][0].__setitem__("started_at", value),
+                        "ISO 8601 timestamp with a UTC offset",
+                    )
+        survey = complete_survey()
+        survey["writers_stopped"][0]["started_at"] = "not-a-time"
+        survey["writers_restarted"][0].update(pid=101, pgid=101, started_at="still-not-a-time")
+        self.assertTrue(any("ISO 8601" in reason for reason in activation.check(survey)))
+
     def test_identical_numeric_process_ids_on_different_hosts_are_distinct(self):
         survey = complete_survey()
         survey["declared_hosts"].append("mac-book")

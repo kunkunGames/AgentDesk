@@ -54,24 +54,31 @@ def _writer_identity(writer, label, hosts, roots, refuse):
         refuse(f"{label}: positive PID/PGID not recorded")
     if not _text(writer.get("executable_realpath")) or not _text(writer.get("started_at")):
         refuse(f"{label}: executable realpath or start time not recorded")
+    elif _started_at(writer["started_at"]) is None:
+        refuse(f"{label}: started_at must be an ISO 8601 timestamp with a UTC offset")
     if not _text(writer.get("root_realpath")):
         refuse(f"{label}: root identity not recorded")
     elif writer["root_realpath"] not in roots:
         refuse(f"{label}: runs against an unresolved root")
 
 
-def _process_incarnation(writer):
-    host, pid, started = (writer.get(key) for key in ("host", "pid", "started_at"))
-    if not _text(host) or type(pid) is not int or pid <= 0 or not _text(started):
+def _started_at(value):
+    if not _text(value):
         return None
-    started = started.strip()
     try:
-        timestamp = datetime.fromisoformat(started)
-        if timestamp.tzinfo is not None:
-            timestamp = timestamp.astimezone(timezone.utc)
-        started = timestamp.isoformat()
+        timestamp = datetime.fromisoformat(value.strip())
+        if timestamp.tzinfo is None:
+            return None
+        return timestamp.astimezone(timezone.utc)
     except (ValueError, OverflowError):
-        pass
+        return None
+
+
+def _process_incarnation(writer):
+    host, pid = writer.get("host"), writer.get("pid")
+    started = _started_at(writer.get("started_at"))
+    if not _text(host) or type(pid) is not int or pid <= 0 or started is None:
+        return None
     # A new executable or process group cannot revive an incarnation already recorded dead.
     return host, pid, started
 
