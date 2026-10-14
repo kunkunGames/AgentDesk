@@ -3215,6 +3215,7 @@ services::discord::answer_flush_barrier::tests::waiter_unblocks_when_flush_ends
 services::discord::bot_role::tests::utility_bot_role_aliases_round_trip_and_are_unique
 services::discord::bot_role::tests::utility_bot_role_metadata_is_exhaustive
 services::discord::busy_followup_retry_store::policy::tests::a_latched_cap_survives_time_and_later_charges
+services::discord::busy_followup_retry_store::policy::tests::a_pane_release_preserves_other_holds_and_requires_a_legacy_binding
 services::discord::busy_followup_retry_store::policy::tests::an_unreadable_source_holds_the_queue_until_it_reads_as_parked
 services::discord::busy_followup_retry_store::policy::tests::checked_restore_keeps_legacy_meaning_and_refuses_what_it_cannot_read
 services::discord::busy_followup_retry_store::policy::tests::classification_refuses_views_and_layers_it_cannot_vouch_for
@@ -13034,6 +13035,7 @@ services::tui_prompt_dedupe::handoff::tests::a_restored_handoff_keeps_only_its_r
 services::tui_prompt_dedupe::handoff::tests::an_expired_handoff_publishes_its_held_input_once
 services::tui_prompt_dedupe::handoff::tests::an_old_handoff_snapshot_keeps_its_original_expiry
 services::tui_prompt_dedupe::handoff::tests::an_older_record_of_the_origin_text_leaves_the_handoff_unbound
+services::tui_prompt_dedupe::handoff::tests::rejected_same_text_handoff_matches_keep_normal_entry_processing
 services::tui_prompt_dedupe::injected_steer_tests::a_rollout_row_seen_after_the_hook_is_still_known_once_the_ledger_forgets
 services::tui_prompt_dedupe::injected_steer_tests::an_input_in_another_turn_joins_its_owner_or_takes_the_direct_path_once
 services::tui_prompt_dedupe::injected_steer_tests::an_input_joining_its_target_turn_publishes_nothing
