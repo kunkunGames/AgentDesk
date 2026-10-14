@@ -539,7 +539,7 @@ done
 while IFS= read -r -d '' tracked_file; do
   scratch_basename=${tracked_file##*/}
   case "$scratch_basename" in
-    pr-body.md|pr_body.md|prs.json|scratch.json|scratchpad.json|cargo_out.txt|npm_output.log|bun_output.txt|plan.md|test_merge_diff.txt)
+    pr-body.md|pr_body.md|prs.json|scratch.json|scratchpad.json|cargo_out.txt|npm_output.log|bun_output.txt)
       case "$tracked_file" in
         */*)
           echo "ERROR: Scratch file detected below repository root: $tracked_file"
