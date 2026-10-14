@@ -211,6 +211,22 @@ async fn restored_draft_hold(held_record: HeldRecord) {
     } else {
         restore_queued_and_inflight_work(&http, &shared, &provider).await;
     }
+    let (held_before, bytes_before) = if matches!(
+        held_record,
+        HeldRecord::LegacyBound | HeldRecord::LegacyLateBound
+    ) {
+        let mut bound = held_before;
+        bound.draft_session = Some(session.clone());
+        assert_eq!(
+            budget(held_id),
+            bound,
+            "recovery binds the pane without changing spending or latches"
+        );
+        (bound, std::fs::read(&retry_path).unwrap())
+    } else {
+        assert_eq!(std::fs::read(&retry_path).unwrap(), bytes_before);
+        (held_before, bytes_before)
+    };
     let queued = || async {
         let snapshot = shared.mailbox(channel).snapshot().await;
         let mut ids: Vec<_> = snapshot

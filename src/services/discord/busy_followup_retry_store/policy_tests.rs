@@ -171,6 +171,58 @@ fn draft_release_clears_count_cost_and_latch_but_keeps_the_notice() {
 }
 
 #[test]
+fn a_pane_release_preserves_other_holds_and_requires_a_legacy_binding() {
+    with_root(|root| {
+        let provider = ProviderKind::Claude;
+        let channel = 68_977;
+        let held = |session: Option<&str>| RetryBudget {
+            draft_hold: true,
+            draft_session: session.map(str::to_string),
+            ..budget(MAX_BUSY_RETRY_COUNT, 320_000, true)
+        };
+        let (a, b, legacy, busy) = (
+            held(Some("pane-a")),
+            held(Some("pane-b")),
+            held(None),
+            budget(2, 70_000, true),
+        );
+        for (id, state) in [(1, &a), (2, &b), (3, &legacy), (4, &busy)] {
+            store::save_in_root(root, &provider, channel, id, state).unwrap();
+        }
+        let read = |id| store::load(&provider, channel, id).unwrap();
+        let pass = store::release_draft_holds(&provider, channel, "pane-a");
+        assert_eq!((pass.released, pass.retry), (1, false));
+        assert_eq!(read(1), a.released_from_draft());
+        assert_eq!(read(2), b);
+        assert_eq!(read(3), legacy);
+        assert_eq!(read(4), busy);
+        assert_eq!(
+            store::release_draft_holds(&provider, channel, "pane-a").released,
+            0
+        );
+        assert!(!store::bind_legacy_draft_session(&provider, channel, 2, "pane-a").unwrap());
+        assert_eq!(read(2), b);
+        assert!(store::bind_legacy_draft_session(&provider, channel, 3, "pane-b").unwrap());
+        assert_eq!(
+            read(3),
+            RetryBudget {
+                draft_session: Some("pane-b".to_string()),
+                ..legacy
+            }
+        );
+        assert_eq!(
+            store::release_draft_holds(&provider, channel, "pane-a").released,
+            0
+        );
+        let pass = store::release_draft_holds(&provider, channel, "pane-b");
+        assert_eq!((pass.released, pass.retry), (2, false));
+        assert_eq!(read(2), b.released_from_draft());
+        assert_eq!(read(3).busy_retry_count, 0);
+        assert_eq!(read(4), busy);
+    });
+}
+
+#[test]
 fn checked_restore_keeps_legacy_meaning_and_refuses_what_it_cannot_read() {
     let restored = |raw: &str| decode_checked(raw.as_bytes());
     let legacy_unbound =

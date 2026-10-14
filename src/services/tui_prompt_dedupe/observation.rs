@@ -310,17 +310,18 @@ fn observe_inner(
     let entry_id = entry_id.map(str::trim).filter(|value| !value.is_empty());
     let prompt_id = prompt_id.filter(|id| !id.value().trim().is_empty());
     let native_turn = native_turn.map(str::trim).filter(|turn| !turn.is_empty());
-    // The reserved Discord prompt binds its handoff and is never an input of its own.
-    if handoff::bind_matching_origin(
-        &provider,
-        tmux_session_name,
-        prompts,
-        native_turn,
-        evidence,
-        observed_at,
-    )
-    .is_some()
-    {
+    // Only a proven origin binds the handoff; rejected or unproven matches use normal dedupe.
+    if matches!(
+        handoff::bind_matching_origin(
+            &provider,
+            tmux_session_name,
+            prompts,
+            native_turn,
+            evidence,
+            observed_at,
+        ),
+        Some(handoff::BindOutcome::Bound)
+    ) {
         return PromptObservation::SuppressedDiscordDuplicate;
     }
     let mut candidates = Vec::new();

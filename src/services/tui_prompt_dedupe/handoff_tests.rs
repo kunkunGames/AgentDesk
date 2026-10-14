@@ -114,6 +114,46 @@ fn slot(turn: &str) -> Option<NativeTurnOwner> {
         .map(|slot| slot.value.owner)
 }
 
+#[test]
+fn rejected_same_text_handoff_matches_keep_normal_entry_processing() {
+    for (bound, complete) in [(false, true), (true, true), (false, false)] {
+        let _lock = locked();
+        let prompt = "repeat this input in a different turn";
+        let _guard = reserve_discord_handoff("codex", TMUX, prompt);
+        if bound {
+            assert_eq!(
+                bind_discord_handoff_record(TMUX, prompt, &record(Some("t1"), Some(Utc::now()))),
+                BindOutcome::Bound
+            );
+        }
+        let at = if bound {
+            Utc::now()
+        } else {
+            Utc::now() - chrono::TimeDelta::minutes(5)
+        };
+        let evidence = record(Some("t2"), complete.then_some(at));
+        let mut published = Published::new();
+        let observe = || {
+            observe_codex_record_prompt_at(
+                TMUX,
+                prompt,
+                Some("rejected-origin-entry"),
+                None,
+                &evidence,
+                Utc::now(),
+            )
+        };
+        assert_eq!(observe(), PromptObservation::PublishedSshDirect);
+        assert_eq!(
+            published.of(prompt),
+            vec![(false, Some("rejected-origin-entry".to_string()))]
+        );
+        assert_eq!(slot("t2"), Some(NativeTurnOwner::Relay));
+        assert_eq!(observe(), PromptObservation::SuppressedReplayedEntry);
+        assert_eq!(published.of(prompt).len(), 1);
+    }
+}
+
 fn competing_bind(
     reserve: bool,
 ) -> (
@@ -392,7 +432,7 @@ fn a_held_input_naming_no_turn_waits_for_its_record() {
     }
 }
 
-/// A record of the origin text older than the reservation is suppressed without binding;
+/// A stale Discord relay record follows the ordinary synthetic-line filter without binding;
 /// the submission's own record binds.
 #[test]
 fn an_older_record_of_the_origin_text_leaves_the_handoff_unbound() {
@@ -401,7 +441,7 @@ fn an_older_record_of_the_origin_text_leaves_the_handoff_unbound() {
     assert_eq!(hook(INPUT, "t1"), PromptObservation::ParkedForHandoff);
     let older = record(Some("t0"), Some(Utc::now() - chrono::TimeDelta::minutes(5)));
     let seen = observe_codex_record_prompt_at(TMUX, ORIGIN, Some("a0"), None, &older, Utc::now());
-    assert_eq!(seen, PromptObservation::SuppressedDiscordDuplicate);
+    assert_eq!(seen, PromptObservation::Ignored);
     assert_eq!(slot("t0"), None);
     assert_eq!(held_handoff_inputs_for_tests("codex", TMUX), Some(1));
     let own = record(Some("t1"), Some(Utc::now()));

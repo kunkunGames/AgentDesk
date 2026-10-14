@@ -337,6 +337,7 @@ fn watch_draft_release(
             let pass = super::super::busy_followup_retry_store::release_draft_holds(
                 &provider,
                 channel_id.get(),
+                &session,
             );
             any_released |= pass.released > 0;
             tracing::info!(
@@ -396,6 +397,7 @@ fn rewatch_matching_draft_holds(
     use crate::services::claude_tui::composer_lock::{DraftGuard, guard_draft};
     let held = super::super::busy_followup_retry_store::draft_held_inputs(provider);
     for (channel, input, session) in held {
+        let legacy = session.is_none();
         if legacy_only && session.is_some() {
             continue;
         }
@@ -414,6 +416,14 @@ fn rewatch_matching_draft_holds(
             }) else {
                 continue;
             };
+            if legacy
+                && !super::super::busy_followup_retry_store::bind_legacy_draft_session(
+                    provider, channel, input, &session,
+                )
+                .unwrap_or(false)
+            {
+                continue;
+            }
             guard_draft(&session, DraftGuard::RecoveryRequired);
             watch_draft_release(shared.clone(), provider.clone(), channel_id, session);
         }

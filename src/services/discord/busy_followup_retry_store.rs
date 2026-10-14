@@ -645,11 +645,12 @@ pub(in crate::services::discord) struct DraftRelease {
     pub retry: bool,
 }
 
-/// Gives this channel's inputs whose last retry met a draft protection a fresh budget once that
-/// protection is gone; inputs held by busy turns keep theirs. A failed step never stops the rest.
+/// Gives inputs held by this pane a fresh budget after its draft protection is gone.
+/// Unbound legacy holds retain their budget until recovery confirms and saves their pane.
 pub(in crate::services::discord) fn release_draft_holds(
     provider: &ProviderKind,
     channel_id: u64,
+    session: &str,
 ) -> DraftRelease {
     let release = || -> Result<DraftRelease, String> {
         let (root, _guard) = locked_root()?;
@@ -680,7 +681,9 @@ pub(in crate::services::discord) fn release_draft_holds(
                 pass.retry = true;
                 continue;
             };
-            let Some(state) = decode_checked(&bytes).ok().filter(|state| state.draft_hold) else {
+            let Some(state) = decode_checked(&bytes).ok().filter(|state| {
+                state.draft_hold && state.draft_session.as_deref() == Some(session)
+            }) else {
                 continue;
             };
             let fresh = state.released_from_draft();
@@ -699,6 +702,34 @@ pub(in crate::services::discord) fn release_draft_holds(
     fenced(provider, channel_id, release).unwrap_or(DraftRelease {
         released: 0,
         retry: true,
+    })
+}
+
+/// Pins an unbound legacy hold to the canonical watcher binding without changing its budget.
+pub(in crate::services::discord) fn bind_legacy_draft_session(
+    provider: &ProviderKind,
+    channel_id: u64,
+    input_id: u64,
+    session: &str,
+) -> Result<bool, String> {
+    if session.trim().is_empty() {
+        return Err("draft session must be non-empty".to_string());
+    }
+    fenced(provider, channel_id, || {
+        let (root, _guard) = locked_root()?;
+        let Some(mut state) = refused(read_source_in_root(&root, provider, channel_id, input_id))?
+        else {
+            return Ok(false);
+        };
+        if !state.draft_hold {
+            return Ok(false);
+        }
+        if let Some(bound) = &state.draft_session {
+            return Ok(bound == session);
+        }
+        state.draft_session = Some(session.to_string());
+        save_in_root(&root, provider, channel_id, input_id, &state)?;
+        Ok(true)
     })
 }
 
