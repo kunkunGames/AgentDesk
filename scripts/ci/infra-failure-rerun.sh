@@ -563,7 +563,7 @@ run_classifier() {
     return 0
   fi
 
-  # Only the initial failed attempt may request one retry per shard.
+  # Only the initial failed attempt may request one retry workflow attempt.
   if (( run_attempt >= 2 )); then
     decision="no-op:attempt-cap"
     write_summary "$run_id" "$run_attempt" "$decision"
@@ -607,6 +607,8 @@ run_classifier() {
   local pg_classified_count=0
   local regression_count=0
   local unknown_count=0
+  local pg_retry_count=0
+  local unsafe_bulk_count=0
   local -a pg_job_ids=()
   # Newline-delimited name set: bash 3.2 (macOS prepush) has no associative arrays.
   local seen_pg_names=$'\n'
@@ -638,6 +640,7 @@ run_classifier() {
       if job_is_infra_failure "$log_path" "$executed_steps"; then
         pg_classified_count=$((pg_classified_count + 1))
         pg_job_ids+=("$job_id")
+        pg_retry_count=$((pg_retry_count + 1))
         if [[ "$job_class" != "regression" ]]; then
           if grep -a -E -i -q -- "$INFRA_ACTION_TIMEOUT_REGEX" "$log_path"; then
             job_class="infra-timeout"
@@ -656,12 +659,22 @@ run_classifier() {
       else
         job_class="unclassified-pg-failure"
       fi
+    elif [[ "$job_name" != "Fast targeted tests (ubuntu-latest)" ]] ||
+      log_has_real_failure "$log_path" || log_has_repo_config_fault "$log_path" ||
+      ! grep -a -F -q -- "pg_db=true requires test_fast to succeed; result was 'failure'" "$log_path"; then
+      # --failed also retries other failed jobs. Permit only the PG result
+      # mirror whose failure is explicitly caused by those shards; unrelated
+      # or advisory failures must not widen this PG-only retry policy.
+      unsafe_bulk_count=$((unsafe_bulk_count + 1))
     fi
 
     append_summary_row "$job_id" "$job_class"
   done < <(failed_job_rows "$jobs_payload")
 
   decision="$(decide_retry "$pg_failed_count" "$pg_classified_count" "$regression_count" "$unknown_count")"
+  if [[ "$decision" == "would-rerun:infra" ]] && (( pg_retry_count > 1 && unsafe_bulk_count > 0 )); then
+    decision="no-op:unsafe-bulk-rerun"
+  fi
   if [[ "$decision" != "would-rerun:infra" ]]; then
     write_summary "$run_id" "$run_attempt" "$decision"
     echo "decision=$decision"
@@ -681,14 +694,18 @@ run_classifier() {
     return 0
   fi
 
-  for job_id in ${pg_job_ids[@]+"${pg_job_ids[@]}"}; do
-    if ! gh run rerun "$run_id" --repo "$repo" --job "$job_id"; then
-      decision="no-op:rerun-request-failed"
-      write_summary "$run_id" "$run_attempt" "$decision"
-      echo "decision=$decision pg_job_id=$job_id" >&2
-      return 1
-    fi
-  done
+  # Starting one rerun advances the workflow attempt, invalidating all other
+  # job IDs from this attempt. Submit multiple eligible shards atomically.
+  local -a rerun_args=(--job "${pg_job_ids[0]}")
+  if (( pg_retry_count > 1 )); then
+    rerun_args=(--failed)
+  fi
+  if ! gh run rerun "$run_id" --repo "$repo" "${rerun_args[@]}"; then
+    decision="no-op:rerun-request-failed"
+    write_summary "$run_id" "$run_attempt" "$decision"
+    echo "decision=$decision pg_job_ids=${pg_job_ids[*]}" >&2
+    return 1
+  fi
   decision="rerun-requested:infra"
   write_summary "$run_id" "$run_attempt" "$decision"
   echo "decision=$decision pg_job_ids=${pg_job_ids[*]}"

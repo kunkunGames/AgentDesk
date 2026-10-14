@@ -415,6 +415,13 @@ if [ "${1-}" = "api" ]; then
 fi
 if [[ "${1-} ${2-}" == "run rerun" && "${GH_ALLOW_RERUN-}" == 1 ]]; then
   printf '%s\n' "$*" >> "$GH_FIXTURE_DIR/rerun.log"
+  if [[ -f "$GH_FIXTURE_DIR/attempt-advanced" ]]; then
+    echo 'HTTP 403: Only jobs from the current attempt can be re-run' >&2
+    exit 1
+  fi
+  if [[ "${GH_FAIL_RERUN:-0}" == 0 ]]; then
+    : > "$GH_FIXTURE_DIR/attempt-advanced"
+  fi
   exit "${GH_FAIL_RERUN:-0}"
 fi
 printf 'gh %s\n' "$*" >>"$GH_FIXTURE_DIR/refused.log"
@@ -547,9 +554,38 @@ assert_rerun_ids() {
   if [[ "$got" == "$expected" ]]; then pass "retry IDs: $expected"; else fail "retry IDs expected '$expected', got '$got'"; fi
 }
 
+assert_atomic_failed_request() {
+  if [[ "$(cat "$E2E_CASE/rerun.log")" == 'run rerun 31116949449 --repo itismyfield/AgentDesk --failed' ]]; then
+    pass "two shards make one atomic failed-jobs request"
+  else
+    fail "two shards did not make one atomic failed-jobs request"
+  fi
+}
+
 new_shard_case
-GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "both infra shards retry independently" "rerun-requested:infra" "infra-shutdown"
-assert_rerun_ids '901,902'
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "both infra shards retry in one workflow attempt" "rerun-requested:infra" "infra-shutdown"
+assert_atomic_failed_request
+
+new_shard_case
+jq '.total_count = 3 | .jobs += [{"id":903,"name":"Fast targeted tests (ubuntu-latest)","conclusion":"failure","steps":[{"name":"Set up job"},{"name":"Mirror result"}]}]' "$E2E_CASE/jobs.json" > "$E2E_CASE/expanded.json"
+mv "$E2E_CASE/expanded.json" "$E2E_CASE/jobs.json"
+printf '%s\n' "::error::pg_db=true requires test_fast to succeed; result was 'failure'" > "$E2E_CASE/job-903.log"
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "PG failure mirror can accompany an atomic shard retry" "rerun-requested:infra" "infra-shutdown"
+[[ "$(wc -l < "$E2E_CASE/rerun.log" | tr -d ' ')" == 1 ]] || fail "PG mirror caused multiple workflow attempts"
+
+new_shard_case
+jq '.total_count = 3 | .jobs += [{"id":903,"name":"Lint runner","conclusion":"failure","steps":[{"name":"Set up job"},{"name":"Run checks"}]}]' "$E2E_CASE/jobs.json" > "$E2E_CASE/expanded.json"
+mv "$E2E_CASE/expanded.json" "$E2E_CASE/jobs.json"
+printf '%s\n' 'unclassified failure' > "$E2E_CASE/job-903.log"
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "bulk retry refuses unrelated failed jobs" "no-op:unsafe-bulk-rerun" "unrelated-failure"
+[[ ! -e "$E2E_CASE/rerun.log" ]] || fail "unrelated failure widened PG retry scope"
+
+new_shard_case
+jq '.total_count = 3 | .jobs += [{"id":903,"name":"Fast targeted tests (ubuntu-latest)","conclusion":"failure","steps":[{"name":"Set up job"},{"name":"Mirror result"}]}]' "$E2E_CASE/jobs.json" > "$E2E_CASE/expanded.json"
+mv "$E2E_CASE/expanded.json" "$E2E_CASE/jobs.json"
+printf '%s\n' 'unclassified mirror failure' > "$E2E_CASE/job-903.log"
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "bulk retry requires explicit PG-dependent mirror evidence" "no-op:unsafe-bulk-rerun" "unrelated-failure"
+[[ ! -e "$E2E_CASE/rerun.log" ]] || fail "unproved mirror widened PG retry scope"
 
 new_shard_case
 printf '%s\n' 'Failed to resolve action download info. Error: Unable to resolve action `acme/gone@v1`, repository not found' > "$E2E_CASE/job-902.log"
@@ -590,7 +626,7 @@ out="$(PATH="$E2E_BIN:$PATH" GH_FIXTURE_DIR="$E2E_CASE" GITHUB_REPOSITORY=itismy
 
 new_shard_case
 GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 GH_FAIL_RERUN=1 GH_EXPECT_RC=1 assert_e2e "rejected retry request remains a failure" "no-op:rerun-request-failed" "infra-shutdown"
-assert_rerun_ids '901'
+assert_atomic_failed_request
 
 # --- R2: sibling regex drift must break the build -------------------------
 # End-to-end proof, not an inspection: mirror both scripts into a scratch repo,
