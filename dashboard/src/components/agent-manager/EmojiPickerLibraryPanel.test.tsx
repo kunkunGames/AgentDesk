@@ -50,8 +50,8 @@ describe("EmojiPickerLibraryPanel accessibility", () => {
     );
     const buttons = target.querySelectorAll<HTMLButtonElement>("button.epr-emoji");
 
-    expect(buttons[0]?.getAttribute("aria-current")).toBe("true");
-    expect(buttons[1]?.getAttribute("aria-current")).toBe("false");
+    expect(buttons[0]?.getAttribute("aria-pressed")).toBe("true");
+    expect(buttons[1]?.getAttribute("aria-pressed")).toBe("false");
 
     await act(async () => {
       root?.render(
@@ -59,7 +59,7 @@ describe("EmojiPickerLibraryPanel accessibility", () => {
       );
     });
 
-    expect(buttons[0]?.getAttribute("aria-current")).toBe("false");
-    expect(buttons[1]?.getAttribute("aria-current")).toBe("true");
+    expect(buttons[0]?.getAttribute("aria-pressed")).toBe("false");
+    expect(buttons[1]?.getAttribute("aria-pressed")).toBe("true");
   });
 });

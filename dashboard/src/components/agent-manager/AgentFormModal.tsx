@@ -143,7 +143,7 @@ export default function AgentFormModal({
           <SurfaceSubsection
             className="min-w-0"
             title={tr("기본 정보", "Basic Info")}
-            description={tr("이름, 아이콘, 부서를 먼저 설정합니다.", "Set the identity, icon, and department first.")}
+            description={tr("이름, 이모지, 부서를 먼저 설정합니다.", "Set the identity, emoji, and department first.")}
           >
             <div className="space-y-4">
             {/* ── 스프라이트 얼굴 미리보기 + 위/아래 변경 ── */}

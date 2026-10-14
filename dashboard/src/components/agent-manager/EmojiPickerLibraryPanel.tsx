@@ -40,7 +40,7 @@ export default function EmojiPickerLibraryPanel({
     const syncSelected = () => {
       container.querySelectorAll("button.epr-emoji").forEach((button) => {
         const isSelected = target !== null && normalize(button.textContent ?? "") === target;
-        button.setAttribute("aria-current", isSelected ? "true" : "false");
+        button.setAttribute("aria-pressed", isSelected ? "true" : "false");
       });
     };
 
