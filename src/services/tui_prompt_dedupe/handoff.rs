@@ -334,7 +334,7 @@ impl TuiPromptDedupeState {
         }
         let mut claimed = false;
         let mut consumed_entry_ids = Vec::new();
-        entry.value.parked.retain(|held| {
+        entry.value.parked.retain_mut(|held| {
             let same_text = prompts_match(&held.prompt, prompt);
             let matches = same_text
                 && held
