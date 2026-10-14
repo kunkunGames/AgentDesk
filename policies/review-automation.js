@@ -371,10 +371,7 @@ var reviewAutomation = {
         }
         return;
       }
-      var cardMeta = agentdesk.db.query(
-        "SELECT repo_id, github_issue_url FROM kanban_cards WHERE id = ?",
-        [dispatch.kanban_card_id]
-      );
+      var cardMeta = agentdesk.cards.get(dispatch.kanban_card_id);
       var tracking = loadPrTracking(dispatch.kanban_card_id);
       if (!tracking || tracking.dispatch_generation !== stampGen) {
         agentdesk.log.info(
@@ -387,7 +384,7 @@ var reviewAutomation = {
       }
       var latestWork = loadLatestCompletedWorkTarget(dispatch.kanban_card_id);
       var repoId = (tracking && tracking.repo_id)
-        || (cardMeta.length > 0 ? (cardMeta[0].repo_id || extractRepoFromIssueUrl(cardMeta[0].github_issue_url)) : null);
+        || (cardMeta ? (cardMeta.repo_id || extractRepoFromIssueUrl(cardMeta.github_issue_url)) : null);
       var worktreePath = (tracking && tracking.worktree_path)
         || (latestWork && latestWork.worktree_path);
       var branch = (tracking && tracking.branch)
@@ -986,12 +983,9 @@ function attemptCreatePrDispatchForReviewPass(cardId, noopVerification) {
     return { status: "noop", reason: "already_on_remote_main" };
   }
 
-  var prCardInfo = agentdesk.db.query(
-    "SELECT assigned_agent_id, title, github_issue_number, repo_id, github_issue_url FROM kanban_cards WHERE id = ?",
-    [cardId]
-  );
+  var card = agentdesk.cards.get(cardId);
   // Card gone entirely is a genuine noop — nothing to track.
-  if (prCardInfo.length === 0) return { status: "noop", reason: "card_missing" };
+  if (!card) return { status: "noop", reason: "card_missing" };
 
   // #701: A card with completed work AND a resolvable repo but NO assigned
   // agent is a genuine anomaly, not a benign noop — there is shippable
@@ -1007,9 +1001,9 @@ function attemptCreatePrDispatchForReviewPass(cardId, noopVerification) {
   // retries that follow once the agent is assigned. Surface it to manual
   // intervention immediately and return `no_agent_escalated` so the caller
   // skips the normal retry-bump path.
-  var precheckRepoId = prCardInfo[0].repo_id
-    || extractRepoFromIssueUrl(prCardInfo[0].github_issue_url);
-  if (!prCardInfo[0].assigned_agent_id) {
+  var precheckRepoId = card.repo_id
+    || extractRepoFromIssueUrl(card.github_issue_url);
+  if (!card.assigned_agent_id) {
     if (precheckRepoId) {
       upsertPrTracking(
         cardId,
@@ -1035,7 +1029,7 @@ function attemptCreatePrDispatchForReviewPass(cardId, noopVerification) {
     return { status: "error", reason: "no_agent_escalated" };
   }
 
-  var agentId = prCardInfo[0].assigned_agent_id;
+  var agentId = card.assigned_agent_id;
   var repoId = precheckRepoId;
   if (!repoId) return { status: "noop", reason: "no_repo" };
 
