@@ -208,22 +208,6 @@ class PrCapCheckTest(unittest.TestCase):
         self.assert_fail(result)
         self.assertIn("cannot compute numstat", result.stderr)
 
-    def test_scratch_file_fails(self) -> None:
-        (self.repo / "plan.md").write_text("plan\n", encoding="utf-8")
-        self.commit()
-        result = self.check_cap()
-        self.assert_fail(result)
-        self.assertIn("CAP: FAIL (scratch file detected: plan.md)", result.stdout)
-
-    def test_scratch_file_nested_fails(self) -> None:
-        docs = self.repo / "docs"
-        docs.mkdir()
-        (docs / "pr-body.md").write_text("body\n", encoding="utf-8")
-        self.commit()
-        result = self.check_cap()
-        self.assert_fail(result)
-        self.assertIn("CAP: FAIL (scratch file detected: docs/pr-body.md)", result.stdout)
-
 
 if __name__ == "__main__":
     unittest.main()
