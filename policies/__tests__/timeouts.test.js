@@ -335,6 +335,30 @@ test("timeouts dispatch maintenance shadows failed-dispatch retries without chan
   assert.equal(shadow.incomparable, true);
 });
 
+test("generic timeout retries exclude native Campaign ownership across held and active cards", () => {
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(":memory:");
+  db.exec(`CREATE TABLE task_dispatches (id TEXT, kanban_card_id TEXT, to_agent_id TEXT,
+    dispatch_type TEXT, title TEXT, retry_count INTEGER, status TEXT, updated_at TEXT);
+    CREATE TABLE kanban_cards (id TEXT, latest_dispatch_id TEXT, status TEXT,
+    github_issue_url TEXT, github_issue_number INTEGER);
+    CREATE TABLE campaign_graph_tasks (card_id TEXT);`);
+  for (const [id, native] of [["ordinary", false], ["held", true], ["active", true]]) {
+    db.prepare("INSERT INTO kanban_cards VALUES (?, ?, 'in_progress', NULL, NULL)").run(id, id);
+    db.prepare("INSERT INTO task_dispatches VALUES (?, ?, 'qa', 'implementation', 'Validate', 0, 'failed', datetime('now','-2 minutes'))").run(id, id);
+    if (native) db.prepare("INSERT INTO campaign_graph_tasks VALUES (?)").run(id);
+  }
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    dbQuery(sql, params) { return db.prepare(sql).all(...(params || [])); }
+  });
+  policy._section_J();
+  assert.deepEqual(state.dispatchCreates.map(d => d.cardId), ["ordinary"]);
+  assert.equal(state.dispatchRetryCountCalls.length, 1);
+  assert.equal(state.dispatchRetryCountCalls[0].count, 1);
+  assert.equal(state.logs.error.length, 0);
+  db.close();
+});
+
 test("timeouts reconcile fallback does not advance a completed scope-assessment (#3605)", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     config: { pm_decision_gate_enabled: true },
@@ -721,6 +745,110 @@ test("timeouts active monitor module checks tmux live panes exactly", () => {
   });
 
   assert.equal(policy._tmuxHasLivePane("AgentDesk-codex-project-agentdesk"), true);
+});
+
+function staleRuntimeFixture(runtimeKind, liveness) {
+  const sessionKey = "provider:AgentDesk-codex-stale-runtime";
+  return {
+    session: { session_key: sessionKey, status: "turn_active", provider: "codex", channel_id: "42",
+      instance_id: "hub-incarnation-1", turn_generation: 9, last_heartbeat: "2026-10-03T16:00:00.123456Z",
+      active_dispatch_id: "dispatch-stale-runtime", active_dispatch_status: "dispatched",
+      runtime_evidence: { runtime_kind: runtimeKind, liveness, reason: liveness === "unknown" ? "registry_entry_absent" : "owned_child_identity_verified" } },
+    inflight: { session_key: sessionKey, tmux_session_name: "AgentDesk-codex-stale-runtime", provider: "codex",
+      channel_id: "42", dispatch_id: "dispatch-stale-runtime", runtime_kind: runtimeKind,
+      process_liveness: { state: liveness, reason: "registry_probe" }, updated_at: timestampMinutesAgo(35) }
+  };
+}
+
+test("native stale owners never use tmux absence as live, exit, or restart-unknown settlement evidence", () => {
+  for (const kind of ["process_backend", "claude_e_adapter"]) {
+    for (const liveness of ["live", "exited", "unknown"]) {
+      const f = staleRuntimeFixture(kind, liveness);
+      const { policy, state } = loadPolicy("policies/timeouts.js", {
+        inflights: [f.inflight], timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [f.session] },
+        exec() { throw new Error("native ownership must not query tmux"); }
+      });
+      for (let tick = 0; tick < 3; tick++) policy._section_I();
+      assert.equal(state.execCalls.length, 0);
+      assert.equal(state.timeoutStaleRecoveryCalls.length, 0);
+      assert.equal(state.dispatchMarkFailedCalls.length, 0);
+      assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+      assert.equal(state.httpPosts.length, 0);
+    }
+  }
+});
+
+test("native runtime evidence survives a missing inflight after restart", () => {
+  const f = staleRuntimeFixture("process_backend", "unknown");
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [f.session] },
+    exec() { throw new Error("native registry absence must not fall back to tmux"); }
+  });
+  policy._section_I();
+  assert.equal(state.execCalls.length, 0);
+  assert.equal(state.timeoutStaleRecoveryCalls.length, 0);
+});
+
+test("unknown or conflicting runtime evidence preserves stale ownership", () => {
+  for (const mode of ["unknown", "backend-conflict", "dispatch-replaced", "session-replaced"]) {
+    const f = staleRuntimeFixture("codex_tui", "unknown");
+    if (mode === "unknown") { f.session.runtime_evidence.runtime_kind = null; f.inflight.runtime_kind = null; }
+    if (mode === "backend-conflict") f.inflight.runtime_kind = "process_backend";
+    if (mode === "dispatch-replaced") f.inflight.dispatch_id = "new-dispatch";
+    if (mode === "session-replaced") f.inflight.session_key = "other-session";
+    const { policy, state } = loadPolicy("policies/timeouts.js", {
+      inflights: [f.inflight], timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [f.session] },
+      exec() { throw new Error("ambiguous identity must not query tmux"); }
+    });
+    policy._section_I();
+    assert.equal(state.execCalls.length, 0);
+    assert.equal(state.timeoutStaleRecoveryCalls.length, 0);
+    assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+  }
+});
+
+test("live TUI owners retain the existing accepted-turn behavior", () => {
+  const f = staleRuntimeFixture("codex_tui", "unknown");
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    inflights: [f.inflight], timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [f.session] },
+    exec() { return "0\n"; }
+  });
+  policy._section_I();
+  assert.equal(state.execCalls.length, 2);
+  assert.equal(state.timeoutStaleRecoveryCalls.length, 0);
+  assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+});
+
+test("dead TUI recovery uses one identity snapshot and canonical guarded facade for both scans", () => {
+  const f = staleRuntimeFixture("legacy_tmux_wrapper", "unknown");
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    inflights: [f.inflight], timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [f.session],
+      recoverStaleSession() { return { ok: true, applied: true }; } }, exec() { return "1\n"; }
+  });
+  policy._section_I();
+  assert.equal(state.timeoutStaleRecoveryCalls.length, 1);
+  assert.deepEqual(toPlain(state.timeoutStaleRecoveryCalls[0]), { snapshot: f.session, clear_active_dispatch_id: true });
+  assert.equal(state.dispatchMarkFailedCalls.length, 0);
+  assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+  assert.equal(state.logs.info.filter((line) => line.includes("Proven dead tmux owner")).length, 1);
+});
+
+test("changed, unapplied, or failed recovery never performs a second idle write or success log", () => {
+  for (const outcome of ["changed", "empty", "throw"]) {
+    const f = staleRuntimeFixture("codex_tui", "unknown");
+    const { policy, state } = loadPolicy("policies/timeouts.js", {
+      inflights: [f.inflight], timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [],
+        recoverStaleSession() {
+          if (outcome === "throw") throw new Error("concurrent settlement rolled back");
+          return outcome === "empty" ? null : { ok: true, applied: false, reason: "session_identity_changed" };
+        } }, exec() { return "1\n"; }
+    });
+    policy._section_I();
+    assert.equal(state.timeoutStaleRecoveryCalls.length, 1);
+    assert.equal(state.dispatchMarkFailedCalls.length, 0);
+    assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+    assert.equal(state.logs.info.filter((line) => line.includes("Proven dead tmux owner")).length, 0);
+  }
 });
 
 test("timeouts active monitor deadlock section uses typed timeout facade", () => {

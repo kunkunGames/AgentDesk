@@ -5,9 +5,8 @@
 
 use super::ProcessIdentity;
 use std::collections::HashSet;
-use std::io::Read;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 pub(super) fn capture(root: u32, identity: ProcessIdentity) -> Vec<(u32, ProcessIdentity)> {
     if root <= 1
@@ -53,35 +52,12 @@ pub(super) fn capture(root: u32, identity: ProcessIdentity) -> Vec<(u32, Process
 fn process_parents() -> Option<Vec<(u32, u32)>> {
     // No command arguments or environment are collected. Drain stdout while ps
     // runs so a large host process table cannot block on the pipe buffer.
-    let mut child = Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid="])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = super::stream_child::spawn_reader(move || {
-        let mut text = String::new();
-        stdout.read_to_string(&mut text).ok().map(|_| text)
-    });
-    let deadline = Instant::now() + Duration::from_secs(2);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                // This is our unreaped ps child, not a PID found in the snapshot.
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
-    if !status.success() {
-        return None;
-    }
-    let text = reader.recv_timeout(Duration::from_secs(1)).ok()??;
+    static LANE: std::sync::LazyLock<super::bounded_probe::ProbeLane> =
+        std::sync::LazyLock::new(Default::default);
+    let mut command = Command::new("/bin/ps");
+    command.args(["-axo", "pid=,ppid="]);
+    let output = LANE.output(command, Duration::from_secs(2), 8 * 1024 * 1024)?;
+    let text = String::from_utf8(output.stdout).ok()?;
     text.lines()
         .map(|line| {
             let mut fields = line.split_whitespace();

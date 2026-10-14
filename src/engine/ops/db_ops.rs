@@ -1085,7 +1085,7 @@ fn translate_policy_sql_placeholders(
         let ch = sql[idx..]
             .chars()
             .next()
-            .expect("idx is always within SQL bounds");
+            .ok_or_else(|| "unexpected end of SQL while translating placeholders".to_string())?;
         result.push(ch);
         idx += ch.len_utf8();
     }

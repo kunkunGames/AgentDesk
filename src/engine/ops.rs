@@ -42,14 +42,16 @@ pub fn register_globals_with_supervisor_and_pg(
     ctx: &Ctx<'_>,
     pg_pool: Option<sqlx::PgPool>,
     supervisor_bridge: BridgeHandle,
+    server_config: &crate::config::ServerConfig,
 ) -> JsResult<()> {
-    register_globals_pg_only(ctx, pg_pool, supervisor_bridge)
+    register_globals_pg_only(ctx, pg_pool, supervisor_bridge, server_config)
 }
 
 fn register_globals_pg_only(
     ctx: &Ctx<'_>,
     pg_pool: Option<sqlx::PgPool>,
     supervisor_bridge: BridgeHandle,
+    server_config: &crate::config::ServerConfig,
 ) -> JsResult<()> {
     let globals = ctx.globals();
 
@@ -74,7 +76,7 @@ fn register_globals_pg_only(
     log_ops::register_log_ops(ctx)?;
     quality_ops::register_quality_ops(ctx)?;
     config_ops::register_config_ops(ctx, pg_pool.clone())?;
-    http_ops::register_http_ops(ctx)?;
+    http_ops::register_http_ops(ctx, server_config)?;
     dispatch_ops::register_dispatch_ops(ctx, pg_pool.clone())?;
     kanban_ops::register_kanban_ops(ctx, pg_pool.clone())?;
     ci_recovery_ops::register_ci_recovery_ops(ctx, pg_pool.clone())?;

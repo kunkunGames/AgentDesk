@@ -41,13 +41,13 @@ class Service:
         self.log = None
         self.boots = 0
 
-    def request(self, path, body=None, authenticated=True):
+    def request(self, path, body=None, authenticated=True, method=None):
         headers = {"Content-Type": "application/json"}
         if authenticated:
             headers["Authorization"] = "Bearer " + self.token
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}/api/{path}",
-            data=None if body is None else json.dumps(body).encode(), headers=headers,
+            data=None if body is None else json.dumps(body).encode(), headers=headers, method=method,
         )
         # Ignore ambient proxy configuration, including for loopback requests.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))

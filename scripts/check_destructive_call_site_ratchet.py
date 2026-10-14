@@ -366,7 +366,15 @@ def _snapshot(
         "measured_at_sha": measured_sha,
         "comment": WARNING,
         "categories": {
-            "tmux_kill": {"files": dict(sorted(counts["tmux_kill"].items()))},
+            "tmux_kill": {
+                "comment": (
+                    "Counts include test call sites. stale_recovery/tests.rs owns only its "
+                    "UUID-named keeper session, with a two-second timeout and no kill-server "
+                    "fallback. manual_rebind/authority_test_support.rs owns only the tmux "
+                    "session it created. Registration grants no production cleanup authority."
+                ),
+                "files": dict(sorted(counts["tmux_kill"].items())),
+            },
             "watcher_cancel": {"files": dict(sorted(counts["watcher_cancel"].items()))},
             "process_kill": {"files": dict(sorted(counts["process_kill"].items()))},
             "registry_remove": {

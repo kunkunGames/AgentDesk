@@ -142,6 +142,7 @@ TOP_LEVEL_MODULE_PURPOSES = {
     "pipeline.rs": "Pipeline stage loading, resolution, and transition helpers.",
     "queue_contract.rs": "Queue field compatibility contracts shared by planner prompts, API documentation, and runtime-facing consumers.",
     "receipt.rs": "Receipt parsing and workspace attribution helpers.",
+    "reconcile/": "Read-only classification helpers for boot-time delivery reconciliation guards.",
     "reconcile.rs": "Boot-time reconciliation for persisted state and dispatch-runtime drift.",
     "manual_intervention.rs": "Manual intervention parsing and helpers shared by Discord reply/requeue flows.",
     "runtime_layout/": "Managed runtime layout, memory-path migration, shared prompt sync, and skill deployment.",

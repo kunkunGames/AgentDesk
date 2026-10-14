@@ -27,6 +27,9 @@ def main():
     parser.add_argument("--database-owner", default="agentdesk")
     parser.add_argument("--native-operations", action="store_true",
                         help="also exercise Campaign admission with a local script fixture; no LLM")
+    parser.add_argument("--goal-revisions", action="store_true")
+    parser.add_argument("--native-graphs", action="store_true",
+                        help="also verify graph goal opt-in and restart persistence; no LLM")
     args = parser.parse_args()
     require(platform.system() == "Darwin", "this canary requires native macOS")
     require(args.database_owner.isidentifier(), "invalid database owner")
@@ -104,6 +107,12 @@ def main():
                     from probe_campaign_native_operations import check
                     check(service, lambda statement: sql(statement, name, args.database_owner),
                           root, report)
+                if args.native_graphs:
+                    from probe_campaign_graph_runtime import check
+                    check(service, lambda statement: sql(statement, name, args.database_owner), report,
+                          revise=args.goal_revisions)
+                    from probe_campaign_api_docs import check as check_api_docs
+                    check_api_docs(service, report)
                 report["passed"] = True
             finally:
                 service.stop()

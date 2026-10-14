@@ -1,10 +1,16 @@
 mod session_markers;
+#[cfg(test)]
 pub(crate) use session_markers::{
-    resolve_tmux_runtime_kind_marker, tmux_session_auth_profile_matches,
-    write_tmux_runtime_kind_marker, write_tmux_session_auth_profile,
+    HostingIntentWriteStage, with_hosting_intent_write_failure_for_test,
+};
+pub(crate) use session_markers::{
+    hosting_intent_at_path_requires_preservation, persist_process_backend_hosting_intent,
+    require_tmux_hosting_admission, resolve_tmux_runtime_kind_marker,
+    source_requires_native_preservation_under_authority, tmux_session_auth_profile_matches,
+    write_tmux_runtime_kind_marker, write_tmux_runtime_kind_marker_under_source_authority,
+    write_tmux_session_auth_profile,
 };
 
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -1136,29 +1142,8 @@ pub fn ensure_sessions_dir_on_startup() -> Result<(), String> {
         .map_err(|e| format!("Failed to create sessions dir '{}': {}", dir.display(), e))
 }
 
-fn host_temp_namespace() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "unknown-host".to_string())
-}
-
-fn session_temp_prefix(session_name: &str) -> String {
-    let host = host_temp_namespace();
-    let mut hasher = Sha256::new();
-    hasher.update(current_tmux_owner_marker().as_bytes());
-    hasher.update(b"|");
-    hasher.update(host.as_bytes());
-    let digest = hasher.finalize();
-    let runtime_hash = format!("{:x}", digest);
-    format!(
-        "agentdesk-{}-{}-{}",
-        &runtime_hash[..12],
-        host,
-        session_name
-    )
-}
+mod namespace;
+pub(crate) use namespace::session_temp_prefix;
 
 /// Build a path for an AgentDesk runtime temp file in the **canonical**
 /// (persistent) location.
@@ -1217,8 +1202,15 @@ const TMUX_AUTH_PROFILE_TEMP_EXT: &str = "auth_profile";
 /// location and the legacy `/tmp/` location so cleanup is total regardless
 /// of where the wrapper originally wrote.
 pub fn cleanup_session_temp_files(session_name: &str) {
-    with_tmux_source_authority(session_name, |_| {
-        cleanup_session_temp_files_under_source_authority(session_name)
+    with_tmux_source_authority(session_name, |authority| {
+        if source_requires_native_preservation_under_authority(authority) {
+            tracing::warn!(
+                session_name,
+                "preserving native or unknown source during generic tmux cleanup"
+            );
+            return;
+        }
+        cleanup_session_temp_files_under_source_authority(authority.session())
     });
 }
 

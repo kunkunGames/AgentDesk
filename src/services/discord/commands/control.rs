@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 use crate::services::provider::ProviderKind;
 
+#[path = "control/managed_reset.rs"]
+mod managed_reset;
+
 use super::super::catch_up::retry_state::clear_channel_discarding_catch_up_backlog;
 use super::super::formatting::{send_long_message_ctx, truncate_str};
 use super::super::queue_io::mailbox_cancel_queued_primary_message;
@@ -121,7 +124,11 @@ fn pending_session_reset_plan(
     None
 }
 
-pub(in crate::services::discord) fn reset_managed_process_session(session_name: &str) -> bool {
+pub(in crate::services::discord) fn reset_managed_process_session(
+    shared: &SharedData,
+    session_name: &str,
+) -> bool {
+    managed_reset::retire_watcher(shared, session_name);
     let mut reset = false;
     let lingering_pid =
         crate::services::session_backend::process_session_pid(session_name).map(|pid| pid as i32);
@@ -151,7 +158,8 @@ pub(in crate::services::discord) fn reset_managed_process_session(session_name: 
 }
 
 #[cfg(unix)]
-fn recreate_tmux_session(session_name: &str, reset_source: &str) -> bool {
+fn recreate_tmux_session(shared: &SharedData, session_name: &str, reset_source: &str) -> bool {
+    managed_reset::retire_watcher(shared, session_name);
     if !crate::services::platform::tmux::has_session(session_name) {
         return false;
     }
@@ -172,7 +180,8 @@ fn recreate_tmux_session(session_name: &str, reset_source: &str) -> bool {
 }
 
 #[cfg(not(unix))]
-fn recreate_tmux_session(_session_name: &str, _reset_source: &str) -> bool {
+fn recreate_tmux_session(shared: &SharedData, session_name: &str, _reset_source: &str) -> bool {
+    managed_reset::retire_watcher(shared, session_name);
     false
 }
 
@@ -273,13 +282,13 @@ pub(in crate::services::discord) async fn reset_channel_provider_state(
         if reset_provider_state {
             match managed_session_reset_behavior(provider) {
                 ManagedSessionResetBehavior::ResetManagedProcess => {
-                    reset_managed_process_session(name);
+                    reset_managed_process_session(shared, name);
                 }
                 ManagedSessionResetBehavior::Noop => {}
             }
         }
         if recreate_tmux {
-            recreate_tmux_session(name, reset_source);
+            recreate_tmux_session(shared, name, reset_source);
         }
     }
 
@@ -471,7 +480,7 @@ pub(in crate::services::discord) async fn clear_channel_session_state_with_sessi
     match managed_session_clear_behavior(provider) {
         ManagedSessionClearBehavior::ResetManagedProcess => {
             if let Some(name) = tmux_name {
-                reset_managed_process_session(&name);
+                reset_managed_process_session(shared, &name);
             }
         }
         ManagedSessionClearBehavior::Noop => {}

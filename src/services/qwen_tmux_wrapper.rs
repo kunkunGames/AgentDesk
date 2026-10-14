@@ -12,12 +12,16 @@ use crate::services::tmux_wrapper::{InputMode, render_for_terminal};
 #[cfg(all(test, unix))]
 mod retry_tests;
 
+#[cfg(test)]
+mod native_protocol_tests;
+
 const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
 
 #[derive(Debug, Default)]
 struct PartialBlockState {
     kind: String,
     tool_name: Option<String>,
+    tool_use_id: Option<String>,
     input_json: String,
     thinking_emitted: bool,
 }
@@ -509,7 +513,9 @@ fn normalize_qwen_line(line: &str, state: &mut TurnNormalizationState) -> Vec<Va
     match json.get("type").and_then(|v| v.as_str()) {
         Some("system") => normalize_system_event(&json, state),
         Some("stream_event") => {
-            state.partial_stream_seen = true;
+            // Goal/session metadata also uses stream_event, even with partial
+            // messages disabled. Only content framing replaces full messages.
+            state.partial_stream_seen |= crate::services::qwen::protocol::is_partial_content(&json);
             normalize_stream_event(&json, state)
         }
         Some("assistant") => normalize_assistant_message(&json, state),
@@ -546,7 +552,7 @@ fn next_turn_watchdog_outcome(
 }
 
 fn normalize_system_event(json: &Value, state: &mut TurnNormalizationState) -> Vec<Value> {
-    if json.get("subtype").and_then(|v| v.as_str()) != Some("session_start") {
+    if !crate::services::qwen::protocol::is_session_start(json) {
         return Vec::new();
     }
 
@@ -613,6 +619,7 @@ fn normalize_stream_event(json: &Value, state: &mut TurnNormalizationState) -> V
                         .get("name")
                         .and_then(|v| v.as_str())
                         .map(str::to_string),
+                    tool_use_id: block.get("id").and_then(Value::as_str).map(str::to_string),
                     input_json: block
                         .get("input")
                         .map(render_qwen_value)
@@ -692,6 +699,7 @@ fn normalize_stream_event(json: &Value, state: &mut TurnNormalizationState) -> V
                 block.tool_name.as_deref().unwrap_or("tool"),
                 input,
                 state.current_model.as_deref(),
+                block.tool_use_id.as_deref(),
             )]
         }
         _ => Vec::new(),
@@ -736,6 +744,7 @@ fn normalize_assistant_message(json: &Value, state: &mut TurnNormalizationState)
                     block.get("name").and_then(|v| v.as_str()).unwrap_or("tool"),
                     input,
                     state.current_model.as_deref(),
+                    block.get("id").and_then(Value::as_str),
                 ));
             }
             _ => {}
@@ -786,6 +795,7 @@ fn normalize_user_message(json: &Value) -> Vec<Value> {
             "message": {
                 "content": [{
                     "type": "tool_result",
+                    "tool_use_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
                     "content": content,
                     "is_error": is_error,
                 }]
@@ -862,13 +872,19 @@ fn assistant_thinking_event(model: Option<&str>) -> Value {
     })
 }
 
-fn assistant_tool_use_event(name: &str, input: Value, model: Option<&str>) -> Value {
+fn assistant_tool_use_event(
+    name: &str,
+    input: Value,
+    model: Option<&str>,
+    tool_use_id: Option<&str>,
+) -> Value {
     json!({
         "type": "assistant",
         "message": {
             "model": model,
             "content": [{
                 "type": "tool_use",
+                "id": tool_use_id,
                 "name": name,
                 "input": input,
             }]

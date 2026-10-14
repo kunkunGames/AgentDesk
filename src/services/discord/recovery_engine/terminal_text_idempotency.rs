@@ -1135,9 +1135,15 @@ mod tests {
         let _lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let (_temp, _reset) = set_runtime_root();
+        let (temp, _reset) = set_runtime_root();
         let provider = ProviderKind::Codex;
-        let state = state(provider.clone(), 44_003);
+        let mut state = state(provider.clone(), 44_003);
+        state.output_path = Some(
+            temp.path()
+                .join("durable-matched-transcript.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+        );
         let tmux = state.tmux_session_name.as_deref().unwrap();
         write_generation_marker(tmux);
         inflight::save_inflight_state(&state).expect("save inflight");

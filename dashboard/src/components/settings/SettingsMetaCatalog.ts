@@ -172,7 +172,7 @@ export function useSettingsMetaCatalog({
     () =>
       CATEGORIES.flatMap((category) =>
         category.fields.map<SettingRowMeta>((field) => {
-          const fallback = field.inputKind === "toggle" ? false : 0;
+          const fallback = field.inputKind === "toggle" ? false : field.inputKind === "text" ? "" : 0;
           const current = rcValues[field.key] ?? rcDefaults[field.key] ?? fallback;
           const def = rcDefaults[field.key] ?? fallback;
           const overrideActive = current !== def;

@@ -8,6 +8,8 @@ pub mod api_friction;
 pub mod auto_queue;
 pub mod automation_candidate_contract;
 pub mod automation_candidate_materializer;
+pub(crate) mod campaign_artifacts;
+pub(crate) mod campaign_control_input;
 pub mod claude;
 pub(crate) mod claude_command;
 pub mod claude_compact_context;

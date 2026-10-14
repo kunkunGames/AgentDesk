@@ -11,6 +11,79 @@ use crate::services::discord::session_identity::tmux_name_from_session_key;
 
 const SLOT_THREAD_RESET_SESSION_INFO: &str = "Slot thread reset";
 
+/// Called while the durable cleanup job still holds its slots. Ordinary queue
+/// cancellations retain their reusable sessions; only canonical graph attempts
+/// in this job's terminal dispatch set are eligible for a CLI stop.
+pub(super) async fn stop_cancelled_graph_dispatches_pg(
+    registry: Option<&HealthRegistry>,
+    pool: &PgPool,
+    dispatch_ids: &[String],
+) -> Result<(), String> {
+    let targets: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT d.id, a.provider, d.thread_id FROM task_dispatches d
+         JOIN campaign_graph_tasks t ON t.card_id=d.kanban_card_id
+         JOIN agents a ON a.id=d.to_agent_id
+         WHERE d.id=ANY($1::text[]) AND d.status IN ('cancelled','failed')
+           AND d.dispatch_type IN ('implementation','rework')
+           AND d.thread_id IS NOT NULL AND a.provider IN ('qwen','opencode','codex')",
+    )
+    .bind(dispatch_ids)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("load cancelled campaign runtime targets: {e}"))?;
+    for (dispatch, provider, channel) in targets {
+        let provider = crate::services::provider::ProviderKind::from_str(&provider)
+            .ok_or_else(|| format!("Unknown campaign provider {provider}"))?;
+        let channel = channel
+            .parse::<u64>()
+            .map_err(|e| format!("Invalid campaign dispatch channel: {e}"))?;
+        crate::services::discord::dispatch_cleanup::stop_owned_turn(
+            registry, &provider, channel, &dispatch,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// A rejected review can retain a terminal receipt while its exact local turn
+/// is still open. The durable claim/card binding authorizes only this dispatch
+/// identity; a successor or a runtime on another host remains untouched.
+pub(crate) async fn stop_failed_review_turns_pg(
+    registry: Option<&HealthRegistry>,
+    pool: &PgPool,
+    task_key: &str,
+) -> Result<(), String> {
+    let targets: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT d.id,a.provider,d.thread_id FROM campaign_dag_reviews review
+         JOIN campaign_dag_control_assignments authority ON authority.task_key=review.task_key
+         JOIN campaign_graph_tasks t ON t.task_key=review.task_key
+         JOIN task_dispatches d ON d.kanban_card_id=t.card_id
+         JOIN agents a ON a.id=d.to_agent_id
+         WHERE review.task_key=$1 AND review.status='failed'
+           AND t.role='template_review' AND t.version IS NULL AND t.campaign_id=review.owner_campaign_id
+           AND authority.purpose='template_review' AND authority.family_id=review.family_id
+           AND authority.agent_id=review.superior_agent_id AND d.to_agent_id=review.superior_agent_id
+           AND d.dispatch_type IN ('implementation','rework') AND d.thread_id IS NOT NULL
+           AND a.provider IN ('qwen','opencode','codex')
+           AND EXISTS(SELECT 1 FROM sessions s WHERE s.status IN ('working','turn_active','awaiting_bg','awaiting_user')
+             AND (s.active_dispatch_id=d.id OR string_to_array(replace(s.cwd,chr(92),'/'),'/') @> ARRAY['card-'||t.card_id]
+               OR s.thread_channel_id=d.thread_id))",
+    ).bind(task_key).fetch_all(pool).await
+        .map_err(|error| format!("load failed review owner turns: {error}"))?;
+    for (dispatch, provider, channel) in targets {
+        let provider = crate::services::provider::ProviderKind::from_str(&provider)
+            .ok_or_else(|| format!("Unknown campaign provider {provider}"))?;
+        let channel = channel
+            .parse::<u64>()
+            .map_err(|error| format!("Invalid campaign dispatch channel: {error}"))?;
+        crate::services::discord::dispatch_cleanup::stop_owned_turn(
+            registry, &provider, channel, &dispatch,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeSlotClearTarget {
     provider_name: String,

@@ -3,7 +3,7 @@
 use super::github_sync::github_sync_on_transition_pg;
 use super::hooks::fire_dynamic_hooks;
 use super::review_tuning::record_true_negative_if_pass_with_backends;
-use super::state_machine::resolve_pipeline_with_pg;
+use super::state_machine::{resolve_pipeline_on_pg_conn, resolve_pipeline_with_pg};
 use super::terminal_cleanup::cleanup_terminal_managed_worktrees_pg;
 use super::transition_cleanup::{
     AllowedOnConnMutation, PgTransitionCleanupCounts, clear_escalation_alert_state_on_pg_tx,
@@ -332,9 +332,18 @@ async fn transition_status_with_opts_pg_inner(
     let check_disposition: String = row.try_get("check_disposition")?;
 
     crate::pipeline::ensure_loaded();
-    let effective =
-        resolve_pipeline_with_pg(pg_pool, card_repo_id.as_deref(), card_agent_id.as_deref())
+    let mut effective =
+        resolve_pipeline_on_pg_conn(&mut tx, card_repo_id.as_deref(), card_agent_id.as_deref())
             .await?;
+    super::native_campaign::add_completion_rule(
+        &mut tx,
+        &mut effective,
+        card_id,
+        &old_status,
+        new_status,
+        latest_dispatch_id.as_deref(),
+    )
+    .await?;
 
     if old_status == new_status {
         if force_intent.is_forced() && !effective.is_valid_state(new_status) {

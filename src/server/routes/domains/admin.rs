@@ -16,11 +16,52 @@ use super::super::{
 fn campaign_router() -> ApiRouter {
     Router::new()
         .route("/campaigns", get(campaigns::list).post(campaigns::create))
+        .route("/campaigns/graph-schema", get(campaigns::graph_schema))
         .route(
             "/campaigns/{id}",
             get(campaigns::get).put(campaigns::replace),
         )
         .route("/campaigns/{id}/history", get(campaigns::history))
+        .route(
+            "/campaigns/{id}/execution",
+            get(campaigns::execution).post(campaigns::enroll_execution),
+        )
+        .route(
+            "/campaigns/{id}/execution/effect-ownership",
+            get(campaigns::effect_ownership),
+        )
+        .route(
+            "/campaigns/{id}/execution/activate",
+            post(campaigns::activate_graph),
+        )
+        .route(
+            "/campaigns/{id}/execution/manager",
+            post(campaigns::configure_manager),
+        )
+        .route(
+            "/campaigns/{id}/execution/reconcile",
+            post(campaigns::reconcile_graph),
+        )
+        .route(
+            "/campaigns/{id}/execution/replan",
+            post(campaigns::request_replan),
+        )
+        .route(
+            "/campaigns/{id}/execution/recover-finish",
+            post(campaigns::recover_finish),
+        )
+        .route(
+            "/campaigns/{id}/execution/schedule",
+            post(campaigns::activate_schedule),
+        )
+        .route(
+            "/campaigns/{id}/execution/revise",
+            post(campaigns::revise_goal),
+        )
+        .route(
+            "/campaigns/{id}/execution/budget",
+            post(campaigns::extend_budget),
+        )
         .route(
             "/campaigns/{id}/operations",
             get(campaigns::operations).post(campaigns::adopt_operation),

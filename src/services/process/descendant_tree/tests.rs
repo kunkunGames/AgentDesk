@@ -1,9 +1,11 @@
-use super::*;
+use super::{capture, descendant_pids};
 use crate::services::process::{
-    configure_child_process_group, kill_pid_tree, kill_pid_tree_if_identity_matches,
+    ProcessIdentity, configure_child_process_group, kill_pid_tree,
+    kill_pid_tree_if_identity_matches,
 };
 use std::path::Path;
-use std::process::Child;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 struct UnrelatedChild(Child);
 
@@ -100,16 +102,7 @@ fn wait_for_writes(path: &Path) {
     }
 }
 
-#[test]
-fn cancellation_stops_tool_in_separate_process_group_without_touching_sibling() {
-    let mut tree = ToolTree::spawn();
-    let unrelated = UnrelatedChild(Command::new("sleep").arg("30").spawn().unwrap());
-    let unrelated_identity = ProcessIdentity::capture(unrelated.0.id());
-    wait_for_writes(&tree.files.path().join("writes"));
-    let captured = capture(tree.root.id(), ProcessIdentity::capture(tree.root.id()));
-    assert!(captured.iter().any(|(pid, _)| *pid == tree.worker));
-    assert!(!captured.iter().any(|(pid, _)| *pid == unrelated.0.id()));
-
+fn cancel_and_assert_stopped(tree: &mut ToolTree) {
     kill_pid_tree(tree.root.id());
     tree.root.wait().unwrap();
     let stopped_at = tree.writes();
@@ -123,9 +116,67 @@ fn cancellation_stops_tool_in_separate_process_group_without_touching_sibling() 
         !tree.files.path().join("after-child-exit").exists(),
         "waiting parent advanced after its tool was killed"
     );
+}
+
+#[test]
+fn cancellation_stops_tool_in_separate_process_group_without_touching_sibling() {
+    let mut tree = ToolTree::spawn();
+    let unrelated = UnrelatedChild(Command::new("sleep").arg("30").spawn().unwrap());
+    let unrelated_identity = ProcessIdentity::capture(unrelated.0.id());
+    wait_for_writes(&tree.files.path().join("writes"));
+    let captured = capture(tree.root.id(), ProcessIdentity::capture(tree.root.id()));
+    assert!(captured.iter().any(|(pid, _)| *pid == tree.worker));
+    assert!(!captured.iter().any(|(pid, _)| *pid == unrelated.0.id()));
+
+    cancel_and_assert_stopped(&mut tree);
     assert!(
         unrelated_identity.matches(unrelated.0.id()),
         "cleanup killed an unrelated process"
+    );
+}
+
+#[test]
+fn concurrent_cancellation_stops_separate_groups_without_touching_sibling() {
+    let unrelated = UnrelatedChild(Command::new("sleep").arg("30").spawn().unwrap());
+    let unrelated_identity = ProcessIdentity::capture(unrelated.0.id());
+    let trees: Vec<_> = (0..4).map(|_| ToolTree::spawn()).collect();
+    for tree in &trees {
+        wait_for_writes(&tree.files.path().join("writes"));
+    }
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let mut starts = Vec::new();
+    let callers: Vec<_> = trees
+        .into_iter()
+        .map(|mut tree| {
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
+            starts.push(start_tx);
+            let ready_tx = ready_tx.clone();
+            std::thread::Builder::new()
+                .name("owned-concurrent-cancellation".into())
+                .spawn(move || {
+                    ready_tx.send(()).unwrap();
+                    start_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("owned cancellation start gate timed out or was aborted");
+                    cancel_and_assert_stopped(&mut tree);
+                })
+                .expect("owned cancellation worker must start")
+        })
+        .collect();
+    for _ in 0..4 {
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("owned cancellation worker did not become ready");
+    }
+    for start in starts {
+        start.send(()).unwrap();
+    }
+    for caller in callers {
+        caller.join().unwrap();
+    }
+    assert!(
+        unrelated_identity.matches(unrelated.0.id()),
+        "unrelated sibling was killed"
     );
 }
 

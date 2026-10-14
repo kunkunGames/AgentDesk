@@ -1,13 +1,15 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "f0d2eebe4eda35b367067cb24ac87da2e21c58d9",
+  "measured_at_sha": "9772b3f63d5760d54e400dbe214beb1314637bd5",
   "comment": "These counts are a growth-blocking baseline, not proof of safety.",
   "categories": {
     "tmux_kill": {
+      "comment": "Counts include test call sites. stale_recovery/tests.rs owns only its UUID-named keeper session, with a two-second timeout and no kill-server fallback. manual_rebind/authority_test_support.rs owns only the tmux session it created. Registration grants no production cleanup authority.",
       "files": {
         "src/cli/dcserver.rs": 1,
         "src/cli/utils.rs": 1,
         "src/engine/ops/exec_ops.rs": 2,
+        "src/engine/ops/timeouts_ops/stale_recovery/tests.rs": 1,
         "src/server/routes/provider_auth_profiles.rs": 2,
         "src/services/claude.rs": 6,
         "src/services/claude_tui/hosting/warm_followup.rs": 4,
@@ -18,8 +20,8 @@
         "src/services/discord/health/relay_auto_heal.rs": 2,
         "src/services/discord/health/snapshot.rs": 2,
         "src/services/discord/recovery_engine/manual_rebind/adoption.rs": 1,
+        "src/services/discord/recovery_engine/manual_rebind/authority_test_support.rs": 1,
         "src/services/discord/recovery_engine/manual_rebind/mod.rs": 1,
-        "src/services/discord/recovery_engine/manual_rebind/post_adoption_guard_tests.rs": 2,
         "src/services/discord/relay_recovery/tests.rs": 2,
         "src/services/discord/relay_recovery/tests/circuit_breaker_apply.rs": 2,
         "src/services/discord/router/message_handler/provider_isolation.rs": 1,
@@ -29,10 +31,12 @@
         "src/services/discord/tmux_watcher/pre_emit_guard.rs": 1,
         "src/services/discord/tmux_watcher/terminal_abort_exits.rs": 1,
         "src/services/discord/turn_bridge/retry_state.rs": 1,
+        "src/services/discord/turn_bridge/tmux_runtime/qwen_generation_tests.rs": 1,
         "src/services/discord/watchers/lifecycle/restore.rs": 1,
         "src/services/dispatched_sessions/tmux_cleanup.rs": 1,
         "src/services/provider/cancel_token_cleanup/executor.rs": 1,
         "src/services/qwen/session_lifecycle.rs": 3,
+        "src/services/qwen/session_lifecycle/tests.rs": 1,
         "src/services/session_resume.rs": 1,
         "src/services/tmux_turn_liveness.rs": 1,
         "src/services/turn_lifecycle.rs": 1
@@ -40,6 +44,7 @@
     },
     "watcher_cancel": {
       "files": {
+        "src/services/discord/commands/control/managed_reset.rs": 1,
         "src/services/discord/health/recovery.rs": 2,
         "src/services/discord/health/relay_auto_heal.rs": 1,
         "src/services/discord/inflight/destructive_commit.rs": 1,
@@ -51,14 +56,13 @@
         "src/services/discord/task_supervisor/watcher_completion_tests.rs": 1,
         "src/services/discord/tmux_watcher/cancel_handoff/interrupted_adoption_tests.rs": 1,
         "src/services/discord/tmux_watcher/placeholder_reclaim.rs": 1,
+        "src/services/discord/tmux_watcher/post_stream_exit.rs": 1,
         "src/services/discord/tmux_watcher/streaming_status_tick/native_collector_tests.rs": 2,
         "src/services/discord/tmux_watcher_registry.rs": 1,
         "src/services/discord/tmux_watcher_registry_restore_tests.rs": 1,
         "src/services/discord/tui_direct_pending_start.rs": 1,
         "src/services/discord/tui_prompt_relay/tests.rs": 1,
         "src/services/discord/turn_bridge/resume_pin_tests.rs": 1,
-        "src/services/discord/turn_bridge/runtime_handoff_loop.rs": 1,
-        "src/services/discord/turn_bridge/runtime_handoff_loop/watcher_handoff.rs": 2,
         "src/services/discord/turn_bridge/terminal_outcome_delivery/delivery_epilogue_tests.rs": 1,
         "src/services/discord/turn_finalizer.rs": 2,
         "src/services/discord/watchers/lifecycle/claims.rs": 3,
@@ -74,8 +78,9 @@
       }
     },
     "registry_remove": {
-      "comment": "Measured production external removals are 8/3/3/2 (total 16). The design's 10/2/3/2=17 counted turn_finalizer/watcher_backstop.rs:252, which is inside #[cfg(test)] at this SHA. health/recovery.rs remove_locked is classified as direct channel remove, not remove_tmux_session_locked.",
+      "comment": "Measured production external removals are 3/5/4/3 (total 15). The design's 10/2/3/2=17 counted turn_finalizer/watcher_backstop.rs:252, which is inside #[cfg(test)] at this SHA. health/recovery.rs remove_locked is classified as direct channel remove, not remove_tmux_session_locked.",
       "files": {
+        "src/services/discord/commands/control/managed_reset.rs": 1,
         "src/services/discord/health/recovery.rs": 2,
         "src/services/discord/health/relay_auto_heal.rs": 1,
         "src/services/discord/recovery_engine/manual_rebind/mod.rs": 1,
@@ -83,20 +88,20 @@
         "src/services/discord/task_supervisor.rs": 1,
         "src/services/discord/tmux_watcher/post_stream_exit.rs": 1,
         "src/services/discord/tui_direct_pending_start.rs": 1,
-        "src/services/discord/turn_bridge/runtime_handoff_loop.rs": 2,
-        "src/services/discord/turn_bridge/runtime_handoff_loop/watcher_handoff.rs": 3,
+        "src/services/discord/turn_bridge/runtime_handoff_loop.rs": 1,
+        "src/services/discord/turn_bridge/runtime_handoff_loop/watcher_handoff.rs": 2,
         "src/services/discord/watchers/lifecycle/claims.rs": 2
       }
     },
     "identity_fence_bind": {
-      "comment": "#5071 relay-tail S4: production `under_identity_fence` binders, excluding the owner file that defines it. These are the ONLY destructive removals that carry the WatcherIdentityFence and TerminalDeliveryFence conjuncts; every other entry in registry_remove reaches an unfenced helper. Pinning this set does not fence those — it makes adding, moving or dropping a fenced site a reviewed baseline diff.",
+      "comment": "#5071 relay-tail S4: production `under_identity_fence` binders, excluding the owner file that defines it. These are the ONLY destructive removals that carry the WatcherIdentityFence and TerminalDeliveryFence conjuncts; every other entry in registry_remove reaches an unfenced helper. Pinning this set does not fence those \u2014 it makes adding, moving or dropping a fenced site a reviewed baseline diff.",
       "files": {
         "src/services/discord/relay_recovery/apply.rs": 1,
         "src/services/discord/tui_direct_pending_start.rs": 1
       }
     },
     "delivery_fence_bind": {
-      "comment": "#5071 relay-tail S4 r2: production `with_terminal_delivery_fence` binders, same exclusions as identity_fence_bind. This must be the SAME per-file set: the checker's pairing pass rejects any file where the two counts differ, which is what catches a delivery fence being dropped from a site that keeps its identity fence — a DECREASE the no-growth ratchet would otherwise wave through.",
+      "comment": "#5071 relay-tail S4 r2: production `with_terminal_delivery_fence` binders, same exclusions as identity_fence_bind. This must be the SAME per-file set: the checker's pairing pass rejects any file where the two counts differ, which is what catches a delivery fence being dropped from a site that keeps its identity fence \u2014 a DECREASE the no-growth ratchet would otherwise wave through.",
       "files": {
         "src/services/discord/relay_recovery/apply.rs": 1,
         "src/services/discord/tui_direct_pending_start.rs": 1
@@ -112,7 +117,7 @@
         "src/services/discord/mod.rs": 4,
         "src/services/discord/placeholder_sweeper/abandon_guard.rs": 1,
         "src/services/discord/recovery_engine/manual_rebind/mod.rs": 2,
-        "src/services/discord/recovery_engine/restore_inflight.rs": 10,
+        "src/services/discord/recovery_engine/restore_inflight.rs": 9,
         "src/services/discord/recovery_engine/runtime.rs": 1,
         "src/services/discord/recovery_paths/restart.rs": 2,
         "src/services/discord/relay_recovery/apply.rs": 1,
@@ -120,14 +125,13 @@
         "src/services/discord/router/intake_gate/stale_turn.rs": 2,
         "src/services/discord/standby_relay.rs": 1,
         "src/services/discord/tmux_restart_handoff.rs": 1,
-        "src/services/discord/tmux_watcher/no_result_exits.rs": 2,
+        "src/services/discord/tmux_watcher/no_result_exits.rs": 1,
         "src/services/discord/tmux_watcher/stall_exit.rs": 1,
         "src/services/discord/tmux_watcher/terminal_commit_epilogue.rs": 1,
         "src/services/discord/tmux_watcher/turn_identity.rs": 2,
         "src/services/discord/tui_direct_pending_start.rs": 2,
         "src/services/discord/tui_prompt_relay/synthetic_start.rs": 1,
-        "src/services/discord/turn_bridge/completion_postlude.rs": 2,
-        "src/services/discord/turn_bridge/guards.rs": 2,
+        "src/services/discord/turn_bridge/completion_postlude.rs": 1,
         "src/services/discord/turn_finalizer/cleanup.rs": 1,
         "src/services/discord/turn_finalizer/finalize.rs": 2,
         "src/services/discord/watchers/dispatched_origin_ghost.rs": 1,

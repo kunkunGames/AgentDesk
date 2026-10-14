@@ -14,6 +14,7 @@ mod delivery_lease_cell;
 mod delivery_lease_key;
 mod destructive_cancel_gate;
 mod discord_io;
+pub(crate) mod dispatch_cleanup;
 pub(crate) mod dispatch_policy;
 pub(crate) mod e2e_control;
 mod footer_view_reconciler;
@@ -295,7 +296,7 @@ use settings::{
     load_last_session_path, resolve_role_binding, save_bot_settings,
     validate_bot_channel_routing_with_provider_channel,
 };
-pub(super) use skills_scan::scan_skills;
+pub(crate) use skills_scan::scan_skills;
 use skills_scan::skill_dir_fingerprint_with_projects;
 #[cfg(unix)]
 use tmux::restore_tmux_watchers;
@@ -496,17 +497,8 @@ pub(in crate::services::discord) use queue_io::{
 pub(super) fn single_message_panel_enabled() -> bool {
     single_message_panel::enabled()
 }
-/// Parse `var` as a `u64` seconds `Duration`, falling back to `default_secs`.
-fn env_duration_secs(var: &str, default_secs: u64) -> Duration {
-    let secs = (std::env::var(var).ok()).and_then(|s| s.parse::<u64>().ok());
-    Duration::from_secs(secs.unwrap_or(default_secs))
-}
-
-/// Minimum interval between Discord placeholder progress edits (AGENTDESK_STATUS_INTERVAL_SECS, default 5s).
-pub(super) fn status_update_interval() -> Duration {
-    static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| env_duration_secs("AGENTDESK_STATUS_INTERVAL_SECS", 5))
-}
+mod runtime_tuning;
+pub(super) use runtime_tuning::status_update_interval;
 
 pub(crate) fn clear_inflight_by_tmux_name(provider: &ProviderKind, tmux_name: &str) -> bool {
     inflight::clear_inflight_by_tmux_name(provider, tmux_name)

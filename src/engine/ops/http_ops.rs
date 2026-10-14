@@ -65,7 +65,38 @@ fn resolve_http_post_timeout() -> Result<std::time::Duration, String> {
 /// routes reply with small JSON; this only guards against a runaway peer.
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
-fn invoke_localhost_post(url: &str, body_json: &str) -> String {
+/// Keep API credentials in Rust and bind them to this server's loopback origin.
+/// Policies may call other local services, but those never receive this token.
+fn policy_http_token<'a>(
+    server: Option<&'a crate::config::ServerConfig>,
+    url: &url::Url,
+) -> Result<Option<&'a str>, &'static str> {
+    let Some(server) = server else {
+        return Ok(None);
+    };
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !url.path().starts_with("/api/")
+        || !crate::utils::loopback_url::is_loopback_url(url.as_str(), Some(server.port))
+    {
+        return Ok(None);
+    }
+    let token = server
+        .auth_token
+        .as_deref()
+        .filter(|token| !token.is_empty());
+    if token.is_some_and(|token| token.bytes().any(|byte| byte < 0x20 || byte == 0x7f)) {
+        return Err("invalid policy HTTP authorization");
+    }
+    Ok(token)
+}
+
+fn invoke_localhost_post(
+    url: &str,
+    body_json: &str,
+    server: Option<&crate::config::ServerConfig>,
+) -> String {
     if !crate::utils::loopback_url::is_loopback_url(url, None) {
         return r#"{"error":"only localhost allowed"}"#.to_string();
     }
@@ -78,6 +109,14 @@ fn invoke_localhost_post(url: &str, body_json: &str) -> String {
             return format!(r#"{{"error":"{}"}}"#, escape_for_json(&message));
         }
     };
+    let parsed = match url::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(_) => return r#"{"error":"invalid localhost URL"}"#.to_string(),
+    };
+    let token = match policy_http_token(server, &parsed) {
+        Ok(token) => token.map(str::to_owned),
+        Err(message) => return format!(r#"{{"error":"{message}"}}"#),
+    };
     let url_owned = url.to_string();
     let body_owned = body_json.to_string();
     // Run on a dedicated thread to avoid blocking the tokio I/O driver.
@@ -89,7 +128,7 @@ fn invoke_localhost_post(url: &str, body_json: &str) -> String {
         // The dcserver is plain http, so every real policy call takes this
         // panic-free, self-managed path (see `loopback_http_post`).
         Ok(parsed) if parsed.scheme() == "http" => {
-            loopback_http_post(&parsed, &body_owned, timeout)
+            loopback_http_post(&parsed, &body_owned, timeout, token.as_deref())
         }
         // https loopback is unused by the dcserver but permitted by
         // `is_loopback_url`; keep the legacy ureq path so TLS targets still
@@ -103,7 +142,7 @@ fn invoke_localhost_post(url: &str, body_json: &str) -> String {
 
 // Read-only policy preflight for the plain-HTTP dcserver. Reuse the POST
 // transport's bounded, proxy-free, redirect-free socket path (#5714).
-fn invoke_localhost_get(url: &str) -> String {
+fn invoke_localhost_get(url: &str, server: Option<&crate::config::ServerConfig>) -> String {
     let parsed = match url::Url::parse(url) {
         Ok(parsed)
             if parsed.scheme() == "http"
@@ -113,16 +152,20 @@ fn invoke_localhost_get(url: &str) -> String {
         }
         _ => return r#"{"error":"only http localhost allowed"}"#.to_string(),
     };
+    let token = match policy_http_token(server, &parsed) {
+        Ok(token) => token.map(str::to_owned),
+        Err(message) => return format!(r#"{{"error":"{message}"}}"#),
+    };
     let timeout = match resolve_http_post_timeout() {
         Ok(timeout) => timeout,
         Err(message) => return format!(r#"{{"error":"{}"}}"#, escape_for_json(&message)),
     };
-    std::thread::spawn(
-        move || match loopback_http_request_inner(&parsed, "", timeout, "GET") {
+    std::thread::spawn(move || {
+        match loopback_http_request_inner(&parsed, "", timeout, "GET", token.as_deref()) {
             Ok(body) => body,
             Err(message) => format!(r#"{{"error":"{}"}}"#, escape_for_json(&message)),
-        },
-    )
+        }
+    })
     .join()
     .unwrap_or_else(|_| r#"{"error":"thread panic"}"#.to_string())
 }
@@ -143,13 +186,18 @@ fn invoke_localhost_get(url: &str) -> String {
 ///   * buffered-body phase → `read_exact(..).expect("failed to read exact
 ///     buffer length from stream")` PANIC at ureq `response.rs:403`.
 /// Neither is a tainted header value (the session key is url-encoded into the
-/// path; the only request header is a constant `Content-Type`) — both are the
+/// path; that transport sent only a constant `Content-Type`) — both were the
 /// same `setsockopt` EINVAL. We fix it at the source by owning the socket: the
 /// read/write timeout is set exactly once, right after `connect` while the fd
 /// is guaranteed valid, and never reset — so the failing syscall never runs
 /// and neither symptom can occur.
-fn loopback_http_post(url: &url::Url, body: &str, timeout: std::time::Duration) -> String {
-    match loopback_http_post_inner(url, body, timeout) {
+fn loopback_http_post(
+    url: &url::Url,
+    body: &str,
+    timeout: std::time::Duration,
+    token: Option<&str>,
+) -> String {
+    match loopback_http_post_inner(url, body, timeout, token) {
         Ok(response_body) => response_body,
         Err(message) => format!(r#"{{"error":"{}"}}"#, escape_for_json(&message)),
     }
@@ -159,8 +207,9 @@ fn loopback_http_post_inner(
     url: &url::Url,
     body: &str,
     timeout: std::time::Duration,
+    token: Option<&str>,
 ) -> Result<String, String> {
-    loopback_http_request_inner(url, body, timeout, "POST")
+    loopback_http_request_inner(url, body, timeout, "POST", token)
 }
 
 fn loopback_http_request_inner(
@@ -168,6 +217,7 @@ fn loopback_http_request_inner(
     body: &str,
     timeout: std::time::Duration,
     method: &str,
+    token: Option<&str>,
 ) -> Result<String, String> {
     use std::io::{Read, Write};
 
@@ -180,6 +230,9 @@ fn loopback_http_request_inner(
     let addrs = url
         .socket_addrs(|| Some(80))
         .map_err(|e| format!("resolve {authority}: {e}"))?;
+    if token.is_some() && addrs.iter().any(|addr| !addr.ip().is_loopback()) {
+        return Err("authenticated policy HTTP target is not loopback".to_string());
+    }
 
     // Total-deadline anchor: the per-read socket timeout below bounds each
     // `read` syscall, NOT the whole exchange — a peer dribbling one byte per
@@ -206,9 +259,9 @@ fn loopback_http_request_inner(
         .map_err(|e| format!("set_write_timeout: {e}"))?;
 
     let head = if method == "POST" {
-        build_request_head(&request_target, authority, body.len())
+        build_request_head(&request_target, authority, body.len(), token)
     } else {
-        build_request_head_for_method(&request_target, authority, body.len(), method)
+        build_request_head_for_method(&request_target, authority, body.len(), method, token)
     };
     stream
         .write_all(head.as_bytes())
@@ -327,8 +380,13 @@ fn connect_first_reachable(
 /// close-delimited — the two framings the read loop understands. This keeps
 /// the client free of a chunked decoder (parsing surface we chose not to
 /// grow; a rogue chunked reply is rejected fail-closed in `build_response`).
-fn build_request_head(request_target: &str, authority: &str, body_len: usize) -> String {
-    build_request_head_for_method(request_target, authority, body_len, "POST")
+fn build_request_head(
+    request_target: &str,
+    authority: &str,
+    body_len: usize,
+    token: Option<&str>,
+) -> String {
+    build_request_head_for_method(request_target, authority, body_len, "POST", token)
 }
 
 fn build_request_head_for_method(
@@ -336,12 +394,17 @@ fn build_request_head_for_method(
     authority: &str,
     body_len: usize,
     method: &str,
+    token: Option<&str>,
 ) -> String {
+    let authorization = token
+        .map(|token| format!("Authorization: Bearer {token}\r\n"))
+        .unwrap_or_default();
     format!(
         "{method} {request_target} HTTP/1.0\r\n\
          Host: {authority}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {body_len}\r\n\
+         {authorization}\
          Connection: close\r\n\r\n"
     )
 }
@@ -498,7 +561,7 @@ mod tests {
         let context = rquickjs::Context::full(&runtime).unwrap();
         context.with(|ctx| {
             ctx.eval::<(), _>("var agentdesk = {};").unwrap();
-            register_http_ops(&ctx).unwrap();
+            register_http_ops(&ctx, &crate::config::ServerConfig::default()).unwrap();
             let count: i32 = ctx
                 .eval(format!(
                     "agentdesk.http.get('http://127.0.0.1:{port}/api/cluster/nodes').nodes.length"
@@ -512,10 +575,13 @@ mod tests {
     #[test]
     fn policy_http_get_rejects_remote_targets_and_never_follows_redirects() {
         assert!(
-            invoke_localhost_get("http://100.64.0.1:8791/api/cluster/nodes")
+            invoke_localhost_get("http://100.64.0.1:8791/api/cluster/nodes", None)
                 .contains("only http localhost allowed")
         );
-        assert!(invoke_localhost_get("file:///etc/passwd").contains("only http localhost allowed"));
+        assert!(
+            invoke_localhost_get("file:///etc/passwd", None)
+                .contains("only http localhost allowed")
+        );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let target = listener.local_addr().unwrap();
@@ -524,7 +590,7 @@ mod tests {
         );
         let port = spawn_oneshot_server(response.into_bytes(), Duration::ZERO);
         assert_eq!(
-            invoke_localhost_get(&format!("http://127.0.0.1:{port}/api/cluster/nodes")),
+            invoke_localhost_get(&format!("http://127.0.0.1:{port}/api/cluster/nodes"), None),
             "{}"
         );
         assert!(
@@ -611,7 +677,7 @@ mod tests {
         let body = r#"{"ok":true,"accepted":true,"posted":false}"#;
         let port = spawn_oneshot_server(http_response("200 OK", body, true), Duration::ZERO);
         let url = format!("http://127.0.0.1:{port}/api/sessions/claude%2Fhost%3Asess/idle-recap");
-        let out = invoke_localhost_post(&url, "{}");
+        let out = invoke_localhost_post(&url, "{}", None);
         let parsed: serde_json::Value =
             serde_json::from_str(&out).unwrap_or_else(|e| panic!("response not JSON: {e}: {out}"));
         assert_eq!(
@@ -633,7 +699,7 @@ mod tests {
         let body = r#"{"ok":false,"error":"session not found"}"#;
         let port = spawn_oneshot_server(http_response("404 Not Found", body, true), Duration::ZERO);
         let url = format!("http://127.0.0.1:{port}/api/sessions/claude%2Fx%3Ay/idle-recap");
-        let out = invoke_localhost_post(&url, "{}");
+        let out = invoke_localhost_post(&url, "{}", None);
         let parsed: serde_json::Value =
             serde_json::from_str(&out).unwrap_or_else(|e| panic!("response not JSON: {e}: {out}"));
         assert_eq!(
@@ -663,7 +729,7 @@ mod tests {
         );
         let url = format!("http://127.0.0.1:{port}/api/sessions/claude%2Fh%3As/idle-recap");
         let start = Instant::now();
-        let out = invoke_localhost_post(&url, "{}");
+        let out = invoke_localhost_post(&url, "{}", None);
         let elapsed = start.elapsed();
         let parsed: serde_json::Value =
             serde_json::from_str(&out).unwrap_or_else(|e| panic!("response not JSON: {e}: {out}"));
@@ -719,7 +785,7 @@ mod tests {
         ))
         .expect("test url");
         let start = Instant::now();
-        let result = loopback_http_post_inner(&url, "{}", Duration::from_millis(400));
+        let result = loopback_http_post_inner(&url, "{}", Duration::from_millis(400), None);
         let elapsed = start.elapsed();
         assert!(
             matches!(&result, Err(message) if message.contains("deadline exceeded")),
@@ -769,7 +835,7 @@ mod tests {
             "http://127.0.0.1:{port}/api/sessions/claude%2Fh%3As/idle-recap"
         ))
         .expect("test url");
-        let result = loopback_http_post_inner(&url, "{}", Duration::from_secs(10));
+        let result = loopback_http_post_inner(&url, "{}", Duration::from_secs(10), None);
         assert!(
             matches!(&result, Err(message) if message.contains("exceeds 8 MiB cap")),
             "expected streaming cap error, got truncated-or-ok result: {:?}",
@@ -819,7 +885,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{}".to_vec();
         let port = spawn_draining_oneshot_server(response);
         let url = url::Url::parse(&format!("http://127.0.0.1:{port}/api/x")).expect("url");
-        let result = loopback_http_post_inner(&url, "{}", Duration::from_secs(5));
+        let result = loopback_http_post_inner(&url, "{}", Duration::from_secs(5), None);
         assert!(
             matches!(&result, Err(message) if message.contains("truncated response")),
             "short Content-Length must be rejected, got {result:?}"
@@ -845,7 +911,7 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nB\r\n{\"ok\":true}\r\n0\r\n\r\n".to_vec();
         let port = spawn_draining_oneshot_server(response);
         let url = url::Url::parse(&format!("http://127.0.0.1:{port}/api/x")).expect("url");
-        let result = loopback_http_post_inner(&url, "{}", Duration::from_secs(5));
+        let result = loopback_http_post_inner(&url, "{}", Duration::from_secs(5), None);
         assert!(
             matches!(&result, Err(message) if message.contains("chunked")),
             "chunked reply must be an explicit error, got {result:?}"
@@ -857,7 +923,7 @@ mod tests {
     /// chunk to a 1.0 client). Bumping it back to HTTP/1.1 fails this assert.
     #[test]
     fn request_head_speaks_http_1_0_and_closes() {
-        let head = build_request_head("/api/x", "127.0.0.1:8791", 2);
+        let head = build_request_head("/api/x", "127.0.0.1:8791", 2, None);
         assert!(
             head.starts_with("POST /api/x HTTP/1.0\r\n"),
             "request line must pin HTTP/1.0: {head:?}"
@@ -894,7 +960,7 @@ mod tests {
 
     #[test]
     fn invoke_localhost_post_rejects_non_loopback() {
-        let body = invoke_localhost_post("https://example.com/api", "{}");
+        let body = invoke_localhost_post("https://example.com/api", "{}", None);
         assert_eq!(body, r#"{"error":"only localhost allowed"}"#);
     }
 
@@ -908,7 +974,7 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         drop(listener);
         let url = format!("http://127.0.0.1:{port}/api/sessions/x/idle-recap");
-        let body = invoke_localhost_post(&url, "{}");
+        let body = invoke_localhost_post(&url, "{}", None);
         assert!(
             body.starts_with(r#"{"error":"#),
             "expected error JSON, got: {body}"
@@ -983,22 +1049,33 @@ mod tests {
     }
 }
 
-pub(super) fn register_http_ops<'js>(ctx: &Ctx<'js>) -> JsResult<()> {
+#[cfg(test)]
+mod auth_tests;
+
+pub(super) fn register_http_ops<'js>(
+    ctx: &Ctx<'js>,
+    server_config: &crate::config::ServerConfig,
+) -> JsResult<()> {
     let ad: Object<'js> = ctx.globals().get("agentdesk")?;
     let http_obj = Object::new(ctx.clone())?;
 
+    let get_server = server_config.clone();
     http_obj.set(
         "__get_raw",
-        Function::new(ctx.clone(), |url: String| -> String {
-            invoke_localhost_get(&url)
+        Function::new(ctx.clone(), move |url: String| -> String {
+            invoke_localhost_get(&url, Some(&get_server))
         })?,
     )?;
 
+    let post_server = server_config.clone();
     http_obj.set(
         "__post_raw",
-        Function::new(ctx.clone(), |url: String, body_json: String| -> String {
-            invoke_localhost_post(&url, &body_json)
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |url: String, body_json: String| -> String {
+                invoke_localhost_post(&url, &body_json, Some(&post_server))
+            },
+        )?,
     )?;
 
     ad.set("http", http_obj)?;

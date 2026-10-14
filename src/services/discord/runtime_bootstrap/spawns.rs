@@ -370,29 +370,43 @@ pub(super) fn run_bot_spawn_skills_hot_reload(
                 paths.dedup();
                 paths
             };
-            let fp = skill_dir_fingerprint_with_projects(&provider_for_skills, &project_paths);
-            if fp != last_fingerprint && last_fingerprint != (0, 0) {
-                // Merge home + all project skills (scan_skills deduplicates by name)
-                let mut merged = scan_skills(&provider_for_skills, None);
-                let mut seen: std::collections::HashSet<String> =
-                    merged.iter().map(|(n, _)| n.clone()).collect();
-                for path in &project_paths {
-                    for skill in scan_skills(&provider_for_skills, Some(path)) {
-                        if seen.insert(skill.0.clone()) {
-                            merged.push(skill);
+            let provider = provider_for_skills.clone();
+            let previous = last_fingerprint;
+            let scanned = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let fp = skill_dir_fingerprint_with_projects(&provider, &project_paths)?;
+                let merged = if fp != previous && previous != (0, 0) {
+                    let mut merged = scan_skills(&provider, None);
+                    let mut seen: std::collections::HashSet<String> =
+                        merged.iter().map(|(n, _)| n.clone()).collect();
+                    for path in &project_paths {
+                        for skill in scan_skills(&provider, Some(path)) {
+                            if seen.insert(skill.0.clone()) {
+                                merged.push(skill);
+                            }
                         }
                     }
+                    merged.sort_by(|a, b| a.0.cmp(&b.0));
+                    Some(merged)
+                } else {
+                    None
+                };
+                Ok((fp, merged))
+            })
+            .await;
+            match scanned {
+                Ok(Ok((fp, merged))) => {
+                    if let Some(merged) = merged {
+                        let count = merged.len();
+                        *shared_for_skills.skills_cache.write().await = merged;
+                        tracing::info!(count, files = fp.0, "Skills hot-reloaded");
+                    }
+                    last_fingerprint = fp;
                 }
-                merged.sort_by(|a, b| a.0.cmp(&b.0));
-                let count = merged.len();
-                *shared_for_skills.skills_cache.write().await = merged;
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                tracing::info!(
-                    "  [{ts}] 🔄 Skills hot-reloaded: {count} skill(s) ({} files, mtime Δ)",
-                    fp.0
-                );
+                other => tracing::warn!(
+                    ?other,
+                    "Skill scan incomplete; retaining last verified cache"
+                ),
             }
-            last_fingerprint = fp;
         }
     });
 }

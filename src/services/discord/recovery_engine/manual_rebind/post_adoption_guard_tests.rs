@@ -1,5 +1,11 @@
 use super::*;
 
+#[cfg(unix)]
+#[path = "authority_test_support.rs"]
+mod authority_test_support;
+#[cfg(unix)]
+use authority_test_support::{OwnedTmuxSession, RebindTask};
+
 #[test]
 fn episode_pin_rejects_every_handoff_consumed_authority_axis() {
     let _lock = crate::config::shared_test_env_lock()
@@ -229,9 +235,7 @@ fn replacement_after_adoption_before_claim_is_untouched() {
     let channel_id = 4_465_880_000_001_u64;
     let channel = ChannelId::new(channel_id);
     let tmux_session = format!("AgentDesk-claude-e2e4465-{}-cc", std::process::id());
-    let created = crate::services::platform::tmux::create_session(&tmux_session, None, "sleep 60")
-        .expect("create tmux session");
-    assert!(created.status.success());
+    let _owned_session = OwnedTmuxSession::start(&tmux_session);
     crate::services::tmux_common::write_tmux_runtime_kind_marker(
         &tmux_session,
         RuntimeHandoffKind::ClaudeTui,
@@ -371,7 +375,7 @@ fn replacement_after_adoption_before_claim_is_untouched() {
                     last_heartbeat_ts_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1)),
                 },
             );
-            let task = {
+            let mut task = RebindTask::new({
                 let shared = shared.clone();
                 let http = http.clone();
                 let provider = provider.clone();
@@ -388,8 +392,10 @@ fn replacement_after_adoption_before_claim_is_untouched() {
                     )
                     .await
                 })
-            };
-            reached.wait().await;
+            });
+            task.checkpoint(&reached, "before_adoption")
+                .await
+                .expect("rebind reaches the exact-episode replacement checkpoint");
             let mut episode_b = episode_a.clone();
             episode_b.session_id = Some("episode-b-session".to_string());
             episode_b.output_path = Some(replacement_output.display().to_string());
@@ -400,16 +406,17 @@ fn replacement_after_adoption_before_claim_is_untouched() {
                     .expect("episode B before claim"),
             )
             .expect("serialize B before");
-            resume.wait().await;
+            task.checkpoint(&resume, "release_before_adoption")
+                .await
+                .expect("release the exact-episode replacement checkpoint");
             (
-                task.await.expect("rebind task"),
+                task.finish().await.expect("bounded rebind task completion"),
                 replacement_before,
                 replacement_token,
                 replacement_watcher_cancel,
             )
         });
 
-    let _ = crate::services::platform::tmux::kill_session(&tmux_session, "#4465 test cleanup");
     assert!(matches!(result, Err(RebindError::InflightEpisodeChanged)));
     assert_eq!(shared.tmux_watchers.len(), 1, "B keeps its sole watcher");
     let watcher = shared
@@ -503,9 +510,7 @@ fn replacement_writer_linearizes_after_episode_authority_handoff() {
     let provider = ProviderKind::Claude;
     let channel_id = 4_465_880_000_002_u64;
     let tmux_session = format!("AgentDesk-claude-e2e4465-{}-lock", std::process::id());
-    let created = crate::services::platform::tmux::create_session(&tmux_session, None, "sleep 60")
-        .expect("create tmux session");
-    assert!(created.status.success());
+    let _owned_session = OwnedTmuxSession::start(&tmux_session);
     crate::services::tmux_common::write_tmux_runtime_kind_marker(
         &tmux_session,
         RuntimeHandoffKind::ClaudeTui,
@@ -551,7 +556,7 @@ fn replacement_writer_linearizes_after_episode_authority_handoff() {
     let shared = runtime.block_on(async { crate::services::discord::make_shared_data_for_tests() });
     let http = std::sync::Arc::new(serenity::Http::new("Bot test-token"));
     let (result, writer_finished_while_guarded) = runtime.block_on(async {
-        let task = {
+        let mut task = RebindTask::new({
             let shared = shared.clone();
             let http = http.clone();
             let provider = provider.clone();
@@ -568,20 +573,26 @@ fn replacement_writer_linearizes_after_episode_authority_handoff() {
                 )
                 .await
             })
-        };
-        reached.wait().await;
+        });
+        task.checkpoint(&reached, "authority_held")
+            .await
+            .expect("rebind reaches the held-authority checkpoint");
         let writer = tokio::task::spawn_blocking(move || {
             super::inflight::save_inflight_state(&episode_b).expect("B writes after authority");
         });
         tokio::time::sleep(std::time::Duration::from_millis(75)).await;
         let prematurely_finished = writer.is_finished();
-        resume.wait().await;
-        let result = task.await.expect("rebind task");
-        writer.await.expect("replacement writer");
+        task.checkpoint(&resume, "release_authority")
+            .await
+            .expect("release the held episode authority");
+        let result = task.finish().await.expect("bounded rebind task completion");
+        tokio::time::timeout(std::time::Duration::from_secs(20), writer)
+            .await
+            .expect("replacement writer finishes after authority release")
+            .expect("replacement writer");
         (result, prematurely_finished)
     });
 
-    let _ = crate::services::platform::tmux::kill_session(&tmux_session, "#4465 test cleanup");
     assert!(
         !writer_finished_while_guarded,
         "B writer must block on A's canonical episode authority"

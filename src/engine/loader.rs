@@ -433,8 +433,7 @@ pub(crate) fn load_single_policy_with_deadline(
                     hook.js_name()
                 )
             })?;
-            if val.is_function() {
-                let func = val.into_function().unwrap();
+            if let Some(func) = val.into_function() {
                 let persistent = Persistent::save(&ctx, func);
                 hooks.insert(*hook, persistent);
             }
@@ -453,8 +452,7 @@ pub(crate) fn load_single_policy_with_deadline(
             let val: rquickjs::Value = policy_obj.get(&key).map_err(|e| {
                 anyhow::anyhow!("policy {}: read dynamic hook {}: {e}", path.display(), key)
             })?;
-            if val.is_function() {
-                let func = val.into_function().unwrap();
+            if let Some(func) = val.into_function() {
                 let persistent = Persistent::save(&ctx, func);
                 dynamic_hooks.insert(key, persistent);
             }

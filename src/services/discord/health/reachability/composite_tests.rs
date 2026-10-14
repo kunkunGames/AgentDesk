@@ -749,6 +749,8 @@ fn section_6_2_enrichment(capture_lagged: bool) -> SessionEnrichment {
         unread_bytes: None,
         relay_stale: true,
         capture_lagged,
+        relay_backlog:
+            crate::services::discord::health::session_enrichment::RelayBacklogEvidence::unobserved(),
         // #5071 relay-tail S1 (I-4): the §6.2 shape has a coordinate entry that
         // never advanced and no durable row — `has_relay_coord` above already
         // says the first half. `desynced` reads neither.

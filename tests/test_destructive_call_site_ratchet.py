@@ -35,21 +35,20 @@ class SourceContractTests(unittest.TestCase):
         self.assertEqual(ratchet.growth_errors(self.actual, self.baseline), [])
 
     def test_registry_remeasurement_and_p2_1_classification_are_explicit(self) -> None:
-        # #5504 Stack A moved five channel-only handoff cleanup spellings behind
-        # exact cleanup helpers, so 8/3/3/2 became 3/5/4/2. The baseline
-        # comment stays at the historical no-growth ceiling; this assertion pins
-        # the safer checked-in tree without relaxing that ceiling.
+        # #5504 Stack A moved channel-only handoff cleanup spellings behind
+        # exact cleanup helpers. A regenerated baseline reports the measured
+        # checked-in tree, and the exact subcounts below preserve its contract.
         self.assertEqual(
             self.registry_subcounts,
             {
                 "direct_channel_remove": 3,
                 "remove_if_current": 5,
                 "cancel_and_remove_if_current": 4,
-                "remove_locked_helper": 2,
+                "remove_locked_helper": 3,
             },
         )
         comment = self.payload["categories"]["registry_remove"]["comment"]
-        self.assertIn("8/3/3/2 (total 16)", comment)
+        self.assertIn("3/5/4/3 (total 15)", comment)
         self.assertIn("10/2/3/2=17", comment)
         self.assertIn("health/recovery.rs remove_locked", comment)
         watcher_backstop = ROOT / "src/services/discord/turn_finalizer/watcher_backstop.rs"
@@ -124,7 +123,9 @@ class SourceContractTests(unittest.TestCase):
             self.registry_subcounts,
             self.payload["measured_at_sha"],
         )
-        for category in ("structural_candidate_apply", "destructive_warrant_bind"):
+        for category in (
+            "tmux_kill", "registry_remove", "structural_candidate_apply", "destructive_warrant_bind"
+        ):
             self.assertEqual(
                 generated["categories"][category]["comment"],
                 self.payload["categories"][category]["comment"],

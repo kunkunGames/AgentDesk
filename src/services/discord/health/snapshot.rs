@@ -1,6 +1,9 @@
 use poise::serenity_prelude::ChannelId;
 use serde::Serialize;
 
+mod channel_owner;
+pub use channel_owner::WatcherStateLookup;
+
 // #5942 r4: the relay-verdict operand assembly lives in a child module so this
 // file — a registered `shrink` giant (#5447) — does not grow to carry it. The
 // gate here replaces the per-item `#[cfg(unix)]` the four moved items carried.
@@ -423,67 +426,31 @@ fn authoritative_tmux_session(
 }
 
 impl HealthRegistry {
-    /// #964 / #1133: Snapshot per-channel watcher/relay state for
-    /// observability.
-    ///
-    /// Scans every registered provider and returns the first entry that
-    /// knows about this `channel_id`. When no watcher, no relay-coord, no
-    /// inflight state, and no mailbox active-turn / queue entry exist,
-    /// returns `None` so the handler can emit 404. #1133 widens the
-    /// "knows about" criteria to include the mailbox so that a channel
-    /// with a queued intervention (but no live tmux yet) still surfaces.
-    ///
-    /// All new #1133 fields are derived from the same in-memory snapshot
-    /// or a single inflight-JSON read (no extra IO per provider). The
-    /// `tmux_session_alive` probe shells out to `tmux has-session`; the
-    /// call is wrapped in `spawn_blocking` so it never stalls the axum
-    /// runtime even if tmux is wedged.
+    /// Read a channel from its current runtime owner. Shared provider/channel
+    /// files alone cannot make the first registered runtime authoritative.
+    /// Internal callers abstain when ownership is ambiguous or unobserved.
     pub async fn snapshot_watcher_state(&self, channel_id: u64) -> Option<WatcherStateSnapshot> {
-        self.snapshot_watcher_state_filtered(channel_id, None).await
+        self.snapshot_watcher_state_lookup(channel_id)
+            .await
+            .into_snapshot()
     }
 
-    /// #1446 — provider-scoped variant of `snapshot_watcher_state`. Used by
-    /// the stall watchdog so a multi-provider deployment that shares a
-    /// single Discord channel never has provider B's pass skip cleanup
-    /// because provider A happened to be the first registered entry that
-    /// "knew" the channel.
-    ///
-    /// `provider_filter == None` preserves the legacy behaviour
-    /// (first-match across all providers).
+    /// The HTTP diagnostic distinguishes missing channel evidence from a
+    /// runtime selection that could not establish one authoritative owner.
+    pub async fn snapshot_watcher_state_lookup(&self, channel_id: u64) -> WatcherStateLookup {
+        channel_owner::lookup(self, ChannelId::new(channel_id), None).await
+    }
+
+    /// Provider-scoped observers use the same ownership rules and abstain
+    /// instead of falling back to a different runtime of the same provider.
     pub(crate) async fn snapshot_watcher_state_for_provider(
         &self,
         provider: &ProviderKind,
         channel_id: u64,
     ) -> Option<WatcherStateSnapshot> {
-        let channel = ChannelId::new(channel_id);
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.shared_for_provider_on_channel(provider, channel),
-        )
-        .await
-        {
-            Ok(Some(shared)) => {
-                return watcher_state_snapshot_for_shared(
-                    provider.as_str(),
-                    shared,
-                    channel,
-                    self.started_at_unix(),
-                )
-                .await;
-            }
-            Ok(None) => {}
-            Err(_) => {
-                tracing::warn!(
-                    provider = provider.as_str(),
-                    channel_id,
-                    "watcher-state provider/channel runtime resolve timed out; skipping provider scan to preserve channel ownership",
-                );
-                return None;
-            }
-        }
-
-        self.snapshot_watcher_state_filtered(channel_id, Some(provider))
+        channel_owner::lookup(self, ChannelId::new(channel_id), Some(provider))
             .await
+            .into_snapshot()
     }
 
     /// Snapshot a channel against a specific runtime.
@@ -506,37 +473,6 @@ impl HealthRegistry {
             self.started_at_unix(),
         )
         .await
-    }
-
-    async fn snapshot_watcher_state_filtered(
-        &self,
-        channel_id: u64,
-        provider_filter: Option<&ProviderKind>,
-    ) -> Option<WatcherStateSnapshot> {
-        let channel = ChannelId::new(channel_id);
-        let providers = self.providers.lock().await;
-        for entry in providers.iter() {
-            if let Some(filter) = provider_filter
-                && !entry.name.eq_ignore_ascii_case(filter.as_str())
-            {
-                continue;
-            }
-            let provider_kind = ProviderKind::from_str(&entry.name);
-            if let Some(snapshot) = watcher_state_snapshot_for_shared(
-                provider_kind
-                    .as_ref()
-                    .map(ProviderKind::as_str)
-                    .unwrap_or(entry.name.as_str()),
-                entry.shared.clone(),
-                channel,
-                self.started_at_unix(),
-            )
-            .await
-            {
-                return Some(snapshot);
-            }
-        }
-        None
     }
 }
 
@@ -1013,6 +949,7 @@ pub(super) async fn build_health_snapshot_with_options(
                     #[cfg(unix)]
                     reachability,
                     frontier_provenance,
+                    relay_backlog: session.relay_backlog.clone(),
                     relay_stall_state,
                     relay_health,
                 });

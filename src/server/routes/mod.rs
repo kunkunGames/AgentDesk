@@ -113,7 +113,8 @@ pub const EXPLICIT_AUTH_MUTATION_ROUTES: &[ExplicitAuthMutationRoute] = &[
 /// Mutation routes that fail closed unless an operator auth mechanism is
 /// configured. These routes are still useful in the boot audit because they
 /// explain why an endpoint may reject all callers on auth-less installs.
-pub const FAIL_CLOSED_OPERATOR_MUTATION_ROUTES: &[&str] = &[];
+pub const FAIL_CLOSED_OPERATOR_MUTATION_ROUTES: &[&str] =
+    &["campaigns: settled external effect replan"];
 
 /// Returns true when `host` resolves to a loopback interface (so the bound
 /// control-plane is only reachable from the same machine). Accepts:

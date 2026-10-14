@@ -2574,12 +2574,9 @@ async fn probe_redrive_reattach_stays_eligible_with_unreadable_reachability_oper
     let output = root_dir.path().join("axis-b-redrive.jsonl");
     std::fs::write(
         &output,
-        "{\"type\":\"thread.started\",\"thread_id\":\"axis-b-redrive\"}\n",
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"commentary\",\"content\":[{\"type\":\"output_text\",\"text\":\"pending redrive text\"}]}}\n",
     )
     .expect("write redrive transcript fixture");
-    let output_len = std::fs::metadata(&output)
-        .expect("redrive transcript metadata")
-        .len();
     let token = start_test_turn(&shared, channel, user_msg).await;
     let mut state = super::super::inflight::InflightTurnState::new(
         provider.clone(),
@@ -2593,21 +2590,34 @@ async fn probe_redrive_reattach_stays_eligible_with_unreadable_reachability_oper
         Some(tmux.clone()),
         Some(output.to_string_lossy().to_string()),
         None,
-        output_len,
+        0,
     );
     state.set_relay_owner_kind(super::super::inflight::RelayOwnerKind::Watcher);
+    state.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::CodexTui);
     state.turn_nonce = token.turn_nonce().map(str::to_string);
     let stale_at = (chrono::Local::now() - chrono::Duration::minutes(30))
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
     state.started_at = stale_at.clone();
     state.updated_at = stale_at;
+    super::super::health::watchdog_test_support::seed_source_generation(
+        &shared, channel, &mut state,
+    );
     super::super::inflight::save_inflight_state(&state).expect("seed redrive inflight row");
     let (watcher, _) = test_watcher_handle(&tmux, &output);
     watcher
         .last_heartbeat_ts_ms
         .store(0, std::sync::atomic::Ordering::Relaxed);
     shared.tmux_watchers.insert(channel, watcher);
+    let pre = super::super::health::watchdog_test_support::wait_for_overdue_backlog(
+        &registry, &provider, &shared, channel,
+    )
+    .await;
+    assert_eq!(
+        pre.relay_stall_state,
+        super::super::relay_health::RelayStallState::TmuxAliveRelayDead,
+        "a parsed overdue obligation must make this redrive eligible before the ledger is corrupted"
+    );
     let ledger_path = root_dir
         .path()
         .join("runtime")

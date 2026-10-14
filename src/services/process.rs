@@ -1,4 +1,6 @@
 #[cfg(unix)]
+mod bounded_probe;
+#[cfg(unix)]
 mod descendant_tree;
 pub(crate) mod stream_child;
 
@@ -176,10 +178,17 @@ impl ProcessIdentity {
     /// Capture identity for `pid` (best-effort; returns an empty snapshot on
     /// unsupported platforms or if the read fails).
     pub fn capture(pid: u32) -> Self {
+        #[cfg(target_os = "macos")]
+        let (starttime, macos_lstart_hash) = preferred_baseline(
+            || read_process_starttime(pid),
+            || read_lstart_hash_macos(pid),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let starttime = read_process_starttime(pid);
         Self {
-            starttime: read_process_starttime(pid),
+            starttime,
             #[cfg(target_os = "macos")]
-            macos_lstart_hash: read_lstart_hash_macos(pid),
+            macos_lstart_hash,
         }
     }
 
@@ -187,9 +196,8 @@ impl ProcessIdentity {
     /// identity (fail-closed for #2320).
     ///
     /// Three cases:
-    /// 1. No snapshot was captured at all (unsupported platform): return
-    ///    `true` so legacy escalation behaviour is preserved on platforms
-    ///    where we cannot read identity anyway.
+    /// 1. No snapshot was captured: supported Linux/macOS observers fail
+    ///    closed. Unsupported platforms preserve best-effort escalation.
     /// 2. A snapshot exists and the current starttime equals it: `true`.
     /// 3. A snapshot exists but current starttime is unreadable or differs:
     ///    `false`. We must fail closed here — proceeding with SIGKILL on a
@@ -217,8 +225,8 @@ impl ProcessIdentity {
                 return read_lstart_hash_macos(pid) == Some(saved_lstart);
             }
         }
-        // Case 1: no baseline — defer to legacy behaviour.
-        true
+        // Missing observation on a supported platform never authorizes a kill.
+        cfg!(not(any(target_os = "linux", target_os = "macos")))
     }
 
     /// Three-state identity probe for replay barriers. Unlike [`Self::matches`],
@@ -323,6 +331,17 @@ impl ProcessIdentity {
     }
 }
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn preferred_baseline(
+    primary: impl FnOnce() -> Option<u128>,
+    legacy: impl FnOnce() -> Option<u128>,
+) -> (Option<u128>, Option<u128>) {
+    match primary() {
+        Some(starttime) => (Some(starttime), None),
+        None => (None, legacy()),
+    }
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn unix_kill_zero_probe(target: libc::pid_t) -> ProcessGroupProbe {
@@ -394,13 +413,11 @@ fn read_starttime_macos(pid: u32) -> Option<u128> {
 fn read_lstart_hash_macos(pid: u32) -> Option<u128> {
     use std::hash::{Hash, Hasher};
 
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "lstart="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    static LANE: std::sync::LazyLock<bounded_probe::ProbeLane> =
+        std::sync::LazyLock::new(Default::default);
+    let mut command = Command::new("/bin/ps");
+    command.args(["-p", &pid.to_string(), "-o", "lstart="]);
+    let output = LANE.output(command, Duration::from_millis(250), 256)?;
     let lstart = String::from_utf8_lossy(&output.stdout);
     let lstart = lstart.trim();
     if lstart.is_empty() {
@@ -409,6 +426,77 @@ fn read_lstart_hash_macos(pid: u32) -> Option<u128> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     lstart.hash(&mut hasher);
     Some(hasher.finish() as u128)
+}
+
+#[cfg(all(test, unix))]
+mod preferred_baseline_tests {
+    use super::preferred_baseline;
+
+    #[test]
+    fn sdk_baseline_never_invokes_legacy_observer() {
+        assert_eq!(
+            preferred_baseline(|| Some(123), || panic!("legacy observer called")),
+            (Some(123), None)
+        );
+    }
+
+    #[test]
+    fn missing_sdk_preserves_legacy_baseline_or_unknown() {
+        assert_eq!(preferred_baseline(|| None, || Some(456)), (None, Some(456)));
+        assert_eq!(preferred_baseline(|| None, || None), (None, None));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn missing_baseline_cannot_authorize_signals_or_prove_exit() {
+        let identity = super::ProcessIdentity::from_persisted(None, None);
+        let pid = std::process::id();
+        assert!(!identity.matches(pid));
+        assert_eq!(identity.probe(pid), super::ProcessIdentityProbe::ProbeError);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn missing_baseline_refuses_tree_signals_to_live_owned_leaf() {
+        struct OwnedLeaf(std::process::Child);
+        impl Drop for OwnedLeaf {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedLeaf(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .expect("owned leaf"),
+        );
+        let identity = super::ProcessIdentity::from_persisted(None, None);
+        assert!(!super::kill_pid_tree_with_identity(child.0.id(), identity));
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "unverified process was signalled"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn persisted_legacy_identity_roundtrip_and_primary_mismatch_remain_guarded() {
+        let pid = std::process::id();
+        let legacy = super::read_lstart_hash_macos(pid).expect("bounded native legacy observation");
+        let identity = super::ProcessIdentity::from_persisted(None, Some(legacy));
+        assert_eq!(identity.persisted_starttime(), None);
+        assert_eq!(identity.persisted_macos_lstart_hash(), Some(legacy));
+        assert!(identity.matches(pid));
+        assert_eq!(identity.probe(pid), super::ProcessIdentityProbe::Same);
+        let current = super::read_process_starttime(pid).expect("native SDK birth observation");
+        let wrong_primary = super::ProcessIdentity::from_persisted(Some(current + 1), Some(legacy));
+        assert!(!wrong_primary.matches(pid));
+        assert_eq!(
+            wrong_primary.probe(pid),
+            super::ProcessIdentityProbe::GoneOrReused
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -545,6 +633,14 @@ pub(crate) fn kill_pid_tree_if_identity_matches(pid: u32, _identity: ProcessIden
 #[allow(unsafe_code)]
 fn kill_pid_tree_with_identity(pid: u32, identity: ProcessIdentity) -> bool {
     if pid <= 1 || pid == std::process::id() {
+        return false;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if !identity.has_baseline() {
+        tracing::debug!(
+            pid,
+            "skip process-tree signals because identity was not captured"
+        );
         return false;
     }
     // A waiting parent must not advance to its next command when we terminate

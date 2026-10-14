@@ -2,9 +2,11 @@ use super::super::*;
 use crate::utils::format::safe_suffix;
 use tracing::Instrument as _;
 
+mod campaign;
 mod completion_context;
 mod completion_postgres;
 
+pub(in crate::services::discord) use campaign::native_campaign_result;
 use completion_context::*;
 use completion_postgres::*;
 
@@ -606,6 +608,9 @@ async fn complete_work_dispatch_snapshot(
     snapshot: &DispatchSnapshot,
 ) {
     let explicit_work_outcome = turn_output.and_then(extract_explicit_work_outcome);
+    if campaign::complete_if_enrolled(shared, dispatch_id, adk_cwd).await {
+        return;
+    }
     let tracked_changes = tracked_change_summary(adk_cwd);
 
     // Direct finalize_dispatch with retry — single completion authority (#143)

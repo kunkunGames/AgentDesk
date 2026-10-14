@@ -42,6 +42,7 @@ NON_PG_SKIP_ARGS=(
   --skip db::relay_dead_letter::tests
   --skip db::scheduled_messages::postgres_tests
   --skip db::session_transcripts::clear_fence_pg_tests
+  --skip db::turns::postgres_tests
   --skip dispatch::dispatch_cancel::pg_observability_tests
   --skip dispatch::dispatch_context::pg_rereview_tests
   --skip dispatch::dispatch_status::auto_queue_phase_gate_finalize_wrapper_tests::postgres_tests
@@ -51,10 +52,32 @@ NON_PG_SKIP_ARGS=(
   --skip engine::ops::db_ops::tests
   --skip engine::ops::kanban_ops::tests
   --skip engine::ops::message_ops::tests
+  --skip engine::ops::timeouts_ops::stale_recovery::tests
   --skip github::sync::terminal_open_alert_tests
   --skip high_risk_recovery
   --skip reconcile::dispatch_delivery_reconcile_tests
   --skip server::campaign_execution::native_tests
+  --skip server::campaign_graph::tests
+  --skip server::campaign_graph::tests::budget_revision_tests
+  --skip server::campaign_graph::tests::effect_ownership_tests
+  --skip server::campaign_graph::tests::learning_tests
+  --skip server::campaign_graph::tests::planning_input_tests
+  --skip server::campaign_graph::tests::planning_ownership_tests
+  --skip server::campaign_graph::tests::planning_ownership_tests::unstarted_planner_tests
+  --skip server::campaign_graph::tests::planning_recovery_tests
+  --skip server::campaign_graph::tests::proposal_identity_tests
+  --skip server::campaign_graph::tests::recovery_tests
+  --skip server::campaign_graph::tests::rejected_candidate_replan_tests
+  --skip server::campaign_graph::tests::replan_artifact_tests
+  --skip server::campaign_graph::tests::replan_effect_tests
+  --skip server::campaign_graph::tests::replan_policy_tests
+  --skip server::campaign_graph::tests::replan_settled_effect_tests
+  --skip server::campaign_graph::tests::replan_tests
+  --skip server::campaign_graph::tests::replan_validation_tests
+  --skip server::campaign_graph::tests::result_transport_tests
+  --skip server::campaign_graph::tests::revision_tests
+  --skip server::campaign_graph::tests::schedule_budget_tests
+  --skip server::campaign_graph::tests::validation_recovery_tests
   --skip server::issue_specs::issue_specs_pg_tests
   --skip server::message_outbox_retry_tests
   --skip server::multinode_regression::multinode_regression_pg_tests
@@ -118,6 +141,7 @@ NON_PG_SKIP_ARGS=(
   --skip services::discord::runtime_bootstrap::intake_delivery_reconciler::postgres_tests
   --skip services::discord::runtime_bootstrap::intake_delivery_sweep::tests
   --skip services::discord::session_runtime::worktree_reuse_channel_isolation_tests
+  --skip services::discord::streaming_finalizer::native_campaign_tests
   --skip services::discord::task_notification_delivery::tests
   --skip services::discord::terminal_delivery_custody::pg_tests
   --skip services::discord::tmux::watcher_lifecycle::dispatched_origin_ghost_tests::dispatched_origin_ghost_order_pg_tests
@@ -129,6 +153,7 @@ NON_PG_SKIP_ARGS=(
   --skip services::discord::turn_bridge::recovery_text::tests
   --skip services::discord::turn_bridge::resume_pin_tests
   --skip services::discord::turn_bridge::terminal_outcome_delivery::delivery_epilogue_tests::rowless_receipt_tests::pg_tests
+  --skip services::discord::turn_bridge::turn_analytics::timestamp_tests
   --skip services::discord::turn_bridge::voice_completion::voice_completion_tests
   --skip services::dispatches::discord_delivery::guard::tests::delivery_journal_pg_tests
   --skip services::dispatches::outbox_claiming::tests::outbox_claiming_pg_tests
@@ -245,6 +270,13 @@ NON_PG_FILTER_REPLAY=(
   high_risk_recovery::cross_channel_tmux_claim_observability_distinguishes_thread_follow_up_4984
   reconcile::dispatch_delivery_reconcile_tests::dispatch_delivery_reconcile_classifies_rows_without_postgres
   reconcile::dispatch_delivery_reconcile_tests::dispatch_delivery_reconcile_treats_all_completed_statuses_as_delivered
+  server::campaign_graph::tests::artifact_capture_accepts_file_boundary_and_rejects_one_extra_byte_without_publication
+  server::campaign_graph::tests::artifact_capture_checks_total_bundle_boundary_before_publication
+  server::campaign_graph::tests::artifact_handoff_uses_frozen_bytes_rejects_corruption_and_conflicting_inputs
+  server::campaign_graph::tests::effect_ownership_tests::effect_ownership_query_preserves_graph_task_key_contract_and_bounds_scope
+  server::campaign_graph::tests::failure_classification_does_not_replay_unknown_and_redacts_credentials
+  server::campaign_graph::tests::graph_contract_rejects_cycles_missing_outputs_paths_and_self_verification
+  server::campaign_graph::tests::learning_tests::campaign_dag_policy_defaults_bounds_and_scope_are_explicit
   server::message_outbox_retry_tests::message_outbox_failure_action_retries_then_fails
   server::message_outbox_retry_tests::outbox_alert_snippet_truncates_and_handles_empty
   server::message_outbox_retry_tests::session_release_is_limited_to_terminal_turn_delivery_sources
@@ -447,6 +479,7 @@ NON_PG_FILTER_REPLAY=(
   services::discord::turn_bridge::resume_pin_tests::c1_same_synthetic_and_handoff_pin_resume_without_clearing_marker
   services::discord::turn_bridge::resume_pin_tests::c1_synthetic_and_handoff_stale_pins_leave_replacement_untouched
   services::discord::turn_bridge::resume_pin_tests::sa2_capture_hands_off_owned_provider_receiver
+  services::discord::turn_bridge::turn_analytics::timestamp_tests::analytics_start_preserves_explicit_offsets_and_legacy_host_local_instants
   services::discord::turn_bridge::voice_completion::voice_completion_tests::background_completion_target_marker_wins_over_reverse_lookup_disagreement
   services::discord::turn_bridge::voice_completion::voice_completion_tests::background_completion_target_refuses_legacy_prefix_without_marker
   services::discord::turn_bridge::voice_completion::voice_completion_tests::background_completion_target_refuses_marker_with_wrong_background_channel

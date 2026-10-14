@@ -271,6 +271,24 @@ pub async fn generate(
         }
     }
 
+    if !crate::services::settings::internal_tasks_enabled(pool)
+        .await
+        .map_err(AppError::internal)?
+    {
+        cards.retain(|card| {
+            if card.github_issue_number.is_some() {
+                true
+            } else {
+                skip_breakdown.filter.push(json!({
+                    "card_id": card.card_id,
+                    "reason": "internal_tasks_disabled",
+                    "hint": "GitHub issue required; enable internalTasksEnabled for internal Kanban work"
+                }));
+                false
+            }
+        });
+    }
+
     if cards.is_empty() {
         let statuses: Vec<String> = crate::pipeline::try_get()
             .map(|pipeline| {

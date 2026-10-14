@@ -96,6 +96,24 @@ LIB_INVENTORY_STATIC_ONLY_BASE = frozenset({
 })
 LIB_INVENTORY_STATIC_ONLY_BY_PLATFORM = {
     "darwin": frozenset({
+        "server::campaign_execution::inputs::publication::tests::interrupted_private_staging_recovers_without_replacing_conflicting_input",
+        "server::campaign_execution::native_tests::campaign_contract_pause_duplicate_and_writer_guards_pg",
+        "server::campaign_execution::native_tests::campaign_rework_budget_exhausts_without_starving_independent_work_pg",
+        "server::campaign_execution::native_tests::verified_files_supply_finite_batches_and_resume_once_pg",
+        "server::test_phase_runs::checks::native_tests::cancellation_reaps_running_checker_without_recording_success_pg",
+        "server::test_phase_runs::checks::native_tests::candidate_rejects_literal_backslash_and_aliasing_filenames",
+        "server::test_phase_runs::checks::native_tests::capture_scope_failure_is_visible_and_cannot_be_retried_by_editing_files_pg",
+        "server::test_phase_runs::checks::native_tests::deadline_reaps_a_checker_even_after_it_prints_a_passing_report",
+        "server::test_phase_runs::checks::native_tests::failed_candidate_is_not_replaced_by_editing_live_workspace_pg",
+        "server::test_phase_runs::checks::native_tests::kernel_denies_candidate_mutation_network_children_and_forged_background_report",
+        "server::test_phase_runs::checks::native_tests::missing_report_retries_are_bounded_across_reconciliation_pg",
+        "server::test_phase_runs::checks::native_tests::real_check_receipt_drives_fsm_once_and_preserves_artifact_pg",
+        "server::test_phase_runs::checks::native_tests::rejected_captures_do_not_starve_independent_checks_pg",
+        "server::test_phase_runs::checks::native_tests::sweep_reaches_independent_check_after_unready_review_cards_pg",
+        "services::cluster::execution_capacity::recovery::local_process::tests::escaped_writer_and_namespace_mismatch_do_not_become_stop_proof",
+        "services::platform::managed_process::linux::tests::admission_rejects_preexisting_hardlinks_and_service_owned_workspaces",
+        "services::platform::managed_process::linux::tests::kernel_denies_alias_proc_exec_and_inherited_fd_but_allows_workspace_edits",
+        "services::platform::managed_process::linux::tests::protected_config_rejects_aliases_and_writable_control_files",
         "services::process::simple_cancel_watcher_tests::linux_proc_stat_parser_handles_comm_with_spaces_and_parens",
     }),
     "linux": frozenset({
@@ -103,6 +121,7 @@ LIB_INVENTORY_STATIC_ONLY_BY_PLATFORM = {
         "cli::init::launchd_plist_tests::generate_launchd_plist_release_sets_clamped_soft_number_of_files_limit",
         "cli::init::launchd_plist_tests::generate_launchd_plist_uses_requested_fresh_home_and_root_only",
         "services::platform::binary_resolver::tests::codex_fallback_dirs_include_app_bundle_resources_on_macos",
+        "services::process::preferred_baseline_tests::persisted_legacy_identity_roundtrip_and_primary_mismatch_remain_guarded",
     }),
 }
 LIB_INVENTORY_KNOWN_CARGO_ONLY = frozenset({

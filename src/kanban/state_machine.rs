@@ -19,6 +19,20 @@ pub(crate) async fn resolve_pipeline_with_pg(
     repo_id: Option<&str>,
     agent_id: Option<&str>,
 ) -> Result<crate::pipeline::PipelineConfig> {
+    let mut conn = pg_pool
+        .acquire()
+        .await
+        .map_err(|error| anyhow::anyhow!("acquire pipeline configuration connection: {error}"))?;
+    resolve_pipeline_on_pg_conn(&mut conn, repo_id, agent_id).await
+}
+
+/// Resolve overrides on the transition's connection so a card row lock does
+/// not require a second pool connection or observe a different transaction.
+pub(crate) async fn resolve_pipeline_on_pg_conn(
+    conn: &mut sqlx::PgConnection,
+    repo_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<crate::pipeline::PipelineConfig> {
     let repo_override = if let Some(repo_id) = repo_id {
         sqlx::query_scalar::<_, Option<String>>(
             "SELECT pipeline_config::text AS pipeline_config
@@ -26,7 +40,7 @@ pub(crate) async fn resolve_pipeline_with_pg(
              WHERE id = $1",
         )
         .bind(repo_id)
-        .fetch_optional(pg_pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|error| anyhow::anyhow!("load repo pipeline override for {repo_id}: {error}"))?
         .flatten()
@@ -45,7 +59,7 @@ pub(crate) async fn resolve_pipeline_with_pg(
              WHERE id = $1",
         )
         .bind(agent_id)
-        .fetch_optional(pg_pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(|error| anyhow::anyhow!("load agent pipeline override for {agent_id}: {error}"))?
         .flatten()

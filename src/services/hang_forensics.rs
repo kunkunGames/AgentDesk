@@ -1375,14 +1375,15 @@ mod tests {
     /// Returns the body of `[profile.release]` from the workspace manifest.
     fn release_profile_section() -> String {
         let manifest = include_str!("../../Cargo.toml");
-        let start = manifest
-            .find("\n[profile.release]\n")
-            .expect("Cargo.toml must define [profile.release]");
-        let body = &manifest[start + "\n[profile.release]\n".len()..];
-        match body.find("\n[") {
-            Some(end) => body[..end].to_string(),
-            None => body.to_string(),
-        }
+        let mut lines = manifest.lines();
+        assert!(
+            lines.any(|line| line.trim() == "[profile.release]"),
+            "Cargo.toml must define [profile.release]"
+        );
+        lines
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Parses rather than searches, truncating the value at a trailing `#`:

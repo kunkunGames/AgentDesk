@@ -130,11 +130,17 @@ pub(super) fn commit_live_direct_resume_fallback(
                     Some(_) => return false,
                     None => current.binding,
                 };
+            if tmux_common::write_tmux_runtime_kind_marker_under_source_authority(
+                authority,
+                RuntimeHandoffKind::CodexTui,
+            )
+            .is_err()
+            {
+                return false;
+            }
             if !claim_watcher() {
                 return false;
             }
-            #[rustfmt::skip]
-            tmux_common::write_tmux_runtime_kind_marker(tmux_session_name, RuntimeHandoffKind::CodexTui).ok();
             #[rustfmt::skip]
             dedupe::register_rehydrated_tmux_runtime_binding_under_source_authority(
                 authority, ProviderKind::Codex.as_str(), channel_id.get(), binding,

@@ -302,62 +302,14 @@ pub(crate) async fn enqueue_run_cleanup_task_on_tx(
     .map_err(|error| format!("enqueue auto-queue run cleanup task: {error}"))
 }
 
-fn parse_card_rollback_dispatch_id(item: &serde_json::Value) -> Result<Option<String>, String> {
-    match item.get("dispatch_id") {
-        Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(dispatch_id)) => Ok(Some(dispatch_id.clone())),
-        None => Err("missing dispatch_id".to_string()),
-        Some(_) => Err("invalid dispatch_id: expected null or string".to_string()),
-    }
-}
+mod payload;
+#[cfg(test)]
+use payload::parse_card_rollback_dispatch_id;
+use payload::task_from_row;
 
-fn task_from_row(row: &sqlx::postgres::PgRow) -> Result<RunCleanupTask, String> {
-    let released_slots: serde_json::Value = row
-        .try_get("released_slots")
-        .map_err(|error| format!("decode auto-queue cleanup released slots: {error}"))?;
-    let pending_emits: serde_json::Value = row
-        .try_get("pending_emits")
-        .map_err(|error| format!("decode auto-queue cleanup pending emits: {error}"))?;
-    let card_rollback_tasks_json: serde_json::Value = row
-        .try_get("card_rollback_tasks")
-        .map_err(|error| format!("decode auto-queue cleanup card rollback tasks: {error}"))?;
-    let card_rollback_tasks: Vec<(String, Option<String>)> = card_rollback_tasks_json
-        .as_array()
-        .ok_or_else(|| "card_rollback_tasks is not an array".to_string())?
-        .iter()
-        .map(|item| {
-            let card_id = item
-                .get("card_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing or invalid card_id".to_string())?
-                .to_string();
-            let dispatch_id = parse_card_rollback_dispatch_id(item)?;
-            Ok((card_id, dispatch_id))
-        })
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(|error| format!("parse auto-queue cleanup card rollback tasks: {error}"))?;
-    Ok(RunCleanupTask {
-        id: row
-            .try_get("id")
-            .map_err(|error| format!("decode auto-queue cleanup id: {error}"))?,
-        run_ids: row
-            .try_get("run_ids")
-            .map_err(|error| format!("decode auto-queue cleanup run ids: {error}"))?,
-        dispatch_ids: row
-            .try_get("dispatch_ids")
-            .map_err(|error| format!("decode auto-queue cleanup dispatch ids: {error}"))?,
-        released_slots: serde_json::from_value(released_slots)
-            .map_err(|error| format!("parse auto-queue cleanup released slots: {error}"))?,
-        pending_emits: serde_json::from_value(pending_emits)
-            .map_err(|error| format!("parse auto-queue cleanup pending emits: {error}"))?,
-        emitted: row
-            .try_get("emitted")
-            .map_err(|error| format!("decode auto-queue cleanup emitted flag: {error}"))?,
-        card_rollback_tasks,
-        card_rollback_source: row
-            .try_get("card_rollback_source")
-            .map_err(|error| format!("decode auto-queue cleanup card rollback source: {error}"))?,
-    })
+/// Ownership gates use the exact durable replay decoder, including array members.
+pub(crate) fn task_payload_is_known(row: &sqlx::postgres::PgRow) -> bool {
+    task_from_row(row).is_ok()
 }
 
 /// Number of cleanup rows still owed. Tests use it to prove convergence.
@@ -853,8 +805,16 @@ pub(crate) async fn drain_run_cleanup_task_pg(
     // `session_clear_is_a_structural_no_op_after_the_cancel_commit_pg` pins the
     // zero-row fact so nobody mistakes it for the step that clears
     // `claude_session_id` — that is step 4, via the slot's threads.
-    let cleared_dispatch_sessions = match clear_sessions_for_dispatches_pg(pool, &task.dispatch_ids)
-        .await
+    let cleared_dispatch_sessions = match async {
+        super::runtime::stop_cancelled_graph_dispatches_pg(
+            health_registry.as_deref(),
+            pool,
+            &task.dispatch_ids,
+        )
+        .await?;
+        clear_sessions_for_dispatches_pg(pool, &task.dispatch_ids).await
+    }
+    .await
     {
         Ok(cleared) => cleared,
         Err(error) => {

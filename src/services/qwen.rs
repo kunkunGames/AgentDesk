@@ -16,6 +16,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 mod fresh_session;
+pub(crate) mod protocol;
 mod system_settings;
 pub(crate) use system_settings::{QwenSystemSettingsOverride, create_system_settings_override};
 #[allow(clippy::too_many_arguments)]
@@ -743,7 +744,7 @@ fn process_qwen_stream_line(line: &str, state: &mut QwenAttemptState) {
 fn process_qwen_json_event(json: &Value, state: &mut QwenAttemptState) {
     match json.get("type").and_then(|v| v.as_str()) {
         Some("system") => {
-            if json.get("subtype").and_then(|v| v.as_str()) == Some("session_start") {
+            if protocol::is_session_start(json) {
                 track_session_id(state, json.get("session_id").and_then(|v| v.as_str()));
                 state.current_model = json
                     .get("model")
@@ -758,7 +759,7 @@ fn process_qwen_json_event(json: &Value, state: &mut QwenAttemptState) {
             }
         }
         Some("stream_event") => {
-            state.partial_stream_seen = true;
+            state.partial_stream_seen |= protocol::is_partial_content(json);
             process_qwen_partial_event(
                 json.get("event").unwrap_or(&Value::Null),
                 json.get("session_id").and_then(|v| v.as_str()),

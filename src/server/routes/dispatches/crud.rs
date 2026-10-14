@@ -347,7 +347,7 @@ pub async fn update_dispatch(
         .await;
         match changed {
             Ok(0) => {
-                if allowed_from_refs.is_some()
+                if let Some(allowed_from) = body.allowed_from.as_ref()
                     && let Ok(dispatch) = crate::dispatch::query_dispatch_row_pg(pool, &id).await
                 {
                     let current_status = dispatch
@@ -357,8 +357,7 @@ pub async fn update_dispatch(
                     return dispatch_status_conflict(
                         &id,
                         format!(
-                            "dispatch {id} is in status '{current_status}' which is not in allowed_from {:?}",
-                            body.allowed_from.as_ref().expect("checked is_some")
+                            "dispatch {id} is in status '{current_status}' which is not in allowed_from {allowed_from:?}"
                         ),
                     );
                 }

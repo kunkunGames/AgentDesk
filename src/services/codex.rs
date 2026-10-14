@@ -1680,6 +1680,7 @@ fn execute_streaming_local_tui_tmux(
     compact_token_limit: Option<u64>,
     force_fresh_provider_session: bool,
 ) -> Result<(), String> {
+    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)?;
     let warm_followup_enabled =
         crate::services::codex_tui::warm_followup::codex_tui_warm_followup_enabled();
     let turn_lock = warm_followup_enabled.then(|| codex_tui_session_turn_lock(tmux_session_name));
@@ -2156,6 +2157,7 @@ fn execute_streaming_local_tmux(
     compact_token_limit: Option<u64>,
     force_fresh_provider_session: bool,
 ) -> Result<(), String> {
+    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)?;
     let auth_overlay = crate::services::discord::org_schema::overlay_from_tmux_session(
         ProviderKind::Codex,
         tmux_session_name,

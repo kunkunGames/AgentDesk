@@ -124,3 +124,10 @@
   .campaign-toolbar label > :is(input, select) { min-height: 40px; }
   .campaigns-panel .campaign-view-toggle button, .campaigns-panel .campaign-list-tools button, .campaign-inspector-header button { min-height: 44px; }
 }
+.campaign-execution { border: 1px solid var(--th-border); border-radius: 8px; padding: 8px; }
+.campaign-execution-body { padding: 8px; overflow-wrap: anywhere; }
+.campaign-execution-metrics { display: flex; flex-wrap: wrap; gap: 16px; }
+.campaign-execution-metrics div { min-width: 140px; }
+.campaign-execution-metrics dt { color: var(--th-text-muted); font-size: 12px; }
+.campaign-execution-metrics dd { margin: 4px 0; font-weight: 600; }
+.campaign-execution small { display: block; }

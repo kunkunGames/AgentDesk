@@ -48,24 +48,24 @@ pub(super) fn install(
         ))
     };
     let publish = |source: &Path, target: &Path| -> anyhow::Result<()> {
-        let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
-        let target = std::ffi::CString::new(target.as_os_str().as_bytes())?;
+        let source_name = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+        let target_name = std::ffi::CString::new(target.as_os_str().as_bytes())?;
         // NOREPLACE is the commit point. No named partial file or hardlink is
         // ever visible in the workspace, even if the server dies immediately.
         anyhow::ensure!(
             unsafe {
                 libc::renameat2(
                     libc::AT_FDCWD,
-                    source.as_ptr(),
+                    source_name.as_ptr(),
                     libc::AT_FDCWD,
-                    target.as_ptr(),
+                    target_name.as_ptr(),
                     libc::RENAME_NOREPLACE,
                 )
             } == 0,
             "atomic input publication failed: {}",
             std::io::Error::last_os_error()
         );
-        fs::File::open(&staging)?.sync_all()?;
+        crate::services::discord::runtime_store::fsync_parent_dir(source)?;
         Ok(())
     };
     for (relative, bytes) in inputs {
@@ -105,11 +105,7 @@ pub(super) fn install(
                         "cannot set input directory ownership"
                     );
                     publish(&staged, &path)?;
-                    fs::File::open(
-                        path.parent()
-                            .ok_or_else(|| anyhow::anyhow!("input directory has no parent"))?,
-                    )?
-                    .sync_all()?;
+                    crate::services::discord::runtime_store::fsync_parent_dir(&path)?;
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -138,7 +134,7 @@ pub(super) fn install(
         );
         file.sync_all()?;
         publish(&staged, &target)?;
-        fs::File::open(parent)?.sync_all()?;
+        crate::services::discord::runtime_store::fsync_parent_dir(&target)?;
     }
     Ok(())
 }

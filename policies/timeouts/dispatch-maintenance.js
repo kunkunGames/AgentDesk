@@ -122,7 +122,10 @@ module.exports = function attachDispatchMaintenance(timeouts, helpers) {
         "AND COALESCE(td.retry_count, 0) < " + MAX_DISPATCH_RETRIES + " " +
         "AND td.updated_at < datetime('now', '-30 seconds') " +
         "AND kc.latest_dispatch_id = td.id " +
-        "AND kc.status IN (?, ?)",
+        "AND kc.status IN (?, ?) " +
+        // Native Campaign owns failed outcomes and explicit reconciliation.
+        // Generic retries must never bypass that authority or poll a held card.
+        "AND NOT EXISTS (SELECT 1 FROM campaign_graph_tasks native WHERE native.card_id = kc.id)",
         [jInitial, jInProgress]
       );
       for (var jr = 0; jr < failedForRetry.length; jr++) {

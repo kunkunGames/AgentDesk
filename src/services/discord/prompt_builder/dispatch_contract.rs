@@ -18,6 +18,7 @@ pub(crate) struct CurrentTaskContext<'a> {
     pub(crate) dispatch_title: Option<&'a str>,
     pub(crate) dispatch_context: Option<&'a str>,
     pub(crate) card_title: Option<&'a str>,
+    pub(crate) campaign_graph_prompt: Option<&'a str>,
     pub(crate) github_issue_url: Option<&'a str>,
 }
 
@@ -332,6 +333,16 @@ pub(super) fn render_dispatch_contract(
     dispatch_type: Option<&str>,
     current_task: &CurrentTaskContext<'_>,
 ) -> Option<String> {
+    if current_task.campaign_graph_prompt.is_some() {
+        return Some(format!(
+            "[Dispatch Contract]\nNative Campaign graph task: execute only the contract below. Write .agentdesk-campaign-result.json in the assigned workspace; the native completion owner submits it after the turn ends. The COMPLETE result file, including the DAG and receipt, must be at most {} UTF-8 bytes on disk. Write compact JSON and check its actual byte size before ending the turn. Do not call completion APIs or discover credentials. Do not create a PR unless this goal explicitly requires that external action. Do not use OUTCOME: noop for declared artifacts.\nNative artifact handoff limits (enforced): each declared output must be a nonempty regular file of at most {} bytes; all declared outputs for one task together must be at most {} bytes. Each DAG task requires 1..{} declared outputs and at most {} mapped inputs. These limits apply to planning, validation and business tasks. Keep evidence within these bounds; if splitting evidence, declare every part in the DAG and the verifier inputs. Check actual file sizes before ending the turn.\nPublished task keys have immutable contracts. A changed contract for a failed, unaccepted artifact_only task requires a new task key identifying that revised contract and its inputs; retain the original failed attempt. Preserve accepted, running and external-effect task keys and contracts. Do not reset cumulative usage or replay an unknown external effect.",
+            crate::db::campaigns::graph::receipt::MAX_RESULT_FILE_BYTES,
+            crate::db::campaigns::graph::MAX_ARTIFACT_FILE_BYTES,
+            crate::db::campaigns::graph::MAX_ARTIFACT_BUNDLE_BYTES,
+            crate::db::campaigns::graph::MAX_TASK_OUTPUTS,
+            crate::db::campaigns::graph::MAX_TASK_INPUTS,
+        ));
+    }
     match dispatch_type {
         Some("implementation") | Some("rework") => {
             let patch_guidance = current_task.dispatch_id.map(|dispatch_id| {
@@ -544,6 +555,10 @@ pub(super) fn render_current_task_section(
         render_dispatch_context_section(dispatch_type, current_task.dispatch_context)
     {
         sections.push(dispatch_context_section);
+    }
+
+    if let Some(prompt) = current_task.campaign_graph_prompt {
+        sections.push(format!("[Campaign Task Requirements]\n{prompt}"));
     }
 
     if let Some(dispatch_contract) = render_dispatch_contract(dispatch_type, current_task) {

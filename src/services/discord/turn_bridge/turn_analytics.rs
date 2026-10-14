@@ -59,6 +59,23 @@ pub(super) fn turn_duration_ms(started_at: std::time::Instant) -> i64 {
     i64::try_from(started_at.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
+fn analytics_started_at_utc<Tz: chrono::TimeZone>(
+    value: &str,
+    legacy_timezone: &Tz,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(value.with_timezone(&chrono::Utc));
+    }
+    // Inflight state still uses its existing host-local clock encoding for
+    // lease identity and recovery. Resolve that encoding at its producer,
+    // rather than letting the database connection supply a different zone.
+    let value = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S").ok()?;
+    legacy_timezone
+        .from_local_datetime(&value)
+        .single()
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_turn_bridge_invariant(
     condition: bool,
@@ -321,7 +338,11 @@ pub(in crate::services::discord) fn persist_turn_analytics_row_with_handles(
     let dispatch_id = dispatch_id
         .map(str::to_string)
         .or_else(|| inflight_state.dispatch_id.clone());
-    let started_at = inflight_state.started_at.clone();
+    let Some(started_at) = analytics_started_at_utc(&inflight_state.started_at, &chrono::Local)
+    else {
+        tracing::warn!(%turn_id, "turn analytics start instant is invalid or ambiguous; row not persisted");
+        return;
+    };
     let analytics_snapshot =
         TurnAnalyticsSnapshot::capture(inflight_state, session_id, token_usage);
     let (resolved_session_id, resolved_token_usage) =
@@ -337,7 +358,7 @@ pub(in crate::services::discord) fn persist_turn_analytics_row_with_handles(
         session_id: resolved_session_id,
         dispatch_id,
         started_at: Some(started_at),
-        finished_at: Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+        finished_at: Some(chrono::Utc::now()),
         duration_ms: Some(duration_ms),
         token_usage: resolved_token_usage,
     };
@@ -369,6 +390,101 @@ pub(in crate::services::discord) fn persist_turn_analytics_row_with_handles(
                 "  [{ts}] ⚠ failed to create runtime for turn analytics persistence: {error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::{
+        ChannelId, InflightTurnState, MessageId, ProviderKind, analytics_started_at_utc,
+        discord_turn_id, persist_turn_analytics_row_with_handles,
+    };
+    use chrono::{DateTime, FixedOffset, Utc};
+
+    #[test]
+    fn analytics_start_preserves_explicit_offsets_and_legacy_host_local_instants() {
+        let legacy_timezone = FixedOffset::east_opt(9 * 3600).unwrap();
+        let expected = DateTime::parse_from_rfc3339("2026-10-02T19:55:40Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for value in [
+            "2026-10-02T19:55:40Z",
+            "2026-10-03T04:55:40+09:00",
+            "2026-10-03 04:55:40",
+        ] {
+            assert_eq!(
+                analytics_started_at_utc(value, &legacy_timezone),
+                Some(expected)
+            );
+        }
+        assert!(analytics_started_at_utc("invalid", &legacy_timezone).is_none());
+        assert!(analytics_started_at_utc("2026-02-30 04:55:40", &legacy_timezone).is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_analytics_production_writer_preserves_utc_instants_and_duration_pg() {
+        let fixture = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
+        let pool = fixture.connect_and_migrate_with_max_connections(1).await;
+        sqlx::query("SET TIME ZONE 'UTC'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let provider = ProviderKind::Codex;
+        let channel = ChannelId::new(987654);
+        let message = MessageId::new(456789);
+        let inflight = InflightTurnState::new(
+            provider.clone(),
+            channel.get(),
+            None,
+            123,
+            message.get(),
+            message.get(),
+            "timestamp regression".into(),
+            None,
+            None,
+            None,
+            None,
+            0,
+        );
+        let expected_start =
+            analytics_started_at_utc(&inflight.started_at, &chrono::Local).unwrap();
+        let before = Utc::now();
+        persist_turn_analytics_row_with_handles(
+            Some(&pool),
+            &provider,
+            channel,
+            message,
+            None,
+            None,
+            None,
+            None,
+            &inflight,
+            crate::db::turns::TurnTokenUsage::default(),
+            306_632,
+        );
+        let turn_id = discord_turn_id(&provider, channel, Some(message), None, None);
+        let row = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(row) = sqlx::query_as::<_, (DateTime<Utc>, DateTime<Utc>, i64)>(
+                    "SELECT started_at, finished_at, duration_ms FROM turns WHERE turn_id = $1",
+                )
+                .bind(&turn_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                {
+                    break row;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("production analytics row persisted within deadline");
+        assert_eq!(row.0, expected_start);
+        assert!(row.1 >= before && row.1 <= Utc::now());
+        assert_eq!(row.2, 306_632);
+        pool.close().await;
+        fixture.drop().await;
     }
 }
 

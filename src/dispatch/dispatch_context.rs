@@ -1280,58 +1280,8 @@ async fn resolve_card_repo_dir_with_context_pg(
 ///
 /// Returns `(worktree_path, worktree_branch, head_commit)` derived from the
 /// card's `github_issue_number` + resolved repo dir.
-pub(crate) async fn resolve_card_worktree(
-    pool: &PgPool,
-    card_id: &str,
-    context: Option<&serde_json::Value>,
-) -> Result<Option<(String, String, String)>> {
-    let Some((issue_number, _repo_id)) = load_card_issue_repo_pg(pool, card_id).await else {
-        return Ok(None);
-    };
-    let Some(issue_number) = issue_number else {
-        return Ok(None);
-    };
-    let Some(repo_dir) =
-        resolve_card_repo_dir_with_context_pg(pool, card_id, context, "resolve worktree repo")
-            .await?
-    else {
-        return Ok(None);
-    };
-    Ok(
-        crate::services::platform::find_worktree_for_issue(&repo_dir, issue_number)
-            .map(|wt| (wt.path, wt.branch, wt.commit)),
-    )
-}
-
-pub(crate) async fn ensure_card_worktree(
-    pool: &PgPool,
-    card_id: &str,
-    context: Option<&serde_json::Value>,
-) -> Result<Option<(String, String, String, bool)>> {
-    let Some((issue_number, _repo_id)) = load_card_issue_repo_pg(pool, card_id).await else {
-        return Ok(None);
-    };
-    let Some(issue_number) = issue_number else {
-        return Ok(None);
-    };
-    let Some(repo_dir) =
-        resolve_card_repo_dir_with_context_pg(pool, card_id, context, "create worktree repo")
-            .await?
-    else {
-        return Ok(None);
-    };
-    let ensured =
-        crate::services::platform::shell::ensure_worktree_for_issue(&repo_dir, issue_number)
-            .map_err(|error| {
-                anyhow::anyhow!("Cannot create worktree for card {card_id}: {error}")
-            })?;
-    Ok(Some((
-        ensured.path,
-        ensured.branch,
-        ensured.commit,
-        ensured.created,
-    )))
-}
+mod worktrees;
+pub(crate) use worktrees::{ensure_card_worktree, resolve_card_worktree};
 
 /// PG-native variant of [`inject_review_dispatch_identifiers`].
 ///

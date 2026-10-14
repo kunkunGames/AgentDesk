@@ -208,7 +208,9 @@ pub(super) fn planning_sort_key(card: &GenerateCandidate, idx: usize) -> (i32, u
 
 pub(super) fn dependency_issue_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"#(\d+)").expect("dependency regex must compile"))
+    RE.get_or_init(|| {
+        regex::Regex::new(r"#(\d+)").expect("dependency regex must compile") // agentdesk-audit: allow-unwrap -- fixed literal; dependency parser regressions exercise initialization.
+    })
 }
 
 pub(super) fn dependency_section_header_regex() -> &'static regex::Regex {
@@ -217,7 +219,7 @@ pub(super) fn dependency_section_header_regex() -> &'static regex::Regex {
         regex::Regex::new(
             r"(?i)^\s*(?:#{1,6}\s*)?(dependencies?|dependency|depends on|선행 작업|선행작업|의존성)\s*:?\s*$",
         )
-        .expect("dependency section regex must compile")
+        .expect("dependency section regex must compile") // agentdesk-audit: allow-unwrap -- fixed literal; dependency parser regressions exercise initialization.
     })
 }
 
@@ -227,20 +229,22 @@ pub(super) fn dependency_inline_regex() -> &'static regex::Regex {
         regex::Regex::new(
             r"(?i)^\s*(?:[-*]\s*)?(?:#{1,6}\s*)?(dependencies?|dependency|depends on|선행 작업|선행작업|의존성)\s*:?\s+(.+)$",
         )
-        .expect("dependency inline regex must compile")
+        .expect("dependency inline regex must compile") // agentdesk-audit: allow-unwrap -- fixed literal; dependency parser regressions exercise initialization.
     })
 }
 
 pub(super) fn markdown_header_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"^#{1,6}\s").expect("markdown header regex must compile"))
+    RE.get_or_init(|| {
+        regex::Regex::new(r"^#{1,6}\s").expect("markdown header regex must compile") // agentdesk-audit: allow-unwrap -- fixed literal; dependency parser regressions exercise initialization.
+    })
 }
 
 pub(super) fn bare_dependency_list_regex() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
         regex::Regex::new(r"^\s*#\d+(?:[\s,]+#\d+)*\s*$")
-            .expect("dependency bare-list regex must compile")
+            .expect("dependency bare-list regex must compile") // agentdesk-audit: allow-unwrap -- fixed literal; dependency parser regressions exercise initialization.
     })
 }
 
@@ -428,10 +432,56 @@ pub(super) fn extract_file_paths_from_text(text: &str) -> HashSet<String> {
     let re = regex::Regex::new(
         r"(?:src|dashboard|policies|tests|scripts|docs|crates|migrations|assets|prompts|templates|examples|references)/[A-Za-z0-9_./-]+",
     )
-    .expect("file path regex must compile");
+    .expect("file path regex must compile"); // agentdesk-audit: allow-unwrap -- fixed literal; similarity path regressions exercise initialization.
     re.find_iter(text)
         .filter_map(|m| normalize_similarity_path(m.as_str()))
         .collect()
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::*;
+
+    #[test]
+    fn dependency_text_respects_sections_and_excludes_self_references() {
+        let mut deps = HashSet::new();
+        let mut signals = HashSet::new();
+        extract_dependency_numbers_from_text(
+            "의존성: #41, #42\n### 선행 작업\n- #43\n## 검증\n- #44",
+            "description",
+            false,
+            &mut deps,
+            &mut signals,
+            Some(42),
+        );
+        assert_eq!(deps, HashSet::from([41, 43]));
+        assert!(signals.contains("description:inline:의존성"));
+        extract_dependency_numbers_from_text(
+            "#45 #42",
+            "metadata",
+            true,
+            &mut deps,
+            &mut signals,
+            Some(42),
+        );
+        assert_eq!(deps, HashSet::from([41, 43, 45]));
+        assert!(signals.contains("metadata:bare-list"));
+    }
+
+    #[test]
+    fn similarity_paths_strip_markdown_punctuation_and_ignore_external_urls() {
+        let paths = extract_file_paths_from_text(
+            "변경: `src/engine/sql_guard.rs`, dashboard/src/App.tsx. docs/campaign-ledger.md) https://example.invalid/other.rs",
+        );
+        assert_eq!(
+            paths,
+            HashSet::from([
+                "src/engine/sql_guard.rs".to_string(),
+                "dashboard/src/App.tsx".to_string(),
+                "docs/campaign-ledger.md".to_string(),
+            ])
+        );
+    }
 }
 
 pub(super) fn similarity_paths(card: &GenerateCandidate) -> HashSet<String> {

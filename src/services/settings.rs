@@ -46,6 +46,9 @@ const RUNTIME_CONFIG_KEYS: &[&str] = &[
     "ceoWarnDepth",
     "maxRetries",
     "maxEntryRetries",
+    "internalTasksEnabled",
+    "campaignSuperiorAgentId",
+    "campaignDagTemplateMinSamples",
     "staleDispatchedGraceMin",
     "staleDispatchedTerminalStatuses",
     "staleDispatchedRecoverNullDispatch",
@@ -437,6 +440,8 @@ impl SettingsService {
     }
 
     pub async fn put_runtime_config(&self, body: Value) -> ServiceResult<SettingsOkResponse> {
+        crate::db::campaigns::graph::learning::policy::Policy::from_value(&body)
+            .map_err(|error| ServiceError::bad_request(error.to_string()))?;
         let pool = self.pg_pool("put_runtime_config.pg_pool")?;
         if let Some(values) = body.as_object() {
             let mut tx = pool.begin().await.map_err(|error| {
@@ -885,56 +890,26 @@ fn runtime_config_yaml_overrides(config: &crate::config::Config) -> Map<String, 
             .dispatch_rate_limit_gate_danger_pct
             .map(u64::from),
     );
+    insert_runtime_string(
+        &mut overrides,
+        "campaignSuperiorAgentId",
+        config.runtime.campaign_superior_agent_id.as_deref(),
+    );
+    insert_runtime_number(
+        &mut overrides,
+        "campaignDagTemplateMinSamples",
+        config
+            .runtime
+            .campaign_dag_template_min_samples
+            .map(u64::from),
+    );
     overrides
 }
 
-fn runtime_config_defaults_map(config: &crate::config::Config) -> Map<String, Value> {
-    let mut defaults = json!({
-        "dispatchPollSec": 30,
-        "agentSyncSec": 300,
-        "githubIssueSyncSec": 900,
-        "claudeRateLimitPollSec": 120,
-        "codexRateLimitPollSec": 120,
-        "issueTriagePollSec": 300,
-        "ceoWarnDepth": 3,
-        "maxRetries": 3,
-        "maxEntryRetries": 3,
-        "staleDispatchedGraceMin": 2,
-        "staleDispatchedTerminalStatuses": "cancelled,failed",
-        "staleDispatchedRecoverNullDispatch": true,
-        "staleDispatchedRecoverMissingDispatch": true,
-        "reviewReminderMin": 30,
-        "rateLimitWarningPct": 80,
-        "rateLimitDangerPct": 95,
-        "githubRepoCacheSec": 300,
-        "rateLimitStaleSec": 600,
-        "dispatchRateLimitGateEnabled": true,
-        "dispatchRateLimitGateDangerPct": 100,
-    })
-    .as_object()
-    .cloned()
-    .unwrap_or_default();
-    for (key, value) in runtime_config_yaml_overrides(config) {
-        defaults.insert(key, value);
-    }
-    defaults
-}
-
-pub fn runtime_config_defaults(config: &crate::config::Config) -> Value {
-    Value::Object(runtime_config_defaults_map(config))
-}
-
-pub(crate) fn explicit_runtime_config_keys(values: &Map<String, Value>) -> HashSet<String> {
-    values
-        .get(RUNTIME_CONFIG_EXPLICIT_KEYS_META)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter(|key| RUNTIME_CONFIG_KEYS.contains(key))
-        .map(ToOwned::to_owned)
-        .collect()
-}
+mod runtime_config_read;
+pub use runtime_config_read::runtime_config_defaults;
+use runtime_config_read::runtime_config_defaults_map;
+pub(crate) use runtime_config_read::{explicit_runtime_config_keys, internal_tasks_enabled};
 
 fn write_runtime_config_pg(
     pg_pool: &sqlx::PgPool,
@@ -1011,6 +986,10 @@ pub async fn seed_runtime_config_defaults_pg(
     .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
     .and_then(|value| value.as_object().cloned());
     let target = seeded_runtime_config_map(saved_obj, config);
+    crate::db::campaigns::graph::learning::policy::Policy::from_value(&Value::Object(
+        target.clone(),
+    ))
+    .map_err(|error| error.to_string())?;
     write_runtime_config_pg(pool, &target).map_err(|error| error.to_string())
 }
 
@@ -1225,6 +1204,40 @@ mod tests {
         }
         let entries = service.get_config_entries().await.unwrap().entries;
         assert!(entries.iter().all(|entry| !entry.key.starts_with("merge_")));
+        database.drop().await;
+    }
+
+    #[tokio::test]
+    async fn internal_tasks_require_explicit_boolean_opt_in_pg() {
+        let database = TestDatabase::create().await;
+        let pool = database.connect().await;
+        assert!(!internal_tasks_enabled(&pool).await.unwrap());
+        for (value, expected) in [
+            (json!({"internalTasksEnabled": true}), true),
+            (json!({"internalTasksEnabled": false}), false),
+            (json!({"internalTasksEnabled": "true"}), false),
+            (json!({}), false),
+        ] {
+            upsert_test_kv(&pool, "runtime-config", &value.to_string()).await;
+            assert_eq!(internal_tasks_enabled(&pool).await.unwrap(), expected);
+        }
+        let config = crate::config::Config::default();
+        assert_eq!(
+            runtime_config_defaults(&config)["internalTasksEnabled"],
+            false
+        );
+        let saved = with_explicit_runtime_config_keys(
+            json!({"internalTasksEnabled": true})
+                .as_object()
+                .unwrap()
+                .clone(),
+            None,
+        );
+        assert_eq!(
+            seeded_runtime_config_map(Some(saved), &config)["internalTasksEnabled"],
+            true
+        );
+        pool.close().await;
         database.drop().await;
     }
 
@@ -1682,6 +1695,63 @@ mod tests {
         assert_eq!(seeded.current.get("maxEntryRetries"), Some(&json!(7)));
         assert_eq!(seeded.explicit_keys, vec!["maxEntryRetries"]);
 
+        drop(service);
+        pool.close().await;
+        database.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn campaign_dag_policy_pg_yaml_api_and_restart_preserve_operator_choices() {
+        let database = TestDatabase::create().await;
+        let pool = database.connect().await;
+        let mut config = crate::config::Config::default();
+        assert_eq!(
+            runtime_config_defaults(&config)["campaignDagTemplateMinSamples"],
+            10
+        );
+        assert_eq!(
+            runtime_config_defaults(&config)["campaignSuperiorAgentId"],
+            "codex"
+        );
+        config.runtime.campaign_superior_agent_id = Some("brain".into());
+        config.runtime.campaign_dag_template_min_samples = Some(4);
+        seed_runtime_config_defaults_pg(&pool, &config)
+            .await
+            .unwrap();
+        let service = SettingsService::new(Some(pool.clone()), Arc::new(config.clone()));
+        assert_eq!(
+            service.get_runtime_config().await.unwrap().current["campaignDagTemplateMinSamples"],
+            4
+        );
+        service
+            .put_runtime_config(
+                json!({"campaignSuperiorAgentId":"codex","campaignDagTemplateMinSamples":7}),
+            )
+            .await
+            .unwrap();
+        for invalid in [
+            json!({"campaignDagTemplateMinSamples":0}),
+            json!({"campaignDagTemplateMinSamples":101}),
+            json!({"campaignSuperiorAgentId":"../agent"}),
+        ] {
+            assert!(service.put_runtime_config(invalid).await.is_err());
+        }
+        seed_runtime_config_defaults_pg(&pool, &config)
+            .await
+            .unwrap();
+        let policy = crate::db::campaigns::graph::learning::policy::Policy::load(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            (policy.superior_agent.as_str(), policy.min_samples),
+            ("codex", 7)
+        );
+        let restarted = service.get_runtime_config().await.unwrap();
+        assert!(
+            restarted
+                .explicit_keys
+                .contains(&"campaignDagTemplateMinSamples".into())
+        );
         drop(service);
         pool.close().await;
         database.drop().await;

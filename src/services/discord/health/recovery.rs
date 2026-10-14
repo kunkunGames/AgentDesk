@@ -1479,7 +1479,7 @@ pub async fn clear_provider_channel_runtime(
     #[cfg(unix)]
     if let Some(name) = tmux_name {
         if provider.uses_managed_tmux_backend() {
-            discord::commands::reset_managed_process_session(&name);
+            discord::commands::reset_managed_process_session(&shared, &name);
         }
     }
 
@@ -5253,7 +5253,11 @@ mod stall_watchdog_auto_heal_tests {
         let watcher_cancel = Arc::new(AtomicBool::new(false));
         shared.tmux_watchers.insert(
             channel,
-            watcher_handle(tmux, &output, watcher_cancel.clone()),
+            watcher_handle(
+                "AgentDesk-codex-stale-owner-343742347365974026",
+                &output,
+                watcher_cancel.clone(),
+            ),
         );
         let turn_view_ops_before = shared.turn_view_reconciler.ops().len();
 
@@ -5265,6 +5269,10 @@ mod stall_watchdog_auto_heal_tests {
             .snapshot_watcher_state_for_shared(&provider, shared.clone(), channel.get())
             .await
             .expect("initial long-active-turn watcher snapshot");
+        assert!(
+            initial_snapshot.desynced,
+            "the stale watcher binding must arm branch 4"
+        );
         let observation_time = chrono::Utc::now().timestamp();
         assert!(
             !super::super::liveness_authority::observe_capture_coordinate(
@@ -5388,9 +5396,32 @@ mod stall_watchdog_auto_heal_tests {
         let watcher_cancel = Arc::new(AtomicBool::new(false));
         shared.tmux_watchers.insert(
             channel,
-            watcher_handle(tmux, &output, watcher_cancel.clone()),
+            watcher_handle(
+                "AgentDesk-codex-stale-owner-343742347365974026",
+                &output,
+                watcher_cancel.clone(),
+            ),
         );
         let turn_view_ops_before = shared.turn_view_reconciler.ops().len();
+
+        let pre = registry
+            .snapshot_watcher_state_for_shared(&provider, shared.clone(), channel.get())
+            .await
+            .expect("genuine-stall pre-tick snapshot");
+        assert!(pre.desynced, "the stale watcher binding must arm branch 4");
+        assert!(
+            super::stall_watchdog_should_force_clean(
+                pre.attached,
+                pre.desynced,
+                false,
+                pre.inflight_terminal_delivery_committed,
+                pre.inflight_started_at.as_deref(),
+                chrono::Utc::now().timestamp(),
+                super::STALL_WATCHDOG_THRESHOLD_SECS,
+                registry.started_at_unix(),
+            ),
+            "flat capture without positive evidence must reach stall paging"
+        );
 
         for pass in 1..=2 {
             let cleaned = super::run_stall_watchdog_pass(&registry, &provider).await;
@@ -5557,12 +5588,14 @@ mod stall_watchdog_auto_heal_tests {
         )
         .expect("runtime kind marker");
         let output_path = tempdir.path().join("relay-5396-reuse-tick.jsonl");
-        // A session-start marker: at-rest for `jsonl_ready_for_input` (so the
-        // idle-repair branch is armed) but NOT a `result`, so the unrelayed
-        // tail-answer branch above it stays out of the way.
+        // Undelivered assistant text creates a real backlog obligation. The
+        // final init marker arms idle repair without claiming a terminal answer.
         std::fs::write(
             &output_path,
-            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}\n",
+            concat!(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"pending relay text\"}]}}\n",
+                "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}\n",
+            ),
         )
         .expect("seed at-rest transcript");
 
@@ -5623,6 +5656,7 @@ mod stall_watchdog_auto_heal_tests {
         state.turn_nonce = token.turn_nonce().map(str::to_string);
         state.runtime_kind = Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui);
         state.set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::Watcher);
+        super::super::watchdog_test_support::seed_source_generation(&shared, channel, &mut state);
         crate::services::discord::inflight::save_inflight_state(&state)
             .expect("seed authoritative inflight");
         // `save_inflight_state` restamps `updated_at` to now on every write, so
@@ -5656,10 +5690,15 @@ mod stall_watchdog_auto_heal_tests {
         // destructive branch is a property of this pre-tick snapshot — the
         // reattach apply readopts the row and refreshes `updated_at`, which is
         // why a post-tick re-snapshot would answer a different question.
-        let pre = registry
-            .snapshot_watcher_state_for_shared(&provider, shared.clone(), channel.get())
-            .await
-            .expect("pre-tick snapshot");
+        let pre = super::super::watchdog_test_support::wait_for_overdue_backlog(
+            &registry, &provider, &shared, channel,
+        )
+        .await;
+        assert_eq!(
+            pre.relay_stall_state,
+            crate::services::discord::relay_health::RelayStallState::TmuxAliveRelayDead,
+            "the witnessed overdue answer must make reattach eligible"
+        );
         assert!(
             super::watchdog_decisions::stale_idle_foreground_queue_detected(
                 pre.relay_health.active_turn,
@@ -6160,6 +6199,11 @@ mod hard_stop_completion_event_tests {
         let second = super::super::super::make_shared_data_for_tests();
         let channel = ChannelId::new(4_048_260);
         let token = Arc::new(CancelToken::new());
+        // A prelaunch mailbox owns a runtime only after naming its executor.
+        token.bind_owned_tmux_session(
+            provider.clone(),
+            "AgentDesk-claude-providerless-owner-4048260-cc",
+        );
 
         second
             .mailbox(channel)

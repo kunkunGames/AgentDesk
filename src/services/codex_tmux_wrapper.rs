@@ -183,21 +183,8 @@ pub fn run(
     eprintln!("\x1b[90m--- Session ended ({exit_reason}) ---\x1b[0m");
 }
 
-fn normalize_resume_session_id(resume_session_id: Option<&str>) -> Option<String> {
-    resume_session_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn codex_first_event_timeout() -> std::time::Duration {
-    let seconds = std::env::var("AGENTDESK_CODEX_FIRST_EVENT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .unwrap_or(DEFAULT_CODEX_FIRST_EVENT_TIMEOUT_SECS);
-    std::time::Duration::from_secs(seconds)
-}
+mod launch_settings;
+use launch_settings::{codex_first_event_timeout, normalize_resume_session_id};
 
 fn cleanup(output_file: &str, input_fifo: &str) {
     let _ = std::fs::remove_file(output_file);
@@ -700,6 +687,7 @@ fn handle_response_tool_call(
             "message": {
                 "content": [{
                     "type": "tool_use",
+                    "id": payload.get("call_id").or_else(|| payload.get("id")),
                     "name": name,
                     "input": input,
                 }]
@@ -729,6 +717,7 @@ fn handle_response_tool_output(
             "message": {
                 "content": [{
                     "type": "tool_result",
+                    "tool_use_id": payload.get("call_id").or_else(|| payload.get("id")),
                     "content": content,
                     "is_error": is_error,
                 }]
@@ -957,7 +946,8 @@ fn compact_json_or_string(value: &serde_json::Value) -> String {
 mod modern_event_tests {
     use super::{
         CodexWrapperTurnState, emit_schema_drift_result, handle_codex_wrapper_event,
-        schema_drift_reason,
+        handle_item_completed, handle_item_started, handle_response_tool_call,
+        handle_response_tool_output, schema_drift_reason,
     };
     use crate::services::tmux_common::RotatingJsonlWriter;
     use serde_json::json;
@@ -1061,10 +1051,40 @@ mod modern_event_tests {
         assert_eq!(lines[0]["type"], "assistant");
         assert_eq!(lines[0]["message"]["content"][0]["type"], "tool_use");
         assert_eq!(lines[0]["message"]["content"][0]["name"], "update_plan");
+        assert_eq!(lines[0]["message"]["content"][0]["id"], "call-plan");
         assert_eq!(
             lines[0]["message"]["content"][0]["input"],
             "{\"plan\":[{\"step\":\"Render Codex plan\",\"status\":\"in_progress\"}]}"
         );
+    }
+
+    #[test]
+    fn wrapper_preserves_provider_tool_identity_for_calls_and_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool-events.jsonl");
+        let mut output = RotatingJsonlWriter::open(&path).unwrap();
+        handle_response_tool_call(
+            &mut output,
+            &json!({"name":"exec","input":"check","id":"response-id","call_id":"call-id"}),
+        )
+        .unwrap();
+        handle_response_tool_output(
+            &mut output,
+            &json!({"output":"ok","id":"different-response-id","call_id":"call-id"}),
+        )
+        .unwrap();
+        handle_item_started(
+            &mut output,
+            &json!({"type":"command_execution","id":"item-7","command":"check"}),
+        )
+        .unwrap();
+        handle_item_completed(&mut output, &json!({"type":"command_execution","id":"item-7","aggregated_output":"ok","exit_code":0}), &mut String::new()).unwrap();
+        let lines = read_jsonl(&path);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0]["message"]["content"][0]["id"], "call-id");
+        assert_eq!(lines[1]["message"]["content"][0]["tool_use_id"], "call-id");
+        assert_eq!(lines[2]["message"]["content"][0]["id"], "item-7");
+        assert_eq!(lines[3]["message"]["content"][0]["tool_use_id"], "item-7");
     }
 
     #[test]
@@ -2006,6 +2026,7 @@ fn handle_item_started(
             "message": {
                 "content": [{
                     "type": "tool_use",
+                    "id": item.get("id"),
                     "name": "Bash",
                     "input": {
                         "command": command,
@@ -2060,6 +2081,7 @@ fn handle_item_completed(
                     "message": {
                         "content": [{
                             "type": "tool_result",
+                            "tool_use_id": item.get("id"),
                             "content": content,
                             "is_error": is_error,
                         }]

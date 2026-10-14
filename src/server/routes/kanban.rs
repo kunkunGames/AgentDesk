@@ -209,6 +209,14 @@ fn pg_pool_required_error() -> AppError {
 }
 
 fn database_error(message: impl Into<String>) -> AppError {
+    let message = message.into();
+    // The string-only Kanban DB facade preserves this exact machine marker.
+    // All other database failures keep their existing classification.
+    if message == "campaign_graph_card_contract_immutable"
+        || message == "error returned from database: campaign_graph_card_contract_immutable"
+    {
+        return AppError::conflict("Issued campaign graph card execution contract is immutable");
+    }
     AppError::internal(message).with_code(ErrorCode::Database)
 }
 
