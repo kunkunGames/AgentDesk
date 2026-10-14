@@ -154,6 +154,68 @@ fn rejected_same_text_handoff_matches_keep_normal_entry_processing() {
     }
 }
 
+#[test]
+fn an_older_same_text_record_preserves_the_new_held_input() {
+    for native_turn in [Some("t2"), None] {
+        let _lock = locked();
+        let guard = reserve_discord_handoff("codex", TMUX, ORIGIN);
+        let mut published = Published::new();
+        assert_eq!(
+            observe_codex_prompt_in_turn_at(TMUX, INPUT, None, native_turn, Utc::now()),
+            PromptObservation::ParkedForHandoff
+        );
+        let older = record(Some("t0"), Some(Utc::now() - chrono::TimeDelta::minutes(5)));
+        assert_eq!(
+            observe_codex_record_prompt_at(TMUX, INPUT, Some("old"), None, &older, Utc::now()),
+            PromptObservation::PublishedSshDirect
+        );
+        assert_eq!(held_handoff_inputs_for_tests("codex", TMUX), Some(1));
+        let own = record(Some("t2"), Some(Utc::now()));
+        let observe =
+            || observe_codex_record_prompt_at(TMUX, INPUT, Some("new"), None, &own, Utc::now());
+        assert_eq!(observe(), PromptObservation::PublishedSshDirect);
+        assert_eq!(slot("t2"), Some(NativeTurnOwner::Relay));
+        assert_eq!(
+            published.of(INPUT),
+            vec![(false, Some("old".into())), (false, Some("new".into()))]
+        );
+        assert_eq!(observe(), PromptObservation::SuppressedReplayedEntry);
+        drop(guard);
+        assert_eq!(
+            published.of(INPUT).len(),
+            2,
+            "each input publishes only once"
+        );
+    }
+}
+
+#[test]
+fn a_fresh_record_of_another_turn_keeps_the_parked_input_distinct() {
+    let _lock = locked();
+    let guard = reserve_discord_handoff("codex", TMUX, ORIGIN);
+    let mut published = Published::new();
+    assert_eq!(hook(INPUT, "t1"), PromptObservation::ParkedForHandoff);
+    let other = record(Some("t2"), Some(Utc::now()));
+    assert_eq!(
+        observe_codex_record_prompt_at(TMUX, INPUT, Some("other"), None, &other, Utc::now()),
+        PromptObservation::PublishedSshDirect
+    );
+    assert_eq!(
+        published.of(INPUT),
+        vec![(false, None), (false, Some("other".into()))]
+    );
+    let mut turns: Vec<_> = published
+        .seen
+        .iter()
+        .filter(|event| event.tmux_session_name == TMUX && event.prompt == INPUT)
+        .map(|event| event.native_turn_id.clone())
+        .collect();
+    turns.sort();
+    assert_eq!(turns, vec![Some("t1".into()), Some("t2".into())]);
+    drop(guard);
+    assert_eq!(published.of(INPUT).len(), 2);
+}
+
 fn competing_bind(
     reserve: bool,
 ) -> (

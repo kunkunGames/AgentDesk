@@ -13028,6 +13028,7 @@ services::tui_prompt_dedupe::binding_events::lane_tests::log_outage_defers_a_hoo
 services::tui_prompt_dedupe::handoff::tests::a_bind_waits_for_a_parking_decision_in_progress
 services::tui_prompt_dedupe::handoff::tests::a_bind_waits_for_an_owning_decision_in_progress
 services::tui_prompt_dedupe::handoff::tests::a_complete_record_binds_and_settles_held_inputs_by_turn
+services::tui_prompt_dedupe::handoff::tests::a_fresh_record_of_another_turn_keeps_the_parked_input_distinct
 services::tui_prompt_dedupe::handoff::tests::a_held_input_is_observed_once_when_its_handoff_ends_unbound
 services::tui_prompt_dedupe::handoff::tests::a_held_input_naming_no_turn_waits_for_its_record
 services::tui_prompt_dedupe::handoff::tests::a_partial_record_ends_the_handoff_without_an_answer_slot
@@ -13035,6 +13036,7 @@ services::tui_prompt_dedupe::handoff::tests::a_restored_handoff_keeps_only_its_r
 services::tui_prompt_dedupe::handoff::tests::an_expired_handoff_publishes_its_held_input_once
 services::tui_prompt_dedupe::handoff::tests::an_old_handoff_snapshot_keeps_its_original_expiry
 services::tui_prompt_dedupe::handoff::tests::an_older_record_of_the_origin_text_leaves_the_handoff_unbound
+services::tui_prompt_dedupe::handoff::tests::an_older_same_text_record_preserves_the_new_held_input
 services::tui_prompt_dedupe::handoff::tests::rejected_same_text_handoff_matches_keep_normal_entry_processing
 services::tui_prompt_dedupe::injected_steer_tests::a_rollout_row_seen_after_the_hook_is_still_known_once_the_ledger_forgets
 services::tui_prompt_dedupe::injected_steer_tests::an_input_in_another_turn_joins_its_owner_or_takes_the_direct_path_once

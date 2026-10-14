@@ -55,6 +55,8 @@ pub(super) enum Evidence<'a> {
     Unattributed,
     /// A live Codex hook, naming its turn as it fired.
     Live,
+    /// An input accepted into a handoff's hold and released for its first observation.
+    Held,
     /// A rollout user record read in file order.
     Record(&'a RecordEvidence),
 }
@@ -180,7 +182,7 @@ pub(super) fn bind_matching_origin(
     observed_at: DateTime<Utc>,
 ) -> Option<BindOutcome> {
     let proof = match evidence {
-        Evidence::Unattributed => return None,
+        Evidence::Unattributed | Evidence::Held => return None,
         Evidence::Live => Proof::Live {
             turn: native_turn,
             at: observed_at,
@@ -312,27 +314,43 @@ impl TuiPromptDedupeState {
     }
 
     /// A record read in file order decides its own held copy, and a fresh record ahead of the
-    /// origin ends the reservation: its turn cannot be the origin's. Returns what to relay.
+    /// origin ends the reservation: its turn cannot be the origin's. Returns whether this
+    /// record claims a held input, and the remaining inputs to relay.
     pub(super) fn settle_handoff_for_record(
         &mut self,
         key: &PromptKey,
         prompt: &str,
         record: &RecordEvidence,
-    ) -> Vec<ParkedObservation> {
+    ) -> (bool, Vec<ParkedObservation>) {
         let Some(entry) = self.handoff_by_tmux.get_mut(key) else {
-            return Vec::new();
+            return (false, Vec::new());
         };
-        entry
-            .value
-            .parked
-            .retain(|held| !prompts_match(&held.prompt, prompt));
-        if entry.value.bound.is_some() || !record.created_since(entry.value.reserved_wall) {
-            return Vec::new();
+        let Some((turn, _)) = record.complete() else {
+            return (false, Vec::new());
+        };
+        if !record.created_since(entry.value.reserved_wall) {
+            return (false, Vec::new());
         }
-        self.handoff_by_tmux
+        let mut claimed = false;
+        entry.value.parked.retain(|held| {
+            let matches = prompts_match(&held.prompt, prompt)
+                && held
+                    .native_turn
+                    .as_deref()
+                    .is_none_or(|held_turn| held_turn == turn)
+                && record.created_since(held.observed_at);
+            claimed |= matches;
+            !matches
+        });
+        if entry.value.bound.is_some() {
+            return (claimed, Vec::new());
+        }
+        let released = self
+            .handoff_by_tmux
             .remove(key)
             .map(|entry| entry.value.parked)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (claimed, released)
     }
 
     fn bind_handoff(

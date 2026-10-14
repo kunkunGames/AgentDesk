@@ -184,7 +184,7 @@ pub(super) fn observe_held_prompt(
         (entry_id, None, native_turn),
         PromptObservationEffect::NotifyAndLease,
         observed_at,
-        handoff::Evidence::Live,
+        handoff::Evidence::Held,
     )
 }
 
@@ -462,7 +462,7 @@ fn observe_inner(
         let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
         state.purge_expired();
         let key = PromptKey::new(&provider, tmux_session_name);
-        let released = record
+        let (claimed_handoff_input, released) = record
             .map(|record| state.settle_handoff_for_record(&key, &candidates[0], record))
             .unwrap_or_default();
         let observation = Observation {
@@ -473,6 +473,7 @@ fn observe_inner(
             native_turn,
             local_only: local_only_control.is_some(),
             may_park: record.is_none() && effect == PromptObservationEffect::NotifyAndLease,
+            handoff_input: claimed_handoff_input || matches!(evidence, handoff::Evidence::Held),
             effect,
             observed_at,
         };

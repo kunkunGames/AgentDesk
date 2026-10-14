@@ -541,6 +541,8 @@ pub(super) struct Observation<'a> {
     pub(super) local_only: bool,
     /// Not read in file order: an unbound handoff holds it.
     pub(super) may_park: bool,
+    /// This accepted held input has not published; an older same-text record is distinct.
+    pub(super) handoff_input: bool,
     pub(super) effect: PromptObservationEffect,
     pub(super) observed_at: DateTime<Utc>,
 }
@@ -570,6 +572,15 @@ pub(super) fn decide_observation(
         local_only,
         ..
     } = *observation;
+    if observation.handoff_input
+        && let Some(recent) = state.recent_observed_by_tmux.get_mut(key)
+    {
+        recent.retain(|seen| {
+            !candidates
+                .iter()
+                .any(|prompt| prompts_match(&seen.value, prompt))
+        });
+    }
     if !local_only {
         // A steering input joins before any lease is recorded, so the running turn's ownership
         // stays; only its text is shown, by the same duplicate rules as an input that opens a turn.
