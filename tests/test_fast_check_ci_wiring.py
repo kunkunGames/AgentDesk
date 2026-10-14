@@ -20,7 +20,7 @@ REQUIRED_CHECK_MIRROR_SHA256 = (
     "57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d"
 )
 CI_RUNNER_HARDENING_SHA256 = (
-    "87308bbdde993eeb0cff016c753f1a2f7f69ac261da074ceb1718235e38a1272"
+    "87bccf319cae6a161658ded34624bd558c7226c24c4b79275bed7f5d743915a0"
 )
 PR_WORKFLOW = REPO_ROOT / ".github/workflows/ci-pr.yml"
 # Job-level condition of every required-context mirror and its source line.
@@ -939,9 +939,9 @@ class FastCheckCiWiringTests(unittest.TestCase):
         self.assertEqual(setup[0][0], {"uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"})
         self.assertEqual(setup[0][1]["with"]["toolchain"], "1.94.1")
         mutation = jobs["relay_authority_mutations"]
-        self.assertEqual(mutation["strategy"], {"fail-fast": False, "matrix": {"shard": [0, 1, 2]}})
+        self.assertEqual(mutation["strategy"], {"fail-fast": False, "matrix": {"shard": [0, 1, 2, 3]}})
         self.assertEqual(mutation["env"]["RELAY_AUTHORITY_MUTATION_SHARD_INDEX"], "${{ matrix.shard }}")
-        self.assertEqual(mutation["env"]["RELAY_AUTHORITY_MUTATION_SHARD_TOTAL"], "3")
+        self.assertEqual(mutation["env"]["RELAY_AUTHORITY_MUTATION_SHARD_TOTAL"], "4")
         self.assertRegex(
             job,
             r"(?m)^      - name: Run named relay-authority contract targets\n"
