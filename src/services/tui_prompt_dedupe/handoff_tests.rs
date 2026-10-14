@@ -160,10 +160,12 @@ fn an_older_same_text_record_preserves_the_new_held_input() {
         let _lock = locked();
         let guard = reserve_discord_handoff("codex", TMUX, ORIGIN);
         let mut published = Published::new();
-        assert_eq!(
-            observe_codex_prompt_in_turn_at(TMUX, INPUT, None, native_turn, Utc::now()),
-            PromptObservation::ParkedForHandoff
-        );
+        for id in ["hook-1", "hook-2"] {
+            assert_eq!(
+                observe_codex_prompt_in_turn_at(TMUX, INPUT, Some(id), native_turn, Utc::now()),
+                PromptObservation::ParkedForHandoff
+            );
+        }
         let older = record(Some("t0"), Some(Utc::now() - chrono::TimeDelta::minutes(5)));
         assert_eq!(
             observe_codex_record_prompt_at(TMUX, INPUT, Some("old"), None, &older, Utc::now()),
@@ -180,6 +182,13 @@ fn an_older_same_text_record_preserves_the_new_held_input() {
             vec![(false, Some("old".into())), (false, Some("new".into()))]
         );
         assert_eq!(observe(), PromptObservation::SuppressedReplayedEntry);
+        for id in ["hook-1", "hook-2"] {
+            assert_eq!(
+                observe_codex_prompt_in_turn_at(TMUX, INPUT, Some(id), native_turn, Utc::now()),
+                PromptObservation::SuppressedReplayedEntry,
+                "the claimed copy keeps every merged entry identity"
+            );
+        }
         drop(guard);
         assert_eq!(
             published.of(INPUT).len(),
@@ -214,6 +223,36 @@ fn a_fresh_record_of_another_turn_keeps_the_parked_input_distinct() {
     assert_eq!(turns, vec![Some("t1".into()), Some("t2".into())]);
     drop(guard);
     assert_eq!(published.of(INPUT).len(), 2);
+}
+
+#[test]
+fn a_partial_input_record_does_not_republish_its_held_hook_on_release() {
+    for native_turn in [Some("t1"), None] {
+        for (turn, timestamp) in [(None, true), (Some("t1"), false), (None, false)] {
+            let _lock = locked();
+            let guard = reserve_discord_handoff("codex", TMUX, ORIGIN);
+            let mut published = Published::new();
+            assert_eq!(
+                observe_codex_prompt_in_turn_at(TMUX, INPUT, None, native_turn, Utc::now()),
+                PromptObservation::ParkedForHandoff
+            );
+            let partial = record(turn, timestamp.then(Utc::now));
+            assert_eq!(
+                observe_codex_record_prompt_at(
+                    TMUX,
+                    INPUT,
+                    Some("legacy"),
+                    None,
+                    &partial,
+                    Utc::now()
+                ),
+                PromptObservation::PublishedSshDirect
+            );
+            assert_eq!(held_handoff_inputs_for_tests("codex", TMUX), Some(1));
+            drop(guard);
+            assert_eq!(published.of(INPUT), vec![(false, Some("legacy".into()))]);
+        }
+    }
 }
 
 fn competing_bind(

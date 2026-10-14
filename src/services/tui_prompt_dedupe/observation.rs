@@ -172,19 +172,22 @@ pub(crate) fn observe_codex_record_prompt_at(
 pub(super) fn observe_held_prompt(
     provider: &str,
     tmux_session_name: &str,
-    prompt: &str,
-    entry_id: Option<&str>,
-    native_turn: Option<&str>,
-    observed_at: DateTime<Utc>,
+    held: &handoff::ParkedObservation,
 ) -> PromptObservation {
     observe_inner(
         provider,
         tmux_session_name,
-        &[prompt.to_string()],
-        (entry_id, None, native_turn),
+        std::slice::from_ref(&held.prompt),
+        (
+            held.entry_ids.first().map(String::as_str),
+            None,
+            held.native_turn.as_deref(),
+        ),
         PromptObservationEffect::NotifyAndLease,
-        observed_at,
-        handoff::Evidence::Held,
+        held.observed_at,
+        handoff::Evidence::Held {
+            distinct_record: held.distinct_record,
+        },
     )
 }
 
@@ -473,7 +476,13 @@ fn observe_inner(
             native_turn,
             local_only: local_only_control.is_some(),
             may_park: record.is_none() && effect == PromptObservationEffect::NotifyAndLease,
-            handoff_input: claimed_handoff_input || matches!(evidence, handoff::Evidence::Held),
+            distinct_handoff_input: claimed_handoff_input
+                || matches!(
+                    evidence,
+                    handoff::Evidence::Held {
+                        distinct_record: true
+                    }
+                ),
             effect,
             observed_at,
         };

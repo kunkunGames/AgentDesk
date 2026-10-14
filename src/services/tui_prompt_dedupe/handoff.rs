@@ -56,7 +56,7 @@ pub(super) enum Evidence<'a> {
     /// A live Codex hook, naming its turn as it fired.
     Live,
     /// An input accepted into a handoff's hold and released for its first observation.
-    Held,
+    Held { distinct_record: bool },
     /// A rollout user record read in file order.
     Record(&'a RecordEvidence),
 }
@@ -67,6 +67,9 @@ pub(super) struct ParkedObservation {
     pub(super) native_turn: Option<String>,
     pub(super) entry_ids: Vec<String>,
     pub(super) observed_at: DateTime<Utc>,
+    /// A complete same-text record proved a different input while this copy was held.
+    #[serde(default)]
+    pub(super) distinct_record: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -182,7 +185,7 @@ pub(super) fn bind_matching_origin(
     observed_at: DateTime<Utc>,
 ) -> Option<BindOutcome> {
     let proof = match evidence {
-        Evidence::Unattributed | Evidence::Held => return None,
+        Evidence::Unattributed | Evidence::Held { .. } => return None,
         Evidence::Live => Proof::Live {
             turn: native_turn,
             at: observed_at,
@@ -258,15 +261,7 @@ pub(crate) fn drain_expired_handoffs() {
 /// Observes each held input exactly once, outside the STATE lock; a missing entry id stays None.
 pub(super) fn drain_parked(provider: &str, tmux: &str, parked: Vec<ParkedObservation>) {
     for held in parked {
-        let entry_id = held.entry_ids.first().map(String::as_str);
-        let observation = observation::observe_held_prompt(
-            provider,
-            tmux,
-            &held.prompt,
-            entry_id,
-            held.native_turn.as_deref(),
-            held.observed_at,
-        );
+        let observation = observation::observe_held_prompt(provider, tmux, &held);
         for extra in held.entry_ids.iter().skip(1) {
             record_relayed_entry_id(provider, tmux, extra);
         }
@@ -308,6 +303,7 @@ impl TuiPromptDedupeState {
                 native_turn: native_turn.map(str::to_string),
                 entry_ids: entry_id.map(str::to_string).into_iter().collect(),
                 observed_at,
+                distinct_record: false,
             }),
         }
         true
@@ -315,7 +311,7 @@ impl TuiPromptDedupeState {
 
     /// A record read in file order decides its own held copy, and a fresh record ahead of the
     /// origin ends the reservation: its turn cannot be the origin's. Returns whether this
-    /// record claims a held input, and the remaining inputs to relay.
+    /// record claims a copy proved distinct from a previous record, and what remains to relay.
     pub(super) fn settle_handoff_for_record(
         &mut self,
         key: &PromptKey,
@@ -329,20 +325,37 @@ impl TuiPromptDedupeState {
             return (false, Vec::new());
         };
         if !record.created_since(entry.value.reserved_wall) {
+            for held in &mut entry.value.parked {
+                if prompts_match(&held.prompt, prompt) {
+                    held.distinct_record = true;
+                }
+            }
             return (false, Vec::new());
         }
         let mut claimed = false;
+        let mut consumed_entry_ids = Vec::new();
         entry.value.parked.retain(|held| {
-            let matches = prompts_match(&held.prompt, prompt)
+            let same_text = prompts_match(&held.prompt, prompt);
+            let matches = same_text
                 && held
                     .native_turn
                     .as_deref()
                     .is_none_or(|held_turn| held_turn == turn)
                 && record.created_since(held.observed_at);
-            claimed |= matches;
+            if same_text && !matches {
+                held.distinct_record = true;
+            }
+            claimed |= matches && held.distinct_record;
+            if matches {
+                consumed_entry_ids.extend(held.entry_ids.iter().cloned());
+            }
             !matches
         });
-        if entry.value.bound.is_some() {
+        let bound = entry.value.bound.is_some();
+        for entry_id in consumed_entry_ids {
+            self.record_relayed_entry(&key.provider, &key.key, &entry_id);
+        }
+        if bound {
             return (claimed, Vec::new());
         }
         let released = self

@@ -541,8 +541,8 @@ pub(super) struct Observation<'a> {
     pub(super) local_only: bool,
     /// Not read in file order: an unbound handoff holds it.
     pub(super) may_park: bool,
-    /// This accepted held input has not published; an older same-text record is distinct.
-    pub(super) handoff_input: bool,
+    /// A complete older or foreign-turn record proved this parked input is distinct.
+    pub(super) distinct_handoff_input: bool,
     pub(super) effect: PromptObservationEffect,
     pub(super) observed_at: DateTime<Utc>,
 }
@@ -572,7 +572,7 @@ pub(super) fn decide_observation(
         local_only,
         ..
     } = *observation;
-    if observation.handoff_input
+    if observation.distinct_handoff_input
         && let Some(recent) = state.recent_observed_by_tmux.get_mut(key)
     {
         recent.retain(|seen| {

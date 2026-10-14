@@ -13031,6 +13031,7 @@ services::tui_prompt_dedupe::handoff::tests::a_complete_record_binds_and_settles
 services::tui_prompt_dedupe::handoff::tests::a_fresh_record_of_another_turn_keeps_the_parked_input_distinct
 services::tui_prompt_dedupe::handoff::tests::a_held_input_is_observed_once_when_its_handoff_ends_unbound
 services::tui_prompt_dedupe::handoff::tests::a_held_input_naming_no_turn_waits_for_its_record
+services::tui_prompt_dedupe::handoff::tests::a_partial_input_record_does_not_republish_its_held_hook_on_release
 services::tui_prompt_dedupe::handoff::tests::a_partial_record_ends_the_handoff_without_an_answer_slot
 services::tui_prompt_dedupe::handoff::tests::a_restored_handoff_keeps_only_its_remaining_ttl
 services::tui_prompt_dedupe::handoff::tests::an_expired_handoff_publishes_its_held_input_once
