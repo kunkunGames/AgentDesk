@@ -126,7 +126,7 @@ class CliTests(unittest.TestCase):
         return result.stdout.decode()
 
     def test_non_push_events_always_run(self) -> None:
-        for event in ("merge_group", "workflow_dispatch"):
+        for event in ("schedule", "workflow_dispatch"):
             with self.subTest(event=event):
                 out = self.run_cli("--event", event, "--paths-from-stdin0", stdin="README.md\0")
                 self.assertEqual(out, "run=true\n")
@@ -267,6 +267,79 @@ class GitMergeBaseTests(unittest.TestCase):
         )
         self.assertEqual(output.read_text(), "run=false\n")
         output.unlink()
+
+
+class ProtectedMainRevisionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.repo = Path(directory.name)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "fixture@example.invalid")
+        self.git("config", "user.name", "Revision fixture")
+        self.git("commit", "-q", "--allow-empty", "-m", "first")
+        self.first = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("commit", "-q", "--allow-empty", "-m", "main tip")
+        self.tip = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("update-ref", "refs/remotes/origin/main", self.tip)
+        self.git("tag", "approved-release", self.first)
+        self.git("update-ref", "refs/remotes/origin/release", self.first)
+
+    def git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args], cwd=self.repo, capture_output=True, text=True, check=True,
+        )
+
+    def select(self, revision: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(ROOT / "scripts/ci/checkout-trusted-main-ref.sh")],
+            cwd=self.repo, env={**os.environ, "REQUESTED_REF": revision},
+            capture_output=True, text=True,
+        )
+
+    def test_empty_revision_selects_protected_main(self) -> None:
+        result = self.select("")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.tip)
+
+    def test_landed_commit_tag_and_remote_branch_are_allowed(self) -> None:
+        for revision in (self.first, "approved-release", "release"):
+            with self.subTest(revision=revision):
+                result = self.select(revision)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.first)
+
+    def test_unlanded_revision_is_refused_before_checkout(self) -> None:
+        self.git("checkout", "-q", "-b", "unlanded", self.first)
+        self.git("commit", "-q", "--allow-empty", "-m", "unlanded")
+        candidate = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("checkout", "-q", "main")
+        result = self.select(candidate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside protected main history", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.tip)
+
+    def test_invalid_and_option_revisions_leave_checkout_unchanged(self) -> None:
+        for revision in ("unknown-revision", "--help", "main^{tree}"):
+            with self.subTest(revision=revision):
+                result = self.select(revision)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.tip)
+
+    def test_missing_protected_main_snapshot_is_refused(self) -> None:
+        self.git("update-ref", "-d", "refs/remotes/origin/main")
+        result = self.select(self.first)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("snapshot is unavailable", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.tip)
+
+    def test_workflow_verifies_revision_before_cache_or_rust_steps(self) -> None:
+        job = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["macos_hosted"]
+        checkout, verifier = job["steps"][:2]
+        self.assertEqual(checkout["with"]["ref"], "main")
+        self.assertIs(checkout["with"]["persist-credentials"], False)
+        self.assertEqual(verifier["env"], {"REQUESTED_REF": "${{ inputs.ref }}"})
+        self.assertEqual(verifier["run"], "bash scripts/ci/checkout-trusted-main-ref.sh")
 
 
 if __name__ == "__main__":

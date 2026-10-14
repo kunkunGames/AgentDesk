@@ -61,7 +61,7 @@ write_log() {
   printf '%s' "$path"
 }
 
-PG_JOB="PostgreSQL tests (ubuntu-postgres)"
+PG_JOB="PostgreSQL tests (shard 0)"
 
 # --- R1: the outage fingerprint is infrastructure -------------------------
 OUTAGE_LOG="$(write_log outage.log \
@@ -403,6 +403,7 @@ if [ "${1-}" = "api" ]; then
       job="${2##*/actions/jobs/}"
       src="$GH_FIXTURE_DIR/job-${job%/logs}.log"
       ;;
+    */actions/runs/*) src="$GH_FIXTURE_DIR/latest.json" ;;
     *)
       printf 'gh %s\n' "$*" >>"$GH_FIXTURE_DIR/refused.log"
       exit 1
@@ -411,6 +412,17 @@ if [ "${1-}" = "api" ]; then
   [ -f "$src" ] || exit 1
   cat "$src"
   exit 0
+fi
+if [[ "${1-} ${2-}" == "run rerun" && "${GH_ALLOW_RERUN-}" == 1 ]]; then
+  printf '%s\n' "$*" >> "$GH_FIXTURE_DIR/rerun.log"
+  if [[ -f "$GH_FIXTURE_DIR/attempt-advanced" ]]; then
+    echo 'HTTP 403: Only jobs from the current attempt can be re-run' >&2
+    exit 1
+  fi
+  if [[ "${GH_FAIL_RERUN:-0}" == 0 ]]; then
+    : > "$GH_FIXTURE_DIR/attempt-advanced"
+  fi
+  exit "${GH_FAIL_RERUN:-0}"
 fi
 printf 'gh %s\n' "$*" >>"$GH_FIXTURE_DIR/refused.log"
 exit 1
@@ -451,13 +463,13 @@ assert_e2e() {
     GH_FIXTURE_DIR="$E2E_CASE" \
     GITHUB_REPOSITORY="itismyfield/AgentDesk" \
     RUN_ID=31116949449 \
-    RUN_ATTEMPT=1 \
-    RERUN_DRY_RUN=1 \
+    RUN_ATTEMPT="${GH_TEST_ATTEMPT:-1}" \
+    RERUN_DRY_RUN="${GH_TEST_DRY_RUN:-1}" \
     GITHUB_STEP_SUMMARY="$E2E_CASE/summary.md" \
     bash "$SCRIPT" 2>&1
   )" || rc=$?
 
-  if [ "$rc" -ne 0 ]; then
+  if [ "$rc" -ne "${GH_EXPECT_RC:-0}" ]; then
     fail "$name (run_classifier exited $rc: $(printf '%s' "$out" | tr '\n' ' '))"
     return
   fi
@@ -528,6 +540,94 @@ printf '%s\n' \
 assert_e2e "E2E: a clean outage still reaches would-rerun:infra without calling gh run rerun" \
   "would-rerun:infra" "infra-shutdown"
 
+new_shard_case() {
+  new_e2e_case
+  printf '%s\n' '{"total_count":2,"jobs":[{"id":901,"name":"PostgreSQL tests (shard 0)","conclusion":"failure","steps":[{"name":"Set up job"}]},{"id":902,"name":"PostgreSQL tests (shard 1)","conclusion":"failure","steps":[{"name":"Set up job"}]}]}' > "$E2E_CASE/jobs.json"
+  printf '%s\n' 'Failed to resolve action download info. Error: Service Unavailable' > "$E2E_CASE/job-901.log"
+  cp "$E2E_CASE/job-901.log" "$E2E_CASE/job-902.log"
+  cp "$E2E_CASE/attempt.json" "$E2E_CASE/latest.json"
+}
+
+assert_rerun_ids() {
+  local expected="$1" got
+  got="$(sed -n 's/.* --job //p' "$E2E_CASE/rerun.log" 2>/dev/null | paste -sd ',' -)"
+  if [[ "$got" == "$expected" ]]; then pass "retry IDs: $expected"; else fail "retry IDs expected '$expected', got '$got'"; fi
+}
+
+assert_atomic_failed_request() {
+  if [[ "$(cat "$E2E_CASE/rerun.log")" == 'run rerun 31116949449 --repo itismyfield/AgentDesk --failed' ]]; then
+    pass "two shards make one atomic failed-jobs request"
+  else
+    fail "two shards did not make one atomic failed-jobs request"
+  fi
+}
+
+new_shard_case
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "both infra shards retry in one workflow attempt" "rerun-requested:infra" "infra-shutdown"
+assert_atomic_failed_request
+
+new_shard_case
+jq '.total_count = 3 | .jobs += [{"id":903,"name":"Fast targeted tests (ubuntu-latest)","conclusion":"failure","steps":[{"name":"Set up job"},{"name":"Mirror result"}]}]' "$E2E_CASE/jobs.json" > "$E2E_CASE/expanded.json"
+mv "$E2E_CASE/expanded.json" "$E2E_CASE/jobs.json"
+printf '%s\n' "::error::pg_db=true requires test_fast to succeed; result was 'failure'" > "$E2E_CASE/job-903.log"
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "PG failure mirror can accompany an atomic shard retry" "rerun-requested:infra" "infra-shutdown"
+[[ "$(wc -l < "$E2E_CASE/rerun.log" | tr -d ' ')" == 1 ]] || fail "PG mirror caused multiple workflow attempts"
+
+new_shard_case
+jq '.total_count = 3 | .jobs += [{"id":903,"name":"Lint runner","conclusion":"failure","steps":[{"name":"Set up job"},{"name":"Run checks"}]}]' "$E2E_CASE/jobs.json" > "$E2E_CASE/expanded.json"
+mv "$E2E_CASE/expanded.json" "$E2E_CASE/jobs.json"
+printf '%s\n' 'unclassified failure' > "$E2E_CASE/job-903.log"
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "bulk retry refuses unrelated failed jobs" "no-op:unsafe-bulk-rerun" "unrelated-failure"
+[[ ! -e "$E2E_CASE/rerun.log" ]] || fail "unrelated failure widened PG retry scope"
+
+new_shard_case
+jq '.total_count = 3 | .jobs += [{"id":903,"name":"Fast targeted tests (ubuntu-latest)","conclusion":"failure","steps":[{"name":"Set up job"},{"name":"Mirror result"}]}]' "$E2E_CASE/jobs.json" > "$E2E_CASE/expanded.json"
+mv "$E2E_CASE/expanded.json" "$E2E_CASE/jobs.json"
+printf '%s\n' 'unclassified mirror failure' > "$E2E_CASE/job-903.log"
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "bulk retry requires explicit PG-dependent mirror evidence" "no-op:unsafe-bulk-rerun" "unrelated-failure"
+[[ ! -e "$E2E_CASE/rerun.log" ]] || fail "unproved mirror widened PG retry scope"
+
+new_shard_case
+printf '%s\n' 'Failed to resolve action download info. Error: Unable to resolve action `acme/gone@v1`, repository not found' > "$E2E_CASE/job-902.log"
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "only the classified infra shard retries" "rerun-requested:infra" "unclassified-pg-failure"
+assert_rerun_ids '901'
+
+new_shard_case
+printf '%s\n' 'test result: FAILED. 1 passed; 1 failed' > "$E2E_CASE/job-902.log"
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "one real regression blocks both shards" "no-op:regression" "regression"
+[[ ! -e "$E2E_CASE/rerun.log" ]] || fail "regression made a retry request"
+
+new_shard_case
+mv "$E2E_CASE/job-902.log" "$E2E_CASE/unavailable.log"
+assert_e2e "one unknown log blocks both shards" "no-op:unknown" "unknown"
+
+# BSD sed (macOS prepush) needs a backup suffix for -i, so write one and drop it.
+new_shard_case
+sed -i.bak 's/"total_count":2/"total_count":3/' "$E2E_CASE/jobs.json" && rm -f "$E2E_CASE/jobs.json.bak"
+out="$(PATH="$E2E_BIN:$PATH" GH_FIXTURE_DIR="$E2E_CASE" GITHUB_REPOSITORY=itismyfield/AgentDesk RUN_ID=31116949449 RUN_ATTEMPT=1 RERUN_DRY_RUN=1 bash "$SCRIPT")"
+[[ "$out" == 'decision=no-op:incomplete-jobs' ]] && pass "incomplete jobs block all retries" || fail "incomplete jobs accepted"
+
+new_shard_case
+sed -i.bak 's/shard 1/shard 0/' "$E2E_CASE/jobs.json" && rm -f "$E2E_CASE/jobs.json.bak"
+assert_e2e "duplicate shard names remain ambiguous" "no-op:unknown" "infra-shutdown"
+
+new_shard_case
+sed -i.bak 's/shard 0/shard 00/;s/shard 1/shard 01/' "$E2E_CASE/jobs.json" && rm -f "$E2E_CASE/jobs.json.bak"
+assert_e2e "near-match names cannot become PG jobs" "no-op:no-pg-failure" "infra-unrelated"
+
+new_shard_case
+sed -i.bak 's/"run_attempt":1/"run_attempt":2/' "$E2E_CASE/latest.json" && rm -f "$E2E_CASE/latest.json.bak"
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 assert_e2e "stale attempt blocks both retry requests" "no-op:stale-attempt" "infra-shutdown"
+[[ ! -e "$E2E_CASE/rerun.log" ]] || fail "stale attempt made a retry request"
+
+new_shard_case
+out="$(PATH="$E2E_BIN:$PATH" GH_FIXTURE_DIR="$E2E_CASE" GITHUB_REPOSITORY=itismyfield/AgentDesk RUN_ID=31116949449 RUN_ATTEMPT=2 RERUN_DRY_RUN=0 bash "$SCRIPT")"
+[[ "$out" == 'decision=no-op:attempt-cap' ]] && pass "each shard is retried at most once" || fail "second retry accepted"
+
+new_shard_case
+GH_TEST_DRY_RUN=0 GH_ALLOW_RERUN=1 GH_FAIL_RERUN=1 GH_EXPECT_RC=1 assert_e2e "rejected retry request remains a failure" "no-op:rerun-request-failed" "infra-shutdown"
+assert_atomic_failed_request
+
 # --- R2: sibling regex drift must break the build -------------------------
 # End-to-end proof, not an inspection: mirror both scripts into a scratch repo,
 # drift only the triage side, and require the classifier's self-test to fail.
@@ -535,6 +635,7 @@ SYNC_REPO="$WORK_DIR/sync-repo"
 mkdir -p "$SYNC_REPO/scripts/ci"
 cp "$ROOT_DIR/scripts/main-ci-triage.sh" "$SYNC_REPO/scripts/main-ci-triage.sh"
 cp "$SCRIPT" "$SYNC_REPO/scripts/ci/infra-failure-rerun.sh"
+cp "$ROOT_DIR/scripts/check_pg_test_lane_membership.py" "$SYNC_REPO/scripts/check_pg_test_lane_membership.py"
 cp "$ROOT_DIR/scripts/ci/real-failure-predicate.sh" "$SYNC_REPO/scripts/ci/real-failure-predicate.sh"
 
 if bash "$SYNC_REPO/scripts/ci/infra-failure-rerun.sh" --self-test >/dev/null 2>&1; then

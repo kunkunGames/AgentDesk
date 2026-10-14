@@ -1,21 +1,26 @@
 name: CI macOS Trusted
 
 on:
-  # Main pushes only: branch pushes used to queue a hosted macOS run each; run a branch manually when needed.
-  push:
-    branches:
-      - main
+  # Current main every 6 hours: a per-push run outlasts the gap between main pushes.
+  # :17 avoids the top-of-hour cron rush; the hours stay clear of the 18:00 UTC nightly.
+  schedule:
+    - cron: "17 3,9,15,21 * * *"
+  # Manual runs may verify a deployed commit that is already in protected main.
   workflow_dispatch:
-  merge_group:
-    types:
-      - checks_requested
+    inputs:
+      ref:
+        description: Commit, branch or tag already in protected main; empty checks current main
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-macos-trusted-${{ github.head_ref || github.ref }}
-  cancel-in-progress: true
+  # One group per event and ref, never cancelling: a manual run and a scheduled run cannot stop each other.
+  group: ci-macos-trusted-${{ github.event_name }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,11 +31,20 @@ jobs:
     # Pin the arm64 image for H2 measurements; the host-triple check rejects image drift.
     runs-on: macos-15
     steps:
-      # Skip heavy steps on docs-only pushes only when the filter succeeds with run=false.
+      # Heavy steps skip only on a successful run=false, which scheduled and manual runs never get.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          # Load the verifier from protected main before reading the requested revision.
+          ref: main
           fetch-depth: 0
           filter: blob:none
+          persist-credentials: false
+
+      - name: Select a revision already in protected main
+        shell: bash
+        env:
+          REQUESTED_REF: ${{ inputs.ref }}
+        run: bash scripts/ci/checkout-trusted-main-ref.sh
 
       - name: Decide whether heavy steps are needed
         id: rust_filter

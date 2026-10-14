@@ -45,6 +45,7 @@ pub(crate) use inflight::read_only_owner_snapshot::{
     CodexEpisodeOwnerSnapshot, codex_episode_snapshot,
 };
 mod inflight_heartbeat_sweeper;
+mod ingress_shadow;
 pub(crate) mod inject_disposition;
 pub(crate) mod internal_api;
 mod jsonl_watcher;
@@ -309,11 +310,7 @@ use serenity::{ChannelId, MessageId, UserId};
 
 use crate::services::agent_protocol::{DEFAULT_ALLOWED_TOOLS, StreamMessage};
 use crate::services::claude;
-use crate::services::codex;
-use crate::services::gemini;
-use crate::services::opencode;
 use crate::services::provider::{CancelToken, ProviderKind, ReadOutputResult};
-use crate::services::qwen;
 use crate::services::turn_orchestrator::ChannelMailboxHandle;
 use crate::services::turn_orchestrator::HasPendingSoftQueueResult;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType};
@@ -328,7 +325,7 @@ use formatting::{format_for_discord, format_tool_input, send_long_message_raw, t
 #[cfg(test)]
 use inflight::save_inflight_state;
 use inflight::{InflightTurnState, load_inflight_states};
-pub(crate) use inflight::{clear_inflight_state, lock_inflight_state_path};
+pub(crate) use inflight::{clear_inflight_state, lock_inflight_state_path, policy_op};
 use placeholder_controller::queued_card_gate::{self, QueuedCardDisposition, QueuedCardTeardown};
 pub(in crate::services::discord) use prompt_builder::load_channel_recent_context;
 use prompt_builder::{RecoveryContextManifestInput, build_system_prompt_with_manifest};
@@ -2662,6 +2659,7 @@ pub(super) struct Data {
     pub(super) provider: ProviderKind,
     pub(super) voice_config: crate::voice::VoiceConfig,
     pub(super) voice_receiver: crate::voice::VoiceReceiver,
+    pub(in crate::services::discord) ingress_shadow: Option<ingress_shadow::IngressShadow>,
 }
 
 pub(super) type Error = Box<dyn std::error::Error + Send + Sync>;
