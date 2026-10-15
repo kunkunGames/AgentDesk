@@ -42,7 +42,7 @@ def run(tree, *args):
         for name, text in tree.items():
             path = Path(tmp) / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text)
+            path.write_text(text, encoding="utf-8")
         done = subprocess.run([sys.executable, str(SCRIPT), "--root", tmp, *args],
                               capture_output=True, text=True)
         return done.returncode, done.stdout
@@ -86,6 +86,41 @@ class DormancyGate(unittest.TestCase):
             tree = {**TREE, mailbox: TREE[mailbox].replace("    handles: u8,\n", leak, 1)
                     if leak.startswith("    handles") else leak + TREE[mailbox]}
             self.assert_fails(tree, "reference to a dormant module outside it")
+
+    def test_sql_literals_and_comments_do_not_activate_rust_modules(self):
+        source = '''fn migration_objects_exist() {
+    let sql = "SELECT to_regclass('channel_recovery_custody') IS NOT NULL";
+    let raw = r###"SELECT
+        'recovery_custody', 'recovery_registry', '})]'
+    "###;
+    /* recovery_registry /* recovery_custody */ channel_recovery_custody */
+    // include!("recovery_registry/mod.rs");
+}
+'''
+        tree = {**TREE, "src/migration_tests.rs": source}
+        self.assertEqual(run(tree), (0, "B3b-4 dormancy: PASS\n"))
+        tree["src/migration_tests.rs"] += "use crate::db::channel_recovery_custody;\n"
+        self.assert_fails(tree, "reference to a dormant module outside it")
+
+    def test_attribute_and_macro_literals_still_fail_closed(self):
+        leaks = (
+            '#[path = "recovery_custody/mod.rs"]\nmod alias;\n',
+            '#[cfg_attr(test,\n path = r#"recovery_registry/mod.rs"#)]\nmod alias;\n',
+            'include!("recovery_registry/mod.rs");\n',
+            'include! { concat!("recovery_custody", "/mod.rs") }\n',
+            'generate_module!["channel_recovery_custody"];\n',
+            'macro_rules! body { () => { "recovery_registry" }; }\n',
+            'macro_rules! body ( () => { "recovery_registry/mod.rs" } ); include!(body!());\n',
+            'macro_rules! body [ () => { "recovery_registry/mod.rs" } ]; include!(body!());\n',
+            'macro_rules! r#body { () => { "recovery_registry/mod.rs" }; } include!(r#body!());\n',
+            'macro_rules! 경로 { () => { "recovery_registry/mod.rs" }; } include!(경로!());\n',
+            '모듈!["channel_recovery_custody"];\n',
+            'include!(\n "recovery_registry/mod.rs"\n',
+        )
+        for leak in leaks:
+            with self.subTest(leak=leak):
+                self.assert_fails({**TREE, "src/outside.rs": leak},
+                                  "reference to a dormant module outside it")
 
     def test_a_fixture_or_a_switch_exposed_in_a_body_fails(self):
         self.assert_fails(planted(REGISTRY, "    #[cfg(test)]\n", ""), "test fixture without #[cfg(test)]")

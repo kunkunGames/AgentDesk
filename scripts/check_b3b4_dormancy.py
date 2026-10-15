@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from rust_lex import CODE, COMMENT, SPACE, StripState, lex_segments
+
 ROOT = Path(__file__).resolve().parent.parent
 MODULES = ("channel_recovery_custody", "recovery_custody", "recovery_registry")
 BODY = (
@@ -51,6 +53,48 @@ FORBIDDEN = (
     "src/services/discord/mod.rs",
 )
 NAMED = re.compile(r"\b(?:%s)\b" % "|".join(MODULES))
+TOKEN_TREE = re.compile(
+    r"#\s*!?\s*(\[)|!\s*([({\[])|"
+    r"\bmacro_rules\s*!\s*[^\s({\[]+\s*([({\[])"
+)
+
+
+def reference_lines(lines):
+    """Ignore ordinary prose; retain literal inputs to attributes and macros.
+
+    A SQL table name is not a Rust module reference. Attribute and macro token
+    trees remain conservative because their literals can select source files.
+    Matching the bang and delimiters also covers raw and Unicode identifiers;
+    parenthesized unary-not expressions conservatively retain their literals.
+    This lexical guard does not claim to expand macros or resolve aliases.
+    """
+    state = StripState()
+    code, uncommented = [], []
+    for line in lines:
+        segments = lex_segments(line, state)
+        code.append("".join(text if kind in (CODE, SPACE) else " " * len(text)
+                            for kind, text in segments))
+        uncommented.append("".join(" " * len(text) if kind == COMMENT else text
+                                   for kind, text in segments))
+    code, uncommented = "\n".join(code), "\n".join(uncommented)
+    visible = list(code)
+    closing = {"(": ")", "[": "]", "{": "}"}
+    for match in TOKEN_TREE.finditer(code):
+        stack = []
+        end = match.end() - 1
+        for end in range(end, len(code)):
+            char = code[end]
+            if char in closing:
+                stack.append(closing[char])
+            elif char in ")]}":
+                if not stack or char != stack.pop():
+                    # Malformed token trees retain the remaining source text.
+                    end = len(code) - 1
+                    break
+                if not stack:
+                    break
+        visible[match.start():end + 1] = uncommented[match.start():end + 1]
+    return "".join(visible).split("\n")
 
 
 def is_body(path):
@@ -81,11 +125,11 @@ def block_end(lines, start):
 
 def check(root):
     errors = []
-    sources = {str(path.relative_to(root)): path.read_text().splitlines()
+    sources = {path.relative_to(root).as_posix(): path.read_text(encoding="utf-8").splitlines()
                for path in sorted((root / "src").rglob("*.rs"))}
     for path, lines in sources.items():
         allowed = DECLARATIONS.get(path, ())
-        for number, line in enumerate(lines, 1):
+        for number, (line, references) in enumerate(zip(lines, reference_lines(lines)), 1):
             text = line.strip()
             if is_body(path):
                 gated = "#[cfg(test)]" in gate_above(lines, number - 1)
@@ -93,7 +137,7 @@ def check(root):
                     errors.append(f"{path}:{number}: gate or switch not allowed in a dormant body: {text}")
                 if any(text.endswith(item) or item in text for item in TEST_ONLY) and not gated:
                     errors.append(f"{path}:{number}: test fixture without #[cfg(test)]: {text}")
-            elif NAMED.search(text) and not text.startswith("//"):
+            elif NAMED.search(references) and not text.startswith("//"):
                 if text not in allowed:
                     errors.append(f"{path}:{number}: reference to a dormant module outside it: {text}")
                 elif text.startswith("pub(crate) mod") and "#[cfg(test)]" not in gate_above(lines, number - 1):
