@@ -169,6 +169,7 @@ mod input_effect_tests {
     use super::*;
     use crate::services::discord::input_runtime::fence::{self, effect};
     use futures::FutureExt;
+    use tokio::sync::oneshot::error::TryRecvError;
 
     #[tokio::test]
     async fn c1b_worker_actual_intake_holds_provider_and_bridge_through_cleanup() {
@@ -330,7 +331,24 @@ mod input_effect_tests {
                 )
                 .is_none()
             );
-            assert!(gate.close().unwrap().drain().now_or_never().is_some());
+            // Refusal can drop an unpolled worker transport, whose capture cleanup runs
+            // on a blocking worker. Await its drain instead of racing that cleanup.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                gate.close().unwrap().drain(),
+            )
+            .await
+            .expect("refused intake must release every input effect");
+            let (mut provider_entered, mut bridge_captured) = (provider_entered, bridge_captured);
+            assert!(
+                matches!(provider_entered.try_recv(), Err(TryRecvError::Empty)),
+                "refused root must not start the provider"
+            );
+            assert!(
+                matches!(bridge_captured.try_recv(), Err(TryRecvError::Empty)),
+                "refused root must not start the bridge"
+            );
+            assert!(effect::current().is_none());
             shared.mailboxes.remove_fixture_for_test(channel);
             return;
         }
