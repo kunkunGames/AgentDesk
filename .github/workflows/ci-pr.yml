@@ -820,6 +820,7 @@ jobs:
               # session_host/'s TmuxHost has a not(unix) stub Windows compiles.
               - 'src/services/qwen/**'
               - 'src/services/session_host/**'
+              - 'src/services/tmux_common/**'
               # The Herdr close owner is unix-gated production code.
               - 'src/services/termination_audit/**'
               # DERIVED BLOCK (#5832) -- do not hand-edit. cross_os_rust does
@@ -841,6 +842,7 @@ jobs:
               - 'src/services/discord/commands/**'
               - 'src/services/discord/delivery_lease_cell.rs'
               - 'src/services/discord/destructive_cancel_gate.rs'
+              - 'src/services/discord/dispatch_cleanup.rs'
               - 'src/services/discord/health.rs'
               - 'src/services/discord/health/**'
               - 'src/services/discord/host_defer_gate.rs'
@@ -885,8 +887,8 @@ jobs:
               - 'src/services/discord/runtime_store.rs'
               - 'src/services/discord/session_idle_cleanup.rs'
               - 'src/services/discord/settings/**'
-              - 'src/services/discord/task_supervisor.rs'
               - 'src/services/discord/skills_scan/**'
+              - 'src/services/discord/task_supervisor.rs'
               - 'src/services/discord/terminal_delivery_custody/**'
               - 'src/services/discord/terminal_ui_obligation.rs'
               - 'src/services/discord/tmux_watcher_registry.rs'
@@ -922,6 +924,7 @@ jobs:
               - 'src/services/memory/**'
               - 'src/services/observability/**'
               - 'src/services/onboarding/**'
+              - 'src/services/opencode/**'
               - 'src/services/platform/**'
               - 'src/services/process/**'
               - 'src/services/provider/**'

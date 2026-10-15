@@ -34,6 +34,17 @@ from pathlib import Path
 # Mechanical ``tests.rs`` / ``*_tests.rs`` basename exclusions.
 PINNED_BASENAME_TEST_FILES = frozenset(
     {
+        "src/db/campaigns/graph/workflow/tests.rs",
+        "src/db/postgres/migration_catalog/tests.rs",
+        "src/server/campaign_graph/cancelled_validator_replan_tests.rs",
+        "src/server/campaign_graph/finish_recovery_tests.rs",
+        "src/server/campaign_graph/graph_card_identity_tests.rs",
+        "src/server/campaign_graph/initial_plan_replan_tests.rs",
+        "src/server/campaign_graph/occurrence_context/tests.rs",
+        "src/server/campaign_graph/schedule_rollover_tests.rs",
+        "src/server/campaign_graph/workflow_tests.rs",
+        "src/services/discord/dispatch_cleanup/transition_tests.rs",
+        "src/services/dispatches/discord_delivery/thread_reuse/startup_validation_tests.rs",
         "src/db/intake_outbox/owner_fence_pg_tests.rs",
         "src/db/intake_outbox/postgres_tests.rs",
         "src/services/cluster/intake_worker/owner_fence_pg_tests.rs",
