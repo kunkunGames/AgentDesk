@@ -4,7 +4,7 @@ use axum::{
 };
 
 use super::super::{
-    ApiRouter, AppState, claude_accounts_api, discord, github, github_dashboard, kakao_calendar,
+    ApiRouter, AppState, claude_accounts_api, discord, github, github_dashboard, hooks, kakao_calendar,
     meetings, pr_summary, protected_api_domain, provider_auth_profiles,
 };
 
@@ -123,6 +123,12 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route(
                 "/round-table-meetings/{id}/issues/discard-all",
                 post(meetings::discard_all_issues),
+            )
+            .route("/hook/reset-status", post(hooks::reset_status))
+            .route("/hook/skill-usage", post(hooks::skill_usage))
+            .route(
+                "/hook/session/{sessionKey}",
+                delete(hooks::disconnect_session),
             ),
         state,
     )
