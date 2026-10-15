@@ -214,6 +214,7 @@ def is_scratch_file_path(path):
         "pr_body.md",
         "pr-body.txt",
         "pr_body.txt",
+        "commit_body.txt",
         "plan.md",
         "plan.txt",
         "prs.json",
