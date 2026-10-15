@@ -616,7 +616,18 @@ exit 101
         self.assert_sources_restored(self, root)
 
     def test_shards_cover_each_mutation_exactly_once(self) -> None:
-        for total in (2, 3, MUTATION_COUNT):
+        job = yaml.safe_load((REPO_ROOT / PR_WORKFLOW).read_text(encoding="utf-8"))["jobs"][
+            MUTATION_JOB
+        ]
+        configured_total = int(job["env"]["RELAY_AUTHORITY_MUTATION_SHARD_TOTAL"])
+        self.assertEqual(job["strategy"]["matrix"]["shard"], list(range(configured_total)))
+        # A cold lib build plus three serial mutant rebuilds exceeded the 45m job.
+        self.assertLessEqual(
+            max(len(MUTATION_NAMES[index::configured_total]) for index in range(configured_total)),
+            2,
+            "workflow shards must run at most two mutant builds each",
+        )
+        for total in sorted({2, 3, configured_total, MUTATION_COUNT}):
             executed = []
             for index in range(total):
                 with self.subTest(index=index, total=total):

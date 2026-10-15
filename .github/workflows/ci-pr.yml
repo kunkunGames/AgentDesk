@@ -368,6 +368,7 @@ jobs:
               - 'src/services/discord/mod.rs'
               - 'src/services/discord/placeholder_sweeper/abandon_guard.rs'
               - 'src/services/discord/placeholder_sweeper/retirement_tests.rs'
+              - 'src/services/discord/queue_io/queued_head_auto_tests.rs'
               - 'src/services/discord/queue_io/queued_head_inject_tests.rs'
               - 'src/services/discord/recovery_engine/herdr_before_start_restart_tests.rs'
               - 'src/services/discord/recovery_engine/host_reconcile_tests.rs'
@@ -444,6 +445,7 @@ jobs:
               - 'src/services/discord/tui_prompt_relay/relay_e2e/replay_defer_intake_e2e_tests.rs'
               - 'src/services/discord/tui_prompt_relay/relay_e2e/thread_guard_host_e2e.rs'
               - 'src/services/discord/tui_prompt_relay/tests/background_child_close_pg_tests.rs'
+              - 'src/services/discord/tui_prompt_relay/tests/codex_direct_owner_tests/boundary_tests/loss_tests.rs'
               - 'src/services/discord/tui_prompt_relay/tests/synthetic_bridge_handoff_pg_tests.rs'
               - 'src/services/discord/turn_bridge/completion_guard/completion_postgres.rs'
               - 'src/services/discord/turn_bridge/completion_guard/replay_hold_tests.rs'
@@ -514,6 +516,7 @@ jobs:
               - 'src/services/tui_o/writer/deferred_pg_tests.rs'
               - 'src/services/tui_o/writer/late_adopt_delegated_tests.rs'
               - 'src/services/tui_o/writer/repost_turn_tests.rs'
+              - 'src/services/tui_o/writer/transition_route_tests.rs'
               - 'src/services/turn_host_tests.rs'
               - 'src/services/turn_lifecycle.rs'
               - 'src/services/turn_orchestrator/recovery_custody/custody_pg_tests.rs'
@@ -826,6 +829,7 @@ jobs:
               - 'src/services/discord/recovery_paths/**'
               - 'src/services/discord/relay_coord.rs'
               - 'src/services/discord/relay_health.rs'
+              - 'src/services/discord/relay_health/**'
               - 'src/services/discord/relay_recovery.rs'
               - 'src/services/discord/relay_recovery/**'
               - 'src/services/discord/relay_recovery_circuit_breaker.rs'
@@ -2298,7 +2302,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=87308bbdde993eeb0cff016c753f1a2f7f69ac261da074ceb1718235e38a1272
+          expected=87bccf319cae6a161658ded34624bd558c7226c24c4b79275bed7f5d743915a0
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
@@ -2414,11 +2418,13 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       RELAY_AUTHORITY_MUTATION_SHARD_INDEX: ${{ matrix.shard }}
-      RELAY_AUTHORITY_MUTATION_SHARD_TOTAL: "3"
+      RELAY_AUTHORITY_MUTATION_SHARD_TOTAL: "4"
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]
+        # A cold lib build plus three mutant rebuilds exceeded this job's 45m budget.
+        # Four shards keep all seven mutations while running at most two per runner.
+        shard: [0, 1, 2, 3]
     steps:
       # Depth 2 keeps HEAD^1, the base side the wiring digest compares against.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -2531,7 +2537,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=87308bbdde993eeb0cff016c753f1a2f7f69ac261da074ceb1718235e38a1272
+          expected=87bccf319cae6a161658ded34624bd558c7226c24c4b79275bed7f5d743915a0
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
