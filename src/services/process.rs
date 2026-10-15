@@ -955,7 +955,20 @@ mod process_group_tests {
             child_identity.probe(child_pid),
             ProcessIdentityProbe::GoneOrReused
         );
-        assert_eq!(process_group_probe(child_pid), ProcessGroupProbe::Gone);
+        // A stopped wrapper cannot reap its children before it is killed.
+        // The OS reaper owns that final step; zombies still keep kill(-pgid, 0)
+        // live after every member has stopped executing. Require actual group
+        // disappearance within a bound, and never treat a probe error as gone.
+        let reaping_deadline = Instant::now() + Duration::from_secs(3);
+        let group = loop {
+            let observed = process_group_probe(child_pid);
+            let remaining = reaping_deadline.saturating_duration_since(Instant::now());
+            if observed != ProcessGroupProbe::Live || remaining.is_zero() {
+                break observed;
+            }
+            thread::sleep(remaining.min(Duration::from_millis(20)));
+        };
+        assert_eq!(group, ProcessGroupProbe::Gone);
     }
 
     fn wait_for_pid_file(path: &std::path::Path) -> Option<u32> {
