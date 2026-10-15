@@ -228,6 +228,13 @@ if run_check guards "24x7 activation evidence counterexamples"; then
 "$PYTHON" -m unittest tests.test_activation_24x7_gate
 fi
 
+if run_check contracts "Campaign operations and routine profile contracts"; then
+"$PYTHON" -m unittest tests.test_campaign_learning_observation tests.test_macos_routine_profile \
+    scripts.campaign_ops.test_client scripts.campaign_ops.test_enrollment \
+    scripts.campaign_ops.test_github scripts.campaign_ops.test_github_feedback \
+    scripts.campaign_ops.test_health scripts.campaign_ops.test_succession
+fi
+
 if run_check guards "Postgres migration checksum guard"; then
 "$PYTHON" scripts/check_postgres_migration_checksums.py --require-base
 "$PYTHON" scripts/check_migration_convergence.py

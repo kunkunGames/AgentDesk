@@ -36,7 +36,10 @@ async fn frozen_input(manifest: &Value, id: &str, goal: &Goal, family: &str) -> 
     let manifest = manifest.clone();
     let captured: Value = tokio::task::spawn_blocking(move || -> Result<Value> {
         crate::services::campaign_artifacts::verify(&root, &manifest)?;
-        let path = root.join(manifest["bundle"].as_str().unwrap()).join(input);
+        let bundle = manifest["bundle"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("frozen planning input bundle is missing"))?;
+        let path = root.join(bundle).join(input);
         Ok(serde_json::from_slice(&std::fs::read(path)?)?)
     })
     .await??;
@@ -219,7 +222,7 @@ pub(super) async fn validate(
     if let Some(authority) = authority {
         ensure!(
             authority.get::<String, _>("family_id") == family
-                && authority.get::<String, _>("agent_id").as_str() == assigned.as_deref().unwrap()
+                && Some(authority.get::<String, _>("agent_id").as_str()) == assigned.as_deref()
                 && authority.get::<String, _>("purpose") == "bootstrap_plan"
                 && authority
                     .get::<Option<Value>, _>("input_manifest")

@@ -231,7 +231,10 @@ pub(super) async fn history_issues(
             .iter()
             .filter(|m| !m.migration_type.is_down_migration())
             .collect();
-        let latest = expected.last().expect("nonempty migration catalog").version;
+        let latest = expected
+            .last()
+            .ok_or_else(|| "empty migration catalog".to_string())?
+            .version;
         let known_len = rows.partition_point(|row| row.version <= latest);
         validate_prefix(&rows[..known_len], lineage)?;
         if known_len < rows.len() && known_len != expected.len() {
