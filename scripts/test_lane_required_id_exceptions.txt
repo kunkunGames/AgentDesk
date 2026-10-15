@@ -13,6 +13,7 @@ services::discord::health::legacy_supervision::boot_status | helper-module | #50
 services::discord::health::legacy_supervision::test_owner | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::health::legacy_supervision::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::health::turn_deliver::inject::test_hook | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
+services::discord::health::watchdog_test_support | helper-module | #2451 | expires=2027-10-15 | Shared source-generation and overdue-backlog fixtures exercised by recovery, relay_auto_heal and relay_recovery tests; declares no test id.
 services::discord::herdr_terminate::test_queue | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::herdr_terminate::test_turn | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::inflight::managed_submission::fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
@@ -50,6 +51,8 @@ services::discord::turn_bridge::cancel_backstop_test_support | helper-module | #
 services::discord::turn_bridge::replay_policy | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::turn_bridge::terminal_outcome_delivery::empty_response_recovery::handler::output_growth | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::zombie_foreground_release::cancel_backstop_test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
+services::process::preferred_baseline_tests::persisted_legacy_identity_roundtrip_and_primary_mismatch_remain_guarded | platform-unavailable | #2451 | expires=2027-10-15 | macOS-only native SDK and legacy birth-identity contract cannot run in required Linux jobs; verify on the native Mac candidate before deployment.
+services::qwen::retry_fixture | helper-module | #2451 | expires=2027-10-15 | Shared isolated provider RetryFixture exercised by qwen::retry_tests and qwen_tmux_wrapper::retry_tests; declares no test id.
 services::session_host::herdr_host::windows_tests::an_unconfigured_herdr_host_refuses_every_operation | platform-unavailable | #5082 | expires=2027-10-12 | Windows-only platform test not run on Linux CI runner
 services::session_host::herdr_socket_rig_tests | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::tui_o::exact_submission::commit_barrier | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
