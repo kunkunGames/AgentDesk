@@ -70,10 +70,10 @@ def write_workflow(
             },
             contract.RELAY_AUTHORITY_TARGETS_JOB: {"steps": steps},
             contract.RELAY_AUTHORITY_MUTATIONS_JOB: {
-                "strategy": {"fail-fast": False, "matrix": {"shard": [0, 1, 2]}},
+                "strategy": {"fail-fast": False, "matrix": {"shard": [0, 1, 2, 3]}},
                 "env": {
                     "RELAY_AUTHORITY_MUTATION_SHARD_INDEX": "${{ matrix.shard }}",
-                    "RELAY_AUTHORITY_MUTATION_SHARD_TOTAL": "3",
+                    "RELAY_AUTHORITY_MUTATION_SHARD_TOTAL": "4",
                 },
                 "steps": mutation_steps,
             },
@@ -139,9 +139,11 @@ class ManifestContract(unittest.TestCase):
         mutations = [
             ("strategy", {"fail-fast": False, "matrix": {"shard": [0, 1]}}),
             ("strategy", {"fail-fast": False, "matrix": {"shard": [0, 1, 1]}}),
-            ("strategy", {"fail-fast": True, "matrix": {"shard": [0, 1, 2]}}),
-            ("env", {"RELAY_AUTHORITY_MUTATION_SHARD_INDEX": "0", "RELAY_AUTHORITY_MUTATION_SHARD_TOTAL": "3"}),
-            ("env", {"RELAY_AUTHORITY_MUTATION_SHARD_INDEX": "${{ matrix.shard }}", "RELAY_AUTHORITY_MUTATION_SHARD_TOTAL": "4"}),
+            ("strategy", {"fail-fast": True, "matrix": {"shard": [0, 1, 2, 3]}}),
+            ("strategy", {"fail-fast": False, "matrix": {"shard": [0, 1, 2]}}),
+            ("env", {"RELAY_AUTHORITY_MUTATION_SHARD_INDEX": "0", "RELAY_AUTHORITY_MUTATION_SHARD_TOTAL": "4"}),
+            ("env", {"RELAY_AUTHORITY_MUTATION_SHARD_INDEX": "${{ matrix.shard }}", "RELAY_AUTHORITY_MUTATION_SHARD_TOTAL": "3"}),
+            ("env", {"RELAY_AUTHORITY_MUTATION_SHARD_INDEX": "${{ matrix.shard }}", "RELAY_AUTHORITY_MUTATION_SHARD_TOTAL": "7"}),
         ]
         for key, value in mutations:
             with self.subTest(key=key, value=value), tempfile.TemporaryDirectory() as temporary:
@@ -151,7 +153,7 @@ class ManifestContract(unittest.TestCase):
                 workflow = root / contract.PR_WORKFLOW
                 workflow.parent.mkdir(parents=True)
                 workflow.write_text(yaml.safe_dump(payload), encoding="utf-8")
-                with self.assertRaisesRegex(contract.ManifestError, "must execute all three|must pass its shard"):
+                with self.assertRaisesRegex(contract.ManifestError, "must execute all four|must pass its shard"):
                     contract.validate_workflow_contract(root, lanes, True)
 
     def test_target_step_cannot_skip_or_mask_command_failure(self) -> None:

@@ -134,9 +134,9 @@ def validate_workflow_contract(
         return
     mutation_job = load_relay_authority_job(repo_root, RELAY_AUTHORITY_MUTATIONS_JOB)
     strategy = mutation_job.get("strategy")
-    if strategy != {"fail-fast": False, "matrix": {"shard": [0, 1, 2]}}:
+    if strategy != {"fail-fast": False, "matrix": {"shard": [0, 1, 2, 3]}}:
         raise ManifestError(
-            f"workflow jobs.{RELAY_AUTHORITY_MUTATIONS_JOB} must execute all three mutation shards"
+            f"workflow jobs.{RELAY_AUTHORITY_MUTATIONS_JOB} must execute all four mutation shards"
         )
     steps = mutation_job.get("steps")
     if not isinstance(steps, list):
@@ -159,7 +159,7 @@ def validate_workflow_contract(
     if (
         not isinstance(env, dict)
         or env.get("RELAY_AUTHORITY_MUTATION_SHARD_INDEX") != "${{ matrix.shard }}"
-        or str(env.get("RELAY_AUTHORITY_MUTATION_SHARD_TOTAL")) != "3"
+        or str(env.get("RELAY_AUTHORITY_MUTATION_SHARD_TOTAL")) != "4"
     ):
         raise ManifestError("workflow mutation job must pass its shard index and total")
 
