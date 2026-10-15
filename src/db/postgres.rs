@@ -12,7 +12,10 @@ use sqlx::{PgPool, Row};
 use crate::config::{AgentChannel, AgentDef, Config};
 
 mod advisory_lock;
+mod migration_catalog;
 pub use advisory_lock::AdvisoryLockLease;
+#[cfg(test)]
+pub(crate) use migration_catalog::install_campaign_fixture_through;
 mod shared_config;
 pub(crate) use shared_config::shared_config_sync_enabled;
 pub use shared_config::{startup_reseed, startup_reseed_with_warmup_pool};
@@ -374,11 +377,7 @@ pub async fn connect_and_migrate(config: &Config) -> Result<Option<PgPool>, Stri
 }
 
 pub async fn migrate(pool: &PgPool) -> Result<(), String> {
-    POSTGRES_MIGRATOR
-        .run(pool)
-        .await
-        .map_err(|error| format!("run postgres migrations: {error}"))?;
-    Ok(())
+    migration_catalog::migrate(pool).await
 }
 
 async fn acquire_startup_advisory_lock(pool: &PgPool) -> Result<AdvisoryLockLease, String> {
@@ -490,6 +489,7 @@ pub struct MigrationStatus {
     pub resolved_versions: Vec<i64>,
     pub missing_from_resolved: Vec<i64>,
     pub pending_versions: Vec<i64>,
+    pub history_issues: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -519,9 +519,25 @@ pub async fn query_applied_migrations(pool: &PgPool) -> Result<Vec<AppliedMigrat
 }
 
 pub async fn migration_status(pool: &PgPool) -> Result<MigrationStatus, String> {
-    let applied = query_applied_migrations(pool).await?;
-    let resolved_versions = POSTGRES_MIGRATOR
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("migration status connection: {e}"))?;
+    let rows = migration_catalog::receipts(&mut conn).await?;
+    let lineage = migration_catalog::diagnostic_lineage(&rows);
+    let history_issues = migration_catalog::history_issues(&mut conn, &rows, lineage).await;
+    let catalog = lineage.migrator();
+    let applied = rows
         .iter()
+        .map(|row| AppliedMigrationInfo {
+            version: row.version,
+            description: row.description.clone(),
+            success: row.success,
+        })
+        .collect::<Vec<_>>();
+    let resolved_versions = catalog
+        .iter()
+        .filter(|migration| !migration.migration_type.is_down_migration())
         .map(|migration| migration.version)
         .collect::<Vec<_>>();
     let resolved_set = resolved_versions.iter().copied().collect::<BTreeSet<_>>();
@@ -543,20 +559,19 @@ pub async fn migration_status(pool: &PgPool) -> Result<MigrationStatus, String> 
         resolved_versions,
         missing_from_resolved,
         pending_versions,
+        history_issues,
     })
 }
 
 pub async fn applied_migration_checksum_mismatch_details(
     pool: &PgPool,
 ) -> Result<Vec<MigrationChecksumMismatch>, String> {
-    let rows = sqlx::query(
-        "SELECT version, checksum, success
-         FROM _sqlx_migrations
-         ORDER BY version",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|error| format!("query _sqlx_migrations checksums: {error}"))?;
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("migration checksum connection: {e}"))?;
+    let rows = migration_catalog::receipts(&mut conn).await?;
+    let catalog = migration_catalog::diagnostic_lineage(&rows).migrator();
 
     // sqlx Migrator yields both ReversibleUp and ReversibleDown entries for the
     // same version. The applied checksum stored in `_sqlx_migrations` is the Up
@@ -565,7 +580,7 @@ pub async fn applied_migration_checksum_mismatch_details(
     // for the same version and a Down checksum can shadow the Up, producing a
     // false-positive drift signal. Mirror sqlx's own `is_down_migration()`
     // filter from `Migrator::run_direct`.
-    let resolved_checksums = POSTGRES_MIGRATOR
+    let resolved_checksums = catalog
         .iter()
         .filter(|migration| !migration.migration_type.is_down_migration())
         .map(|migration| (migration.version, migration.checksum.as_ref()))
@@ -573,15 +588,15 @@ pub async fn applied_migration_checksum_mismatch_details(
 
     let mut mismatches = Vec::new();
     for row in rows {
-        let version = row.get::<i64, _>("version");
-        let success = row.get::<bool, _>("success");
+        let version = row.version;
+        let success = row.success;
         if !success {
             continue;
         }
         let Some(expected_checksum) = resolved_checksums.get(&version) else {
             continue;
         };
-        let applied_checksum = row.get::<Vec<u8>, _>("checksum");
+        let applied_checksum = row.checksum;
         if applied_checksum.as_slice() != *expected_checksum {
             mismatches.push(MigrationChecksumMismatch {
                 version,

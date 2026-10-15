@@ -1712,6 +1712,8 @@ fn execute_streaming_local_tui_tmux(
 ) -> Result<(), String> {
     host_gate::tmux_turn_admitted(tmux_session_name)
         .map_err(crate::services::claude_tui::submit_canary::hold_error)?;
+    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)
+        .map_err(crate::services::claude_tui::submit_canary::hold_error)?;
     debug_log(&format!(
         "=== execute_streaming_local_tui_tmux START: {} ===",
         tmux_session_name
@@ -2508,6 +2510,7 @@ fn execute_streaming_local_tmux(
     compact_lower_bound_tokens: u64,
 ) -> Result<(), String> {
     host_gate::tmux_turn_admitted(tmux_session_name)?;
+    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)?;
     debug_log(&format!(
         "=== execute_streaming_local_tmux START: {} ===",
         tmux_session_name
@@ -2931,18 +2934,22 @@ fn send_followup_to_tmux(
     Ok(outcome)
 }
 
-/// Send a follow-up message to an existing ProcessBackend session.
-fn send_followup_to_process(
+/// Prepare a follow-up while the caller holds the shared source authority.
+/// Output polling belongs to the caller after that authority has been released.
+fn prepare_followup_to_process(
     prompt: &str,
     output_path: &str,
     session_name: &str,
-    sender: Sender<StreamMessage>,
-    cancel_token: Option<std::sync::Arc<CancelToken>>,
-) -> Result<ClaudeFollowupResult, String> {
-    use crate::services::tmux_diagnostics::should_recreate_session_after_stdin_error;
-
+    cancel_token: Option<&CancelToken>,
+) -> Result<
+    (
+        u64,
+        crate::services::session_backend::ProcessSessionActiveTurnGuard,
+    ),
+    String,
+> {
     debug_log(&format!(
-        "=== send_followup_to_process: {} ===",
+        "=== prepare_followup_to_process: {} ===",
         session_name
     ));
 
@@ -2958,54 +2965,8 @@ fn send_followup_to_process(
     });
 
     let active_turn = mark_process_session_active_turn(session_name);
-    if let Err(e) =
-        send_process_session_input(session_name, &msg.to_string(), cancel_token.as_deref())
-    {
-        if should_recreate_session_after_stdin_error(&e) {
-            debug_log(&format!(
-                "stdin pipe error triggers session recreation: {}",
-                e
-            ));
-            return Ok(ClaudeFollowupResult::RecreateSession { error: e });
-        }
-        return Err(e);
-    }
-
-    let read_result = read_output_file_until_result(
-        output_path,
-        start_offset,
-        sender.clone(),
-        cancel_token,
-        process_session_probe(session_name),
-    )?;
-    drop(active_turn);
-
-    let outcome = classify_followup_result(
-        read_result,
-        start_offset,
-        "process died during follow-up output reading",
-    );
-    if matches!(outcome, ClaudeFollowupResult::Delivered) {
-        let current_offset = std::fs::metadata(output_path)
-            .map(|meta| meta.len())
-            .unwrap_or(start_offset);
-        let _ = sender.send(StreamMessage::ProcessReady {
-            output_path: output_path.to_string(),
-            session_name: session_name.to_string(),
-            last_offset: current_offset,
-        });
-    } else if matches!(outcome, ClaudeFollowupResult::RecreateSession { .. }) {
-        debug_log(
-            "process session died during follow-up before new output — requesting recreation",
-        );
-        remove_process_session(session_name);
-    } else {
-        debug_log(
-            "process session died after streaming partial follow-up output — suppress replay",
-        );
-        remove_process_session(session_name);
-    }
-    Ok(outcome)
+    send_process_session_input(session_name, &msg.to_string(), cancel_token)?;
+    Ok((start_offset, active_turn))
 }
 
 /// Execute Claude inside a tmux session on a remote host via SSH.

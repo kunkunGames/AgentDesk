@@ -505,10 +505,13 @@ async fn terminalize_selected_runs_with_pg(
     target_run_ids: &[String],
     reason: &str,
     should_rollback_cards: bool,
+    exclusive_card: Option<&str>,
 ) -> Result<(Value, Vec<String>), String> {
     let completes_run = reason == "auto_queue_end";
     let run_status_filter = if completes_run {
         "status IN ('active', 'paused', 'generated', 'pending')"
+    } else if exclusive_card.is_some() {
+        "status IN ('active', 'paused', 'generated', 'pending', 'restoring')"
     } else {
         "status IN ('active', 'paused', 'restoring')"
     };
@@ -554,9 +557,43 @@ async fn terminalize_selected_runs_with_pg(
         .fetch_all(&mut *tx)
         .await
         .map_err(|error| format!("load postgres auto_queue_runs for cancel: {error}"))?;
-    let locked_run_ids =
+    let mut locked_run_ids =
         crate::db::auto_queue::acquire_run_advisory_xact_locks_on_pg_tx(&mut tx, &lock_candidates)
             .await?;
+
+    if let Some(card) = exclusive_card {
+        // A run-row UPDATE lock also conflicts with the FK KEY SHARE acquired
+        // by an entry INSERT. Lock existing entries to fence reassignment, then
+        // check ownership using the same transaction that cancels and records
+        // cleanup debt. An earlier read cannot authorize a shared-run mutation.
+        sqlx::query("SELECT id FROM auto_queue_runs WHERE id=ANY($1) ORDER BY id FOR UPDATE")
+            .bind(&locked_run_ids)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|error| format!("lock scoped campaign runs: {error}"))?;
+        sqlx::query(
+            "SELECT id FROM auto_queue_entries WHERE run_id=ANY($1) ORDER BY id FOR UPDATE",
+        )
+        .bind(&locked_run_ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| format!("lock scoped campaign entries: {error}"))?;
+        locked_run_ids = sqlx::query_scalar("SELECT r.id FROM auto_queue_runs r WHERE r.id=ANY($1)
+            AND EXISTS(SELECT 1 FROM auto_queue_entries e WHERE e.run_id=r.id AND e.kanban_card_id=$2)
+            AND NOT EXISTS(SELECT 1 FROM auto_queue_entries e WHERE e.run_id=r.id AND e.kanban_card_id IS DISTINCT FROM $2)
+            ORDER BY r.id")
+            .bind(&locked_run_ids).bind(card).fetch_all(&mut *tx).await
+            .map_err(|error| format!("verify exclusive campaign run ownership: {error}"))?;
+        if locked_run_ids.is_empty() {
+            tx.commit()
+                .await
+                .map_err(|error| format!("commit preserved shared campaign runs: {error}"))?;
+            return Ok((
+                json!({"ok":true,"cancelled_entries":0,"cancelled_runs":0,"cancelled_dispatches":0,"released_slots":0}),
+                Vec::new(),
+            ));
+        }
+    }
 
     // P1-B: Capture the cards owned by the entries before terminalizing them. Their
     // generation markers are loaded from kanban_cards after cancellation has applied
@@ -802,9 +839,15 @@ pub(crate) async fn cancel_selected_runs_with_pg(
     target_run_ids: &[String],
     reason: &str,
 ) -> Result<Value, String> {
-    let (response, _rollback_candidate_card_ids) =
-        terminalize_selected_runs_with_pg(health_registry, pool, target_run_ids, reason, true)
-            .await?;
+    let (response, _rollback_candidate_card_ids) = terminalize_selected_runs_with_pg(
+        health_registry,
+        pool,
+        target_run_ids,
+        reason,
+        true,
+        None,
+    )
+    .await?;
     // #5357: Some-generation card rollback candidates are queued in the same
     // transaction as the entry changes and are retried by the replay sweep if
     // the synchronous drain fails. NULL-generation candidates are instead
@@ -824,12 +867,35 @@ pub(crate) async fn end_run_with_pg(
         &[run_id.to_string()],
         "auto_queue_end",
         false, // P1-A: end operations do not roll back cards
+        None,
     )
     .await?;
     Ok(response
         .get("cancelled_runs")
         .and_then(Value::as_u64)
         .is_some_and(|count| count > 0))
+}
+
+/// Cancel only runs that still belong exclusively to this review card under
+/// row locks. Terminal receipts stay intact; stale entries and retained slots
+/// are handled by the existing durable cleanup lifecycle.
+pub(crate) async fn cancel_exclusive_card_runs_with_pg(
+    health_registry: Option<Arc<crate::services::discord::health::HealthRegistry>>,
+    pool: &PgPool,
+    card: &str,
+    run_ids: &[String],
+    reason: &str,
+) -> Result<Value, String> {
+    let (response, _) = terminalize_selected_runs_with_pg(
+        health_registry,
+        pool,
+        run_ids,
+        reason,
+        false,
+        Some(card),
+    )
+    .await?;
+    Ok(response)
 }
 
 pub(crate) async fn skip_dispatched_entries_for_runs_pg(

@@ -7,6 +7,7 @@ import CampaignAutoQueueToggle from "./CampaignAutoQueueToggle";
 import { campaignProgress } from "./campaignModel";
 import { Badge, type Tr } from "./campaignPresentation";
 import CampaignExplorer from "./CampaignExplorer";
+import CampaignExecutionStatus from "./CampaignExecutionStatus";
 import type { CampaignDraft } from "./CampaignNodeDetails";
 import "./campaigns.css";
 
@@ -75,6 +76,7 @@ export default function CampaignsPanel({ language }: { language: string }) {
         <CampaignAutoQueueToggle key={campaign.id} campaign={campaign} tr={tr} onSaved={onSaved} checkedRead={checkedRead} />
       </div>
       {campaign.description && <p className="campaign-description" title={campaign.description}>{campaign.description}</p>}
+      <CampaignExecutionStatus key={campaign.id} id={campaign.id} tr={tr} />
       <progress className="campaign-progress" max={100} value={progress.percent} aria-label={tr("작업 완료율", "Task completion")} />
       {campaign.nodes.length ? <CampaignExplorer key={campaign.id} campaign={campaign} live={live[campaign.id] ?? NO_LIVE} tr={tr} onSaved={onSaved} drafts={drafts} onDraftChange={onDraftChange} /> : <WidgetState kind="empty" title={tr("아직 작업이 없습니다.", "No tasks yet.")} />}
     </div>}

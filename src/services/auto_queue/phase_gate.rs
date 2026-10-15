@@ -218,7 +218,16 @@ async fn create_activate_dispatch_pg_inner(
                 .or_insert_with(|| json!(false));
         }
     }
+    let protected_campaign = crate::services::managed_checks::bind_campaign_dispatch(
+        pool,
+        card_id,
+        to_agent_id,
+        &mut context_with_strategy,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     if !sandbox_preflight_dispatch
+        && !protected_campaign
         && crate::dispatch::dispatch_type_requires_fresh_worktree(Some(dispatch_type))
     {
         let Some((worktree_path, worktree_branch, _, created)) =
@@ -245,6 +254,7 @@ async fn create_activate_dispatch_pg_inner(
             }
         }
     } else if !sandbox_preflight_dispatch
+        && !protected_campaign
         && let Ok(Some((worktree_path, worktree_branch, _))) =
             crate::dispatch::resolve_card_worktree(pool, card_id, Some(&context_with_strategy))
                 .await

@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
+pub(crate) mod checks;
+mod lifecycle;
+#[cfg(test)]
+mod lifecycle_pg_tests;
+mod store;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TestPhaseRun {
     pub id: String,
@@ -108,173 +114,24 @@ pub async fn upsert_test_phase_run(
     pool: &PgPool,
     request: &TestPhaseRunRequest,
 ) -> Result<TestPhaseRun, String> {
-    let phase_key = normalize_required("phase_key", &request.phase_key)?;
-    let head_sha = normalize_required("head_sha", &request.head_sha)?;
-    let status = normalize_status(request.status.as_deref().unwrap_or("queued"))?;
-    let idempotency_key = request
-        .idempotency_key
-        .as_deref()
-        .map(|value| normalize_required("idempotency_key", value))
-        .transpose()?
-        .unwrap_or_else(|| deterministic_idempotency_key(&phase_key, &head_sha));
-    let run_id = format!("tpr-{}", uuid::Uuid::new_v4());
-    let terminal = is_terminal_status(&status);
-    let required_capabilities = request
-        .required_capabilities
-        .clone()
-        .unwrap_or_else(|| json!({}));
-    let evidence = request.evidence.clone().unwrap_or_else(|| json!({}));
-
-    let row = sqlx::query(
-        r#"
-        INSERT INTO test_phase_runs (
-            id, idempotency_key, phase_key, head_sha, status, issue_id, card_id,
-            repo_id, required_capabilities, resource_lock_key, holder_instance_id,
-            holder_job_id, evidence, error, started_at, completed_at, created_at, updated_at
-        )
-        VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-            CASE WHEN $5 = 'running' THEN NOW() ELSE NULL END,
-            CASE WHEN $15 THEN NOW() ELSE NULL END,
-            NOW(), NOW()
-        )
-        ON CONFLICT (idempotency_key) DO UPDATE
-        SET status = EXCLUDED.status,
-            issue_id = COALESCE(EXCLUDED.issue_id, test_phase_runs.issue_id),
-            card_id = COALESCE(EXCLUDED.card_id, test_phase_runs.card_id),
-            repo_id = COALESCE(EXCLUDED.repo_id, test_phase_runs.repo_id),
-            required_capabilities = EXCLUDED.required_capabilities,
-            resource_lock_key = COALESCE(EXCLUDED.resource_lock_key, test_phase_runs.resource_lock_key),
-            holder_instance_id = COALESCE(EXCLUDED.holder_instance_id, test_phase_runs.holder_instance_id),
-            holder_job_id = COALESCE(EXCLUDED.holder_job_id, test_phase_runs.holder_job_id),
-            evidence = EXCLUDED.evidence,
-            error = EXCLUDED.error,
-            started_at = COALESCE(test_phase_runs.started_at, EXCLUDED.started_at),
-            completed_at = CASE WHEN $15 THEN NOW() ELSE NULL END,
-            updated_at = NOW()
-        RETURNING id, idempotency_key, phase_key, head_sha, status, issue_id,
-                  card_id, repo_id, required_capabilities, resource_lock_key,
-                  holder_instance_id, holder_job_id, evidence, error, started_at,
-                  completed_at, created_at, updated_at
-        "#,
-    )
-    .bind(run_id)
-    .bind(idempotency_key)
-    .bind(phase_key)
-    .bind(head_sha)
-    .bind(status)
-    .bind(clean_optional(request.issue_id.as_deref()))
-    .bind(clean_optional(request.card_id.as_deref()))
-    .bind(clean_optional(request.repo_id.as_deref()))
-    .bind(required_capabilities)
-    .bind(clean_optional(request.resource_lock_key.as_deref()))
-    .bind(clean_optional(request.holder_instance_id.as_deref()))
-    .bind(clean_optional(request.holder_job_id.as_deref()))
-    .bind(evidence)
-    .bind(clean_optional(request.error.as_deref()))
-    .bind(terminal)
-    .fetch_one(pool)
-    .await
-    .map_err(|error| format!("upsert test phase run: {error}"))?;
-
-    run_from_row(row)
+    checks::reject_public_write(request)?;
+    lifecycle::upsert(pool, request).await
 }
 
 pub async fn start_test_phase_run(
     pool: &PgPool,
     request: &TestPhaseRunStartRequest,
 ) -> Result<TestPhaseRunStartOutcome, String> {
-    let phase_key = normalize_required("phase_key", &request.run.phase_key)?;
-    let head_sha = normalize_required("head_sha", &request.run.head_sha)?;
-    let lock_key = normalize_required("resource_lock_key", &request.resource_lock_key)?;
-    let holder_instance_id = normalize_required("holder_instance_id", &request.holder_instance_id)?;
-    let holder_job_id = normalize_required("holder_job_id", &request.holder_job_id)?;
-    let metadata = json!({
-        "phase_key": phase_key,
-        "head_sha": head_sha,
-        "idempotency_key": request.run.idempotency_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(""),
-    });
-    let lock_request = crate::server::resource_locks::ResourceLockRequest {
-        lock_key: lock_key.clone(),
-        holder_instance_id: holder_instance_id.clone(),
-        holder_job_id: holder_job_id.clone(),
-        ttl_secs: request.ttl_secs,
-        metadata: Some(metadata),
-    };
-    let lock_outcome = crate::server::resource_locks::acquire_resource_lock(pool, &lock_request)
-        .await
-        .map_err(|error| format!("start test phase acquire lock: {error}"))?;
-    if !lock_outcome.acquired {
-        return Ok(TestPhaseRunStartOutcome {
-            started: false,
-            run: None,
-            lock: None,
-            current_lock: lock_outcome.current,
-        });
-    }
-
-    let mut run_request = request.run.clone();
-    run_request.status = Some("running".to_string());
-    run_request.resource_lock_key = Some(lock_key.clone());
-    run_request.holder_instance_id = Some(holder_instance_id.clone());
-    run_request.holder_job_id = Some(holder_job_id.clone());
-    let run = match upsert_test_phase_run(pool, &run_request).await {
-        Ok(run) => run,
-        Err(error) => {
-            let _ = crate::server::resource_locks::release_resource_lock(
-                pool,
-                &lock_key,
-                &holder_instance_id,
-                &holder_job_id,
-            )
-            .await;
-            return Err(error);
-        }
-    };
-
-    Ok(TestPhaseRunStartOutcome {
-        started: true,
-        run: Some(run),
-        lock: lock_outcome.lock,
-        current_lock: None,
-    })
+    checks::reject_public_write(&request.run)?;
+    lifecycle::start(pool, request).await
 }
 
 pub async fn complete_test_phase_run(
     pool: &PgPool,
     request: &TestPhaseRunCompleteRequest,
 ) -> Result<TestPhaseRunCompleteOutcome, String> {
-    let status = normalize_status(request.run.status.as_deref().unwrap_or(""))?;
-    if !is_terminal_status(&status) {
-        return Err("complete requires status passed, failed, or canceled".to_string());
-    }
-    let run = upsert_test_phase_run(pool, &request.run).await?;
-    let lock_released = if request.release_lock {
-        match (
-            run.resource_lock_key.as_deref(),
-            run.holder_instance_id.as_deref(),
-            run.holder_job_id.as_deref(),
-        ) {
-            (Some(lock_key), Some(holder_instance_id), Some(holder_job_id)) => Some(
-                crate::server::resource_locks::release_resource_lock(
-                    pool,
-                    lock_key,
-                    holder_instance_id,
-                    holder_job_id,
-                )
-                .await?,
-            ),
-            _ => Some(false),
-        }
-    } else {
-        None
-    };
-
-    Ok(TestPhaseRunCompleteOutcome { run, lock_released })
+    checks::reject_public_write(&request.run)?;
+    lifecycle::complete(pool, request).await
 }
 
 pub async fn list_test_phase_runs(

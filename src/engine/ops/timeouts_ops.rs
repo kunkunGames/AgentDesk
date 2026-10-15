@@ -4,6 +4,8 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::{PgPool, Row as SqlxRow};
 
+mod stale_recovery;
+
 // ── Timeout policy typed facade (#3733) ─────────────────────────────
 //
 // Replaces raw session/deadlock DB access in policies/timeouts/active-monitor.js
@@ -47,6 +49,13 @@ pub(super) fn register_timeouts_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>
     )?;
 
     let pg_observe = pg_pool.clone();
+    let pg_stale_recovery = pg_pool.clone();
+    obj.set(
+        "__recoverStaleSessionRaw",
+        Function::new(ctx.clone(), move |payload_json: String| -> String {
+            stale_recovery::recover_stale_session_raw(pg_stale_recovery.as_ref(), &payload_json)
+        })?,
+    )?;
     obj.set(
         "__observeSessionHostRaw",
         Function::new(ctx.clone(), move |session_key: String| -> String {
@@ -131,6 +140,9 @@ pub(super) fn register_timeouts_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>
                     JSON.stringify(request || {})
                 )));
             };
+            agentdesk.timeouts.recoverStaleSession = function(payload) {
+                return unwrap(JSON.parse(agentdesk.timeouts.__recoverStaleSessionRaw(JSON.stringify(payload || {}))));
+            };
             agentdesk.timeouts.getDispatchType = function(dispatchId) {
                 if (!dispatchId) return null;
                 var result = unwrap(JSON.parse(agentdesk.timeouts.__getDispatchTypeRaw(dispatchId || "")));
@@ -185,13 +197,6 @@ fn valid_cutoff_ms(cutoff_ms: i64) -> Result<i64, String> {
     Ok(cutoff_ms)
 }
 
-fn format_ts(value: Option<DateTime<Utc>>) -> serde_json::Value {
-    match value {
-        Some(value) => json!(value.format("%Y-%m-%d %H:%M:%S").to_string()),
-        None => serde_json::Value::Null,
-    }
-}
-
 fn clear_deadlock_counters_for_fresh_sessions_raw(
     pg_pool: Option<&PgPool>,
     stale_scan_minutes: i32,
@@ -242,6 +247,8 @@ fn list_stale_working_sessions_raw(pg_pool: Option<&PgPool>, grace_minutes: i32)
         move |bridge_pool| async move {
             let rows = sqlx::query(
                 "SELECT s.session_key,
+                        s.status, s.provider, s.channel_id, s.instance_id,
+                        s.idle_recap_turn_generation AS turn_generation, s.last_heartbeat,
                         s.active_dispatch_id,
                         s.active_turn_nonce,
                         td.status AS active_dispatch_status
@@ -259,8 +266,16 @@ fn list_stale_working_sessions_raw(pg_pool: Option<&PgPool>, grace_minutes: i32)
             let sessions = rows
                 .into_iter()
                 .map(|row| {
+                    let session_key = row.try_get::<String, _>("session_key").unwrap_or_default();
                     json!({
-                        "session_key": row.try_get::<Option<String>, _>("session_key").ok().flatten(),
+                        "session_key": session_key,
+                        "status": row.try_get::<Option<String>, _>("status").ok().flatten(),
+                        "provider": row.try_get::<Option<String>, _>("provider").ok().flatten(),
+                        "channel_id": row.try_get::<Option<String>, _>("channel_id").ok().flatten(),
+                        "instance_id": row.try_get::<Option<String>, _>("instance_id").ok().flatten(),
+                        "turn_generation": row.try_get::<i64, _>("turn_generation").ok(),
+                        "last_heartbeat": row.try_get::<Option<DateTime<Utc>>, _>("last_heartbeat").ok().flatten(),
+                        "runtime_evidence": stale_recovery::runtime_evidence(&session_key),
                         "active_dispatch_id": row.try_get::<Option<String>, _>("active_dispatch_id").ok().flatten(),
                         "active_dispatch_status": row.try_get::<Option<String>, _>("active_dispatch_status").ok().flatten(),
                         "active_turn_nonce": row.try_get::<Option<String>, _>("active_turn_nonce").ok().flatten()
@@ -296,16 +311,16 @@ fn list_deadlock_candidates_raw(
         pool,
         move |bridge_pool| async move {
             let rows = sqlx::query(
-                "SELECT session_key,
-                        agent_id,
-                        active_dispatch_id,
-                        active_turn_nonce,
-                        last_heartbeat
-                 FROM sessions
-                 WHERE status IN ('turn_active', 'working')
-                   AND session_key NOT LIKE '%deadlock-manager%'
-                   AND last_heartbeat < NOW() - ($1::int * INTERVAL '1 minute')
-                 ORDER BY last_heartbeat ASC
+                "SELECT s.session_key, s.status, s.provider, s.channel_id, s.instance_id,
+                        s.idle_recap_turn_generation AS turn_generation,
+                        s.agent_id, s.active_dispatch_id, s.active_turn_nonce, s.last_heartbeat,
+                        td.status AS active_dispatch_status
+                 FROM sessions s
+                 LEFT JOIN task_dispatches td ON td.id = s.active_dispatch_id
+                 WHERE s.status IN ('turn_active', 'working')
+                   AND s.session_key NOT LIKE '%deadlock-manager%'
+                   AND s.last_heartbeat < NOW() - ($1::int * INTERVAL '1 minute')
+                 ORDER BY s.last_heartbeat ASC
                  LIMIT $2",
             )
             .bind(minutes)
@@ -321,12 +336,20 @@ fn list_deadlock_candidates_raw(
                         row.try_get::<Option<DateTime<Utc>>, _>("last_heartbeat")
                             .ok()
                             .flatten();
+                    let session_key = row.try_get::<String, _>("session_key").unwrap_or_default();
                     json!({
-                        "session_key": row.try_get::<Option<String>, _>("session_key").ok().flatten(),
+                        "session_key": session_key,
+                        "status": row.try_get::<Option<String>, _>("status").ok().flatten(),
+                        "provider": row.try_get::<Option<String>, _>("provider").ok().flatten(),
+                        "channel_id": row.try_get::<Option<String>, _>("channel_id").ok().flatten(),
+                        "instance_id": row.try_get::<Option<String>, _>("instance_id").ok().flatten(),
+                        "turn_generation": row.try_get::<i64, _>("turn_generation").ok(),
+                        "runtime_evidence": stale_recovery::runtime_evidence(&session_key),
                         "agent_id": row.try_get::<Option<String>, _>("agent_id").ok().flatten(),
                         "active_dispatch_id": row.try_get::<Option<String>, _>("active_dispatch_id").ok().flatten(),
+                        "active_dispatch_status": row.try_get::<Option<String>, _>("active_dispatch_status").ok().flatten(),
                         "active_turn_nonce": row.try_get::<Option<String>, _>("active_turn_nonce").ok().flatten(),
-                        "last_heartbeat": format_ts(last_heartbeat)
+                        "last_heartbeat": last_heartbeat
                     })
                 })
                 .collect::<Vec<_>>();

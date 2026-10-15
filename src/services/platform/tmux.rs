@@ -97,54 +97,12 @@ pub fn version() -> Result<String, String> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionPresence {
-    Present,
-    Missing,
-    ProbeFailed,
-}
+mod presence;
 
-/// Check whether a named tmux session definitely exists or definitely does not.
-/// Transport, socket, permission, timeout, and unexpected tmux errors remain
-/// distinguishable from a confirmed missing session so destructive callers can
-/// fail closed.
-fn classify_has_session_output(output: &Output) -> SessionPresence {
-    if output.status.success() {
-        return SessionPresence::Present;
-    }
+use presence::classify_has_session_output;
 
-    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    if stderr.contains("can't find session")
-        || stderr.contains("no such session")
-        || stderr.contains("no server running")
-    {
-        SessionPresence::Missing
-    } else {
-        SessionPresence::ProbeFailed
-    }
-}
-
-pub(crate) fn session_presence(session_name: &str) -> SessionPresence {
-    if is_blank_session_name(session_name) {
-        return SessionPresence::ProbeFailed;
-    }
-
-    let Ok(mut command) = tmux_command() else {
-        return SessionPresence::ProbeFailed;
-    };
-    command.args(["has-session", "-t", &exact_target(session_name)]);
-    let Ok(output) = wait_for_tmux_output(command, Duration::from_secs(3), "tmux has-session")
-    else {
-        return SessionPresence::ProbeFailed;
-    };
-    classify_has_session_output(&output)
-}
-
-/// Compatibility boolean for non-destructive callers. Probe failures continue
-/// to read as unavailable; destructive recovery must use [`session_presence`].
-pub fn has_session(session_name: &str) -> bool {
-    session_presence(session_name) == SessionPresence::Present
-}
+pub use presence::has_session;
+pub(crate) use presence::{SessionPresence, session_presence};
 
 /// Create a new detached tmux session.
 ///
@@ -519,14 +477,18 @@ fn paste_buffer_raw_args<'a>(buffer_name: &'a str, target: &'a str, delete: bool
 /// Return the PID of the active pane process for a tmux session.
 #[cfg(unix)]
 pub fn pane_pid(session_name: &str) -> Option<u32> {
-    let output = tmux_output([
+    if is_blank_session_name(session_name) {
+        return None;
+    }
+    let mut command = tmux_command().ok()?;
+    command.args([
         "display-message",
         "-p",
         "-t",
         &exact_target(session_name),
         "#{pane_pid}",
-    ])
-    .ok()?;
+    ]);
+    let output = wait_for_tmux_output(command, Duration::from_secs(2), "tmux pane PID").ok()?;
     if !output.status.success() {
         return None;
     }

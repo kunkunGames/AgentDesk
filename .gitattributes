@@ -35,3 +35,9 @@ tests/fixtures/relay_obligation/*.jsonl -diff -text
 
 # Preserve the original-byte coordinate canary's BOM and CRLF.
 tools/modmap-driver/canary/src/items_crlf.rs -text
+
+tests/fixtures/relay_obligation/*.expected text eol=lf
+
+# SQLx checksums pin raw bytes, including historical mixed line endings.
+migrations/postgres_campaign_v5/** -text
+migrations/postgres/0146_campaign_upstream_convergence.sql -text

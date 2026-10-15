@@ -1,7 +1,13 @@
 use std::{fs, path::Path};
 
 fn main() {
-    rerun_if_changed_recursively(Path::new("migrations/postgres"));
+    for catalog in [
+        "migrations/postgres",
+        "migrations/postgres_campaign_v5",
+        "migrations/postgres_shared",
+    ] {
+        rerun_if_changed_recursively(Path::new(catalog));
+    }
 }
 
 fn rerun_if_changed_recursively(path: &Path) {

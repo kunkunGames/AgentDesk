@@ -127,6 +127,71 @@ src/
 │   │   ├── postgres_tests.rs
 │   │   └── read.rs
 │   ├── campaigns/
+│   │   ├── graph/
+│   │   │   ├── effect_ownership/
+│   │   │   │   ├── control_history.rs
+│   │   │   │   └── rows.rs
+│   │   │   ├── learning/
+│   │   │   │   ├── budget.rs
+│   │   │   │   ├── members.rs
+│   │   │   │   ├── policy.rs
+│   │   │   │   ├── reviews.rs
+│   │   │   │   ├── samples.rs
+│   │   │   │   └── template.rs
+│   │   │   ├── recovery/
+│   │   │   │   ├── finish/
+│   │   │   │   │   └── audit.rs
+│   │   │   │   ├── replan/
+│   │   │   │   │   ├── settled_effect/
+│   │   │   │   │   │   ├── durable.rs
+│   │   │   │   │   │   └── gates.rs
+│   │   │   │   │   ├── artifact.rs
+│   │   │   │   │   ├── cancelled_validation.rs
+│   │   │   │   │   ├── candidate.rs
+│   │   │   │   │   ├── control.rs
+│   │   │   │   │   ├── effect.rs
+│   │   │   │   │   ├── guards.rs
+│   │   │   │   │   ├── initial_plan.rs
+│   │   │   │   │   └── settled_effect.rs
+│   │   │   │   ├── artifact.rs
+│   │   │   │   ├── captured.rs
+│   │   │   │   ├── descendants.rs
+│   │   │   │   ├── finish.rs
+│   │   │   │   ├── planning.rs
+│   │   │   │   ├── proposal.rs
+│   │   │   │   ├── replan.rs
+│   │   │   │   ├── transport.rs
+│   │   │   │   └── validation.rs
+│   │   │   ├── revision/
+│   │   │   │   └── budget.rs
+│   │   │   ├── schedule/
+│   │   │   │   ├── activation.rs
+│   │   │   │   ├── budget.rs
+│   │   │   │   └── rollover.rs
+│   │   │   ├── store/
+│   │   │   │   └── ownership.rs
+│   │   │   ├── workflow/
+│   │   │   │   ├── lifecycle.rs
+│   │   │   │   ├── retirement.rs
+│   │   │   │   ├── store.rs
+│   │   │   │   └── tests.rs
+│   │   │   ├── control_budget.rs
+│   │   │   ├── effect_ownership.rs
+│   │   │   ├── learning.rs
+│   │   │   ├── metrics.rs
+│   │   │   ├── planning_input.rs
+│   │   │   ├── preflight.rs
+│   │   │   ├── progress.rs
+│   │   │   ├── receipt.rs
+│   │   │   ├── recovery.rs
+│   │   │   ├── result.rs
+│   │   │   ├── revision.rs
+│   │   │   ├── schedule.rs
+│   │   │   ├── schema.rs
+│   │   │   ├── store.rs
+│   │   │   └── workflow.rs
+│   │   ├── graph.rs
+│   │   ├── handoff.rs
 │   │   └── tests.rs
 │   ├── dispatched_sessions/
 │   │   ├── canonical_identity.rs
@@ -162,8 +227,11 @@ src/
 │   │   ├── mod.rs
 │   │   └── transitions.rs
 │   ├── postgres/
+│   │   ├── migration_catalog/
+│   │   │   └── tests.rs
 │   │   ├── advisory_lock.rs
 │   │   ├── advisory_lock_tests.rs
+│   │   ├── migration_catalog.rs
 │   │   ├── shared_config.rs
 │   │   └── test_db_reclaim.rs
 │   ├── prompt_manifests/
@@ -196,6 +264,8 @@ src/
 │   │   └── writes.rs
 │   ├── session_observability/
 │   │   └── background_ordering_pg_tests.rs
+│   ├── turns/
+│   │   └── postgres_tests.rs
 │   ├── agent_read.rs
 │   ├── agents.rs
 │   ├── automation_candidate_card_program.rs
@@ -243,6 +313,10 @@ src/
 │   ├── session_transcripts_native_clear_tests.rs
 │   └── turns.rs
 ├── dispatch/
+│   ├── dispatch_context/
+│   │   └── worktrees.rs
+│   ├── dispatch_create/
+│   │   └── context_admission.rs
 │   ├── dispatch_status/
 │   │   └── terminal_timestamp_tests.rs
 │   ├── completion_hooks.rs
@@ -261,9 +335,14 @@ src/
 │   │   ├── exec_ops/
 │   │   │   ├── exec_allowlist_tests.rs
 │   │   │   └── session_liveness_tests.rs
+│   │   ├── http_ops/
+│   │   │   └── auth_tests.rs
 │   │   ├── timeouts_ops/
+│   │   │   ├── stale_recovery/
+│   │   │   │   └── tests.rs
 │   │   │   ├── host_repair.rs
-│   │   │   └── host_repair_tests.rs
+│   │   │   ├── host_repair_tests.rs
+│   │   │   └── stale_recovery.rs
 │   │   ├── agent_ops.rs
 │   │   ├── auto_queue_ops.rs
 │   │   ├── cards_ops.rs
@@ -288,6 +367,7 @@ src/
 │   │   └── turn_ops.rs
 │   ├── hooks.rs
 │   ├── intent.rs
+│   ├── json_bridge.rs
 │   ├── loader.rs
 │   ├── mod.rs
 │   ├── ops.rs
@@ -312,11 +392,14 @@ src/
 │   ├── github_sync_target.rs
 │   ├── hooks.rs
 │   ├── mod.rs
+│   ├── native_campaign.rs
 │   ├── review_tuning.rs
 │   ├── state_machine.rs
 │   ├── terminal_cleanup.rs
 │   ├── transition_cleanup.rs
 │   └── transition_core.rs
+├── reconcile/
+│   └── delivery_guard.rs
 ├── runtime_layout/
 │   ├── config_merge.rs
 │   ├── legacy_migration.rs
@@ -326,6 +409,48 @@ src/
 │   ├── skill_sync.rs
 │   └── windows_links.rs
 ├── server/
+│   ├── campaign_execution/
+│   │   ├── inputs/
+│   │   │   └── publication.rs
+│   │   ├── inputs.rs
+│   │   ├── native_tests.rs
+│   │   └── plan.rs
+│   ├── campaign_graph/
+│   │   ├── occurrence_context/
+│   │   │   └── tests.rs
+│   │   ├── budget_revision_tests.rs
+│   │   ├── cancelled_validator_replan_tests.rs
+│   │   ├── effect_ownership_tests.rs
+│   │   ├── finish_recovery_tests.rs
+│   │   ├── graph_card_identity_tests.rs
+│   │   ├── initial_plan_replan_tests.rs
+│   │   ├── learning.rs
+│   │   ├── learning_tests.rs
+│   │   ├── manager.rs
+│   │   ├── observation.rs
+│   │   ├── occurrence_context.rs
+│   │   ├── planning.rs
+│   │   ├── planning_input_tests.rs
+│   │   ├── planning_ownership_tests.rs
+│   │   ├── planning_recovery_tests.rs
+│   │   ├── proposal_identity_tests.rs
+│   │   ├── reconcile.rs
+│   │   ├── recovery_tests.rs
+│   │   ├── rejected_candidate_replan_tests.rs
+│   │   ├── replan_artifact_tests.rs
+│   │   ├── replan_effect_tests.rs
+│   │   ├── replan_policy_tests.rs
+│   │   ├── replan_settled_effect_tests.rs
+│   │   ├── replan_tests.rs
+│   │   ├── replan_validation_tests.rs
+│   │   ├── result_transport_tests.rs
+│   │   ├── revision_tests.rs
+│   │   ├── schedule_budget_tests.rs
+│   │   ├── schedule_rollover_tests.rs
+│   │   ├── tests.rs
+│   │   ├── unstarted_planner_tests.rs
+│   │   ├── validation_recovery_tests.rs
+│   │   └── workflow_tests.rs
 │   ├── dashboard_auth/
 │   │   └── tests.rs
 │   ├── dto/
@@ -345,6 +470,8 @@ src/
 │   │   │   └── agent_read.rs
 │   │   ├── agents_turn_deliver/
 │   │   │   └── pg_tests.rs
+│   │   ├── campaigns/
+│   │   │   └── settled_effect_auth.rs
 │   │   ├── dispatches/
 │   │   │   ├── crud.rs
 │   │   │   ├── discord_delivery.rs
@@ -354,8 +481,11 @@ src/
 │   │   ├── docs/
 │   │   │   ├── inventory/
 │   │   │   │   └── endpoints/
+│   │   │   │       ├── campaign_graph.rs
+│   │   │   │       ├── campaign_operations.rs
 │   │   │   │       ├── cluster_execution.rs
 │   │   │   │       ├── kakao_calendar.rs
+│   │   │   │       ├── managed_checks.rs
 │   │   │   │       ├── mod.rs
 │   │   │   │       ├── part_01.rs
 │   │   │   │       ├── part_02.rs
@@ -391,6 +521,8 @@ src/
 │   │   │   ├── session_repair.rs
 │   │   │   ├── tui_output_readiness_tests.rs
 │   │   │   └── unread_tail_attribution_tests.rs
+│   │   ├── queue_api/
+│   │   │   └── watcher_state_tests.rs
 │   │   ├── review_verdict/
 │   │   │   ├── decision_route.rs
 │   │   │   ├── mod.rs
@@ -450,6 +582,7 @@ src/
 │   │   ├── kanban.rs
 │   │   ├── kanban_repos.rs
 │   │   ├── maintenance.rs
+│   │   ├── managed_checks.rs
 │   │   ├── meetings.rs
 │   │   ├── memory_api.rs
 │   │   ├── message_outbox.rs
@@ -485,12 +618,30 @@ src/
 │   │   ├── voice_audio.rs
 │   │   ├── voice_conductor.rs
 │   │   └── voice_config.rs
+│   ├── test_phase_runs/
+│   │   ├── checks/
+│   │   │   ├── artifacts.rs
+│   │   │   ├── capture.rs
+│   │   │   ├── driver.rs
+│   │   │   ├── native_tests.rs
+│   │   │   ├── pg_tests.rs
+│   │   │   ├── process.rs
+│   │   │   ├── process_linux.rs
+│   │   │   ├── rework.rs
+│   │   │   ├── snapshot.rs
+│   │   │   └── store.rs
+│   │   ├── checks.rs
+│   │   ├── lifecycle.rs
+│   │   ├── lifecycle_pg_tests.rs
+│   │   └── store.rs
 │   ├── web_surface/
 │   │   ├── peer_filter.rs
 │   │   └── tests.rs
 │   ├── worker_registry/
 │   │   ├── registry.rs
 │   │   └── status.rs
+│   ├── campaign_execution.rs
+│   ├── campaign_graph.rs
 │   ├── cluster.rs
 │   ├── cluster_session_routing.rs
 │   ├── cron_catalog.rs
@@ -503,6 +654,7 @@ src/
 │   ├── outbox_actionable_delivery.rs
 │   ├── outbox_delivery_alert.rs
 │   ├── outbox_worker.rs
+│   ├── rate_limit_headers.rs
 │   ├── rate_limit_profiles.rs
 │   ├── rate_limit_sync.rs
 │   ├── resource_locks.rs
@@ -559,6 +711,8 @@ src/
 │   │   ├── patterns.rs
 │   │   └── storage.rs
 │   ├── auto_queue/
+│   │   ├── cleanup_tasks/
+│   │   │   └── payload.rs
 │   │   ├── runtime/
 │   │   │   ├── clear_slot_sessions_pg_tests.rs
 │   │   │   ├── slot_reset_host_pg_tests.rs
@@ -699,6 +853,17 @@ src/
 │   │   ├── channel_ingress/
 │   │   │   └── tests.rs
 │   │   ├── execution_capacity/
+│   │   │   ├── recovery/
+│   │   │   │   ├── local_process/
+│   │   │   │   │   └── tests.rs
+│   │   │   │   └── local_process.rs
+│   │   │   ├── renewal/
+│   │   │   │   └── tests.rs
+│   │   │   ├── admission.rs
+│   │   │   ├── managed.rs
+│   │   │   ├── managed_tests.rs
+│   │   │   ├── recovery.rs
+│   │   │   ├── renewal.rs
 │   │   │   ├── store.rs
 │   │   │   └── tests.rs
 │   │   ├── execution_requirements/
@@ -742,6 +907,8 @@ src/
 │   │   │   ├── sampler.rs
 │   │   │   ├── store.rs
 │   │   │   └── tests.rs
+│   │   ├── node_registry/
+│   │   │   └── identity.rs
 │   │   ├── readiness/
 │   │   │   └── tests.rs
 │   │   ├── stream_relay/
@@ -799,7 +966,8 @@ src/
 │   │   ├── tui_session_launch.rs
 │   │   └── tui_tail_result.rs
 │   ├── codex_tmux_wrapper/
-│   │   └── input.rs
+│   │   ├── input.rs
+│   │   └── launch_settings.rs
 │   ├── codex_tui/
 │   │   ├── busy_inject/
 │   │   │   ├── inject_tests.rs
@@ -1004,7 +1172,15 @@ src/
 │   │   │   ├── relay_auto_heal/
 │   │   │   │   ├── orphan_token_tests.rs
 │   │   │   │   └── retired_redrive_tests.rs
+│   │   │   ├── session_enrichment/
+│   │   │   │   ├── relay_backlog/
+│   │   │   │   │   ├── source_scan.rs
+│   │   │   │   │   └── tests.rs
+│   │   │   │   └── relay_backlog.rs
 │   │   │   ├── snapshot/
+│   │   │   │   ├── channel_owner/
+│   │   │   │   │   └── tests.rs
+│   │   │   │   ├── channel_owner.rs
 │   │   │   │   └── relay_probe.rs
 │   │   │   ├── stall_liveness/
 │   │   │   │   └── redrive_grace.rs
@@ -1045,6 +1221,7 @@ src/
 │   │   │   ├── transcript_turn_tests.rs
 │   │   │   ├── turn_deliver.rs
 │   │   │   ├── unpaired_active_token.rs
+│   │   │   ├── watchdog_test_support.rs
 │   │   │   └── watcher_respawn.rs
 │   │   ├── host_teardown_gate/
 │   │   │   └── test_support.rs
@@ -1345,6 +1522,7 @@ src/
 │   │   │   ├── manual_rebind/
 │   │   │   │   ├── adoption.rs
 │   │   │   │   ├── adoption_notice_pg_tests.rs
+│   │   │   │   ├── authority_test_support.rs
 │   │   │   │   ├── codex_tui_replay.rs
 │   │   │   │   ├── coordinate_adoption.rs
 │   │   │   │   ├── coordinate_adoption_tests.rs
@@ -1664,6 +1842,10 @@ src/
 │   │   │   ├── read.rs
 │   │   │   ├── validation.rs
 │   │   │   └── write.rs
+│   │   ├── skills_scan/
+│   │   │   └── fingerprint.rs
+│   │   ├── streaming_finalizer/
+│   │   │   └── native_campaign_tests.rs
 │   │   ├── task_notification_delivery/
 │   │   │   ├── store/
 │   │   │   │   ├── card_claim.rs
@@ -1700,6 +1882,7 @@ src/
 │   │   ├── tmux_output_stream/
 │   │   │   ├── tests/
 │   │   │   │   └── compact_summary_tests.rs
+│   │   │   ├── graph_progress.rs
 │   │   │   ├── native_codex.rs
 │   │   │   └── provider_output_guard_tests.rs
 │   │   ├── tmux_placeholder_suppression/
@@ -1714,7 +1897,8 @@ src/
 │   │   │   ├── retirement_await_tests.rs
 │   │   │   └── stale_busy_identity.rs
 │   │   ├── tmux_session_files/
-│   │   │   └── input_fence_tests.rs
+│   │   │   ├── input_fence_tests.rs
+│   │   │   └── orphan_sweep.rs
 │   │   ├── tmux_watcher/
 │   │   │   ├── cancel_handoff/
 │   │   │   │   ├── completion.rs
@@ -1747,6 +1931,7 @@ src/
 │   │   │   │   ├── chunk_forward.rs
 │   │   │   │   ├── entry.rs
 │   │   │   │   ├── observations.rs
+│   │   │   │   ├── render_seed.rs
 │   │   │   │   └── state.rs
 │   │   │   ├── cancel_handoff.rs
 │   │   │   ├── commit_decisions.rs
@@ -1944,6 +2129,7 @@ src/
 │   │   │   └── tests.rs
 │   │   ├── turn_bridge/
 │   │   │   ├── completion_guard/
+│   │   │   │   ├── campaign.rs
 │   │   │   │   ├── completion_context.rs
 │   │   │   │   ├── completion_postgres.rs
 │   │   │   │   ├── replay_hold_tests.rs
@@ -1986,6 +2172,7 @@ src/
 │   │   │   │   │   ├── authority_tests.rs
 │   │   │   │   │   ├── task_notification.rs
 │   │   │   │   │   └── types.rs
+│   │   │   │   ├── cancel.rs
 │   │   │   │   ├── content_arms.rs
 │   │   │   │   ├── exit_reconcile.rs
 │   │   │   │   ├── expected_identity.rs
@@ -1994,6 +2181,8 @@ src/
 │   │   │   │   ├── provider_recovery.rs
 │   │   │   │   ├── tool_arms.rs
 │   │   │   │   └── types.rs
+│   │   │   ├── stream_receiver/
+│   │   │   │   └── tests.rs
 │   │   │   ├── stream_tick/
 │   │   │   │   ├── guarded_persist.rs
 │   │   │   │   ├── guarded_persist_tests.rs
@@ -2044,6 +2233,7 @@ src/
 │   │   │   │   ├── process_backend_cancel.rs
 │   │   │   │   ├── process_force_kill_tests.rs
 │   │   │   │   ├── process_table.rs
+│   │   │   │   ├── qwen_generation_tests.rs
 │   │   │   │   ├── session_stop.rs
 │   │   │   │   ├── session_stop_tests.rs
 │   │   │   │   ├── stop_host.rs
@@ -2228,6 +2418,7 @@ src/
 │   │   ├── destructive_cancel_capture.rs
 │   │   ├── destructive_cancel_gate.rs
 │   │   ├── discord_io.rs
+│   │   ├── dispatch_cleanup.rs
 │   │   ├── dispatch_policy.rs
 │   │   ├── e2e_control.rs
 │   │   ├── execution_identity.rs
@@ -2311,6 +2502,7 @@ src/
 │   │   ├── runtime_bootstrap.rs
 │   │   ├── runtime_store.rs
 │   │   ├── runtime_store_checkpoint_lock_tests.rs
+│   │   ├── runtime_tuning.rs
 │   │   ├── semantic_boundaries.rs
 │   │   ├── session_banner.rs
 │   │   ├── session_canonical_identity.rs
@@ -2390,6 +2582,8 @@ src/
 │   │   └── tmux_cleanup.rs
 │   ├── dispatches/
 │   │   ├── discord_delivery/
+│   │   │   ├── thread_reuse/
+│   │   │   │   └── startup_validation_tests.rs
 │   │   │   ├── guard.rs
 │   │   │   ├── mod.rs
 │   │   │   ├── orchestration.rs
@@ -2406,6 +2600,8 @@ src/
 │   │   ├── thread_reuse.rs
 │   │   └── wait_queue.rs
 │   ├── git/
+│   │   ├── commit_resolver/
+│   │   │   └── base_ref_tests.rs
 │   │   ├── branch_resolver.rs
 │   │   ├── commit_resolver.rs
 │   │   ├── mod.rs
@@ -2439,6 +2635,8 @@ src/
 │   │   │   ├── voice_cache_sweep.rs
 │   │   │   └── worktree_orphan_sweep.rs
 │   │   └── mod.rs
+│   ├── managed_checks/
+│   │   └── contract.rs
 │   ├── manual_steer/
 │   │   ├── action_handle.rs
 │   │   ├── admission_intent.rs
@@ -2482,8 +2680,15 @@ src/
 │   │   ├── mod.rs
 │   │   └── provider.rs
 │   ├── opencode/
+│   │   ├── completion_tests.rs
+│   │   ├── managed_native_tests.rs
+│   │   ├── managed_runtime.rs
+│   │   ├── managed_session.rs
+│   │   ├── permissions.rs
+│   │   ├── runtime_identity.rs
 │   │   ├── server_launch.rs
-│   │   └── streaming_entry.rs
+│   │   ├── streaming_entry.rs
+│   │   └── watchdog.rs
 │   ├── pipeline_routes/
 │   │   ├── stage_validation.rs
 │   │   └── stage_validation_tests.rs
@@ -2493,28 +2698,38 @@ src/
 │   │   │   ├── resolution.rs
 │   │   │   ├── runtime_path.rs
 │   │   │   └── windows_codex.rs
+│   │   ├── managed_process/
+│   │   │   ├── linux/
+│   │   │   │   └── tests.rs
+│   │   │   └── linux.rs
 │   │   ├── tmux/
 │   │   │   ├── liveness/
 │   │   │   │   └── tests.rs
 │   │   │   ├── availability.rs
 │   │   │   ├── health_probe.rs
 │   │   │   ├── liveness.rs
+│   │   │   ├── presence.rs
 │   │   │   ├── sized.rs
 │   │   │   └── sized_cleanup_tests.rs
 │   │   ├── binary_resolver.rs
 │   │   ├── dump_tool.rs
+│   │   ├── managed_process.rs
 │   │   ├── mod.rs
 │   │   ├── network.rs
 │   │   ├── shell.rs
 │   │   ├── tmux.rs
 │   │   └── windows_job.rs
 │   ├── process/
+│   │   ├── descendant_tree/
+│   │   │   └── tests.rs
 │   │   ├── stream_child/
 │   │   │   ├── stream_queue/
 │   │   │   │   ├── test_delay.rs
 │   │   │   │   └── tests.rs
 │   │   │   ├── stream_queue.rs
 │   │   │   └── test_fixture.rs
+│   │   ├── bounded_probe.rs
+│   │   ├── descendant_tree.rs
 │   │   └── stream_child.rs
 │   ├── provider/
 │   │   ├── cancel_token_cleanup/
@@ -2526,6 +2741,7 @@ src/
 │   │   ├── cancel_token_codex_owed.rs
 │   │   ├── cancel_watchdog.rs
 │   │   ├── channel_rules.rs
+│   │   ├── codex_context_window.rs
 │   │   ├── herdr_before_start.rs
 │   │   ├── output_reader.rs
 │   │   ├── provider_conformance_invariant_tests.rs
@@ -2552,9 +2768,18 @@ src/
 │   │   ├── snapshot.rs
 │   │   └── upgrade.rs
 │   ├── qwen/
+│   │   ├── session_lifecycle/
+│   │   │   └── tests.rs
 │   │   ├── followup_reader.rs
 │   │   ├── fresh_session.rs
-│   │   └── session_lifecycle.rs
+│   │   ├── protocol.rs
+│   │   ├── retry_fixture.rs
+│   │   ├── retry_tests.rs
+│   │   ├── session_lifecycle.rs
+│   │   └── system_settings.rs
+│   ├── qwen_tmux_wrapper/
+│   │   ├── native_protocol_tests.rs
+│   │   └── retry_tests.rs
 │   ├── recovery_defer/
 │   │   ├── cursor.rs
 │   │   └── tests.rs
@@ -2571,12 +2796,19 @@ src/
 │   │   └── worktree_stale.rs
 │   ├── routines/
 │   │   ├── agent_executor/
+│   │   │   ├── completion_pg_tests.rs
+│   │   │   ├── identity.rs
 │   │   │   ├── reliability.rs
 │   │   │   └── start_deferral.rs
 │   │   ├── discord_log/
 │   │   │   └── failure_alert.rs
 │   │   ├── loader/
 │   │   │   └── discovery.rs
+│   │   ├── store/
+│   │   │   ├── campaign/
+│   │   │   │   └── tests.rs
+│   │   │   ├── campaign.rs
+│   │   │   └── validation.rs
 │   │   ├── action.rs
 │   │   ├── agent_executor.rs
 │   │   ├── discord_log.rs
@@ -2600,6 +2832,7 @@ src/
 │   │   └── timing.rs
 │   ├── session_backend/
 │   │   ├── auth_profiles.rs
+│   │   ├── liveness.rs
 │   │   ├── output.rs
 │   │   ├── stream_line.rs
 │   │   └── terminal_usage.rs
@@ -2644,7 +2877,8 @@ src/
 │   │   ├── tmux_host.rs
 │   │   └── traits.rs
 │   ├── settings/
-│   │   └── runtime_config_put.rs
+│   │   ├── runtime_config_put.rs
+│   │   └── runtime_config_read.rs
 │   ├── slo/
 │   │   └── mod.rs
 │   ├── stale_turn_reconciler/
@@ -2664,6 +2898,7 @@ src/
 │   │   └── host_terminate.rs
 │   ├── tmux_common/
 │   │   ├── host_marker.rs
+│   │   ├── namespace.rs
 │   │   └── session_markers.rs
 │   ├── tmux_turn_liveness/
 │   │   ├── cleanup_host.rs
@@ -3054,6 +3289,8 @@ src/
 │   ├── automation_candidate_contract.rs
 │   ├── automation_candidate_materializer.rs
 │   ├── calendar_sync.rs
+│   ├── campaign_artifacts.rs
+│   ├── campaign_control_input.rs
 │   ├── claude.rs
 │   ├── claude_command.rs
 │   ├── claude_compact_context.rs
@@ -3086,6 +3323,7 @@ src/
 │   ├── kakao_message.rs
 │   ├── kanban.rs
 │   ├── kanban_cards.rs
+│   ├── managed_checks.rs
 │   ├── manual_steer.rs
 │   ├── mcp_config.rs
 │   ├── message_outbox.rs
@@ -3243,6 +3481,7 @@ This table is generated from the current `src/` root and fails CI when a new top
 | `src/engine/` | QuickJS policy runtime, hook wiring, transition logic, and Rust-JS bridge ops. |
 | `src/github/` | GitHub sync, issue triage, and Definition-of-Done mirroring. |
 | `src/kanban/` | High-level kanban orchestration, state machine facade, and shared test support. |
+| `src/reconcile/` | Read-only classification helpers for boot-time delivery reconciliation guards. |
 | `src/runtime_layout/` | Managed runtime layout, memory-path migration, shared prompt sync, and skill deployment. |
 | `src/server/` | Axum server boot, routes, workers, background loops, and WebSocket broadcast. |
 | `src/services/` | Core runtime services: provider runners, Discord bot, queueing, memory, and platform helpers. |

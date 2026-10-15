@@ -25,9 +25,27 @@ pub(crate) fn lock_env_then_runtime() -> EnvRuntimeGuard {
 #[cfg(unix)]
 #[test]
 fn env_runtime_fixtures_finish_in_parallel() {
+    use std::collections::BTreeSet;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    let expected: BTreeSet<_> = [
+        "services::discord::tui_prompt_relay::synthetic_start::tests::witnessless_reclaim_records_the_i20_violation_and_a_witnessed_one_does_not",
+        "services::discord::tui_prompt_relay::tests::synthetic_terminal_ordering_tests::synthetic_terminal_duplicate_finalizer_preserves_same_nonce_recovery_actor",
+        "services::discord::tui_prompt_relay::tests::synthetic_terminal_ordering_tests::synthetic_terminal_gateway_preserves_same_nonce_recovery_actor",
+        "services::discord::tui_prompt_relay::tests::synthetic_terminal_ordering_tests::synthetic_terminal_gateway_rejects_lost_admitted_source",
+        "services::discord::tui_prompt_relay::tests::synthetic_terminal_ordering_tests::synthetic_terminal_gateway_retains_original_actor_until_publication",
+        "services::discord::tui_prompt_relay::tests::synthetic_terminal_ordering_tests::synthetic_terminal_gateway_source_loss_preserves_same_nonce_successor",
+        "services::discord::turn_bridge::runtime_handoff_loop::tests::thread_follow_up_tmux_ready_claim_records_intended_classification_4984",
+        "services::discord::voice_barge_in::tests::pcm_harness_tests::voice_foreground_path_does_not_double_chime",
+        "services::discord::voice_barge_in::tests::pcm_harness_tests::voice_intake_chime_absent_on_active_turn_barge_in",
+        "services::discord::voice_barge_in::tests::pcm_harness_tests::voice_intake_chime_absent_on_empty_transcript",
+        "services::discord::voice_barge_in::tests::pcm_harness_tests::voice_intake_chime_fires_before_turn_start",
+        "services::discord::voice_barge_in::tests::pcm_harness_tests::voice_intake_chime_fires_even_when_turn_start_fails",
+        "services::discord::voice_barge_in::tests::pcm_harness_tests::voice_pcm_harness_unattended_e2e",
+    ]
+    .into_iter()
+    .collect();
     let _env = crate::config::test_env_lock::acquire_shared_test_env_lock();
     for round in 0..3 {
         let output = tempfile::tempfile().unwrap();
@@ -63,7 +81,6 @@ fn env_runtime_fixtures_finish_in_parallel() {
         output.seek(SeekFrom::Start(0)).unwrap();
         let mut log = String::new();
         output.read_to_string(&mut log).unwrap();
-        println!("parallel fixture round {round}:\n{log}");
         assert!(
             status.is_some_and(|status| status.success()),
             "round {round}: fixtures failed or deadlocked\n{log}"
@@ -71,6 +88,18 @@ fn env_runtime_fixtures_finish_in_parallel() {
         assert!(
             log.contains("13 passed; 0 failed; 0 ignored"),
             "round {round}: incomplete fixture coverage\n{log}"
+        );
+        let passed: BTreeSet<_> = log
+            .lines()
+            .filter_map(|line| line.strip_prefix("test ")?.strip_suffix(" ... ok"))
+            .collect();
+        assert_eq!(
+            passed, expected,
+            "round {round}: fixture identity changed\n{log}"
+        );
+        println!(
+            "parallel fixture round {round}: {} exact fixtures passed",
+            passed.len()
         );
     }
 }

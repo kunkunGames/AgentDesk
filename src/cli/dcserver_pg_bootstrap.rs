@@ -170,6 +170,9 @@ pub(crate) fn schema_ahead_hold_enabled() -> bool {
 /// Describes a database whose applied migrations are all newer than this
 /// binary's latest; a gap below that latest is drift, not "ahead".
 fn schema_ahead_detail(status: &MigrationStatus) -> Option<String> {
+    if !status.history_issues.is_empty() {
+        return None;
+    }
     let latest = *status.resolved_versions.iter().max()?;
     let ahead = &status.missing_from_resolved;
     if ahead.is_empty() || ahead.iter().any(|version| *version <= latest) {
@@ -567,6 +570,7 @@ mod tests {
             resolved_versions: resolved.to_vec(),
             missing_from_resolved: missing.to_vec(),
             pending_versions: Vec::new(),
+            history_issues: Vec::new(),
         }
     }
 
@@ -578,6 +582,9 @@ mod tests {
         assert!(schema_ahead_detail(&status(&[1, 2, 3], &[0, 4])).is_none());
         assert!(schema_ahead_detail(&status(&[1, 2, 3], &[])).is_none());
         assert!(schema_ahead_detail(&status(&[], &[4])).is_none());
+        let mut corrupt = status(&[1, 2, 3], &[4]);
+        corrupt.history_issues.push("missing receipt 2".into());
+        assert!(schema_ahead_detail(&corrupt).is_none());
     }
 
     /// Writes `bytes` beside `path` and renames it over, as the deploy does.

@@ -30,12 +30,15 @@ class SqlExecutionSurfaceInventoryTests(unittest.TestCase):
             rc = scanner.main(list(args), root)
         return rc, stdout.getvalue(), stderr.getvalue()
 
-    def test_enumerates_only_tracked_three_roots(self):
+    def test_enumerates_only_tracked_source_and_all_migration_catalogs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             names = ["src/lib.rs", "policies/rule.js", "policies/default.yaml",
                 "migrations/postgres/0001.sql",
                 "migrations/postgres/immutable-checksums.json",
+                "migrations/postgres_campaign_v5/0131_native.sql",
+                "migrations/postgres_shared/0147_shared.sql",
+                "migrations/postgres_shared/README.md",
             ]
             for name in names:
                 self.write(root, name, "// fixture\n")
@@ -44,14 +47,21 @@ class SqlExecutionSurfaceInventoryTests(unittest.TestCase):
             with self.tracked(names) as git:
                 inputs = scanner.enumerate_tracked_inputs(root)
             self.assertEqual([item.rel_path for item in inputs], sorted(names))
-            self.assertEqual({item.root for item in inputs}, {"src", "policies", "migrations/postgres"})
-            self.assertEqual(git.call_args.args[0][-3:], ["src", "policies", "migrations/postgres"])
+            roots = ["src", "policies", "migrations/postgres", "migrations/postgres_campaign_v5", "migrations/postgres_shared"]
+            self.assertEqual({item.root for item in inputs}, set(roots))
+            self.assertEqual(git.call_args.args[0][-5:], roots)
+            with self.tracked(names):
+                records = scanner.scan_inventory(root)
+            self.assertTrue(set(roots[2:]).issubset({record.root for record in records}))
             self.assertEqual(next(i.kind for i in inputs if i.rel_path.endswith(".json")), "MIGRATION_METADATA")
             with self.tracked(["migrations/postgres/immutable-checksums.json"]):
                 rc, out, err = self.run_main(root, "--verbose")
             self.assertEqual((rc, err), (0, ""))
             self.assertIn("NON_SQL_TRACKED", out)
             self.assertIn("immutable-checksums.json", out)
+            (root / "migrations/postgres_campaign_v5/0131_native.sql").unlink()
+            with self.tracked(names), self.assertRaises(scanner.InventoryError):
+                scanner.enumerate_tracked_inputs(root)
     def test_tracked_symlink_and_unexpected_extension_fail_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

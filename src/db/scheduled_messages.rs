@@ -449,6 +449,9 @@ pub async fn claim_due_fires_pg(
     let due = sqlx::query_as::<_, ScheduledMessageRow>(&format!(
         "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages
          WHERE status = 'scheduled' AND scheduled_at <= $1
+           -- Rolling upgrades: a legacy worker cannot open sealed delivery plans.
+           -- to_jsonb also supports databases without the newer optional column.
+           AND to_jsonb(scheduled_messages)->>'external_delivery_plan_id' IS NULL
            AND ($2 OR (
                delivery_kind = 'push'
                AND target_channel_id IS NULL

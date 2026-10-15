@@ -33,7 +33,7 @@ pub(super) fn provider_error_presentation(
     } else {
         ProviderErrorPresentation::Failure(
             crate::services::discord::commands::owner_error_response(
-                "provider가 응답을 완료하지 못했어요.\n같은 요청을 다시 시도해 주세요. 문제가 반복되면 `!clear`로 세션을 초기화한 뒤 다시 보내 주세요.",
+                crate::services::provider_error_transcript::PROVIDER_FAILURE_GUIDANCE,
                 &detail,
             ),
         )
@@ -91,5 +91,31 @@ mod tests {
         assert!(response.contains("같은 요청을 다시 시도"));
         assert!(response.contains("||**상세**\n```text\nError: bare provider failure\n```||"));
         assert!(!response.contains("stderr:"));
+    }
+
+    #[test]
+    fn every_presented_transport_failure_is_rejected_as_routine_output() {
+        for detail in [
+            "Qwen stream produced no output for 240 seconds before first progress",
+            "[stream-json-no-output] StreamJson CLI produced no output for 300 seconds",
+            "Failed to create OpenCode session: Network Error: timed out reading response",
+            "new provider failure without a known marker",
+        ] {
+            let ProviderErrorPresentation::Failure(response) =
+                provider_error_presentation(detail, "")
+            else {
+                panic!("expected transport failure");
+            };
+            assert!(
+                crate::services::provider_error_transcript::is_strong_provider_error_transcript(
+                    &response
+                )
+            );
+            assert!(
+                !crate::services::provider_error_transcript::is_strong_provider_error_transcript(
+                    &format!("Example: {response}\nThe retry succeeded.")
+                )
+            );
+        }
     }
 }

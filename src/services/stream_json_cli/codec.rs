@@ -20,7 +20,7 @@ pub trait StreamJsonCodec: Send {
 pub struct MessagesJsonCodec {
     state: StreamLineState,
     session_id: Option<String>,
-    emitted_done: bool,
+    emitted_terminal: bool,
 }
 
 impl MessagesJsonCodec {
@@ -28,7 +28,7 @@ impl MessagesJsonCodec {
         Self {
             state: StreamLineState::new(),
             session_id: None,
-            emitted_done: false,
+            emitted_terminal: false,
         }
     }
 }
@@ -41,6 +41,9 @@ impl Default for MessagesJsonCodec {
 
 impl StreamJsonCodec for MessagesJsonCodec {
     fn push_stdout_line(&mut self, line: &str) -> Result<Vec<StreamMessage>, String> {
+        if self.emitted_terminal {
+            return Ok(Vec::new());
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Ok(Vec::new());
@@ -58,11 +61,13 @@ impl StreamJsonCodec for MessagesJsonCodec {
         let keep_going = process_stream_line(trimmed, &tx, &mut self.state);
         drop(tx);
         let emitted: Vec<StreamMessage> = rx.try_iter().collect();
-        if emitted
-            .iter()
-            .any(|message| matches!(message, StreamMessage::Done { .. }))
-        {
-            self.emitted_done = true;
+        if emitted.iter().any(|message| {
+            matches!(
+                message,
+                StreamMessage::Done { .. } | StreamMessage::Error { .. }
+            )
+        }) {
+            self.emitted_terminal = true;
         }
         if !keep_going && emitted.is_empty() {
             return Err("StreamJson codec stopped without messages".into());
@@ -75,7 +80,7 @@ impl StreamJsonCodec for MessagesJsonCodec {
         exit_code: Option<i32>,
         stderr: &str,
     ) -> Result<Vec<StreamMessage>, String> {
-        if self.emitted_done {
+        if self.emitted_terminal {
             return Ok(Vec::new());
         }
         if let Some((message, stdout)) = self.state.stdout_error.take() {
@@ -455,12 +460,24 @@ mod tests {
                 r#"{"type":"result","subtype":"error","is_error":true,"result":"provider rejected the turn","session_id":"01234567-89ab-cdef-0123-456789abcdef"}"#,
             )
             .unwrap();
-        assert!(emitted.is_empty());
-        let error = codec.finish(Some(0), "").unwrap();
         assert!(matches!(
-            error.as_slice(),
+            emitted.as_slice(),
             [StreamMessage::Error { message, .. }] if message == "provider rejected the turn"
         ));
+        assert!(
+            codec
+                .push_stdout_line(r#"{"type":"result","is_error":false,"result":"late success"}"#)
+                .unwrap()
+                .is_empty(),
+            "a terminal error cannot be replaced by a later success"
+        );
+        assert!(
+            codec
+                .finish(Some(1), "process teardown")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(codec.finish(Some(0), "").unwrap().is_empty());
     }
 
     #[test]

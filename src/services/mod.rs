@@ -8,6 +8,8 @@ pub mod api_friction;
 pub mod auto_queue;
 pub mod automation_candidate_contract;
 pub mod automation_candidate_materializer;
+pub(crate) mod campaign_artifacts;
+pub(crate) mod campaign_control_input;
 pub mod claude;
 pub(crate) mod claude_command;
 pub mod claude_compact_context;
@@ -28,6 +30,8 @@ pub(crate) mod tui_input;
 // Read only by its tests until the `adk custody status` wiring lands on top of it.
 #[allow(dead_code)]
 pub(crate) mod discord_custody;
+
+pub(crate) mod managed_checks;
 // #1693: `discord_delivery` moved to `dispatches::discord_delivery`. The
 // flat path is preserved as a re-export so existing import sites and
 // tests keep working without churn.

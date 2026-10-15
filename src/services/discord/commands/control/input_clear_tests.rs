@@ -42,7 +42,7 @@ impl ClearEffects for Fake {
         self.note(format!("clear:{session_key}"));
         Box::pin(async { true })
     }
-    fn reset_process(&self, tmux: &str) {
+    fn reset_process(&self, _shared: &crate::services::discord::SharedData, tmux: &str) {
         self.note(format!("reset:{tmux}"));
         self.scoped.fetch_or(fence::scope_held(), Ordering::SeqCst);
         self.dead.store(true, Ordering::SeqCst);

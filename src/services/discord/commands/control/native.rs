@@ -36,7 +36,7 @@ pub(in crate::services::discord) trait NativeClearEffects:
     ) -> Effect<'a>;
     fn submit(&self, ticket: &ClearTicket, deadline: Instant) -> NativeClearSubmission;
     fn composer_empty(&self, tmux: &str, deadline: Instant) -> bool;
-    fn reset_process(&self, tmux: &str);
+    fn reset_process(&self, shared: &SharedData, tmux: &str);
 }
 
 struct Production;
@@ -71,8 +71,8 @@ impl NativeClearEffects for Production {
             crate::services::claude_tui::host_input::native_clear_composer_empty(&c)
         })
     }
-    fn reset_process(&self, tmux: &str) {
-        super::reset_managed_process_session(tmux);
+    fn reset_process(&self, shared: &SharedData, tmux: &str) {
+        super::reset_managed_process_session(shared, tmux);
     }
 }
 
@@ -519,7 +519,9 @@ impl NativeClearHost for LiveClear {
             {
                 return false;
             }
-            selection.effects.reset_process(selection.cleared.name());
+            selection
+                .effects
+                .reset_process(&self.shared, selection.cleared.name());
             settle(
                 &self.shared,
                 &self.pool,
@@ -665,7 +667,7 @@ pub(in crate::services::discord) async fn native_clear_admits(
             .is_none()
                 && effects.clear_selector(&session_key).await
                 && {
-                    effects.reset_process(&tmux);
+                    effects.reset_process(shared, &tmux);
                     settle(shared, pool, channel_id, generation, None).await
                 }
         }

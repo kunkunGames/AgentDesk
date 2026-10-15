@@ -1663,6 +1663,7 @@ fn execute_streaming_local_tui_tmux(
     compact_token_limit: Option<u64>,
     force_fresh_provider_session: bool,
 ) -> Result<(), String> {
+    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)?;
     // A Herdr channel is refused before the turn lock, warm follow-up or any session cleanup.
     if crate::services::herdr_launch::herdr_configured_for_tui_launch(report_channel_id) {
         return Err(crate::services::herdr_launch::HERDR_NOT_ADMITTED.to_string());
@@ -1892,7 +1893,7 @@ fn execute_streaming_local_tui_tmux(
     wire_cancel_token_to_tmux_session(cancel_token.as_ref(), tmux_session_name);
 
     // #2172 cancel boundary: keep a clone of the cancel token so that
-    // post-tail emission (RuntimeReady / SessionDied Done) and the
+    // post-tail emission (RuntimeReady / SessionDied Error) and the
     // tail-error tmux-cleanup branch can BOTH consult `cancel_requested`
     // without re-acquiring it. The tail call itself moves its clone into
     // the rollout-tail thread; this clone stays in the launch frame.
@@ -1973,6 +1974,7 @@ fn execute_streaming_local_tmux(
     if crate::services::herdr_launch::herdr_configured_for_tui_launch(report_channel_id) {
         return Err(crate::services::herdr_launch::HERDR_NOT_ADMITTED.to_string());
     }
+    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)?;
     let auth_overlay = crate::services::discord::org_schema::overlay_from_tmux_session(
         ProviderKind::Codex,
         tmux_session_name,
@@ -2194,11 +2196,7 @@ fn execute_streaming_local_tmux(
                 reason,
                 Some(offset),
             );
-            let _ = sender.send(StreamMessage::Done {
-                result: "⚠ 세션이 종료되었습니다. 새 메시지를 보내면 새 세션이 시작됩니다."
-                    .to_string(),
-                session_id: None,
-            });
+            let _ = sender.send(StreamMessage::session_ended("Codex"));
         }
     }
 

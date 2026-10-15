@@ -4,6 +4,11 @@ Campaigns use the existing server and its configured canonical PostgreSQL pool.
 All nodes and dependency edges are one atomic revision. There is no local JSON
 copy, session-bound owner, or restart replay, and nothing runs unless a campaign
 opts into the auto-queue handoff below. After a
+
+All nodes and dependency edges are one atomic revision. The base ledger has no
+local JSON copy, session-bound owner, automatic task execution, or restart
+replay. Explicit native goal enrollment adds the execution controller described
+below; merely saving a ledger does not enroll or execute it. After a
 clear, compaction, quota stop, provider switch or server restart, load the same
 campaign ID before doing more work. A `running` node is a saved checkpoint, not
 proof that its old process remains alive: inspect its session and evidence before
@@ -47,6 +52,28 @@ hide older running work. The dashboard uses this pair for running labels and
 session details; the existing dispatch/session fields retain their latest-record
 meaning. `live` is computed on every read and never written back, so it can
 disagree with a node's saved `status`.
+
+### Explicit native goal execution
+
+Native execution is an opt-in extension. It requires `internalTasksEnabled`,
+an enrolled goal and eligible Codex/Qwen/OpenCode executors. Agent-authored
+graphs undergo independent validation before the existing Kanban, Auto Queue
+and dispatch owners execute their nodes. A configured schedule creates bounded
+occurrences; it does not replay missed routine invocations wholesale.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| GET | `/campaigns/{id}/execution` | Goal, graph versions, tasks, observations, failures, budgets and occurrences; `enrolled:false` when absent |
+| POST | `/campaigns/{id}/execution` | Enroll a goal using `expected_revision` and `goal`; does not overwrite an existing contract |
+| POST | `/campaigns/{id}/execution/activate` | Activate an independently validated graph using `expected_revision` and `version` |
+| POST | `/campaigns/{id}/execution/reconcile` | Record explicit recovery evidence for an eligible held artifact task; fresh validation remains required |
+| POST | `/campaigns/{id}/execution/revise` | Migration 138: audit a goal correction while paused and before business tasks/occurrences; retains original goal and all usage |
+
+The native goal revision history is separate from the base ledger's ten-snapshot
+history. See [native execution](24x7-native-v5/CAMPAIGN-EXECUTION.md) and
+[recovery and goal revision contracts](24x7-native-v5/CAMPAIGN-RECOVERY.md).
+Check the installed release: an implementation in this checkout does not imply
+the migration-138 revision endpoint is already deployed.
 
 Campaign fields: `id`, `title`, `description`, `status`, `round`, `revision`,
 `auto_queue`, `nodes`, `created_at`, `updated_at`. `auto_queue` defaults to false;

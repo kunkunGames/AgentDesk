@@ -82,7 +82,6 @@ mod tests {
             "{name}: {}\n{stdout}\n{stderr}",
             output.status
         );
-        eprintln!("isolated child verified: {name}; selected=1");
     }
 
     #[test]

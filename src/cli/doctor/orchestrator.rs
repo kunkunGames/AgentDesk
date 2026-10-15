@@ -3445,10 +3445,11 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                     CheckGroup::Core,
                     "PostgreSQL",
                     format!(
-                        "{summary} — migration drift: missing_from_resolved={:?} unsuccessful={:?} checksum_mismatches={}",
+                        "{summary} — migration drift: missing_from_resolved={:?} unsuccessful={:?} checksum_mismatches={} history_issues={:?}",
                         status.missing_from_resolved,
                         unsuccessful_migration_versions(&status),
-                        format_checksum_mismatches(&checksum_mismatches)
+                        format_checksum_mismatches(&checksum_mismatches),
+                        status.history_issues
                     ),
                     "Postgres _sqlx_migrations contains drift or unsuccessful migration records.",
                 )
@@ -3459,6 +3460,7 @@ fn check_postgres_connection(cfg: &config::Config) -> Check {
                     "applied_count": status.applied.len(),
                     "resolved_count": status.resolved_versions.len(),
                     "missing_from_resolved": status.missing_from_resolved,
+                    "history_issues": status.history_issues,
                     "unsuccessful_versions": unsuccessful_migration_versions(&status),
                     "pending_versions": status.pending_versions,
                     "checksum_mismatches": checksum_mismatch_evidence(&checksum_mismatches),
@@ -3560,6 +3562,7 @@ fn postgres_migration_status_is_healthy(
     checksum_mismatches: &[crate::db::postgres::MigrationChecksumMismatch],
 ) -> bool {
     status.missing_from_resolved.is_empty()
+        && status.history_issues.is_empty()
         && unsuccessful_migration_versions(status).is_empty()
         && checksum_mismatches.is_empty()
 }
@@ -3965,6 +3968,22 @@ mod profile_filter_tests {
     };
     use crate::cli::doctor::contract::{DoctorProfile, RunContext};
     use serde_json::json;
+
+    #[test]
+    fn migration_health_distinguishes_pending_suffix_from_invalid_history() {
+        let mut status = crate::db::postgres::MigrationStatus {
+            applied: Vec::new(),
+            resolved_versions: vec![1, 2, 3],
+            missing_from_resolved: Vec::new(),
+            pending_versions: vec![3],
+            history_issues: Vec::new(),
+        };
+        assert!(super::postgres_migration_status_is_healthy(&status, &[]));
+        status
+            .history_issues
+            .push("receipt 2 missing before applied receipt 3".into());
+        assert!(!super::postgres_migration_status_is_healthy(&status, &[]));
+    }
 
     #[cfg(not(target_os = "macos"))]
     #[test]

@@ -5,9 +5,19 @@
 
 mod server_launch;
 use server_launch::spawn_server;
+mod runtime_identity;
+use runtime_identity::{OpenCodeServerKey, warm_server_key};
+#[cfg(test)]
+mod managed_native_tests;
+mod managed_runtime;
+mod managed_session;
+mod permissions;
+mod watchdog;
+pub(crate) use permissions::DEFAULT_ALLOWED_TOOLS;
+#[cfg(test)]
+mod completion_tests;
 
 use std::collections::{HashMap, HashSet, hash_map::Entry};
-use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
@@ -23,7 +33,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::services::agent_protocol::StreamMessage;
-use crate::services::process::{configure_child_process_group, kill_pid_tree};
+use crate::services::process::configure_child_process_group;
 use crate::services::provider::{CancelToken, ProviderKind, cancel_requested};
 use crate::services::remote::RemoteProfile;
 
@@ -67,7 +77,10 @@ struct OpenCodeStartupOutput {
 
 struct OpenCodeServerProcess {
     child: Child,
+    identity: crate::services::process::ProcessIdentity,
     startup_output: Arc<Mutex<OpenCodeStartupOutput>>,
+    // Retained until the owned native child has been killed and reaped.
+    _managed_runtime: Option<tempfile::TempDir>,
 }
 
 impl OpenCodeServerProcess {
@@ -100,29 +113,6 @@ impl Drop for OpenCodeServerProcess {
     }
 }
 
-#[derive(Clone, Debug, Eq)]
-struct OpenCodeServerKey {
-    bin: String,
-    working_dir: String,
-    profile_id: String,
-}
-
-impl PartialEq for OpenCodeServerKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.bin == other.bin
-            && self.working_dir == other.working_dir
-            && self.profile_id == other.profile_id
-    }
-}
-
-impl Hash for OpenCodeServerKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.bin.hash(state);
-        self.working_dir.hash(state);
-        self.profile_id.hash(state);
-    }
-}
-
 struct OpenCodeWarmServer {
     key: OpenCodeServerKey,
     base_url: String,
@@ -135,6 +125,28 @@ struct OpenCodeWarmServer {
 }
 
 impl OpenCodeWarmServer {
+    fn runtime_identity(
+        &self,
+    ) -> Result<crate::services::cluster::execution_capacity::recovery::RuntimeIdentity, String>
+    {
+        let process = self
+            .process
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::services::cluster::execution_capacity::recovery::RuntimeIdentity::capture(
+            process.id(),
+            process.identity,
+        )
+    }
+
+    fn kill_owned_tree(&self) {
+        let process = self
+            .process
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::services::process::kill_pid_tree_if_identity_matches(process.id(), process.identity);
+    }
+
     fn id(&self) -> u32 {
         let process = self.process.lock().unwrap_or_else(|e| {
             tracing::warn!("Recovered poisoned lock for OpenCodeWarmServer::process");
@@ -573,6 +585,7 @@ pub fn probe_serve_health(working_dir: &str) -> Result<String, String> {
         &crate::services::provider_auth_profile::ProviderAuthOverlay::default_for(
             ProviderKind::OpenCode,
         ),
+        false,
     )?;
     let result = wait_for_health(&base_url, &auth, Some(&server.startup_output))
         .map(|_| format!("serve health ok at {base_url}"));
@@ -677,7 +690,8 @@ fn execute_command_streaming_inner(
         ProviderKind::OpenCode,
         _report_channel_id,
     )?;
-    let server = acquire_warm_server(&bin, &resolution, working_dir, &overlay)?;
+    let managed = cancel_token.is_some_and(|token| token.managed_execution.get().is_some());
+    let server = acquire_warm_server(&bin, &resolution, working_dir, &overlay, managed)?;
     // The shared `opencode serve` PID is deliberately NOT registered on the
     // caller's CancelToken. Every generic cancel/timeout sink kills
     // `CancelToken.child_pid` *unconditionally* — the provider_exec timeout
@@ -716,24 +730,6 @@ fn execute_command_streaming_inner(
 // ---------------------------------------------------------------------------
 // Server lifecycle
 // ---------------------------------------------------------------------------
-
-fn pool_working_dir(working_dir: &str) -> String {
-    std::fs::canonicalize(working_dir)
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| working_dir.to_string())
-}
-
-fn warm_server_key(bin: &str, working_dir: &str, profile_id: &str) -> OpenCodeServerKey {
-    OpenCodeServerKey {
-        bin: bin.to_string(),
-        working_dir: pool_working_dir(working_dir),
-        profile_id: if profile_id.trim().is_empty() {
-            crate::services::provider_auth_profile::DEFAULT_PROFILE_ID.to_string()
-        } else {
-            profile_id.to_string()
-        },
-    }
-}
 
 fn cleanup_idle_warm_servers(pool: &mut OpenCodeServerPool) {
     let expired = pool
@@ -854,8 +850,20 @@ fn acquire_warm_server(
     resolution: &crate::services::platform::BinaryResolution,
     working_dir: &str,
     overlay: &crate::services::provider_auth_profile::ProviderAuthOverlay,
+    managed: bool,
 ) -> Result<OpenCodeWarmServerLease, String> {
-    let key = warm_server_key(bin, working_dir, &overlay.profile_id);
+    let prepared = if managed {
+        Some(managed_runtime::prepare(bin, working_dir, overlay)?)
+    } else {
+        None
+    };
+    let overlay = prepared
+        .as_ref()
+        .map(|(overlay, _)| overlay)
+        .unwrap_or(overlay);
+    let mut key = warm_server_key(bin, working_dir, overlay);
+    key.managed = managed;
+    key.managed_identity = prepared.as_ref().map(|(_, identity)| identity.clone());
     let pool = opencode_server_pool();
     let mut pool = pool.lock().unwrap_or_else(|e| {
         tracing::warn!("Recovered poisoned lock for OpenCode server pool");
@@ -953,7 +961,15 @@ fn acquire_warm_server(
     let password = generate_password();
     let auth = build_auth_header(&password);
     let base_url = format!("http://127.0.0.1:{port}");
-    let server_process = spawn_server(bin, resolution, port, &password, working_dir, overlay)?;
+    let server_process = spawn_server(
+        bin,
+        resolution,
+        port,
+        &password,
+        working_dir,
+        overlay,
+        managed,
+    )?;
     let startup_output = server_process.startup_output.clone();
 
     if let Err(error) = wait_for_health(&base_url, &auth, Some(&startup_output)) {
@@ -1092,13 +1108,37 @@ fn run_session(
 ) -> Result<(), String> {
     // 1. Wait for server to be ready
     wait_for_health(base_url, auth, startup_output.as_ref())?;
+    let managed = cancel_token.and_then(|token| token.managed_execution.get());
+    let mut permissions = permissions::prepare(base_url, auth, allowed_tools, managed.is_some())?;
+    let managed_model = if managed.is_some() {
+        Some(managed_session::prepare(
+            permissions
+                .as_mut()
+                .ok_or("managed OpenCode requires explicit native permissions")?,
+            model,
+        )?)
+    } else {
+        None
+    };
 
     if is_cancelled(cancel_token) {
         return Err("OpenCode request cancelled before session start".to_string());
     }
 
+    if let Some(attempt) = managed {
+        let server = warm_server
+            .as_ref()
+            .ok_or("managed OpenCode requires an owned native runtime")?;
+        attempt.bind_runtime(&server.runtime_identity()?)?;
+    }
+
     // 2. Create session
-    let session_id = create_session(base_url, auth, cancel_token)?;
+    let session_id = create_session(
+        base_url,
+        auth,
+        cancel_token,
+        permissions.as_ref().map(|policy| &policy.rules),
+    )?;
 
     // 3. Announce session
     let _ = sender.send(StreamMessage::Init {
@@ -1110,52 +1150,73 @@ fn run_session(
         return Err("OpenCode request cancelled before prompt send".to_string());
     }
 
-    // 4. Connect SSE stream first, then send prompt
-    let sse_agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(2))
-        .timeout_read(SSE_READ_TIMEOUT)
-        .build();
+    // The watchdog owns the whole admitted HTTP/SSE phase, including a stalled
+    // prompt request. Per-line polling alone cannot bound a silent connection.
+    let result = watchdog::run(
+        &session_id,
+        cancel_token,
+        base_url,
+        auth,
+        warm_server.clone(),
+        || {
+            // 4. Connect SSE stream first, then send prompt
+            let sse_agent = ureq::AgentBuilder::new()
+                .timeout_connect(Duration::from_secs(2))
+                .timeout_read(SSE_READ_TIMEOUT)
+                .build();
 
-    let sse_response = match sse_agent
-        .get(&format!("{base_url}/global/event"))
-        .set("Authorization", auth)
-        .set("Accept", "text/event-stream")
-        .call()
-    {
-        Ok(response) => response,
-        Err(error) => {
-            abort_session(base_url, auth, &session_id);
-            return Err(format!("Failed to connect to OpenCode SSE stream: {error}"));
+            let sse_response = match sse_agent
+                .get(&format!("{base_url}/global/event"))
+                .set("Authorization", auth)
+                .set("Accept", "text/event-stream")
+                .call()
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    abort_session(base_url, auth, &session_id);
+                    return Err(format!("Failed to connect to OpenCode SSE stream: {error}"));
+                }
+            };
+
+            // Commit the effect boundary before the network operation. Delivery loss
+            // after this point must retain the lease as an unknown writer.
+            if let Some(attempt) = managed {
+                attempt.admit_prompt(&session_id)?;
+            }
+            // 5. Send prompt (non-blocking — server processes it while we read SSE)
+            if let Err(error) = send_prompt(
+                base_url,
+                auth,
+                &session_id,
+                prompt,
+                system_prompt,
+                allowed_tools,
+                managed_model.as_ref().or(model),
+                permissions.as_ref().map(|policy| policy.agent.as_str()),
+                cancel_token,
+            ) {
+                abort_session(base_url, auth, &session_id);
+                return Err(error);
+            }
+
+            // 6. Read SSE stream
+            let reader: BufReader<Box<dyn std::io::Read + Send>> =
+                BufReader::new(Box::new(sse_response.into_reader()));
+            consume_sse_inner(reader, &session_id, sender, cancel_token, base_url, auth)
+        },
+    );
+    if result.is_err() && managed.is_some() {
+        if let Some(cancel) = cancel_token {
+            cancel.publish_cancel_if_source_absent("managed_native_execution_unknown");
         }
-    };
-
-    // 5. Send prompt (non-blocking — server processes it while we read SSE)
-    if let Err(error) = send_prompt(
-        base_url,
-        auth,
-        &session_id,
-        prompt,
-        system_prompt,
-        allowed_tools,
-        model,
-        cancel_token,
-    ) {
         abort_session(base_url, auth, &session_id);
-        return Err(error);
+        if let Some(server) = &warm_server {
+            watchdog::retire_exclusive(server);
+        }
+        // Best-effort cleanup is not quiescence evidence. The durable guard
+        // retains this attempt until an explicit reconciliation proves stop.
     }
-
-    // 6. Read SSE stream
-    let reader: BufReader<Box<dyn std::io::Read + Send>> =
-        BufReader::new(Box::new(sse_response.into_reader()));
-    consume_sse(
-        reader,
-        &session_id,
-        sender,
-        cancel_token,
-        base_url,
-        auth,
-        warm_server,
-    )
+    result
 }
 
 fn wait_for_health(
@@ -1195,31 +1256,62 @@ fn create_session(
     base_url: &str,
     auth: &str,
     cancel_token: Option<&CancelToken>,
+    permission_rules: Option<&Value>,
 ) -> Result<String, String> {
     if is_cancelled(cancel_token) {
         return Err("OpenCode request cancelled before session creation".to_string());
     }
     let agent = session_request_agent();
+    let mut body = serde_json::json!({});
+    if let Some(rules) = permission_rules {
+        body["permission"] = rules.clone();
+    }
+    let managed_title = cancel_token
+        .filter(|token| token.managed_execution.get().is_some())
+        .map(|token| {
+            format!(
+                "AgentDesk managed attempt {}",
+                token.turn_nonce().unwrap_or("unknown")
+            )
+        });
+    if let Some(title) = &managed_title {
+        body["title"] = Value::String(title.clone());
+    }
     let response = agent
         .post(&format!("{base_url}/session"))
         .set("Authorization", auth)
         .set("Content-Type", "application/json")
-        .send_json(serde_json::json!({}))
+        .send_json(body)
         .map_err(|e| format!("Failed to create OpenCode session: {e}"))?;
 
     let json: Value = response
         .into_json()
         .map_err(|e| format!("Failed to parse session response: {e}"))?;
-    if is_cancelled(cancel_token) {
-        return Err("OpenCode request cancelled after session creation".to_string());
-    }
-
     // Accept "id", "sessionID", or "session_id"
-    ["id", "sessionID", "session_id"]
+    let session_id = ["id", "sessionID", "session_id"]
         .iter()
         .find_map(|key| json.get(key).and_then(|v| v.as_str()))
         .map(|s| s.to_string())
-        .ok_or_else(|| format!("Session response missing ID field: {json}"))
+        .ok_or_else(|| "OpenCode session response missing ID field".to_string())?;
+    if let Err(error) = permissions::validate_session(&json, permission_rules) {
+        abort_session(base_url, auth, &session_id);
+        return Err(error);
+    }
+    if managed_title
+        .as_ref()
+        .is_some_and(|title| json.get("title").and_then(Value::as_str) != Some(title.as_str()))
+    {
+        abort_session(base_url, auth, &session_id);
+        return Err(
+            "OpenCode did not bind the managed title; auxiliary title inference is unsupported"
+                .into(),
+        );
+    }
+    if is_cancelled(cancel_token) {
+        abort_session(base_url, auth, &session_id);
+        return Err("OpenCode request cancelled after session creation".to_string());
+    }
+    Ok(session_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1231,12 +1323,16 @@ fn send_prompt(
     system_prompt: Option<&str>,
     allowed_tools: Option<&[String]>,
     model: Option<&OpenCodeModelRef>,
+    agent_name: Option<&str>,
     cancel_token: Option<&CancelToken>,
 ) -> Result<(), String> {
     if is_cancelled(cancel_token) {
         return Err("OpenCode request cancelled before prompt send".to_string());
     }
-    let body = build_prompt_body(prompt, system_prompt, allowed_tools, model);
+    let mut body = build_prompt_body(prompt, system_prompt, allowed_tools, model);
+    if let Some(agent_name) = agent_name {
+        body["agent"] = serde_json::json!(agent_name);
+    }
 
     let agent = session_request_agent();
     let resp = agent
@@ -1350,7 +1446,7 @@ fn compose_system_prompt(
         names.dedup();
         if !names.is_empty() {
             parts.push(format!(
-                "AgentDesk allowed tools advisory: requested allowed tools are {}. OpenCode permission-key mapping is not verified in this runtime; follow this allowlist while AgentDesk enforces outbound safety separately.",
+                "This session is restricted by native OpenCode permissions. Requested allowed tool categories: {}.",
                 names.join(", ")
             ));
         }
@@ -1549,105 +1645,6 @@ fn emit_recovered_text_part(
 // SSE stream consumption
 // ---------------------------------------------------------------------------
 
-/// Poll interval for the cancel-watchdog thread spawned by [`consume_sse`].
-///
-/// `BufReader::lines()` blocks on `read_line` until the SSE peer emits a
-/// chunk or the OS read returns. The in-loop `is_cancelled` check only
-/// fires on the *next* line, so without a watchdog a cancel signal could
-/// take up to `SSE_READ_TIMEOUT` (120 s) to be observed — issue #2091.
-/// 250 ms is short enough to give snappy cancel UX while keeping the
-/// watchdog cost negligible (4 polls/sec, atomic load + sleep).
-const CANCEL_WATCHDOG_POLL: Duration = Duration::from_millis(250);
-
-/// Grace window between `abort_session` (graceful close) and the hard
-/// `kill_pid_tree` fallback. If the SSE socket doesn't EOF within this
-/// window, the watchdog kills the opencode server process so the TCP
-/// connection drops and `read_line` returns. Sized to cover a healthy
-/// server's abort RTT (~tens of ms) plus the main thread's tail
-/// processing without dragging the worst-case cancel latency too high.
-const WATCHDOG_KILL_GRACE: Duration = Duration::from_millis(500);
-
-fn consume_sse(
-    reader: BufReader<Box<dyn std::io::Read + Send>>,
-    session_id: &str,
-    sender: &Sender<StreamMessage>,
-    cancel_token: Option<&CancelToken>,
-    base_url: &str,
-    auth: &str,
-    warm_server: Option<Arc<OpenCodeWarmServer>>,
-) -> Result<(), String> {
-    // Watchdog: when the caller's `CancelToken` fires while we're parked
-    // inside `reader.lines()`, the in-loop poll wouldn't notice until the
-    // peer emits the next chunk. The scoped watchdog thread fires
-    // `abort_session` the moment cancel is observed, which closes the
-    // upstream SSE connection and unblocks the blocking `read_line` —
-    // dropping observed latency from `≤ SSE_READ_TIMEOUT` to `≤
-    // CANCEL_WATCHDOG_POLL + abort_session RTT`.
-    //
-    // Hard fallback: if `abort_session` times out / 5xx's and the SSE
-    // socket still hasn't EOF'd within `WATCHDOG_KILL_GRACE`, the
-    // watchdog kills the registered opencode server PID tree. The local
-    // process exit forces the SSE TCP connection closed regardless of
-    // server-side abort behaviour, capping the worst-case cancel
-    // observation at `CANCEL_WATCHDOG_POLL + ABORT_SESSION_TIMEOUT +
-    // WATCHDOG_KILL_GRACE` instead of `SSE_READ_TIMEOUT`.
-    let watchdog_done = Arc::new(AtomicBool::new(false));
-    thread::scope(|scope| {
-        if let Some(cancel) = cancel_token {
-            let stop = watchdog_done.clone();
-            let watchdog_base_url = base_url.to_string();
-            let watchdog_auth = auth.to_string();
-            let watchdog_session_id = session_id.to_string();
-            let watchdog_server = warm_server.clone();
-            scope.spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    if cancel_requested(Some(cancel)) {
-                        // Graceful: ask opencode to close the SSE stream.
-                        // Bounded by `ABORT_SESSION_TIMEOUT` (3 s).
-                        abort_session(&watchdog_base_url, &watchdog_auth, &watchdog_session_id);
-                        // Give the main thread a brief moment to observe
-                        // the peer-closed connection and exit `read_line`.
-                        let kill_deadline = Instant::now() + WATCHDOG_KILL_GRACE;
-                        while Instant::now() < kill_deadline && !stop.load(Ordering::Relaxed) {
-                            thread::sleep(Duration::from_millis(50));
-                        }
-                        // Hard fallback: if this warm server is not
-                        // shared by another active turn, kill the server
-                        // process tree so the SSE socket drops and
-                        // `read_line` returns. When multiple OpenCode
-                        // turns share the same warm server, killing the
-                        // server would interrupt unrelated sessions, so
-                        // skip the hard-kill fallback and let the bounded
-                        // read timeout surface the cancel/error instead.
-                        if !stop.load(Ordering::Relaxed)
-                            && let Some(server) = watchdog_server.as_ref()
-                        {
-                            if server.try_begin_exclusive_hard_kill().is_ok() {
-                                kill_pid_tree(server.id());
-                                evict_warm_server_from_pool(server);
-                            } else {
-                                let active = server.active_sessions.load(Ordering::SeqCst);
-                                tracing::warn!(
-                                    "Skipping OpenCode hard-kill cancel fallback for shared warm server {} with {} active sessions",
-                                    server.base_url,
-                                    active
-                                );
-                            }
-                        }
-                        return;
-                    }
-                    thread::sleep(CANCEL_WATCHDOG_POLL);
-                }
-            });
-        }
-        let result = consume_sse_inner(reader, session_id, sender, cancel_token, base_url, auth);
-        // Tell the watchdog to exit so `thread::scope` joins promptly even
-        // on the happy path. Done *before* the scope's implicit join.
-        watchdog_done.store(true, Ordering::Relaxed);
-        result
-    })
-}
-
 fn consume_sse_inner(
     reader: BufReader<Box<dyn std::io::Read + Send>>,
     session_id: &str,
@@ -1703,10 +1700,12 @@ fn consume_sse_inner(
             let data = current_data.clone();
             current_data.clear();
 
+            managed_session::handle_permission(&data, session_id, cancel_token, base_url, auth)?;
             if let Some(should_stop) = process_sse_event(&data, session_id, sender, &mut state) {
                 if should_stop {
                     terminal_seen = true;
                     if !state.terminal_error {
+                        managed_session::finish(session_id, cancel_token, base_url, auth)?;
                         send_sse_done(
                             sender,
                             session_id,
@@ -1719,12 +1718,24 @@ fn consume_sse_inner(
         }
     }
 
+    if !terminal_seen && is_cancelled(cancel_token) {
+        abort_session(base_url, auth, session_id);
+        return Err("OpenCode request cancelled".to_string());
+    }
     if !terminal_seen && !current_data.is_empty() {
+        managed_session::handle_permission(
+            &current_data,
+            session_id,
+            cancel_token,
+            base_url,
+            auth,
+        )?;
         let should_stop =
             process_sse_event(&current_data, session_id, sender, &mut state).unwrap_or(false);
         if should_stop {
             terminal_seen = true;
             if !state.terminal_error {
+                managed_session::finish(session_id, cancel_token, base_url, auth)?;
                 send_sse_done(
                     sender,
                     session_id,
@@ -1735,42 +1746,34 @@ fn consume_sse_inner(
     }
 
     if !terminal_seen {
-        let result = state.accumulated_text.trim().to_string();
-        if !result.is_empty() {
+        if is_cancelled(cancel_token) {
             abort_session(base_url, auth, session_id);
-            send_sse_done(sender, session_id, result);
-            return Ok(());
+            return Err("OpenCode request cancelled".to_string());
+        }
+        if state.accumulated_text.trim().is_empty() {
+            // Preserve recovered output for diagnostics/checkpointing. A valid
+            // answer (including valid structured JSON) is not evidence that
+            // the async session, its tools, or the workspace writer stopped.
+            let _ = recover_sse_eof_from_messages(
+                base_url,
+                auth,
+                session_id,
+                sender,
+                &mut state,
+                cancel_token,
+            );
         }
         if is_cancelled(cancel_token) {
             abort_session(base_url, auth, session_id);
             return Err("OpenCode request cancelled".to_string());
         }
-        if let Some(result) = recover_sse_eof_from_messages(
-            base_url,
-            auth,
-            session_id,
-            sender,
-            &mut state,
-            cancel_token,
-        ) {
-            if is_cancelled(cancel_token) {
-                abort_session(base_url, auth, session_id);
-                return Err("OpenCode request cancelled".to_string());
-            }
-            abort_session(base_url, auth, session_id);
-            send_sse_done(sender, session_id, result);
-            return Ok(());
-        }
-        if is_cancelled(cancel_token) {
-            abort_session(base_url, auth, session_id);
-            return Err("OpenCode request cancelled".to_string());
-        }
-        // Stream EOF with no terminal event, no recoverable text, and no
-        // cancel. The async session may still be live server-side; abort it so
-        // it cannot keep mutating a warm-pooled workspace that the next turn
-        // would reuse.
+        // This is a cancellation request, not a quiescence observation. Even
+        // an acknowledged abort must never turn a nonterminal EOF into Done.
         abort_session(base_url, auth, session_id);
-        return Err("OpenCode stream ended without a terminal event".to_string());
+        return Err(
+            "OpenCode stream ended without a terminal event; execution state is unknown"
+                .to_string(),
+        );
     }
 
     Ok(())
@@ -2667,8 +2670,9 @@ fn process_sse_event(
         }
 
         "session.idle" => {
-            // Turn is complete
-            Some(true)
+            // This is a global event stream. An unscoped idle event cannot
+            // complete the current turn, even when it carries valid output.
+            Some(event_session == Some(session_id))
         }
 
         "session.error" | "error" => {
@@ -2828,8 +2832,11 @@ mod tests {
     #[test]
     fn opencode_warm_server_key_canonicalizes_equivalent_working_dirs() {
         let cwd = std::env::current_dir().expect("current dir");
-        let key_from_dot = warm_server_key("opencode", ".", "default");
-        let key_from_cwd = warm_server_key("opencode", &cwd.to_string_lossy(), "default");
+        let overlay = crate::services::provider_auth_profile::ProviderAuthOverlay::default_for(
+            ProviderKind::OpenCode,
+        );
+        let key_from_dot = warm_server_key("opencode", ".", &overlay);
+        let key_from_cwd = warm_server_key("opencode", &cwd.to_string_lossy(), &overlay);
 
         assert_eq!(key_from_dot, key_from_cwd);
     }
@@ -2845,8 +2852,11 @@ mod tests {
         std::fs::create_dir_all(&first).expect("create first temp dir");
         std::fs::create_dir_all(&second).expect("create second temp dir");
 
-        let first_key = warm_server_key("opencode", &first.to_string_lossy(), "default");
-        let second_key = warm_server_key("opencode", &second.to_string_lossy(), "default");
+        let overlay = crate::services::provider_auth_profile::ProviderAuthOverlay::default_for(
+            ProviderKind::OpenCode,
+        );
+        let first_key = warm_server_key("opencode", &first.to_string_lossy(), &overlay);
+        let second_key = warm_server_key("opencode", &second.to_string_lossy(), &overlay);
 
         assert_ne!(first_key, second_key);
 
@@ -2858,8 +2868,12 @@ mod tests {
         use std::hash::{Hash, Hasher};
         let cwd = std::env::current_dir().expect("current dir");
         let cwd = cwd.to_string_lossy();
-        let default_key = warm_server_key("opencode", &cwd, "default");
-        let work_key = warm_server_key("opencode", &cwd, "work");
+        let mut overlay = crate::services::provider_auth_profile::ProviderAuthOverlay::default_for(
+            ProviderKind::OpenCode,
+        );
+        let default_key = warm_server_key("opencode", &cwd, &overlay);
+        overlay.profile_id = "work".to_string();
+        let work_key = warm_server_key("opencode", &cwd, &overlay);
         assert_ne!(default_key, work_key);
         let mut hasher_a = std::collections::hash_map::DefaultHasher::new();
         let mut hasher_b = std::collections::hash_map::DefaultHasher::new();

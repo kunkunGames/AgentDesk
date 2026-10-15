@@ -137,8 +137,15 @@ def package(root: Path, binary: Path, target: str, output: Path, dashboard: bool
                     if path.is_file():
                         bundle.write(path, path.relative_to(scratch).as_posix())
         else:
+            def native_member(member: tarfile.TarInfo) -> tarfile.TarInfo:
+                # Windows chmod/stat cannot represent POSIX execute bits. Encode
+                # the native archive contract explicitly, independent of host OS.
+                executable = member.name == f"{name}/{binary_name}" or member.name.endswith(".sh")
+                member.mode = 0o755 if member.isdir() or executable else 0o644
+                return member
+
             with tarfile.open(archive, "w:gz", compresslevel=9) as bundle:
-                bundle.add(staging, arcname=name)
+                bundle.add(staging, arcname=name, filter=native_member)
         digest = sha256(archive)
         os.replace(archive, output / filename)
         (output / f"{filename}.sha256").write_text(f"{digest}  {filename}\n", encoding="utf-8", newline="\n")

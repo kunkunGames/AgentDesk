@@ -1657,6 +1657,12 @@ async fn handle_text_message_admitted(
     let (wip_warning, reply_context) =
         take_and_merge_wip_warning(shared, &provider, channel_id, reply_context);
 
+    let campaign_graph_prompt = context::campaign_graph_prompt(
+        shared.pg_pool.as_ref(),
+        active_dispatch_id_for_prompt.as_deref(),
+    )
+    .await?;
+
     // #3813 Phase 1a: the intake placeholder POST returned a live id.
     intake_latency.mark_placeholder_posted();
     crate::services::discord::increment_global_active(shared, "intake_after_mailbox_slot");
@@ -1732,16 +1738,7 @@ async fn handle_text_message_admitted(
     }
     .build();
     // Build Discord context info
-    let discord_context = {
-        let data = shared.core.lock().await;
-        let session = data.sessions.get(&channel_id);
-        build_system_discord_context(
-            session.and_then(|s| s.channel_name.as_deref()),
-            session.and_then(|s| s.category_name.as_deref()),
-            channel_id,
-            false,
-        )
-    };
+    let discord_context = context::discord_context(shared, channel_id).await;
     // Claude keeps SAK in the system prompt for prefix-cache stability.
     // Non-Claude providers receive SAK in the user context instead.
     let sak_for_system = memory_injection_plan.sak_for_system_prompt();
@@ -1753,6 +1750,7 @@ async fn handle_text_message_admitted(
             dispatch_context: info.context.as_deref(),
             card_title: info.card_title.as_deref(),
             github_issue_url: info.github_issue_url.as_deref(),
+            campaign_graph_prompt: campaign_graph_prompt.as_deref(),
         }
     });
     let recovery_context_for_manifest =

@@ -488,7 +488,9 @@ pub(crate) async fn sweep_failed_pre_accept_once(
     let target = targets
         .iter()
         .find(|node| {
-            requirements.intake_reasons(node).is_empty()
+            requirements
+                .intake_reasons(node, &source.provider)
+                .is_empty()
                 && (source.attachment_refs.as_array().is_some_and(Vec::is_empty)
                     || crate::services::cluster::attachment_transfer::supports(node))
                 && crate::services::cluster::readiness::evaluate_declared(

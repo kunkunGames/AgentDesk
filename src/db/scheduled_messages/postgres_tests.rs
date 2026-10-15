@@ -1638,3 +1638,45 @@ async fn postgres_agent_turn_start_waits_for_parent_lock_and_observes_cancel() {
     pool.close().await;
     pg_db.drop().await;
 }
+
+#[tokio::test]
+async fn legacy_scheduled_consumer_skips_sealed_plans_without_blocking_supported_reservations_pg() {
+    let (db, pool) =
+        create_test_pool("agentdesk_smsg_capability", "legacy sealed-plan admission").await;
+    sqlx::query("ALTER TABLE scheduled_messages ADD COLUMN external_delivery_plan_id TEXT")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let sealed = insert_due_message(&pool, KIND_PUSH).await;
+    sqlx::query(
+        "UPDATE scheduled_messages SET external_delivery_plan_id='sealed-fixture' WHERE id=$1",
+    )
+    .bind(&sealed.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let supported = insert_due_message(&pool, KIND_PUSH).await;
+    let claimed = claim_due_fires_pg(&pool, "compatible-legacy-worker", true, 10, 30, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].message.id, supported.id);
+    let status: String = sqlx::query_scalar("SELECT status FROM scheduled_messages WHERE id=$1")
+        .bind(&sealed.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "scheduled");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM scheduled_message_deliveries WHERE scheduled_message_id=$1"
+        )
+        .bind(&sealed.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+    pool.close().await;
+    db.drop().await;
+}

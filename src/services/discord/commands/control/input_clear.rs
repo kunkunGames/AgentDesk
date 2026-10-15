@@ -19,7 +19,7 @@ use crate::services::tui_prompt_dedupe::{binding_events, native_clear::ClearTick
 /// Provider, selector and Discord effects; tests replace them.
 pub(super) trait ClearEffects: Send + Sync {
     fn clear_selector<'a>(&'a self, session_key: &'a str) -> Step<'a, bool>;
-    fn reset_process(&self, tmux: &str);
+    fn reset_process(&self, shared: &SharedData, tmux: &str);
     // A process or session still under the name; a failed probe counts as alive.
     fn alive(&self, tmux: &str) -> bool;
     fn notice<'a>(&'a self, channel: serenity::ChannelId, text: &'a str) -> Step<'a, ()>;
@@ -32,8 +32,8 @@ impl ClearEffects for Production {
         let clear = super::super::super::adk_session::clear_provider_session_id_checked;
         Box::pin(async move { clear(session_key).await.is_ok() })
     }
-    fn reset_process(&self, tmux: &str) {
-        super::reset_managed_process_session(tmux);
+    fn reset_process(&self, shared: &SharedData, tmux: &str) {
+        super::reset_managed_process_session(shared, tmux);
     }
     fn alive(&self, tmux: &str) -> bool {
         use crate::services::platform::tmux::{SessionPresence, session_presence};
@@ -253,7 +253,7 @@ impl ClearHost for LedgerClear {
             if cut != Some(true) {
                 return false;
             }
-            self.effects.reset_process(cleared.name());
+            self.effects.reset_process(&self.shared, cleared.name());
             super::native::clear_session_memory(&self.shared, self.channel_id).await;
             super::native::clear_process_reset_pending(&self.shared, self.channel_id).await;
             true

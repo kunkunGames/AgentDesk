@@ -81,7 +81,7 @@ pub(super) async fn route_by_preference(
                         ctx.provider,
                         ctx.preserve_on_cancel,
                     ) && readiness::evaluate_declared(node, ctx.provider, &auth_profile).eligible
-                        && required_node_reasons(node, requirements).is_empty()
+                        && required_node_reasons(node, requirements, ctx.provider).is_empty()
                         && (preferred_node.is_none()
                             || readiness::evaluate(
                                 node,

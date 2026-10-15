@@ -43,9 +43,13 @@ NON_PG_SKIP_ARGS=(
   --skip engine::ops::kanban_ops::tests
   --skip engine::ops::message_ops::tests
   --skip engine::ops::timeouts_ops::host_repair::tests
+  --skip engine::ops::timeouts_ops::stale_recovery::tests
   --skip github::sync::terminal_open_alert_tests
   --skip high_risk_recovery
   --skip reconcile::dispatch_delivery_reconcile_tests
+  --skip server::campaign_execution::native_tests
+  --skip server::campaign_graph::occurrence_context::tests
+  --skip server::campaign_graph::tests
   --skip server::message_outbox_retry_tests
   --skip server::routes::agents::host_guard_tests
   --skip server::routes::auto_queue_preflight_harness_tests
@@ -59,6 +63,7 @@ NON_PG_SKIP_ARGS=(
   --skip server::routes::pipeline::stage_save_tests
   --skip server::routes::session_evidence::tests
   --skip server::task_dispatch_claims::replay_tests
+  --skip server::test_phase_runs::checks::native_tests
   --skip services::agent_quality::regression_alerts::explicit_decode_fallback_tests
   --skip services::auto_queue::route::campaign_handoff::tests
   --skip services::auto_queue::route::command::tests
@@ -74,6 +79,7 @@ NON_PG_SKIP_ARGS=(
   --skip services::cluster::channel_home::tests
   --skip services::cluster::channel_home_boot::tests
   --skip services::cluster::channel_home_drain::tests
+  --skip services::cluster::execution_capacity::managed_tests
   --skip services::cluster::execution_capacity::tests
   --skip services::cluster::intake_preflight::tests
   --skip services::cluster::intake_router_hook::agent_execution_node_tests
@@ -101,6 +107,7 @@ NON_PG_SKIP_ARGS=(
   --skip services::discord::commands::restart::host_guard_tests
   --skip services::discord::commands::text_commands::clear_refusal_reply_tests
   --skip services::discord::commands::tui_passthrough::host_guard_tests
+  --skip services::discord::dispatch_cleanup::transition_tests
   --skip services::discord::health::recovery::live_agent_recovery::host_guard_tests
   --skip services::discord::health::recovery::stall_alert::tests
   --skip services::discord::health::recovery::stall_watchdog_auto_heal_tests
@@ -169,6 +176,7 @@ NON_PG_SKIP_ARGS=(
   --skip services::discord::runtime_bootstrap::queued_recovery::scoped_inflight_restore_tests
   --skip services::discord::session_idle_cleanup::tests
   --skip services::discord::session_runtime::worktree_reuse_channel_isolation_tests
+  --skip services::discord::streaming_finalizer::native_campaign_tests
   --skip services::discord::task_notification_delivery::tests
   --skip services::discord::terminal_ui_obligation::input_fence_tests
   --skip services::discord::terminal_ui_obligation::tests
@@ -202,8 +210,10 @@ NON_PG_SKIP_ARGS=(
   --skip services::discord::turn_bridge::tmux_runtime::codex_stop_delivery::tests
   --skip services::discord::turn_bridge::tmux_runtime::process_backend_cancel::tests
   --skip services::discord::turn_bridge::tmux_runtime::stop_host::tests
+  --skip services::discord::turn_bridge::turn_analytics::timestamp_tests
   --skip services::discord::turn_bridge::voice_completion::voice_completion_tests
   --skip services::discord::turn_teardown_clearance::tests
+  --skip services::dispatches::discord_delivery::thread_reuse::startup_validation_tests
   --skip services::dispatches::outbox_queue::replay_hold_tests
   --skip services::dispatches::wait_queue::tests
   --skip services::herdr_launch::tests
@@ -211,9 +221,11 @@ NON_PG_SKIP_ARGS=(
   --skip services::message_outbox_circuit_authority_tests
   --skip services::message_outbox_recovery_tests
   --skip services::observability::queries::alert_authority_tests
+  --skip services::opencode::managed_native_tests
   --skip services::pipeline_routes::tests
   --skip services::routines::agent_executor::reliability::tests
   --skip services::routines::session_control::tests
+  --skip services::routines::store::campaign::tests
   --skip services::session_forwarding::home_stop::tests
   --skip services::session_forwarding::tests
   --skip services::session_host::herdr_clear_adapter::tests
@@ -281,6 +293,8 @@ NON_PG_FILTER_REPLAY=(
   db::dispatches::metadata::tests::parse_pg_dispatch_context_rejects_malformed_json
   db::dispatches::metadata::tests::parse_pg_dispatch_context_rejects_non_object_context
   db::intake_outbox_delivery_proof::tests::stale_reader_projects_exactly_id
+  db::postgres::migration_catalog::tests::immutable_catalogs_preserve_gaps_up_checksums_and_convergence
+  db::postgres::migration_catalog::tests::mixed_failed_missing_and_unknown_receipts_never_admit
   db::postgres::test_db_reclaim::tests::reclaim_audit_log_appends_stay_whole_across_processes
   db::postgres::test_db_reclaim::tests::reclaim_audit_log_closes_a_torn_tail
   db::postgres::test_db_reclaim::tests::reclaim_classify_owner_identity
@@ -341,6 +355,17 @@ NON_PG_FILTER_REPLAY=(
   high_risk_recovery::cross_channel_tmux_claim_observability_distinguishes_thread_follow_up_4984
   reconcile::dispatch_delivery_reconcile_tests::dispatch_delivery_reconcile_classifies_rows_without_postgres
   reconcile::dispatch_delivery_reconcile_tests::dispatch_delivery_reconcile_treats_all_completed_statuses_as_delivered
+  server::campaign_graph::occurrence_context::tests::bootstrap_explanation_uses_actual_assignment_without_changing_goal_roles
+  server::campaign_graph::occurrence_context::tests::ordinary_goal_has_no_invented_occurrence_or_bootstrap_context
+  server::campaign_graph::occurrence_context::tests::truthful_report_receipt_does_not_relabel_failed_business_checks
+  server::campaign_graph::tests::artifact_capture_accepts_file_boundary_and_rejects_one_extra_byte_without_publication
+  server::campaign_graph::tests::artifact_capture_checks_total_bundle_boundary_before_publication
+  server::campaign_graph::tests::artifact_handoff_uses_frozen_bytes_rejects_corruption_and_conflicting_inputs
+  server::campaign_graph::tests::effect_ownership_tests::effect_ownership_query_preserves_graph_task_key_contract_and_bounds_scope
+  server::campaign_graph::tests::failure_classification_does_not_replay_unknown_and_redacts_credentials
+  server::campaign_graph::tests::graph_contract_rejects_cycles_missing_outputs_paths_and_self_verification
+  server::campaign_graph::tests::learning_tests::campaign_dag_policy_defaults_bounds_and_scope_are_explicit
+  server::campaign_graph::tests::schedule_budget_tests::activation_legacy_request_digest_is_preserved
   server::message_outbox_retry_tests::message_outbox_failure_action_retries_then_fails
   server::message_outbox_retry_tests::outbox_alert_snippet_truncates_and_handles_empty
   server::message_outbox_retry_tests::session_release_is_limited_to_terminal_turn_delivery_sources
@@ -364,6 +389,9 @@ NON_PG_FILTER_REPLAY=(
   server::routes::message_outbox::tests::redrive_contract_defaults_to_dry_run_and_denies_mass_field
   server::routes::scheduled_messages::postgres_tests::scheduled_message_bot_defaults_to_non_triggering_notify
   server::routes::scheduled_messages::postgres_tests::scheduled_push_rejects_agent_only_fields_but_allows_explicit_clears
+  server::test_phase_runs::checks::native_tests::candidate_rejects_literal_backslash_and_aliasing_filenames
+  server::test_phase_runs::checks::native_tests::deadline_reaps_a_checker_even_after_it_prints_a_passing_report
+  server::test_phase_runs::checks::native_tests::kernel_denies_candidate_mutation_network_children_and_forged_background_report
   services::agent_quality::regression_alerts::explicit_decode_fallback_tests::fails_closed_on_column_decode_error
   services::agent_quality::regression_alerts::explicit_decode_fallback_tests::fails_closed_on_other_errors
   services::agent_quality::regression_alerts::explicit_decode_fallback_tests::metric_thresholds_preserve_retired_authority_policy
@@ -397,6 +425,7 @@ NON_PG_FILTER_REPLAY=(
   services::cluster::channel_home::tests::standby_from_boot_changes_nothing_until_this_nodes_home_gate_takes_intake
   services::cluster::channel_home_boot::tests::the_switch_and_the_rows_decide_what_the_boot_registers
   services::cluster::execution_capacity::tests::execution_capacity_ranking_uses_ratio_fairness_and_preserves_legacy_selector
+  services::cluster::execution_capacity::tests::resource_admission_preserves_remote_and_unresolved_legacy_workspaces
   services::cluster::intake_preflight::tests::claude_and_codex_emit_structured_pass_and_fail_evidence
   services::cluster::intake_preflight::tests::each_required_failure_is_independently_fail_closed
   services::cluster::intake_preflight::tests::missing_or_malformed_snapshot_fails_closed
@@ -623,6 +652,7 @@ NON_PG_FILTER_REPLAY=(
   services::discord::router::message_handler::provider_dispatch::herdr_tests::the_switch_alone_decides_whether_a_configured_turn_reaches_the_herdr_executor
   services::discord::router::message_handler::provider_dispatch::tests::a_retired_runtime_refuses_before_the_host_branch_and_the_driver
   services::discord::router::message_handler::provider_dispatch::tests::agy_discord_dispatch_preserves_turn_identity_policy_and_cancellation
+  services::discord::router::message_handler::provider_dispatch::tests::grok_discord_dispatch_uses_native_dialect_and_preserves_model_policy_and_attempt
   services::discord::router::message_handler::voice_announcement_route::voice_route_tests::voice_announcement_foreground_miss_falls_back_to_normal_turn
   services::discord::router::message_handler::voice_announcement_route::voice_route_tests::voice_announcement_foreground_response_bypasses_normal_turn
   services::discord::router::message_handler::watchdog::host_tests::a_scheduled_paused_attach_rereads_the_host_before_each_attempt
@@ -776,6 +806,7 @@ NON_PG_FILTER_REPLAY=(
   services::discord::turn_bridge::tmux_runtime::stop_host::tests::bind_registers_no_pid_for_another_hosts_session
   services::discord::turn_bridge::tmux_runtime::stop_host::tests::runtime_cancel_reads_no_pane_of_another_host
   services::discord::turn_bridge::tmux_runtime::stop_host::tests::zombie_release_never_reads_another_hosts_session_as_idle
+  services::discord::turn_bridge::turn_analytics::timestamp_tests::analytics_start_preserves_explicit_offsets_and_legacy_host_local_instants
   services::discord::turn_bridge::voice_completion::voice_completion_tests::background_completion_target_marker_wins_over_reverse_lookup_disagreement
   services::discord::turn_bridge::voice_completion::voice_completion_tests::background_completion_target_refuses_legacy_prefix_without_marker
   services::discord::turn_bridge::voice_completion::voice_completion_tests::background_completion_target_refuses_marker_with_wrong_background_channel

@@ -29,6 +29,10 @@ def verify_archive(archive: Path, commit: str, version: str, *, allow_dirty: boo
             members = bundle.getmembers()
             if any(not (m.isfile() or m.isdir()) for m in members):
                 raise ValueError("release contains a link or special file")
+            for member in members:
+                if member.isfile() and (member.name == f"{prefix}/agentdesk" or member.name.endswith(".sh")):
+                    if member.mode & 0o111 != 0o111:
+                        raise ValueError(f"native executable permissions missing: {member.name}")
             names = [m.name for m in members if m.isfile()]
             open_member = bundle.extractfile
         if len(names) != len(set(names)):

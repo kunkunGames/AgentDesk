@@ -3,6 +3,32 @@ const assert = require("node:assert/strict");
 
 const { createExecRouter, createSqlRouter, loadPolicy } = require("./support/harness");
 
+for (const disposition of ["await_checks", "await_human"]) {
+  test("review-automation preserves managed " + disposition + " with review disabled", () => {
+    const { policy, state } = loadPolicy("policies/review-automation.js", {
+      config: { review_enabled: false },
+      reviewDispositions: { managed: disposition },
+      cards: { managed: { id: "managed", status: "review", assigned_agent_id: "agent-1" } }
+    });
+    policy.onReviewEnter({ card_id: "managed" });
+    assert.deepEqual(state.statusCalls, []);
+    assert.deepEqual(state.reviewStatusCalls, []);
+    assert.deepEqual(state.dispatchCreates, []);
+  });
+}
+
+test("managed local review never auto-approves without a counter channel", () => {
+  const { policy, state } = loadPolicy("policies/review-automation.js", {
+    config: { review_enabled: false },
+    reviewDispositions: { managed: "run_local_review" },
+    cards: { managed: { id: "managed", status: "review", assigned_agent_id: "agent-1" } },
+    counterChannels: {}
+  });
+  policy.onReviewEnter({ card_id: "managed" });
+  assert.deepEqual(state.statusCalls, []);
+  assert.deepEqual(state.dispatchCreates, []);
+});
+
 test("review-automation immediately terminals cards when review_enabled is false", () => {
   const { policy, state } = loadPolicy("policies/review-automation.js", {
     config: { review_enabled: false },

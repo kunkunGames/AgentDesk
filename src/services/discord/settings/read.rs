@@ -143,9 +143,12 @@ fn load_legacy_bot_settings_entry(token: &str) -> LegacyBotSettingsEntry {
 
     let allowed_tools = match entry.get("allowed_tools") {
         None => None,
-        Some(value) => value
-            .as_array()
-            .map(|tools_arr| normalize_allowed_tools(tools_arr.iter().filter_map(|v| v.as_str()))),
+        Some(value) => value.as_array().map(|tools_arr| {
+            tools_arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        }),
     };
 
     LegacyBotSettingsEntry {
@@ -304,8 +307,8 @@ pub(crate) fn load_bot_settings(token: &str) -> DiscordBotSettings {
     let allowed_tools = configured
         .as_ref()
         .and_then(|bot| bot.auth.allowed_tools.as_ref().cloned())
-        .map(|tools| normalize_allowed_tools(&tools))
         .or(legacy.allowed_tools.clone())
+        .map(|tools| normalize_tools_for_provider(&provider, tools))
         .unwrap_or_else(|| default_allowed_tools_for_provider(&provider));
 
     DiscordBotSettings {

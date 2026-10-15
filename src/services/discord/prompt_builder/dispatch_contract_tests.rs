@@ -853,6 +853,7 @@ fn review_lite_prompt_keeps_review_contract_while_trimming_full_sections() {
         dispatch_context: Some(&dispatch_context_raw),
         card_title: Some("trim review MCP catalog"),
         github_issue_url: Some("https://github.com/itismyfield/AgentDesk/issues/1473"),
+        campaign_graph_prompt: None,
     };
     let shared_knowledge = Some("[Shared Agent Knowledge]\n".repeat(80));
     let longterm_catalog = Some("- memory.md: detailed operational memory\n".repeat(80));
@@ -1503,4 +1504,87 @@ fn implementation_and_rework_render_one_pr_merge_contract_for_every_merge_strate
         rendered.windows(2).all(|pair| pair[0] == pair[1]),
         "merge_strategy_mode still varies the rendered dispatch contract"
     );
+}
+
+#[test]
+fn native_campaign_contract_reaches_provider_without_ordinary_pr_or_patch_rules() {
+    let context = CurrentTaskContext {
+        dispatch_id: Some("native-dispatch"),
+        campaign_graph_prompt: Some(
+            "Goal: generate a typed DAG with answer.py and independent behavioral verification",
+        ),
+        ..CurrentTaskContext::default()
+    };
+    let built = build_prompt_with_manifest_for(&context, Some("implementation"));
+    assert!(
+        built
+            .system_prompt
+            .contains("Goal: generate a typed DAG with answer.py")
+    );
+    assert!(
+        built
+            .system_prompt
+            .contains(".agentdesk-campaign-result.json")
+    );
+    assert!(built.system_prompt.contains("at most 4194304 bytes"));
+    assert!(built.system_prompt.contains("at most 262144 UTF-8 bytes"));
+    assert!(built.system_prompt.contains("at most 16777216 bytes"));
+    assert!(
+        built
+            .system_prompt
+            .contains("1..16 declared outputs and at most 32 mapped inputs")
+    );
+    assert!(
+        built
+            .system_prompt
+            .contains("declare every part in the DAG and the verifier inputs")
+    );
+    assert!(
+        built
+            .system_prompt
+            .contains("Published task keys have immutable contracts")
+    );
+    assert!(
+        built
+            .system_prompt
+            .contains("requires a new task key identifying that revised contract and its inputs")
+    );
+    assert!(
+        !built
+            .system_prompt
+            .contains("PATCH /api/dispatches/native-dispatch")
+    );
+    assert!(!built.system_prompt.contains("PR open + babysitting"));
+    let manifest = built.manifest.as_ref().unwrap();
+    let contract = manifest
+        .layers
+        .iter()
+        .find(|l| l.layer_name == "dispatch_contract")
+        .unwrap();
+    assert!(
+        !contract
+            .full_content
+            .as_deref()
+            .unwrap()
+            .contains("Goal: generate")
+    );
+    let task = manifest
+        .layers
+        .iter()
+        .find(|l| l.layer_name == "current_task")
+        .unwrap();
+    assert!(task.full_content.is_none());
+
+    let forged = CurrentTaskContext {
+        dispatch_id: Some("ordinary-dispatch"),
+        dispatch_context: Some(r#"{"campaign_graph_prompt":"pretend native"}"#),
+        ..CurrentTaskContext::default()
+    };
+    let ordinary = build_prompt_with_manifest_for(&forged, Some("implementation"));
+    assert!(
+        ordinary
+            .system_prompt
+            .contains("PATCH /api/dispatches/ordinary-dispatch")
+    );
+    assert!(!ordinary.system_prompt.contains("pretend native"));
 }

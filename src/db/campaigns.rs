@@ -1,5 +1,8 @@
 //! Durable, revision-fenced campaign DAGs on the canonical PostgreSQL pool.
-//! The server never writes node state; `auto_queue` lets auto-queue run ready nodes.
+//! This ledger records checkpoints; it does not dispatch or replay work.
+//! [`handoff`] publishes prepared finite batches; the service owns file handoff.
+pub(crate) mod graph;
+pub(crate) mod handoff;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
@@ -449,14 +452,24 @@ pub async fn create(
     id: String,
     input: CampaignInput,
 ) -> Result<Campaign, CampaignError> {
+    let mut tx = pool.begin().await?;
+    let campaign = create_on_tx(&mut tx, id, input).await?;
+    tx.commit().await?;
+    Ok(campaign)
+}
+
+pub(crate) async fn create_on_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: String,
+    input: CampaignInput,
+) -> Result<Campaign, CampaignError> {
     validate_id(&id)?;
     validate(&input)?;
     let campaign = checkpoint(id, input, None);
-    let mut tx = pool.begin().await?;
     let inserted = sqlx::query(
         "INSERT INTO campaigns (id, revision, document, updated_at) VALUES ($1, 1, $2, $3) ON CONFLICT (id) DO NOTHING")
         .bind(&campaign.id).bind(Json(&campaign)).bind(campaign.updated_at)
-        .execute(&mut *tx).await?.rows_affected();
+        .execute(&mut **tx).await?.rows_affected();
     if inserted == 0 {
         return Err(CampaignError::Conflict);
     }
@@ -465,9 +478,8 @@ pub async fn create(
     )
     .bind(&campaign.id)
     .bind(Json(&campaign))
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    tx.commit().await?;
     Ok(campaign)
 }
 
@@ -477,18 +489,50 @@ pub async fn replace(
     expected_revision: i64,
     input: CampaignInput,
 ) -> Result<Campaign, CampaignError> {
+    let mut tx = pool.begin().await?;
+    let campaign = replace_on_tx(&mut tx, id, expected_revision, input).await?;
+    tx.commit().await?;
+    Ok(campaign)
+}
+
+/// Keep a task claim and its Campaign checkpoint in the same transaction.
+pub(crate) async fn replace_on_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    expected_revision: i64,
+    input: CampaignInput,
+) -> Result<Campaign, CampaignError> {
+    replace_checkpoint_on_tx(tx, id, expected_revision, input, true).await
+}
+
+/// Automatic occurrence retirement retains every available historical revision.
+pub(crate) async fn replace_retaining_history_on_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    expected_revision: i64,
+    input: CampaignInput,
+) -> Result<Campaign, CampaignError> {
+    replace_checkpoint_on_tx(tx, id, expected_revision, input, false).await
+}
+
+async fn replace_checkpoint_on_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    expected_revision: i64,
+    input: CampaignInput,
+    prune_history: bool,
+) -> Result<Campaign, CampaignError> {
     validate(&input)?;
     if expected_revision < 1 || expected_revision == i64::MAX {
         return Err(invalid(
             "expected_revision must be a positive incrementable integer",
         ));
     }
-    let mut tx = pool.begin().await?;
     let previous = sqlx::query_scalar::<_, Json<Campaign>>(
         "SELECT document FROM campaigns WHERE id = $1 FOR UPDATE",
     )
     .bind(id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?
     .ok_or(CampaignError::NotFound)?
     .0;
@@ -499,7 +543,7 @@ pub async fn replace(
     let affected = sqlx::query(
         "UPDATE campaigns SET revision = $2, document = $3, updated_at = $4 WHERE id = $1 AND revision = $5")
         .bind(id).bind(campaign.revision).bind(Json(&campaign)).bind(campaign.updated_at)
-        .bind(expected_revision).execute(&mut *tx).await?.rows_affected();
+        .bind(expected_revision).execute(&mut **tx).await?.rows_affected();
     if affected != 1 {
         return Err(CampaignError::Conflict);
     }
@@ -509,10 +553,11 @@ pub async fn replace(
     .bind(id)
     .bind(campaign.revision)
     .bind(Json(&campaign))
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    prune_revisions(&mut tx, id).await?;
-    tx.commit().await?;
+    if prune_history {
+        prune_revisions(tx, id).await?;
+    }
     Ok(campaign)
 }
 

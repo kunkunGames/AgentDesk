@@ -3,7 +3,7 @@
 use super::github_sync::github_sync_on_transition_pg;
 use super::hooks::fire_dynamic_hooks;
 use super::review_tuning::record_true_negative_if_pass_with_backends;
-use super::state_machine::resolve_pipeline_with_pg;
+use super::state_machine::{resolve_pipeline_on_pg_conn, resolve_pipeline_with_pg};
 use super::terminal_cleanup::cleanup_terminal_managed_worktrees_pg;
 use super::transition_cleanup::{
     AllowedOnConnMutation, PgTransitionCleanupCounts, clear_escalation_alert_state_on_pg_tx,
@@ -54,6 +54,12 @@ async fn ensure_review_dispatch_after_review_enter_pg(
     card_id: &str,
     source: Option<&str>,
 ) -> Result<()> {
+    let disposition = crate::server::test_phase_runs::checks::disposition(pg_pool, card_id)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    if !matches!(disposition.as_str(), "unmanaged" | "run_local_review") {
+        return Ok(());
+    }
     let Some(row) = sqlx::query(
         "SELECT status,
                 assigned_agent_id,
@@ -83,6 +89,15 @@ async fn ensure_review_dispatch_after_review_enter_pg(
     else {
         return Ok(());
     };
+    if disposition == "run_local_review"
+        && crate::db::agents::resolve_agent_counter_model_channel_pg(pg_pool, &assigned_agent_id)
+            .await?
+            .is_none()
+    {
+        sqlx::query("UPDATE kanban_cards SET blocked_reason='verification_local_review_unavailable' WHERE id=$1 AND status='review'")
+            .bind(card_id).execute(pg_pool).await?;
+        return Ok(());
+    }
 
     let (has_review_dispatch, has_active_work): (bool, bool) = sqlx::query_as(
         "SELECT
@@ -230,6 +245,32 @@ async fn ensure_review_dispatch_after_review_enter_pg(
     Ok(())
 }
 
+/// Reuse the normal review hook and its dispatch recovery after checks finish.
+/// The shared disposition keeps intentional check/human waits out of recovery.
+pub(crate) async fn resume_verified_review(
+    pool: &sqlx::PgPool,
+    engine: &PolicyEngine,
+    card: &str,
+) -> Result<()> {
+    let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_dispatches WHERE kanban_card_id=$1 AND dispatch_type IN ('review','review-decision') AND status IN ('pending','dispatched'))")
+        .bind(card).fetch_one(pool).await?;
+    if active {
+        return Ok(());
+    }
+    let (repo, agent): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT repo_id, assigned_agent_id FROM kanban_cards WHERE id=$1")
+            .bind(card)
+            .fetch_one(pool)
+            .await?;
+    let pipeline = resolve_pipeline_with_pg(pool, repo.as_deref(), agent.as_deref()).await?;
+    engine.try_fire_hook_by_name(
+        "OnReviewEnter",
+        json!({"card_id": card, "source": "managed_checks"}),
+    )?;
+    ensure_review_dispatch_after_review_enter_pg(pool, &pipeline, card, Some("managed_checks"))
+        .await
+}
+
 async fn transition_status_with_opts_pg_inner(
     pg_pool: &sqlx::PgPool,
     engine: &PolicyEngine,
@@ -244,6 +285,10 @@ async fn transition_status_with_opts_pg_inner(
         self, CardState, GateSnapshot, TransitionContext, TransitionOutcome,
     };
 
+    // The decision and its effects must observe the same card lifecycle.
+    // In particular, wait for cancellation's row lock before reading state;
+    // reading first and locking only at UPDATE leaves a stale force decision.
+    let mut tx = pg_pool.begin().await?;
     let row = sqlx::query(
         "SELECT
             status,
@@ -252,12 +297,13 @@ async fn transition_status_with_opts_pg_inner(
             repo_id,
             assigned_agent_id,
             review_entered_at::text AS review_entered_at,
-            blocked_reason
+            blocked_reason,
+            agentdesk_check_disposition(kanban_cards) AS check_disposition
          FROM kanban_cards
-         WHERE id = $1",
+         WHERE id = $1 FOR UPDATE",
     )
     .bind(card_id)
-    .fetch_optional(pg_pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| anyhow::anyhow!("load postgres card {card_id}: {error}"))?
     .ok_or_else(|| anyhow::anyhow!("card not found: {card_id}"))?;
@@ -283,11 +329,21 @@ async fn transition_status_with_opts_pg_inner(
     let blocked_reason: Option<String> = row
         .try_get("blocked_reason")
         .map_err(|error| anyhow::anyhow!("decode blocked_reason for {card_id}: {error}"))?;
+    let check_disposition: String = row.try_get("check_disposition")?;
 
     crate::pipeline::ensure_loaded();
-    let effective =
-        resolve_pipeline_with_pg(pg_pool, card_repo_id.as_deref(), card_agent_id.as_deref())
+    let mut effective =
+        resolve_pipeline_on_pg_conn(&mut tx, card_repo_id.as_deref(), card_agent_id.as_deref())
             .await?;
+    super::native_campaign::add_completion_rule(
+        &mut tx,
+        &mut effective,
+        card_id,
+        &old_status,
+        new_status,
+        latest_dispatch_id.as_deref(),
+    )
+    .await?;
 
     if old_status == new_status {
         if force_intent.is_forced() && !effective.is_valid_state(new_status) {
@@ -336,7 +392,7 @@ async fn transition_status_with_opts_pg_inner(
     .bind(card_id)
     .bind(latest_dispatch_id.as_deref())
     .bind(active_gate_allows_completed_work)
-    .fetch_one(pg_pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|error| anyhow::anyhow!("load active dispatch gate for {card_id}: {error}"))?;
 
@@ -353,7 +409,7 @@ async fn transition_status_with_opts_pg_inner(
     )
     .bind(card_id)
     .bind(review_entered_at.as_deref())
-    .fetch_optional(pg_pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| anyhow::anyhow!("load latest review verdict for {card_id}: {error}"))?
     .flatten();
@@ -368,9 +424,12 @@ async fn transition_status_with_opts_pg_inner(
         pipeline: effective.clone(),
         gates: GateSnapshot {
             has_active_dispatch,
-            review_verdict_pass: matches!(
+            // Managed review is satisfied by the immutable contract's shared
+            // disposition. Other pipeline gates still run normally; the
+            // collector does not use force to bypass them.
+            review_verdict_pass: crate::server::test_phase_runs::checks::review_gate_passes(
+                &check_disposition,
                 latest_review_verdict.as_deref(),
-                Some("pass") | Some("approved")
             ),
             review_verdict_rework: matches!(
                 latest_review_verdict.as_deref(),
@@ -388,10 +447,6 @@ async fn transition_status_with_opts_pg_inner(
     );
 
     if let TransitionOutcome::Blocked(ref reason) = decision.outcome {
-        let mut tx = pg_pool
-            .begin()
-            .await
-            .map_err(|error| anyhow::anyhow!("begin blocked postgres transition tx: {error}"))?;
         for intent in &decision.intents {
             crate::engine::transition_executor_pg::execute_pg_transition_intent(&mut tx, intent)
                 .await
@@ -426,11 +481,6 @@ async fn transition_status_with_opts_pg_inner(
         review_status.as_deref(),
         blocked_reason.as_deref(),
     );
-
-    let mut tx = pg_pool
-        .begin()
-        .await
-        .map_err(|error| anyhow::anyhow!("begin postgres transition tx: {error}"))?;
 
     for intent in &decision.intents {
         crate::engine::transition_executor_pg::execute_pg_transition_intent(&mut tx, intent)

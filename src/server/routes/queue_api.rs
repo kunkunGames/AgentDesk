@@ -14,6 +14,10 @@ use sqlx::Row;
 
 use super::AppState;
 use crate::error::{AppError, AppResult, ErrorCode};
+use crate::services::discord::health::WatcherStateLookup;
+
+#[cfg(test)]
+mod watcher_state_tests;
 
 // ── GET /api/channels/:id/queue ─────────────────────────────────
 
@@ -282,9 +286,11 @@ pub async fn home_stop_v1(
 /// is owned by another channel, or its capture file diverges from relay
 /// telemetry while stale for at least 30 seconds.
 ///
-/// 404 is returned when no watcher, no inflight state, and no mailbox
-/// engagement (active turn or queued intervention) is known for the
-/// channel across all registered providers.
+/// 404 means no channel evidence. 409 means multiple credible current
+/// runtime owners. 503 with `diagnostic_status=unobserved` means ownership
+/// could not be established for this diagnostic; it does not assert that
+/// the server or provider is unhealthy. Unresolved responses publish no
+/// attached, desynced, or relay-stall verdict.
 pub async fn get_watcher_state(
     State(state): State<AppState>,
     Path(channel_id): Path<String>,
@@ -301,17 +307,44 @@ pub async fn get_watcher_state(
         )
     })?;
 
-    match registry.snapshot_watcher_state(channel_num).await {
-        Some(snapshot) => {
-            let body = serde_json::to_value(&snapshot)
+    match registry.snapshot_watcher_state_lookup(channel_num).await {
+        WatcherStateLookup::Selected {
+            snapshot,
+            selection,
+        } => {
+            let mut body = serde_json::to_value(&snapshot)
                 .unwrap_or_else(|_| json!({"error": "failed to serialize watcher snapshot"}));
+            body["owner_selection"] = json!(selection);
             Ok((StatusCode::OK, Json(body)))
         }
-        None => Ok((
+        WatcherStateLookup::Absent(selection) => Ok((
             StatusCode::NOT_FOUND,
             Json(json!({
                 "error": "no watcher, relay-coord, or inflight state for this channel",
                 "channel_id": channel_id,
+                "diagnostic_status": "absent",
+                "observed": false,
+                "owner_selection": selection,
+            })),
+        )),
+        WatcherStateLookup::Ambiguous(selection) => Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "multiple current runtime owners prevent a watcher diagnostic",
+                "channel_id": channel_id,
+                "diagnostic_status": "ambiguous",
+                "observed": false,
+                "owner_selection": selection,
+            })),
+        )),
+        WatcherStateLookup::Unobserved(selection) => Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "current runtime owner is unobserved; this diagnostic does not determine server or provider health",
+                "channel_id": channel_id,
+                "diagnostic_status": "unobserved",
+                "observed": false,
+                "owner_selection": selection,
             })),
         )),
     }

@@ -16,6 +16,7 @@ pub(crate) use super::capability_routing::{
     select_capability_route,
 };
 use super::intake_worker_capabilities::capabilities_with_runtime_state;
+pub(crate) mod identity;
 pub(crate) use super::intake_worker_capabilities::{
     GatewayWaiterGuard, node_awaits_gateway, node_supports_intake_provider,
     node_supports_intake_request, refresh_worker_node_runtime_capabilities,
@@ -387,6 +388,22 @@ fn spawn_heartbeat_loop(
             {
                 tracing::warn!("[cluster] heartbeat MCP endpoint sync failed: {error}");
             }
+            if !crate::db::postgres::background_should_yield(&pool) {
+                let observation = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    super::execution_capacity::recovery::observe_retained(&pool, &instance_id),
+                )
+                .await;
+                match observation {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "[cluster] retained runtime observation failed; leases remain fenced")
+                    }
+                    Err(_) => tracing::warn!(
+                        "[cluster] retained runtime observation timed out; leases remain fenced"
+                    ),
+                }
+            }
             // Stale-row GC: leader-only sweep that flips
             // worker_nodes.status='offline' when a peer's last_heartbeat_at is
             // beyond stale_threshold_secs. Without this, dead nodes keep
@@ -701,18 +718,9 @@ pub(crate) async fn wait_for_self_instance_id(max_wait: std::time::Duration) -> 
 }
 
 fn resolve_instance_id(config: &ClusterConfig) -> String {
-    if let Some(value) = config
-        .instance_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return value.to_string();
-    }
-    if let Ok(value) = std::env::var("AGENTDESK_INSTANCE_ID")
-        && !value.trim().is_empty()
-    {
-        return value.trim().to_string();
+    let environment = std::env::var("AGENTDESK_INSTANCE_ID").ok();
+    if let Some(value) = identity::declared(config.instance_id.as_deref(), environment.as_deref()) {
+        return value.to_owned();
     }
     format!(
         "{}-{}",

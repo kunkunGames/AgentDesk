@@ -224,8 +224,13 @@ if run_check guards "Writer namespace Windows exact-target runner fixtures (#567
 "$PYTHON" -m unittest tests.test_writer_namespace_windows_targets
 fi
 
+if run_check guards "24x7 activation evidence counterexamples"; then
+"$PYTHON" -m unittest tests.test_activation_24x7_gate
+fi
+
 if run_check guards "Postgres migration checksum guard"; then
 "$PYTHON" scripts/check_postgres_migration_checksums.py --require-base
+"$PYTHON" scripts/check_migration_convergence.py
 "$PYTHON" -m unittest tests.test_postgres_migration_checksum_guard
 fi
 

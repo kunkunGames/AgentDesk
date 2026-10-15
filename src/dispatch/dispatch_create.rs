@@ -19,44 +19,9 @@ use super::dispatch_context::{
 use super::dispatch_query::query_dispatch_row_pg;
 use super::{DispatchCreateOptions, cancel_dispatch_and_reset_auto_queue_on_pg_tx};
 
-pub(crate) fn dispatch_context_requests_sidecar(context: &serde_json::Value) -> bool {
-    context
-        .get("sidecar_dispatch")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false)
-        || context
-            .get("phase_gate")
-            .and_then(|value| value.as_object())
-            .is_some()
-}
-
-fn inject_work_dispatch_baseline_commit(dispatch_type: &str, context: &mut serde_json::Value) {
-    if !matches!(dispatch_type, "implementation" | "rework") {
-        return;
-    }
-    let Some(obj) = context.as_object_mut() else {
-        return;
-    };
-    if obj.contains_key("baseline_commit") {
-        return;
-    }
-
-    let target_repo = obj
-        .get("target_repo")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.is_empty());
-    let baseline_commit =
-        crate::services::platform::shell::resolve_repo_dir_for_target(target_repo)
-            .ok()
-            .flatten()
-            .and_then(|repo_dir| {
-                crate::services::platform::shell::git_dispatch_baseline_commit(&repo_dir)
-            });
-
-    if let Some(baseline_commit) = baseline_commit {
-        obj.insert("baseline_commit".to_string(), json!(baseline_commit));
-    }
-}
+mod context_admission;
+pub(crate) use context_admission::dispatch_context_requests_sidecar;
+use context_admission::inject_work_dispatch_baseline_commit;
 
 async fn load_existing_thread_for_channel_pg(
     pool: &PgPool,
@@ -673,6 +638,13 @@ async fn create_dispatch_core_internal(
     };
     let mut context_with_session_strategy =
         dispatch_context_with_session_strategy(dispatch_type, context);
+    crate::services::managed_checks::bind_campaign_dispatch(
+        pg_pool,
+        kanban_card_id,
+        to_agent_id,
+        &mut context_with_session_strategy,
+    )
+    .await?;
     let sandbox_preflight_without_external_side_effects =
         sandbox_preflight_card_disables_external_side_effects(pg_pool, kanban_card_id).await;
     let target_repo = resolve_card_target_repo_ref(

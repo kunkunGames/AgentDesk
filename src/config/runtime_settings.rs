@@ -49,6 +49,14 @@ pub struct RuntimeSettingsConfig {
     pub max_retries: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_entry_retries: Option<u64>,
+    /// Native campaign bootstrap planner and DAG-template promotion reviewer.
+    /// Unset uses the existing `codex` agent. Business executors stay goal-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_superior_agent_id: Option<String>,
+    /// Independently verified completed occurrences per template review batch.
+    /// Unset uses 10; valid operator values are 1..=100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub campaign_dag_template_min_samples: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_dispatched_grace_min: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +184,8 @@ impl RuntimeSettingsConfig {
             && self.context_compact_lower_bound_tokens.is_none()
             && self.max_retries.is_none()
             && self.max_entry_retries.is_none()
+            && self.campaign_superior_agent_id.is_none()
+            && self.campaign_dag_template_min_samples.is_none()
             && self.stale_dispatched_grace_min.is_none()
             && self.stale_dispatched_terminal_statuses.is_none()
             && self.stale_dispatched_recover_null_dispatch.is_none()

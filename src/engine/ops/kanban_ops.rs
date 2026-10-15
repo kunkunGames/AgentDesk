@@ -224,7 +224,7 @@ fn set_status_raw_pg(pool: &PgPool, card_id: &str, new_status: &str, force: bool
         // resolver (`resolve_pipeline_on_pg_tx`) to avoid the cross-pool
         // deadlock fixed in #1342.
         let row = sqlx::query(
-            "SELECT status, review_status, latest_dispatch_id, repo_id, assigned_agent_id, review_entered_at::text AS review_entered_at
+            "SELECT status, review_status, latest_dispatch_id, repo_id, assigned_agent_id, review_entered_at::text AS review_entered_at, agentdesk_check_disposition(kanban_cards) AS check_disposition
              FROM kanban_cards
              WHERE id = $1",
         )
@@ -252,6 +252,9 @@ fn set_status_raw_pg(pool: &PgPool, card_id: &str, new_status: &str, force: bool
         let review_entered_at: Option<String> = row
             .try_get("review_entered_at")
             .map_err(|error| format!("decode review_entered_at for {card_id}: {error}"))?;
+        let check_disposition: String = row
+            .try_get("check_disposition")
+            .map_err(|error| format!("decode check disposition for {card_id}: {error}"))?;
 
         let effective =
             resolve_pipeline_on_pg_tx(&mut tx, repo_id.as_deref(), assigned_agent_id.as_deref())
@@ -346,9 +349,9 @@ fn set_status_raw_pg(pool: &PgPool, card_id: &str, new_status: &str, force: bool
             pipeline: effective.clone(),
             gates: GateSnapshot {
                 has_active_dispatch,
-                review_verdict_pass: matches!(
+                review_verdict_pass: crate::server::test_phase_runs::checks::review_gate_passes(
+                    &check_disposition,
                     latest_review_verdict.as_deref(),
-                    Some("pass") | Some("approved")
                 ),
                 review_verdict_rework: matches!(
                     latest_review_verdict.as_deref(),

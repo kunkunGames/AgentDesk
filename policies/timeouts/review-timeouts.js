@@ -42,6 +42,8 @@ module.exports = function attachReviewTimeouts(timeouts, helpers) {
         [cReview]
       );
       for (var k = 0; k < staleReviews.length; k++) {
+        var disposition = agentdesk.review.disposition(staleReviews[k].card_id);
+        if (disposition !== "unmanaged" && disposition !== "run_local_review") continue;
         var staleReviewReason = "stale review — dispatch 완료 30분+ verdict 없음";
         escalateToManualIntervention(staleReviews[k].card_id, staleReviewReason, { review: true });
         agentdesk.log.warn("[timeout] Stale review → dilemma_pending: card " + staleReviews[k].card_id);
@@ -61,6 +63,8 @@ module.exports = function attachReviewTimeouts(timeouts, helpers) {
         [dReview]
       );
       for (var d = 0; d < stuckDod.length; d++) {
+        var disposition = agentdesk.review.disposition(stuckDod[d].id);
+        if (disposition !== "unmanaged" && disposition !== "run_local_review") continue;
         var dodReason = "DoD 대기 15분 초과";
         escalateToManualIntervention(stuckDod[d].id, dodReason, { review: true });
         agentdesk.log.warn("[timeout] DoD await timeout → dilemma_pending: card " + stuckDod[d].id);
@@ -122,6 +126,8 @@ module.exports = function attachReviewTimeouts(timeouts, helpers) {
       // This avoids partial policy reimplementation (R1/R2 review feedback).
       for (var n = 0; n < orphanReviews.length; n++) {
         var oc = orphanReviews[n];
+        var disposition = agentdesk.review.disposition(oc.id);
+        if (disposition !== "unmanaged" && disposition !== "run_local_review") continue;
         agentdesk.log.warn("[timeout] Orphan review detected: card " + oc.id +
           " (#" + (oc.github_issue_number || "?") + ") in review with no active dispatch → dilemma_pending");
 

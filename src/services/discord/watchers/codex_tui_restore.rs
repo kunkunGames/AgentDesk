@@ -178,6 +178,14 @@ pub(super) fn commit_live_direct_resume_fallback(
             {
                 return false;
             }
+            if tmux_common::write_tmux_runtime_kind_marker_under_source_authority(
+                authority,
+                RuntimeHandoffKind::CodexTui,
+            )
+            .is_err()
+            {
+                return false;
+            }
             let verified = dedupe::codex_verified_marker_metadata(
                 authority,
                 std::path::Path::new(&binding.output_path),
@@ -192,13 +200,6 @@ pub(super) fn commit_live_direct_resume_fallback(
                         channel_id.get(),
                         binding,
                     );
-                if !verified || registered {
-                    tmux_common::write_tmux_runtime_kind_marker(
-                        tmux_session_name,
-                        RuntimeHandoffKind::CodexTui,
-                    )
-                    .ok();
-                }
                 registered
             })
         })

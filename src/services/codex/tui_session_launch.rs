@@ -637,10 +637,7 @@ pub(crate) fn emit_codex_tui_post_tail_handoff(
             "codex tui session ended before producing a response",
             Some(offset),
         );
-        let _ = sender.send(StreamMessage::Done {
-            result: "⚠ Codex TUI session ended before producing a response.".to_string(),
-            session_id: None,
-        });
+        let _ = sender.send(StreamMessage::session_ended("Codex TUI"));
     } else {
         if !register_codex_tui_idle_relay_binding(tmux_session_name, &tail_result) {
             return Ok(());
@@ -699,10 +696,7 @@ pub(crate) fn emit_codex_tui_post_tail_handoff(
                     "codex tui session ended before becoming input-ready",
                     Some(tail_result.final_offset),
                 );
-                let _ = sender.send(StreamMessage::Done {
-                    result: "⚠ Codex TUI session ended before becoming input-ready.".to_string(),
-                    session_id: tail_result.session_id.clone(),
-                });
+                // The completed response remains valid; only its reusable handoff is lost.
             }
             Err(error) => {
                 tracing::warn!(

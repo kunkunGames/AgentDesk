@@ -229,6 +229,30 @@ test("timeouts dispatch maintenance retries failed dispatches with an incremente
   ]);
 });
 
+test("generic timeout retries exclude native Campaign ownership across held and active cards", () => {
+  const { DatabaseSync } = require("node:sqlite");
+  const db = new DatabaseSync(":memory:");
+  db.exec(`CREATE TABLE task_dispatches (id TEXT, kanban_card_id TEXT, to_agent_id TEXT,
+    dispatch_type TEXT, title TEXT, retry_count INTEGER, status TEXT, updated_at TEXT);
+    CREATE TABLE kanban_cards (id TEXT, latest_dispatch_id TEXT, status TEXT,
+    github_issue_url TEXT, github_issue_number INTEGER);
+    CREATE TABLE campaign_graph_tasks (card_id TEXT);`);
+  for (const [id, native] of [["ordinary", false], ["held", true], ["active", true]]) {
+    db.prepare("INSERT INTO kanban_cards VALUES (?, ?, 'in_progress', NULL, NULL)").run(id, id);
+    db.prepare("INSERT INTO task_dispatches VALUES (?, ?, 'qa', 'implementation', 'Validate', 0, 'failed', datetime('now','-2 minutes'))").run(id, id);
+    if (native) db.prepare("INSERT INTO campaign_graph_tasks VALUES (?)").run(id);
+  }
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    dbQuery(sql, params) { return db.prepare(sql).all(...(params || [])); }
+  });
+  policy._section_J();
+  assert.deepEqual(state.dispatchCreates.map(d => d.cardId), ["ordinary"]);
+  assert.equal(state.dispatchRetryCountCalls.length, 1);
+  assert.equal(state.dispatchRetryCountCalls[0].count, 1);
+  assert.equal(state.logs.error.length, 0);
+  db.close();
+});
+
 // Pins the requested-timeout retry budget: retry_count 9 still retries, 10 escalates.
 test("timeouts requested sweep retries below the dispatch budget and escalates at it", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
@@ -599,6 +623,114 @@ test("timeouts active monitor normalizes the full-key host observation without e
   }
 });
 
+function staleRuntimeFixture(runtimeKind, liveness) {
+  const sessionKey = "provider:AgentDesk-codex-stale-runtime";
+  return {
+    session: { session_key: sessionKey, status: "turn_active", provider: "codex", channel_id: "42",
+      instance_id: "hub-incarnation-1", turn_generation: 9, last_heartbeat: "2026-10-03T16:00:00.123456Z",
+      active_dispatch_id: "dispatch-stale-runtime", active_dispatch_status: "dispatched", active_turn_nonce: null,
+      runtime_evidence: { runtime_kind: runtimeKind, liveness, reason: liveness === "unknown" ? "registry_entry_absent" : "owned_child_identity_verified" } },
+    inflight: { session_key: sessionKey, tmux_session_name: "AgentDesk-codex-stale-runtime", provider: "codex",
+      channel_id: "42", dispatch_id: "dispatch-stale-runtime", runtime_kind: runtimeKind,
+      process_liveness: { state: liveness, reason: "registry_probe" }, updated_at: timestampMinutesAgo(35) }
+  };
+}
+
+test("native stale owners never use tmux absence as live, exit, or restart-unknown settlement evidence", () => {
+  for (const kind of ["process_backend", "claude_e_adapter"]) {
+    for (const liveness of ["live", "exited", "unknown"]) {
+      const f = staleRuntimeFixture(kind, liveness);
+      const { policy, state } = loadPolicy("policies/timeouts.js", {
+        inflights: [f.inflight], timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [f.session] },
+        sessionHasLivePane() { return "dead"; },
+        exec() { throw new Error("native ownership must not query tmux"); }
+      });
+      for (let tick = 0; tick < 3; tick++) policy._section_I();
+      assert.equal(state.execCalls.length, 0);
+      assert.equal(state.timeoutStaleRecoveryCalls.length, 0);
+      assert.equal(state.dispatchMarkFailedCalls.length, 0);
+      assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+      assert.equal(state.httpPosts.length, 0);
+    }
+  }
+});
+
+test("native runtime evidence survives a missing inflight after restart", () => {
+  const f = staleRuntimeFixture("process_backend", "unknown");
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [f.session] },
+    sessionHasLivePane() { return "dead"; },
+    exec() { throw new Error("native registry absence must not fall back to tmux"); }
+  });
+  policy._section_I();
+  assert.equal(state.execCalls.length, 0);
+  assert.equal(state.timeoutStaleRecoveryCalls.length, 0);
+});
+
+test("unknown or conflicting runtime evidence preserves stale ownership", () => {
+  for (const mode of ["unknown", "backend-conflict", "dispatch-replaced", "session-replaced"]) {
+    const f = staleRuntimeFixture("codex_tui", "unknown");
+    if (mode === "unknown") { f.session.runtime_evidence.runtime_kind = null; f.inflight.runtime_kind = null; }
+    if (mode === "backend-conflict") f.inflight.runtime_kind = "process_backend";
+    if (mode === "dispatch-replaced") f.inflight.dispatch_id = "new-dispatch";
+    if (mode === "session-replaced") f.inflight.session_key = "other-session";
+    const { policy, state } = loadPolicy("policies/timeouts.js", {
+      inflights: [f.inflight], timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [f.session] },
+      sessionHasLivePane() { return "dead"; },
+      exec() { throw new Error("ambiguous identity must not query tmux"); }
+    });
+    policy._section_I();
+    assert.equal(state.execCalls.length, 0);
+    assert.equal(state.timeoutStaleRecoveryCalls.length, 0);
+    assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+  }
+});
+
+test("live TUI owners retain the existing accepted-turn behavior", () => {
+  const f = staleRuntimeFixture("codex_tui", "unknown");
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    inflights: [f.inflight], timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [f.session] },
+    sessionHasLivePane() { return "live"; }
+  });
+  policy._section_I();
+  assert.equal(state.execCalls.length, 0);
+  assert.deepEqual(state.timeoutHostObservations, [f.session.session_key]);
+  assert.equal(state.timeoutStaleRecoveryCalls.length, 0);
+  assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+});
+
+test("dead TUI recovery uses one identity snapshot and canonical guarded facade for both scans", () => {
+  const f = staleRuntimeFixture("legacy_tmux_wrapper", "unknown");
+  const { policy, state } = loadPolicy("policies/timeouts.js", {
+    inflights: [f.inflight], timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [f.session],
+      recoverStaleSession() { return { ok: true, applied: true }; } }, sessionHasLivePane() { return "dead"; }
+  });
+  policy._section_I();
+  assert.equal(state.timeoutStaleRecoveryCalls.length, 1);
+  assert.deepEqual(toPlain(state.timeoutStaleRecoveryCalls[0]), { snapshot: f.session, clear_active_dispatch_id: true });
+  assert.equal(state.dispatchMarkFailedCalls.length, 0);
+  assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+  assert.equal(state.logs.info.filter((line) => line.includes("Proven dead tmux owner")).length, 1);
+});
+
+test("changed, unapplied, or failed recovery never performs a second idle write or success log", () => {
+  for (const outcome of ["changed", "empty", "throw"]) {
+    const f = staleRuntimeFixture("codex_tui", "unknown");
+    const { policy, state } = loadPolicy("policies/timeouts.js", {
+      inflights: [f.inflight], timeouts: { staleWorkingSessions: [f.session], deadlockCandidates: [],
+        recoverStaleSession() {
+          if (outcome === "throw") throw new Error("concurrent settlement rolled back");
+          return outcome === "empty" ? null : { ok: true, applied: false, reason: "session_identity_changed" };
+        } }, sessionHasLivePane() { return "dead"; }
+    });
+    policy._section_I();
+    assert.equal(state.timeoutStaleRecoveryCalls.length, 1);
+    assert.equal(state.dispatchMarkFailedCalls.length, 0);
+    assert.equal(state.timeoutMarkSessionIdleCalls.length, 0);
+    assert.equal(state.logs.info.filter((line) => line.includes("Proven dead tmux owner")).length, 0);
+  }
+});
+
 test("timeouts active monitor deadlock section uses typed timeout facade", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     timeouts: {
@@ -618,7 +750,7 @@ test("timeouts active monitor deadlock section uses typed timeout facade", () =>
   assert.equal(state.timeoutHistoryCleanupCalls.length, 1);
 });
 
-test("timeouts active monitor module treats synthetic reattach placeholders as absent", () => {
+test("timeouts active monitor preserves a live owner with only a synthetic reattach placeholder", () => {
   const sessionKey = "provider:AgentDesk-codex-project-agentdesk";
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     inflights: [
@@ -658,10 +790,8 @@ test("timeouts active monitor module treats synthetic reattach placeholders as a
 
   assert.equal(state.deadlockAlerts.length, 0);
   assert.equal(state.httpPosts.length, 0);
-  assert.deepEqual(toPlain(state.timeoutRepairCalls), [{ sessionKey, request: {
-    session_id: 1, active_dispatch_id: "dispatch-1", active_turn_nonce: null, observed: "live",
-    fail_dispatch: false, fail_reason: "", clear_active_dispatch_id: false
-  } }]);
+  assert.deepEqual(toPlain(state.timeoutRepairCalls), []);
+  assert.deepEqual(toPlain(state.timeoutStaleRecoveryCalls), []);
 });
 
 test("S7 active monitor exempts synthetic turns without force-kill or repeated logs", () => {
@@ -1277,13 +1407,14 @@ test("active monitor defers every unresolved host in both loops and refreshes it
       .map((dispatchStatus) => ({ observed, hasInflight, dispatchStatus }))));
   for (const { observed, hasInflight, dispatchStatus } of cases) {
     const sessionKey = "claude/tok/mac-mini:__proto__";
-    const row = { session_key: sessionKey, active_dispatch_id: "d1", active_dispatch_status: dispatchStatus, active_turn_nonce: "turn-1" };
+    const row = { session_key: sessionKey, active_dispatch_id: "d1", active_dispatch_status: dispatchStatus, active_turn_nonce: "turn-1",
+      runtime_evidence: { runtime_kind: "legacy_tmux_wrapper", liveness: "unknown", reason: "tmux_probe_required" } };
     let observation = observed;
     const { policy, state } = loadPolicy("policies/timeouts.js", {
       sessionHost() { return Object.assign({ session_id: 7, tmux_name: "__proto__" }, observation); },
       inflights: hasInflight ? [{
         session_key: sessionKey, tmux_session_name: "__proto__", provider: "codex",
-        channel_id: "test-channel", dispatch_id: "d1", request_owner_user_id: 1,
+        channel_id: "test-channel", dispatch_id: "d1", request_owner_user_id: 1, runtime_kind: "legacy_tmux_wrapper",
         started_at: timestampMinutesAgo(45), updated_at: timestampMinutesAgo(35)
       }] : [],
       timeouts: { staleWorkingSessions: [row], deadlockCandidates: [row] }
@@ -1292,15 +1423,11 @@ test("active monitor defers every unresolved host in both loops and refreshes it
     state.kv.set(key, "preserved");
     policy._section_I();
     const defer = observed.state === "unknown";
-    const recover = !defer && (observed.state === "dead" || !hasInflight);
-    const repair = (stale) => ({ sessionKey, request: {
-      session_id: 7, active_dispatch_id: "d1", active_turn_nonce: "turn-1", observed: observed.state,
-      fail_dispatch: stale && dispatchStatus !== "completed",
-      fail_reason: stale ? "Stale working session recovery — no active tmux session after 10min" : "",
-      clear_active_dispatch_id: stale
-    } });
+    const recover = observed.state === "dead";
+    const repair = { snapshot: row, clear_active_dispatch_id: true };
     const label = JSON.stringify(observed) + " inflight=" + hasInflight + " dispatch=" + dispatchStatus;
-    assert.deepEqual(toPlain(state.timeoutRepairCalls), recover ? [repair(true), repair(false)] : [], label);
+    assert.deepEqual(toPlain(state.timeoutStaleRecoveryCalls), recover ? [repair] : [], label);
+    assert.equal(state.timeoutRepairCalls.length, 0, label);
     assert.equal(state.dispatchMarkFailedCalls.length, 0, label);
     assert.equal(state.kv.has(key), defer, label);
     assert.equal(state.logs.warn.filter((line) => line.includes("(" + observed.reason + "); deferring")).length, defer ? 1 : 0, label);
@@ -1315,7 +1442,7 @@ test("active monitor defers every unresolved host in both loops and refreshes it
     observation = { state: "dead" };
     policy._section_I();
     assert.deepEqual(state.timeoutHostObservations, [sessionKey, sessionKey], label);
-    assert.equal(state.timeoutRepairCalls.length, (recover ? 2 : 0) + 2, label);
+    assert.equal(state.timeoutStaleRecoveryCalls.length, (recover ? 1 : 0) + 1, label);
     assert.equal(state.kv.has(key), false, label);
   }
 });
@@ -1327,11 +1454,11 @@ test("active monitor reports a repair the facade refused without an idle log", (
     sessionHost() { return { state: "dead", session_id: 7, tmux_name: "AgentDesk-claude-swapped" }; },
     timeouts: {
       staleWorkingSessions: [row], deadlockCandidates: [row],
-      repairStaleSession() { return { ok: true, repaired: false, deferred: "row_changed" }; }
+      recoverStaleSession() { return { ok: true, applied: false, reason: "row_changed" }; }
     }
   });
   policy._section_I();
-  assert.equal(state.timeoutRepairCalls.length, 2);
+  assert.equal(state.timeoutStaleRecoveryCalls.length, 2);
   assert.equal(state.logs.warn.filter((line) => line.includes("Repair deferred (row_changed)")).length, 2);
   assert.equal(state.logs.info.filter((line) => line.includes("→ idle")).length, 0);
   assert.equal(state.logs.warn.filter((line) => line.includes("Failed stale dispatch")).length, 0);

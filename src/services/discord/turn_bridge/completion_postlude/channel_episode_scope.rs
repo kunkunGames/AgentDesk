@@ -480,10 +480,15 @@ mod tests {
         ] {
             assert_eq!(live_original.matches(call).count(), 1);
         }
-        let intake = include_str!("../../router/message_handler/intake_turn.rs");
-        let headless = include_str!("../../router/message_handler/headless_turn.rs");
-        let recovery = include_str!("../../recovery_engine/restore_inflight.rs");
-        let tui_direct = include_str!("../../tui_prompt_relay/claude_idle_bridge.rs");
+        // Source contracts must survive both Windows CRLF and Unix LF checkouts.
+        let intake =
+            include_str!("../../router/message_handler/intake_turn.rs").replace("\r\n", "\n");
+        let headless =
+            include_str!("../../router/message_handler/headless_turn.rs").replace("\r\n", "\n");
+        let recovery =
+            include_str!("../../recovery_engine/restore_inflight.rs").replace("\r\n", "\n");
+        let tui_direct =
+            include_str!("../../tui_prompt_relay/claude_idle_bridge.rs").replace("\r\n", "\n");
         assert_eq!(intake.matches(&spawn).count(), 2);
         assert_eq!(headless.matches(&spawn).count(), 1);
         assert_eq!(recovery.matches(&spawn).count(), 1);

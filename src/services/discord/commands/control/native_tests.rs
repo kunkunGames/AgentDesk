@@ -79,7 +79,7 @@ impl NativeClearEffects for Fake {
                 })
             })
     }
-    fn reset_process(&self, tmux: &str) {
+    fn reset_process(&self, _shared: &crate::services::discord::SharedData, tmux: &str) {
         self.note(format!("reset:{tmux}"));
     }
 }

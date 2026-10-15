@@ -1,4 +1,4 @@
-use chrono::Timelike;
+use chrono::SubsecRound;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -333,7 +333,7 @@ impl BlackoutWindowConstraint {
 
     fn current_utc_time(&self) -> chrono::NaiveTime {
         self.now_utc
-            .unwrap_or_else(|| chrono::Utc::now().time().with_nanosecond(0).unwrap())
+            .unwrap_or_else(|| chrono::Utc::now().time().trunc_subsecs(0))
     }
 
     fn parse_time(raw: &str) -> Option<chrono::NaiveTime> {

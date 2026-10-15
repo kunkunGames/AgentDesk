@@ -562,6 +562,7 @@ mod tests {
             unread_bytes: Some(10),
             relay_stale: true,
             capture_lagged: false,
+            relay_backlog: super::super::session_enrichment::RelayBacklogEvidence::unobserved(),
             // #5071 relay-tail S1 (I-4): an attached fixture's coordinate has
             // advanced to the same offset the fields above report. Descriptive
             // only — no predicate in this suite reads it.
@@ -1363,6 +1364,7 @@ mod tests {
     #[test]
     fn health_detail_mailbox_serializes_unavailable_shadow_verdict_as_null() {
         let mailbox = MailboxHealthSnapshot {
+            relay_backlog: super::super::session_enrichment::RelayBacklogEvidence::unobserved(),
             provider: ProviderKind::Codex.as_str().to_string(),
             channel_id: 42,
             has_cancel_token: false,
@@ -1416,6 +1418,11 @@ mod tests {
             serde_json::json!([])
         );
         assert_eq!(serialized["stall_shadow_verdict"], serde_json::Value::Null);
+        assert_eq!(
+            serialized["relay_backlog"],
+            serde_json::json!({"status": "unknown", "reason": "not_observed"}),
+            "unmeasured delivery must remain observable rather than serialize as clear"
+        );
         // #5071 relay-tail S1 (I-4): the two witnesses reach the detail surface
         // as two fields, and the hypothesis they discriminate rides beside them.
         assert_eq!(

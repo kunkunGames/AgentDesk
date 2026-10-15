@@ -78,6 +78,20 @@ class PostgresMigrationChecksumGuardTest(unittest.TestCase):
         self.assertIn(sha256(self.original), result.stderr)
         self.assertIn(sha256(self.changed), result.stderr)
 
+    def test_native_and_shared_catalogs_are_immutable_and_cannot_be_omitted(self):
+        for folder in ("postgres_campaign_v5", "postgres_shared"):
+            with self.subTest(folder=folder):
+                migration = self.root / "migrations" / folder / "0146_convergence.sql"
+                migration.parent.mkdir(exist_ok=True)
+                migration.write_bytes(self.original)
+                payload = self.guard.manifest_payload(self.guard.find_migrations(self.root))
+                self.manifest.write_text(json.dumps(payload), encoding="utf-8")
+                self.assertEqual(self.run_guard().returncode, 0)
+                migration.write_bytes(self.changed)
+                self.assertNotEqual(self.run_guard().returncode, 0)
+                migration.unlink()
+                self.assertNotEqual(self.run_guard().returncode, 0)
+
     def test_allows_drift_only_when_repair_allowlist_matches_old_and_new_checksum(self):
         self.migration.write_bytes(self.changed)
         self.allowlist.write_text(

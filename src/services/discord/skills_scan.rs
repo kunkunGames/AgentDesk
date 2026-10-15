@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 
 /// Scan for provider-specific skills available to this bot.
-pub(in crate::services) fn scan_skills(
+pub(crate) fn scan_skills(
     provider: &ProviderKind,
     project_path: Option<&str>,
 ) -> Vec<(String, String)> {
@@ -66,93 +66,26 @@ pub(in crate::services) fn scan_skills(
     skills
 }
 
-/// Compute a lightweight fingerprint of skill directories: (file_count, max_mtime_epoch).
-/// Used by the hot-reload poll to detect additions, modifications, and deletions.
-fn skill_dir_fingerprint(provider: &ProviderKind) -> (usize, u64) {
-    let mut count = 0usize;
-    let mut max_mtime = 0u64;
+mod fingerprint;
 
-    let mut dirs = collect_provider_skill_roots(provider, None);
-    if provider_supports_directory_skills(provider) {
-        if let Some(root) = crate::config::runtime_root() {
-            dirs.push(crate::runtime_layout::managed_skills_root(&root));
-        }
-    }
-
-    fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk_mtime(&path, count, max_mtime);
-            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
-                *count += 1;
-                if let Ok(meta) = fs::metadata(&path) {
-                    if let Ok(mt) = meta.modified() {
-                        let epoch = mt
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if epoch > *max_mtime {
-                            *max_mtime = epoch;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for dir in &dirs {
-        walk_mtime(dir, &mut count, &mut max_mtime);
-    }
-
-    (count, max_mtime)
-}
-
-/// Like `skill_dir_fingerprint` but also includes project-level skill directories.
+/// Includes home, managed and active project skills. The caller must use the
+/// blocking pool and preserve its last good cache if a complete scan fails.
 pub(in crate::services::discord) fn skill_dir_fingerprint_with_projects(
     provider: &ProviderKind,
     project_paths: &[String],
-) -> (usize, u64) {
-    let (mut count, mut max_mtime) = skill_dir_fingerprint(provider);
-
-    fn walk_mtime(dir: &Path, count: &mut usize, max_mtime: &mut u64) {
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk_mtime(&path, count, max_mtime);
-            } else if path.extension().map(|e| e == "md").unwrap_or(false) {
-                *count += 1;
-                if let Ok(meta) = fs::metadata(&path) {
-                    if let Ok(mt) = meta.modified() {
-                        let epoch = mt
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if epoch > *max_mtime {
-                            *max_mtime = epoch;
-                        }
-                    }
-                }
-            }
+) -> anyhow::Result<(usize, u64)> {
+    let mut roots = collect_provider_skill_roots(provider, None);
+    if provider_supports_directory_skills(provider) {
+        if let Some(root) = crate::config::runtime_root() {
+            roots.push(crate::runtime_layout::managed_skills_root(&root));
         }
     }
-
-    for path in project_paths {
-        let Some(proj_dir) = provider_project_skill_dir(provider, path) else {
-            continue;
-        };
-        if proj_dir.is_dir() {
-            walk_mtime(&proj_dir, &mut count, &mut max_mtime);
-        }
-    }
-
-    (count, max_mtime)
+    roots.extend(
+        project_paths
+            .iter()
+            .filter_map(|path| provider_project_skill_dir(provider, path)),
+    );
+    fingerprint::scan(roots)
 }
 
 fn provider_supports_directory_skills(provider: &ProviderKind) -> bool {

@@ -104,14 +104,16 @@ async fn finalize_work_dispatch_from_stream(
     request: &WatcherStreamingFinalRequest<'_>,
     followup_source: &str,
 ) -> StreamingFinalResult {
-    let completion_result = watcher_completion_context(
-        request.pg_pool,
-        request.dispatch_id,
-        "watcher_streaming_final",
-        false,
-        request.adk_cwd,
-        request.full_response,
-    );
+    let completion_result = match watcher_completion_result(request).await {
+        Ok(result) => result,
+        Err(error) => {
+            return StreamingFinalResult::not_completed(
+                StreamingFinalDisposition::FinalizeFailed,
+                None,
+                Some(format!("Campaign completion receipt rejected: {error}")),
+            );
+        }
+    };
     let completed = super::turn_bridge::streaming_final_complete_dispatch_with_result(
         request.dispatch_id,
         &completion_result,
@@ -131,6 +133,41 @@ async fn finalize_work_dispatch_from_stream(
             Some("watcher streaming finalizer did not complete dispatch".to_string()),
         )
     }
+}
+
+#[cfg(test)]
+#[path = "streaming_finalizer/native_campaign_tests.rs"]
+mod native_campaign_tests;
+
+async fn watcher_completion_result(
+    request: &WatcherStreamingFinalRequest<'_>,
+) -> anyhow::Result<serde_json::Value> {
+    let native = match request.pg_pool {
+        Some(pool) => {
+            super::turn_bridge::native_campaign_result(pool, request.dispatch_id, request.adk_cwd)
+                .await
+        }
+        None => Err(anyhow::anyhow!(
+            "streaming completion ownership unavailable"
+        )),
+    };
+    Ok(match native? {
+        Some(mut receipt) => {
+            // The direct PG finalizer records this source in its completion
+            // event; retain the same authoritative metadata in future results.
+            receipt["completion_source"] = serde_json::json!("watcher_streaming_final");
+            crate::db::campaigns::graph::result::validate_dispatch(&receipt)?;
+            receipt
+        }
+        None => watcher_completion_context(
+            request.pg_pool,
+            request.dispatch_id,
+            "watcher_streaming_final",
+            false,
+            request.adk_cwd,
+            request.full_response,
+        ),
+    })
 }
 
 pub(in crate::services::discord) async fn finalize_watcher_streaming_dispatch(

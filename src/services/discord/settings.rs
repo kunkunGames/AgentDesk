@@ -74,6 +74,27 @@ pub(crate) fn discord_token_hash(token: &str) -> String {
     format!("discord_{}", hex::encode(&result[..8]))
 }
 
+/// OpenCode permission categories are not Claude tool display names. Preserve
+/// native names (including unknown entries for the adapter to reject) instead
+/// of silently dropping categories or changing `edit` into unsupported `Edit`.
+fn normalize_tools_for_provider<I, S>(provider: &ProviderKind, tools: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    if *provider != ProviderKind::OpenCode {
+        return normalize_allowed_tools(tools);
+    }
+    let mut seen = std::collections::HashSet::new();
+    tools
+        .into_iter()
+        .filter_map(|tool| {
+            let name = tool.as_ref().trim();
+            (!name.is_empty() && seen.insert(name.to_string())).then(|| name.to_string())
+        })
+        .collect()
+}
+
 fn default_allowed_tools_for_provider(provider: &ProviderKind) -> Vec<String> {
     // Qwen validates `allowed_tools` against its own QWEN_SUPPORTED_ALLOWED_TOOLS list at
     // session start and errors on unknown entries. The shared DEFAULT_ALLOWED_TOOLS now
@@ -82,6 +103,7 @@ fn default_allowed_tools_for_provider(provider: &ProviderKind) -> Vec<String> {
     // to launch. Hand Qwen its own supported list instead.
     let source: &[&str] = match provider {
         ProviderKind::Qwen => crate::services::qwen::QWEN_SUPPORTED_ALLOWED_TOOLS,
+        ProviderKind::OpenCode => crate::services::opencode::DEFAULT_ALLOWED_TOOLS,
         _ => DEFAULT_ALLOWED_TOOLS,
     };
     source.iter().map(|tool| (*tool).to_string()).collect()
