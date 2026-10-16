@@ -7279,9 +7279,9 @@ services::discord::router::message_handler::intake_turn::dispatch_stamp::postgre
 services::discord::router::message_handler::intake_turn::dispatch_stamp::postgres_tests::stamp_is_written_when_ready_capability_is_injected_pg
 services::discord::router::message_handler::intake_turn::feedback_reminder_take_order_tests::intake_takes_feedback_reminder_once_after_guards_and_before_prompt_use
 services::discord::router::message_handler::intake_turn::feedback_reminder_take_order_tests::tui_busy_enqueue_refusal_puts_back_feedback_reminder_for_next_turn
+services::discord::router::message_handler::intake_turn::future_size_tests::intake_entry_futures_stay_within_worker_stack_budget
 services::discord::router::message_handler::intake_turn::input_effect_tests::c1b_off_role_override_keeps_runtime_transition_on_original_provider
 services::discord::router::message_handler::intake_turn::input_effect_tests::c1b_worker_core_refuses_closing_before_settings_or_voice_consumption
-services::discord::router::message_handler::intake_turn::input_effect_tests::intake_entry_futures_stay_within_worker_stack_budget
 services::discord::router::message_handler::intake_turn::intake_outbox_state_builder_tests::bridge_handoff_stamp_call_site_is_adjacent_to_the_only_spawn_turn_bridge
 services::discord::router::message_handler::intake_turn::intake_outbox_state_builder_tests::builder_adopts_worker_intake_outbox_identity
 services::discord::router::message_handler::intake_turn::intake_outbox_state_builder_tests::builder_cannot_replace_an_already_adopted_intake_outbox_identity
