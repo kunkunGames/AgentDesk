@@ -455,6 +455,9 @@ db::campaigns::graph::receipt::tests::envelope_rejects_authority_and_unadvertise
 db::campaigns::graph::receipt::tests::sample_evidence_redacts_credentials_and_preserves_business_outcome
 db::campaigns::graph::result::tests::runtime_metadata_is_validated_separately_and_cannot_relax_provider_schema
 db::campaigns::graph::schema::tests::generated_schema_exposes_strict_native_fields_and_versioned_contracts
+db::campaigns::graph::schema::tests::settled_effect_schema_exposes_graph_local_node_id_contract
+db::campaigns::graph::settled_gate::tests::existing_node_ids_are_valid_and_persistent_keys_are_not_rewritten
+db::campaigns::graph::settled_gate::tests::malformed_audit_and_reference_failures_are_distinct
 db::campaigns::graph::workflow::tests::completion_covers_each_goal_criterion_and_exact_accepted_verification_output
 db::campaigns::graph::workflow::tests::incomplete_independent_verification_and_unsettled_work_block_completion
 db::campaigns::graph::workflow::tests::new_result_and_negative_goal_evidence_change_the_frontier_but_reads_do_not
