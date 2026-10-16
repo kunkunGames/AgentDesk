@@ -25,8 +25,6 @@ mod incarnation;
 mod injected_inputs;
 #[allow(dead_code)]
 pub(crate) mod input_fence;
-#[allow(dead_code)]
-pub(crate) mod input_handback;
 mod intervention;
 mod lease_release;
 mod mailbox_observation;
@@ -85,7 +83,9 @@ use inbound_order::{claim_yields, pause_inbound_stall_for_turn};
 pub(crate) use injected_inputs::{
     ExpectedClaim, HANDBACK_NOT_WRITTEN, InjectionSettlement, ReserveOutcome,
 };
-pub(crate) use intervention::{Intervention, InterventionMode, SourceMessageTextSegment};
+pub(crate) use intervention::{
+    Intervention, InterventionMode, QueuedRoute, SourceMessageTextSegment,
+};
 use lease_release::release_active_turn_anchor;
 pub(crate) use overflow::SoftInterventionProbe;
 use overflow::drain_head_overflow;
@@ -104,7 +104,6 @@ pub(crate) use pending_queue_persistence::{
 use pending_queue_persistence::{
     cleanup_stale_pending_queue_tmp_files_in_dir, cleanup_stale_pending_queue_tmp_files_under_root,
 };
-#[cfg(test)]
 pub(crate) use pending_queue_persistence::{
     load_channel_pending_dispatch_marker_checked, load_channel_pending_queue_checked,
 };
@@ -207,16 +206,6 @@ fn push_unique_message_ids(
             existing.push(message_id);
         }
     }
-}
-
-fn should_merge_intervention(last: &Intervention, incoming: &Intervention) -> bool {
-    last.mode == InterventionMode::Soft
-        && incoming.mode == InterventionMode::Soft
-        && last.merge_consecutive
-        && incoming.merge_consecutive
-        && last.author_id == incoming.author_id
-        && !last.has_reply_boundary
-        && !incoming.has_reply_boundary
 }
 
 #[derive(Clone, Debug)]
@@ -380,7 +369,7 @@ impl EnqueueRefusalReason {
 pub(crate) struct EnqueueInterventionResult {
     pub(crate) enqueued: bool,
     /// True when the incoming intervention was folded into the previous queue
-    /// entry via `should_merge_intervention` (text concatenated, source IDs
+    /// entry via `Intervention::merges_with` (text concatenated, source IDs
     /// accumulated). Callers use this to surface a different reaction emoji
     /// for merged messages so users can tell merged from standalone entries.
     pub(crate) merged: bool,
@@ -1206,9 +1195,6 @@ impl ChannelMailboxRegistry {
 
 // Once `CloseIfIdle` sets `state.closed`, the exhaustive `registry_purge::gate_closed_arm` passes
 // reads and refuses every other arm; CommitCapturedReadyDelivery refuses closed actors in its own arm.
-pub(crate) mod installed_actor_handoff;
-mod scoped_claim;
-
 enum ChannelMailboxMsg {
     FreezeInput {
         closing: Arc<crate::services::discord::input_runtime::fence::Closing>,
@@ -1316,10 +1302,6 @@ enum ChannelMailboxMsg {
         user_message_id: Option<MessageId>,
         reply: oneshot::Sender<RecoveryKickoffResult>,
     },
-    #[cfg(test)]
-    InstalledActorHandoff(installed_actor_handoff::Request),
-    #[cfg(test)]
-    ScopedClaim(scoped_claim::ScopedMsg),
     ClearRecoveryMarker {
         reply: closed_verdict::VerdictReply<()>,
     },
@@ -1384,12 +1366,12 @@ enum ChannelMailboxMsg {
         persistence: QueuePersistenceContext,
         reply: oneshot::Sender<FinishTurnResult>,
     },
-    /// A before-start policy close: one step claims the exact episode, clears its receipt and
-    /// releases it (see `policy_close.rs`).
+    /// A before-start policy close and its later tail claim on the same actor (`policy_close.rs`).
     PolicyClose {
         request: Box<policy_close::PolicyCloseRequest>,
         reply: oneshot::Sender<policy_close::PolicyMailboxOutcome>,
     },
+    ClaimPolicyTail(policy_close::tail::TailClaim),
     HardStop {
         reply: oneshot::Sender<FinishTurnResult>,
     },
@@ -1587,12 +1569,6 @@ struct ChannelMailboxState {
     policy_witness: Option<policy_close::PolicyWitness>,
     /// The queue snapshot's head reservation and submitted sources; see `queued_head.rs`.
     queued_head: queued_head::HeadLedger,
-    /// What an actor a scoped claim installed still owes; see `scoped_claim.rs`.
-    #[cfg(test)]
-    installed_pending: Option<scoped_claim::InstalledPending>,
-    /// Namespaces whose claim left a file holding neither snapshot; scoped claims refuse them.
-    #[cfg(test)]
-    scoped_undecided: Vec<(ProviderKind, String)>,
 }
 
 #[cfg(test)]
@@ -1991,12 +1967,6 @@ fn input_mailbox_step(
             state.turn_started_instant = Some(recovery_started_at);
             let _ = reply.send(RecoveryKickoffResult::Activated);
         }
-        #[cfg(test)]
-        ChannelMailboxMsg::InstalledActorHandoff(request) => {
-            installed_actor_handoff::step(&mut state, channel_id, own_recovery_done, request);
-        }
-        #[cfg(test)]
-        ChannelMailboxMsg::ScopedClaim(msg) => scoped_claim::step(&mut state, channel_id, msg),
         ChannelMailboxMsg::ClearRecoveryMarker { reply } => {
             state.recovery_started_at = None;
             let _ = reply.send(());
@@ -2439,8 +2409,8 @@ fn input_mailbox_step(
                 });
             }
         }
-        ChannelMailboxMsg::PolicyClose { request, reply } => {
-            policy_close::answer(&mut state, channel_id, *request, &_step, reply);
+        msg @ (ChannelMailboxMsg::PolicyClose { .. } | ChannelMailboxMsg::ClaimPolicyTail(_)) => {
+            policy_close::answer(&mut state, channel_id, msg, (&_step, own_recovery_done));
         }
         ChannelMailboxMsg::HardStop { reply } => {
             let persistence = state.last_persistence.clone();

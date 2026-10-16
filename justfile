@@ -115,7 +115,6 @@ test-non-pg:
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::inflight::destructive_commit::tests -- --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::inflight::save_store::bridge_entry_guard_tests -- --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::inflight::save_store::identity_gate::bridge_entry::tests -- --test-threads=1
-    env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::inflight::save_store::identity_gate::claude_e_stamp::tests -- --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::bridge_entry_persist::tests -- --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::current_message_anchor::tests -- --test-threads=1
     env -u AGENTDESK_ROOT_DIR cargo test --lib services::discord::turn_bridge::guards::tests -- --test-threads=1
@@ -201,18 +200,25 @@ test-postgres-shard:
     set -euo pipefail
     python3 scripts/check_pg_test_lane_membership.py --validate-pg-shard "${PG_INCLUDE_SHARD:-}"
     test -n "${POSTGRES_TEST_DATABASE_URL_BASE:-}" || (echo "POSTGRES_TEST_DATABASE_URL_BASE must name the dedicated PostgreSQL test server with an explicit host and port" >&2; exit 1)
-    source scripts/ci/non-pg-test-filter.sh && cargo test --lib -- "${PG_INCLUDE_ARGS[@]}" --nocapture --test-threads=1
+    source scripts/ci/non-pg-test-filter.sh && run_prepared_lib_test cargo test --lib -- "${PG_INCLUDE_ARGS[@]}" --nocapture --test-threads=1
     pg_selection_status=$?
     if [ "$pg_selection_status" != 0 ]; then exit "$pg_selection_status"; fi
     if [ "$PG_INCLUDE_SHARD" != 0 ]; then exit 0; fi
-    # The routing test keeps these targets identical to the unsharded recipe.
-    cargo test --lib services::memory::memento::anchor::tests -- --nocapture --test-threads=1
-    cargo test --lib services::discord::prompt_builder::session_anchors::tests -- --nocapture --test-threads=1
-    cargo test --lib tmux_turn_liveness::idle_cleanup_tests -- --nocapture --test-threads=1
-    cargo test --lib frozen_busy_jsonl -- --nocapture --test-threads=1
-    cargo test --lib idle_tmux_snapshot_missing_output_path -- --nocapture --test-threads=1
-    cargo test --lib dispatched_sessions::kill_tmux_resume_tests -- --nocapture --test-threads=1
-    cargo test --lib services::routines::session_control::tests -- --nocapture --test-threads=1
+    unset PG_INCLUDE_SHARD && just test-postgres-continuity
+
+# Shard 0 of both PG matrices and the PR selector's shard 0 run these. The routing test
+# keeps them identical to the unsharded recipe's.
+test-postgres-continuity:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/ci/non-pg-test-filter.sh
+    run_prepared_lib_test cargo test --lib services::memory::memento::anchor::tests -- --nocapture --test-threads=1
+    run_prepared_lib_test cargo test --lib services::discord::prompt_builder::session_anchors::tests -- --nocapture --test-threads=1
+    run_prepared_lib_test cargo test --lib tmux_turn_liveness::idle_cleanup_tests -- --nocapture --test-threads=1
+    run_prepared_lib_test cargo test --lib frozen_busy_jsonl -- --nocapture --test-threads=1
+    run_prepared_lib_test cargo test --lib idle_tmux_snapshot_missing_output_path -- --nocapture --test-threads=1
+    run_prepared_lib_test cargo test --lib dispatched_sessions::kill_tmux_resume_tests -- --nocapture --test-threads=1
+    run_prepared_lib_test cargo test --lib services::routines::session_control::tests -- --nocapture --test-threads=1
 
 # The first command of test-postgres alone.
 test-postgres-selection:

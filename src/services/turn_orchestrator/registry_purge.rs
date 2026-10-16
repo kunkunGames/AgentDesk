@@ -30,8 +30,8 @@
 //! about to be severed from the registry. Refused callers recover through the
 //! `*_with_closed_retry` registry helpers below, which re-resolve a FRESH
 //! actor (the unlink runs right after the verdict) and replay the request.
-//! The gate is exhaustive: a closed actor's channel-keyed state is the successor's, so every non-read
-//! arm is refused; restitution and user commands replay through [`retry_while_closed`].
+//! The gate is exhaustive: a closed actor's channel-keyed state is the successor's, so it refuses
+//! each non-read arm but a receipt-only policy reconcile; commands replay via [`retry_while_closed`].
 
 use std::future::Future;
 use std::sync::Arc;
@@ -39,7 +39,6 @@ use std::sync::Arc;
 use poise::serenity_prelude::{ChannelId, MessageId, UserId};
 
 pub(crate) use super::closed_verdict::MailboxRefusal;
-use super::policy_close::{PolicyMailboxOutcome, PolicyRetain};
 use super::{
     ChannelMailboxHandle, ChannelMailboxMsg, ChannelMailboxRegistry, ChannelMailboxSnapshot,
     ChannelMailboxState, ClaimObservation, EnqueueInterventionResult, EnqueueRefusalReason,
@@ -74,17 +73,12 @@ pub(super) fn close_if_idle_verdict(state: &mut ChannelMailboxState) -> Result<(
     if super::injected_inputs::holds_order(state) {
         return Err("injection_reserved");
     }
-    // An installed actor's unacknowledged exits and driver outlive its slot.
-    #[cfg(test)]
-    if state.installed_pending.is_some() {
-        return Err("installed_pending");
-    }
     state.closed = true;
     Ok(())
 }
 
-/// Tombstone gate run before the actor's arm match: on a closed actor reads pass, every other arm is
-/// refused here and `None` skips the match. Exhaustive, so a new arm must be classified here.
+/// Tombstone gate run before the actor's arm match: a closed actor passes reads and a receipt-only
+/// policy reconcile, refuses the rest (`None` skips the match) and never retries a policy close.
 pub(super) fn gate_closed_arm(
     state: &ChannelMailboxState,
     channel_id: ChannelId,
@@ -119,18 +113,6 @@ pub(super) fn gate_closed_arm(
             let _ = reply.send(());
             "RestoreActiveTurn"
         }
-        #[cfg(test)]
-        M::ScopedClaim(super::scoped_claim::ScopedMsg::Pending { .. }) => return Some(msg),
-        #[cfg(test)]
-        M::ScopedClaim(scoped) => {
-            scoped.refuse(super::scoped_claim::ScopedClaimRefusal::ActorClosed);
-            "ScopedClaim"
-        }
-        #[cfg(test)]
-        M::InstalledActorHandoff(request) => {
-            request.refuse(crate::services::cluster::channel_home_port::RestoreFailure::Rejected("handoff actor closed".into()));
-            "InstalledActorHandoff"
-        }
         M::RecoveryKickoff { reply, .. } => {
             let _ = reply.send(RecoveryKickoffResult::RefusedClosed);
             "RecoveryKickoff"
@@ -151,11 +133,9 @@ pub(super) fn gate_closed_arm(
             });
             "RequeueFront"
         }
-        // A policy close commits only on its captured actor; the successor is never retried.
-        M::PolicyClose { reply, .. } => {
-            let _ = reply.send(PolicyMailboxOutcome::Retained(PolicyRetain::ActorClosed));
-            "PolicyClose"
-        }
+        M::PolicyClose { ref request, .. } if request.reconciles(state, channel_id) => return Some(msg),
+        M::PolicyClose { reply, .. } => super::policy_close::refuse_closed(reply),
+        M::ClaimPolicyTail(claim) => claim.closed(),
         // Reply dropped: the handle's offline fallback is the refusal, and what an idle closed
         // actor would answer anyway; finish wrappers read `mailbox_online: false` and stop.
         M::CancelActiveTurnWithReason { .. }
@@ -481,13 +461,6 @@ impl ChannelMailboxRegistry {
 
 #[cfg(test)]
 mod closed_gate_tests;
-
-#[cfg(test)]
-#[path = "recovery_custody/mod.rs"]
-pub(crate) mod recovery_custody;
-#[cfg(test)]
-#[path = "recovery_registry/mod.rs"]
-pub(crate) mod recovery_registry;
 
 #[cfg(test)]
 mod tests {
