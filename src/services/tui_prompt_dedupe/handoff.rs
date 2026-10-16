@@ -767,7 +767,7 @@ pub(crate) fn codex_record_admission(
         let released = if allowed {
             Vec::new()
         } else {
-            state.settle_handoff_for_record(&key, prompt, record)
+            state.settle_handoff_for_record(&key, prompt, record).1
         };
         (allowed, released)
     };
