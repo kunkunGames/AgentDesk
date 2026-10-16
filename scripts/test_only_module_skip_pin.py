@@ -44,6 +44,7 @@ PINNED_BASENAME_TEST_FILES = frozenset(
         "src/server/campaign_graph/schedule_rollover_tests.rs",
         "src/server/campaign_graph/workflow_tests.rs",
         "src/services/discord/dispatch_cleanup/transition_tests.rs",
+        "src/services/discord/router/message_handler/intake_turn/future_size_tests.rs",
         "src/services/dispatches/discord_delivery/thread_reuse/startup_validation_tests.rs",
         "src/services/cluster/stream_relay/source_read_proof_tests.rs",
         "src/db/intake_outbox/owner_fence_pg_tests.rs",

@@ -7281,6 +7281,7 @@ services::discord::router::message_handler::intake_turn::feedback_reminder_take_
 services::discord::router::message_handler::intake_turn::feedback_reminder_take_order_tests::tui_busy_enqueue_refusal_puts_back_feedback_reminder_for_next_turn
 services::discord::router::message_handler::intake_turn::input_effect_tests::c1b_off_role_override_keeps_runtime_transition_on_original_provider
 services::discord::router::message_handler::intake_turn::input_effect_tests::c1b_worker_core_refuses_closing_before_settings_or_voice_consumption
+services::discord::router::message_handler::intake_turn::input_effect_tests::intake_entry_futures_stay_within_worker_stack_budget
 services::discord::router::message_handler::intake_turn::intake_outbox_state_builder_tests::bridge_handoff_stamp_call_site_is_adjacent_to_the_only_spawn_turn_bridge
 services::discord::router::message_handler::intake_turn::intake_outbox_state_builder_tests::builder_adopts_worker_intake_outbox_identity
 services::discord::router::message_handler::intake_turn::intake_outbox_state_builder_tests::builder_cannot_replace_an_already_adopted_intake_outbox_identity
@@ -12423,6 +12424,7 @@ services::session_host::herdr_host::tests::m0_close_variant_alias_fixture
 services::session_host::herdr_host::tests::m0_close_variant_closed_world
 services::session_host::herdr_host::tests::name_only_scan_follows_reexports_and_function_values
 services::session_host::herdr_host::tests::name_only_teardown_calls_stay_on_the_reviewed_list
+services::session_host::herdr_host::tests::production_census_recognizes_conjunctive_test_cfg
 services::session_host::herdr_host::tests::session_target_guard_stays_behind_the_keyed_gate
 services::session_host::herdr_host::tests::typed_session_probe_entries_have_no_production_caller
 services::session_host::herdr_host::windows_tests::an_unconfigured_herdr_host_refuses_every_operation

@@ -20,6 +20,8 @@ mod stale_dispatch_guard;
 mod voice_intake;
 mod worker_entry;
 
+#[cfg(test)]
+mod future_size_tests;
 #[cfg(all(test, unix))]
 mod native_fresh_prompt_tests;
 #[cfg(all(test, unix))]
@@ -34,27 +36,6 @@ pub(in crate::services::discord) use context::IntakeDeps;
 mod input_effect_tests {
     use super::*;
 
-    #[test]
-    fn intake_entry_futures_stay_within_worker_stack_budget() {
-        fn size<F>(_: impl FnOnce(&'static IntakeDeps<'static>, IntakeRequest) -> F) -> usize {
-            std::mem::size_of::<F>()
-        }
-        let admitted = size(|deps, request| {
-            handle_text_message_admitted(deps, false, request, false, Vec::new(), None)
-        });
-        let entry = size(|deps, request| {
-            handle_text_message(deps, false, request, false, Vec::new(), None)
-        });
-        eprintln!("INTAKE_FUTURE_BYTES entry={entry} admitted={admitted}");
-        assert!(
-            entry <= 64 * 1024,
-            "entry embeds {entry} bytes on the caller stack"
-        );
-        assert!(
-            admitted <= 256 * 1024,
-            "admitted turn retains {admitted} bytes before nested polls"
-        );
-    }
     use crate::services::discord::input_runtime::fence::{self, Gate};
     use futures::FutureExt;
 

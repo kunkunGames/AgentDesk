@@ -11,20 +11,26 @@ pub(in crate::services::discord) struct IntakeDeps<'a> {
     pub token: &'a str,
 }
 
-pub(super) async fn campaign_graph_prompt(
-    pool: Option<&sqlx::PgPool>,
-    dispatch_id: Option<&str>,
-) -> Result<Option<String>, Error> {
-    Ok(match (pool, dispatch_id) {
-        (Some(pool), Some(dispatch)) => {
-            let prompt =
-                crate::db::campaigns::graph::store::execution_prompt(pool, dispatch).await?;
-            if prompt.is_some() {
-                crate::services::campaign_control_input::prepare_input(pool, dispatch).await?;
+// Keep graph SQL and control-input preparation out of the enclosing intake
+// future. Its nested effect scopes otherwise retain that state even for turns
+// without a campaign, which can exhaust the default worker-thread stack.
+pub(super) fn campaign_graph_prompt<'a>(
+    pool: Option<&'a sqlx::PgPool>,
+    dispatch_id: Option<&'a str>,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<Option<String>, Error>> + Send + 'a>>
+{
+    Box::pin(async move {
+        Ok(match (pool, dispatch_id) {
+            (Some(pool), Some(dispatch)) => {
+                let prompt =
+                    crate::db::campaigns::graph::store::execution_prompt(pool, dispatch).await?;
+                if prompt.is_some() {
+                    crate::services::campaign_control_input::prepare_input(pool, dispatch).await?;
+                }
+                prompt
             }
-            prompt
-        }
-        _ => None,
+            _ => None,
+        })
     })
 }
 
