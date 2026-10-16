@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "78b206adf2ffa6a8127f561c2e6d502618ad200e",
+  "measured_at_sha": "8df760da52c987e25ed967f5dfde93a26c9a93ea",
   "records": [
     {
       "root": "migrations/postgres",
@@ -15669,15 +15669,6 @@
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:c700dd8f02d40d0806ec9299f6fef4be389966ac811cdbe24e2f59803e64b5f8"
-    },
-    {
-      "root": "src",
-      "kind": "RUST",
-      "path": "src/db/postgres.rs",
-      "api": "sqlx::query",
-      "symbol": "query",
-      "classification": "STATIC",
       "fingerprint": "sha256:f20191ae4ba1b1c65c59dc0e0d14b23c132b2e4f1a4a1ae95c7c304e42f71628"
     },
     {
@@ -16282,6 +16273,15 @@
       "symbol": "raw_sql",
       "classification": "STATIC",
       "fingerprint": "sha256:90f3fd4b290391239bd2d59c04c485c204dc9e93db60bdfebfe4a01146a4bbcc"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/db/postgres/migration_status.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:88465d6c09dbad70a4a009a2cba07636107857c5965c297724a2189b2a318742"
     },
     {
       "root": "src",

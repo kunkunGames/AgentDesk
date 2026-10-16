@@ -37,6 +37,7 @@ src/
 │   │   │   ├── health_snapshot.rs
 │   │   │   ├── observation_checks.rs
 │   │   │   ├── observation_tests.rs
+│   │   │   ├── postgres_checks.rs
 │   │   │   ├── provider_credentials.rs
 │   │   │   ├── repair_response.rs
 │   │   │   ├── report_display.rs
@@ -232,6 +233,7 @@ src/
 │   │   ├── advisory_lock.rs
 │   │   ├── advisory_lock_tests.rs
 │   │   ├── migration_catalog.rs
+│   │   ├── migration_status.rs
 │   │   ├── shared_config.rs
 │   │   └── test_db_reclaim.rs
 │   ├── prompt_manifests/
@@ -264,6 +266,8 @@ src/
 │   │   └── writes.rs
 │   ├── session_observability/
 │   │   └── background_ordering_pg_tests.rs
+│   ├── session_transcripts/
+│   │   └── event.rs
 │   ├── turns/
 │   │   └── postgres_tests.rs
 │   ├── agent_read.rs
@@ -521,6 +525,8 @@ src/
 │   │   │   ├── session_repair.rs
 │   │   │   ├── tui_output_readiness_tests.rs
 │   │   │   └── unread_tail_attribution_tests.rs
+│   │   ├── kanban/
+│   │   │   └── errors.rs
 │   │   ├── queue_api/
 │   │   │   └── watcher_state_tests.rs
 │   │   ├── review_verdict/
@@ -1104,6 +1110,8 @@ src/
 │   │   │   │   └── token.rs
 │   │   │   ├── exact_lease.rs
 │   │   │   └── source_epoch_observer.rs
+│   │   ├── dispatch_cleanup/
+│   │   │   └── transition_tests.rs
 │   │   ├── execution_identity/
 │   │   │   ├── herdr_agent_hint.rs
 │   │   │   ├── herdr_agent_hint_tests.rs
@@ -1894,6 +1902,7 @@ src/
 │   │   │   ├── finalize.rs
 │   │   │   ├── host_guard.rs
 │   │   │   ├── host_guard_tests.rs
+│   │   │   ├── orphan_wrapper.rs
 │   │   │   ├── retirement_await_tests.rs
 │   │   │   └── stale_busy_identity.rs
 │   │   ├── tmux_session_files/
