@@ -169,8 +169,9 @@ pub(super) async fn validate(
             && failures.len() == tasks.len() * 2 - 1
             && reconciliations.len() + 1 == tasks.len()
             && revisions.len() + 1 == tasks.len()
-            && tasks.last().unwrap().get::<String, _>("task_key")
-                == scope.failure.get::<String, _>("task_key"),
+            && tasks.last().is_some_and(|task| {
+                task.get::<String, _>("task_key") == scope.failure.get::<String, _>("task_key")
+            }),
         "latest pregraph planner must own the complete unbranched repair history"
     );
     let goal = serde_json::to_value(scope.goal)?;
