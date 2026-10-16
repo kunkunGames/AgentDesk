@@ -2460,6 +2460,7 @@ async fn handle_text_message_admitted(
     let provider_for_blocking = provider.clone();
     let execution_pool = shared.pg_pool.clone();
     let producer_registration = original_registration.clone();
+    let campaign_dispatch_id = dispatch_id.clone();
     let teardown_clearance = super::super::super::turn_teardown_clearance::for_turn(
         shared.pg_pool.as_ref(),
         &provider,
@@ -2480,6 +2481,7 @@ async fn handle_text_message_admitted(
                     super::provider_dispatch::execute(
                         super::provider_dispatch::StreamingTurn {
                             pool: execution_pool.as_ref(),
+                            campaign_dispatch_id: campaign_dispatch_id.as_deref(),
                             provider: &provider_for_blocking,
                             prompt: &context_prompt,
                             session_id: session_id_clone.as_deref(),

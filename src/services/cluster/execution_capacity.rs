@@ -13,12 +13,16 @@ mod managed;
 pub(crate) mod recovery;
 mod renewal;
 mod store;
+mod wait;
 pub(crate) use managed::{ExecutionLimits, ManagedAttempt};
 use managed::{LeaseAdmission, LeaseIdentity};
+pub(crate) use wait::AdmissionCheck;
 #[cfg(test)]
 pub(crate) mod managed_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wait_tests;
 
 static LOCAL: OnceLock<(u32, Arc<Semaphore>)> = OnceLock::new();
 const LEASE_SECONDS: i64 = 30;
@@ -149,7 +153,10 @@ pub(crate) fn acquire(
     working_dir: &str,
     remote: bool,
     cancel: Arc<CancelToken>,
+    admission_check: Option<&dyn AdmissionCheck>,
 ) -> Result<Option<ExecutionGuard>, String> {
+    let handle = tokio::runtime::Handle::current();
+    handle.block_on(wait::verify(&cancel, admission_check))?;
     let config = crate::config::load_graceful();
     let instance = super::node_registry::resolve_self_instance_id_without_config();
     let channel = channel.to_string();
@@ -189,6 +196,7 @@ pub(crate) fn acquire(
                 .map_err(|_| "retained execution lookup timed out".to_string())?
             })?;
         }
+        handle.block_on(wait::verify(&cancel, admission_check))?;
         return Ok(None);
     }
     let slots = config
@@ -200,26 +208,33 @@ pub(crate) fn acquire(
     if *configured != slots {
         return Err("execution_slots changed; restart the node before new execution".into());
     }
-    let permit = semaphore.clone().try_acquire_owned().map_err(|_| {
-        "node execution capacity exhausted; retry when a turn completes".to_string()
-    })?;
+    let permit = handle.block_on(wait::permit(
+        Arc::clone(semaphore),
+        &cancel,
+        admission_check,
+    ))?;
     let pool = pool
         .ok_or("execution capacity requires PostgreSQL")?
         .clone();
     let provider = provider.to_string();
-    acquire_guard(
+    let guard = acquire_guard(
         pool,
         instance,
         provider,
         channel,
-        cancel,
+        Arc::clone(&cancel),
         permit,
         resource_key.map(|resource_key| LeaseAdmission {
             resource_key,
             limits,
         }),
-    )
-    .map(Some)
+        wait::io_budget(admission_check),
+    )?;
+    // A PG timeout/error is never retried as local congestion. After a known
+    // success, a refused caller drops the existing guard and uses its normal
+    // nonce-scoped lease finalization before the local permit is returned.
+    handle.block_on(wait::verify(&cancel, admission_check))?;
+    Ok(Some(guard))
 }
 
 fn acquire_guard(
@@ -230,7 +245,11 @@ fn acquire_guard(
     cancel: Arc<CancelToken>,
     permit: OwnedSemaphorePermit,
     admission: Option<LeaseAdmission>,
+    io_budget: Duration,
 ) -> Result<ExecutionGuard, String> {
+    if io_budget.is_zero() {
+        return Err("campaign execution admission deadline elapsed before PostgreSQL".into());
+    }
     let managed = admission.as_ref().is_some_and(|a| a.limits.is_some());
     let nonce = if managed {
         uuid::Uuid::parse_str(
@@ -246,7 +265,7 @@ fn acquire_guard(
     let admission_started = std::time::Instant::now();
     let deadline = handle.block_on(async {
         tokio::time::timeout(
-            LEASE_IO_TIMEOUT,
+            io_budget,
             store::acquire_scoped(
                 &pool,
                 &instance,

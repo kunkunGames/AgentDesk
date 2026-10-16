@@ -170,6 +170,7 @@ async fn execution_capacity_atomic_reservations_execution_and_fenced_expiry_pg()
                 cancel,
                 semaphore.try_acquire_owned().unwrap(),
                 None,
+                LEASE_IO_TIMEOUT,
             )
         }
     })
@@ -207,6 +208,7 @@ async fn execution_capacity_atomic_reservations_execution_and_fenced_expiry_pg()
                 Arc::new(CancelToken::new()),
                 semaphore.try_acquire_owned().unwrap(),
                 None,
+                LEASE_IO_TIMEOUT,
             )
             .unwrap();
             drop(guard);
@@ -274,6 +276,7 @@ async fn execution_lease_survives_pool_timeout_but_cancels_on_lost_ownership_pg(
             worker_cancel,
             permit,
             None,
+            LEASE_IO_TIMEOUT,
         )
         .unwrap();
         ready_tx.send(()).unwrap();

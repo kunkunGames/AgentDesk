@@ -112,6 +112,7 @@ pub(crate) fn guarded(
             resource_key: resource.into(),
             limits: Some(limits),
         }),
+        LEASE_IO_TIMEOUT,
     )
     .unwrap();
     (cancel, guard)

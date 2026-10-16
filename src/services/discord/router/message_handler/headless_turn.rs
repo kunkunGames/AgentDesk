@@ -1006,6 +1006,7 @@ async fn start_reserved_headless_turn_admitted(
                         super::provider_dispatch::execute(
                             super::provider_dispatch::StreamingTurn {
                                 pool: execution_pool.as_ref(),
+                                campaign_dispatch_id: None,
                                 provider: &provider_for_blocking,
                                 prompt: &context_prompt,
                                 session_id: session_id_clone.as_deref(),
