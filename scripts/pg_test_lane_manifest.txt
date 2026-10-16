@@ -73,6 +73,7 @@ src/server/campaign_graph/occurrence_context/tests.rs
 src/server/campaign_graph/planning_input_tests.rs
 src/server/campaign_graph/planning_ownership_tests.rs
 src/server/campaign_graph/planning_recovery_tests.rs
+src/server/campaign_graph/pregraph_plan_replan_tests.rs
 src/server/campaign_graph/proposal_identity_tests.rs
 src/server/campaign_graph/recovery_tests.rs
 src/server/campaign_graph/rejected_candidate_replan_tests.rs
@@ -426,6 +427,7 @@ server::campaign_graph::tests::cancelled_validator_replan_tests
 server::campaign_graph::tests::effect_ownership_tests
 server::campaign_graph::tests::graph_card_identity_tests
 server::campaign_graph::tests::initial_plan_replan_tests
+server::campaign_graph::tests::initial_plan_replan_tests::pregraph_plan_replan_tests
 server::campaign_graph::tests::learning_tests
 server::campaign_graph::tests::planning_input_tests
 server::campaign_graph::tests::planning_ownership_tests
@@ -1256,6 +1258,11 @@ server::campaign_graph::tests::initial_plan_replan_tests::initial_plan_capacity_
 server::campaign_graph::tests::initial_plan_replan_tests::initial_plan_capacity_replan_rejects_active_owners_cleanup_progress_graph_and_replay_pg
 server::campaign_graph::tests::initial_plan_replan_tests::initial_plan_capacity_replan_rejects_other_errors_raw_drift_and_noncanonical_events_pg
 server::campaign_graph::tests::initial_plan_replan_tests::initial_plan_capacity_replan_rejects_profile_evidence_authority_and_chronology_drift_pg
+server::campaign_graph::tests::initial_plan_replan_tests::pregraph_plan_replan_tests::pregraph_repair_checks_ancestor_execution_and_complete_audit_set_pg
+server::campaign_graph::tests::initial_plan_replan_tests::pregraph_plan_replan_tests::pregraph_repair_rejects_lineage_and_profile_drift_without_mutation_pg
+server::campaign_graph::tests::initial_plan_replan_tests::pregraph_plan_replan_tests::pregraph_repair_rejects_newer_unobserved_control_and_extra_unknown_pg
+server::campaign_graph::tests::initial_plan_replan_tests::pregraph_plan_replan_tests::pregraph_second_capacity_repair_preserves_budget8_history_and_fresh_qa_pg
+server::campaign_graph::tests::initial_plan_replan_tests::pregraph_plan_replan_tests::pregraph_third_capacity_repair_proves_every_prior_reconciliation_pg
 server::campaign_graph::tests::learning_tests::active_template_reviews_repeat_each_batch_keep_and_deduplicate_versions_pg
 server::campaign_graph::tests::learning_tests::bootstrap_superior_then_enrolled_planner_preserves_published_contracts_pg
 server::campaign_graph::tests::learning_tests::completed_repaired_graph_collects_despite_retained_failed_revision_pg
