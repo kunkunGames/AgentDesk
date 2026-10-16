@@ -111,8 +111,8 @@ pub(crate) fn guarded(
         Some(LeaseAdmission {
             resource_key: resource.into(),
             limits: Some(limits),
-        }),
-        LEASE_IO_TIMEOUT,
+        })
+        .into(),
     )
     .unwrap();
     (cancel, guard)
