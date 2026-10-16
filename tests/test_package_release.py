@@ -107,15 +107,35 @@ class ReleasePackagingTests(unittest.TestCase):
             verification.verify_archive(archive, head, "1.2.3", allow_dirty=True, profile="release")
 
     def test_native_archive_remains_executable_on_non_posix_packaging_host(self):
+        executable_assets = [
+            "scripts/launchd-migrated/token-daily-report.py",
+            "scripts/launchd-migrated/token-usage-snapshot.py",
+            "scripts/launchd-migrated/extensionless-runner",
+        ]
+        data_asset = "scripts/launchd-migrated/non-executable.py"
+        for relative in [*executable_assets, data_asset]:
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("#!/usr/bin/env python3\nprint('fixture')\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.root), "add", "scripts/launchd-migrated"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.root), "update-index", "--chmod=+x", *executable_assets],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(self.root), "update-index", "--chmod=-x", data_asset],
+                       check=True, capture_output=True)
         # Simulate a host where chmod cannot encode execute bits, then inspect
         # actual archive metadata consumed by tar extraction on the target host.
-        with mock.patch.object(Path, "chmod"):
-            archive = packaging.package(self.root, self.binary("darwin"),
-                                        "aarch64-apple-darwin", self.output)
-        with tarfile.open(archive) as bundle:
-            self.assertEqual(bundle.getmember("agentdesk-darwin-aarch64/agentdesk").mode, 0o755)
-            self.assertEqual(bundle.getmember("agentdesk-darwin-aarch64/scripts/queue-stability-batch.sh").mode, 0o755)
-            self.assertEqual(bundle.getmember("agentdesk-darwin-aarch64/policies/default-pipeline.yaml").mode, 0o644)
+        for target, system in [("aarch64-apple-darwin", "darwin"),
+                               ("x86_64-unknown-linux-gnu", "linux")]:
+            with self.subTest(target=target), mock.patch.object(Path, "chmod"), \
+                    mock.patch.object(packaging.os, "access", return_value=False):
+                archive = packaging.package(self.root, self.binary(system), target, self.output)
+            prefix = archive.name.removesuffix(".tar.gz") + "/"
+            with tarfile.open(archive) as bundle:
+                for relative in ["agentdesk", "scripts/queue-stability-batch.sh", *executable_assets]:
+                    self.assertEqual(bundle.getmember(prefix + relative).mode, 0o755, relative)
+                for relative in ["policies/default-pipeline.yaml", data_asset, "dashboard/dist/index.html"]:
+                    self.assertEqual(bundle.getmember(prefix + relative).mode, 0o644, relative)
 
     def test_publish_rejects_native_binary_without_execute_permission(self):
         archive = packaging.package(self.root, self.binary("darwin"),

@@ -127,8 +127,12 @@ pub const EXPLICIT_AUTH_MUTATION_ROUTES: &[ExplicitAuthMutationRoute] = &[
 /// Mutation routes that fail closed unless an operator auth mechanism is
 /// configured. These routes are still useful in the boot audit because they
 /// explain why an endpoint may reject all callers on auth-less installs.
-pub const FAIL_CLOSED_OPERATOR_MUTATION_ROUTES: &[&str] =
-    &["campaigns: settled external effect replan"];
+pub const FAIL_CLOSED_OPERATOR_MUTATION_ROUTES: &[&str] = &[
+    "campaigns: settled external effect replan",
+    "campaigns: recover-finish",
+    "managed-checks: enroll",
+    "managed-checks: approve",
+];
 
 /// Returns true when `host` resolves to a loopback interface (so the bound
 /// control-plane is only reachable from the same machine). Accepts:
@@ -313,6 +317,16 @@ mod audit_explicit_auth_routes_tests {
                 ("auto-queue", "submit_order"),
             ],
             "keep every live mutation gate and exclude the retired batch-transition"
+        );
+        assert_eq!(
+            FAIL_CLOSED_OPERATOR_MUTATION_ROUTES,
+            [
+                "campaigns: settled external effect replan",
+                "campaigns: recover-finish",
+                "managed-checks: enroll",
+                "managed-checks: approve",
+            ],
+            "include each mutation that requires an explicitly configured server admin bearer"
         );
     }
 
