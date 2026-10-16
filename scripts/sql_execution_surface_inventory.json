@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "44f1368db2c15401efd7fb7e4522c2780e062ebd",
+  "measured_at_sha": "30c33183cdd5042d9880bb72072e9b65be648cfc",
   "records": [
     {
       "root": "migrations/postgres",
@@ -31681,6 +31681,24 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:db293c62fcbcf639dfdef663ee9d32238cfaefd63013b1d98980e7661b34cca5"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/workflow_tests.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:5e76da3e3e5710d610fd3fdab48912fd868148d474cba1cc79b68300dcef23ea"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/workflow_tests.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:dda5f4de2ff309857d84b65fac90566648efe57b5ebcbf09ceabca6cc8ff36e7"
     },
     {
       "root": "src",
