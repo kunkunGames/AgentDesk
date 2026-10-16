@@ -98,6 +98,7 @@ pub(super) fn watch_draft_release(
             let pass = super::super::super::busy_followup_retry_store::release_draft_holds(
                 &provider,
                 channel_id.get(),
+                &session,
             );
             any_released |= pass.released > 0;
             tracing::info!(

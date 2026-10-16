@@ -1,16 +1,13 @@
 # exact-test-id (helper-module: exact module path) | mode | #issue | expires=YYYY-MM-DD | reason; sorted.
 # Modes: intentional-nonrequired, model-unresolved, platform-unavailable, helper-module; stale rows fail.
 config::disk_write::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
-db::channel_recovery_custody | helper-module | #5340 | expires=2027-10-14 | dormant custody row store (reserve, revision CAS, read) exercised by the recovery_custody PG tests; it holds no test of its own
 db::postgres::advisory_lock::test_seam | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 server::routes::o_transition::test_hooks | helper-module | #5340 | expires=2027-10-12 | counts the transition route's sends and runs a probe between reply and consumption for the route tests; it holds no test of its own
 services::claude_tui::hook_server::observation_ingress::windows_tests::a_claude_transcript_without_supported_file_identity_is_refused | platform-unavailable | #5082 | expires=2027-10-12 | Windows-only platform test not run on Linux CI runner
 services::claude_tui::hook_server::observation_ingress::windows_tests::a_rollout_without_supported_file_identity_is_refused | platform-unavailable | #5082 | expires=2027-10-12 | Windows-only platform test not run on Linux CI runner
 services::claude_tui::host_input::guarded_submission::test_support | helper-module | #6325 | expires=2026-10-26 | Scoped request and result fixtures used by executor_tests; this helper declares no test id.
 services::claude_tui::submission_fence::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
-services::cluster::channel_home_port::scoped_restore | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::catch_up::consumed_commands::test_gate | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
-services::discord::health::legacy_supervision::boot_status | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::health::legacy_supervision::test_owner | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::health::legacy_supervision::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::health::o_transition::test_hooks | helper-module | #5340 | expires=2027-10-12 | counts transition context resolutions for the route admission tests; it holds no test of its own
@@ -35,7 +32,6 @@ services::discord::recovery_engine::herdr_before_start_restart::test_hooks | hel
 services::discord::recovery_engine::legacy_restart_replay | helper-module | #5925 | expires=2026-11-13 | dormant classifier, proof and claim contract exercised by legacy_restart_replay_tests; no owned test id
 services::discord::recovery_engine::rebind_runtime::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::recovery_engine::restore_persist_outcome::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
-services::discord::replay_policy::injected::test_support | helper-module | #6008 | expires=2026-10-27 | Shared actual-PG receipt/projection fixture and callback observations for watcher/bridge acceptance tests; declares no test id.
 services::discord::router::intake_dispatch::replay_admission::test_activation | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::router::intake_gate::busy_inject::test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::router::message_handler::provider_dispatch::producer_error_test_support | helper-module | #5340 | expires=2027-10-12 | hands the turn-bridge cold-error tests intake's own producer_error frame; it holds no test of its own
@@ -69,6 +65,5 @@ services::tui_prompt_dedupe::test_clock | helper-module | #5082 | expires=2027-1
 services::turn_orchestrator::dispatch_reservation::marker_remove_fault | helper-module | #6995 | expires=2027-10-15 | fails a clear's dispatch marker removal before or after it for the reclaim tests; it holds no test of its own
 services::turn_orchestrator::pending_queue_persistence::fsync_fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::turn_orchestrator::pending_queue_persistence::post_save_fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
-services::turn_orchestrator::pending_queue_persistence::queue_exit_debt::read_back_fault | helper-module | #5340 | expires=2027-10-12 | lets the queue-exit commit tests change the file between a failed save and its re-read; it holds no test of its own
 services::turn_orchestrator::pending_queue_persistence::queued_recovery::scan_fault | helper-module | #6813 | expires=2027-10-12 | injects read_dir and entry failures for queued recovery acceptance tests; owns no test function
 services::turn_orchestrator::policy_close::test_hooks | helper-module | #5340 | expires=2027-10-12 | lets the before-start policy close tests observe and panic at each mailbox step stage; it holds no test of its own
