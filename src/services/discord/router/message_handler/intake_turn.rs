@@ -42,9 +42,7 @@ mod input_effect_tests {
         let handler_marker = ["\npub(super) async fn handle_", "text_message("].concat();
         let body = source.split_once(handler_marker.as_str()).unwrap().1;
         let start = body
-            .find(
-                "    let Some((channel_id, bootstrapped_fresh_thread_session, redirected_permit))",
-            )
+            .find("    let Some((route, bootstrapped_fresh_thread_session, redirected_permit))")
             .unwrap();
         let end = body[start..]
             .find("    let (mut session_id, mut memento_context_loaded")
@@ -274,7 +272,7 @@ pub(super) async fn handle_text_message(
     deps: &IntakeDeps<'_>,
     preserve_on_cancel: bool,
     request: IntakeRequest,
-    _queued_drain: bool,
+    (_queued_drain, queued): (bool, Option<adk_thread::Route>),
     preloaded_uploads: crate::services::cluster::attachment_transfer::uploads::PendingUploads,
     gate_resolved_voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 ) -> Result<IntakeExecution, Error> {
@@ -284,7 +282,7 @@ pub(super) async fn handle_text_message(
             deps,
             preserve_on_cancel,
             request,
-            _queued_drain,
+            (_queued_drain, queued),
             preloaded_uploads,
             gate_resolved_voice_announcement,
         ))
@@ -308,7 +306,7 @@ pub(super) async fn handle_text_message(
             },
             preserve_on_cancel,
             request,
-            _queued_drain,
+            (_queued_drain, queued),
             preloaded_uploads,
             gate_resolved_voice_announcement,
         ))
@@ -322,7 +320,7 @@ async fn handle_text_message_admitted(
     deps: &IntakeDeps<'_>,
     preserve_on_cancel: bool,
     request: IntakeRequest,
-    _queued_drain: bool,
+    (_queued_drain, queued): (bool, Option<adk_thread::Route>),
     preloaded_uploads: crate::services::cluster::attachment_transfer::uploads::PendingUploads,
     gate_resolved_voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
 ) -> Result<IntakeExecution, Error> {
@@ -521,7 +519,8 @@ async fn handle_text_message_admitted(
         .unwrap_or_else(|| settings_provider.clone());
     let early_fast_mode_channel_id =
         effective_fast_mode_channel_id(channel_id, early_thread_parent.clone());
-    let (inbound, input) = ((channel_id, channel_id), (preloaded_uploads, None));
+    let inbound = (channel_id, channel_id, _queued_drain);
+    let input = (preloaded_uploads, None);
     let admitted = host_refusal::admitted_uploads(http, shared, &settings_provider, inbound, input);
     let Some(preloaded_uploads) = admitted.await? else {
         return Ok(IntakeExecution::Executed);
@@ -894,9 +893,7 @@ async fn handle_text_message_admitted(
             );
         }
     }
-    let dispatch_uses_thread_routing =
-        crate::dispatch::dispatch_type_uses_thread_routing(dispatch_type_str.as_deref());
-    let Some((channel_id, bootstrapped_fresh_thread_session, redirected_permit)) =
+    let Some((route, bootstrapped_fresh_thread_session, redirected_permit)) =
         adk_thread::redirect_dispatch(adk_thread::RedirectDispatch {
             http,
             cache,
@@ -907,25 +904,19 @@ async fn handle_text_message_admitted(
             dispatch_id_for_thread: &dispatch_id_for_thread,
             dispatch_info_cached: &dispatch_info_cached,
             dispatch_type_str: dispatch_type_str.as_deref(),
-            dispatch_uses_thread_routing,
             is_already_thread,
             user_text,
             dispatch_effective_path: &dispatch_effective_path,
             pending_uploads: &mut pending_uploads,
             session_was_cleared,
+            queued_drain: _queued_drain,
+            queued,
         })
         .await?
     else {
         return Ok(IntakeExecution::Executed);
     };
-    let final_provider =
-        if let Some(override_channel) = shared.dispatch.role_overrides.get(&channel_id) {
-            resolve_role_binding(*override_channel, None)
-                .and_then(|binding| binding.provider)
-                .unwrap_or_else(|| provider.clone())
-        } else {
-            provider.clone()
-        };
+    let (channel_id, final_provider) = (route.target, route.provider(&provider));
     let final_permit = adk_thread::final_admission(&final_provider, channel_id, redirected_permit)?;
     let (http_owned, cache_owned, ctx_owned, shared_owned, token_owned) = (
         http.clone(),
@@ -967,7 +958,7 @@ async fn handle_text_message_admitted(
             &dispatch_id_for_thread,
             None,
             preserve_on_cancel,
-            _queued_drain,
+            (_queued_drain, route),
         ),
         (session_id, memento_context_loaded, current_path),
     )
@@ -1062,8 +1053,7 @@ async fn handle_text_message_admitted(
     let mut resolved_role_binding = {
         // For cross-channel dispatch reuse (e.g. review in implementation thread),
         // resolve role from the override channel instead of the thread's parent.
-        if let Some(override_ch) = shared.dispatch.role_overrides.get(&channel_id) {
-            let alt_ch = *override_ch;
+        if let Some(alt_ch) = route.role {
             ResolvedThreadRoleBinding::direct(resolve_role_binding(alt_ch, None))
         } else {
             let data = shared.core.lock().await;
@@ -1084,7 +1074,7 @@ async fn handle_text_message_admitted(
 
     // For cross-channel dispatch reuse, override the provider so the turn
     // executes via the counter-model CLI (e.g. Codex reviews Claude's work).
-    let provider = if shared.dispatch.role_overrides.contains_key(&channel_id) {
+    let provider = if route.role.is_some() {
         role_binding
             .as_ref()
             .and_then(|rb| rb.provider.clone())
@@ -1364,6 +1354,10 @@ async fn handle_text_message_admitted(
             ),
         ))
         .await;
+    // The claim owns the route: publish it before this turn can be observed.
+    if started {
+        route.publish(shared, &provider);
+    }
 
     // #3813 Phase 1a: intake latency span anchor (turn claimed; observation-only
     // — see latency_spans.rs). Never `.log()`'d on the early returns below.
@@ -1449,6 +1443,7 @@ async fn handle_text_message_admitted(
             None,
             preserve_on_cancel,
             race_loss::QueuedIntakeCause::RaceLoss,
+            route,
         )
         .await.map(|_| IntakeExecution::deferred(channel_id));
     }
@@ -1499,9 +1494,6 @@ async fn handle_text_message_admitted(
                 None
             },
             false,
-            crate::services::tui_o::n1_observation::Context {
-                provider: provider.as_str(), origin: "discord_active", input_message_id: Some(user_msg_id.get()),
-            },
         )
         .await
         {
@@ -1600,9 +1592,6 @@ async fn handle_text_message_admitted(
             // "📬" notice) and is the one answering, so it must NOT gate behind a
             // multi-chunk answer flush — that would self-deadlock the active card.
             false,
-            crate::services::tui_o::n1_observation::Context {
-                provider: provider.as_str(), origin: "discord_active", input_message_id: Some(user_msg_id.get()),
-            },
         )
         .await
         {

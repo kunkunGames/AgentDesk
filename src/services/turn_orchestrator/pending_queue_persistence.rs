@@ -6,27 +6,17 @@ use std::time::{Duration, Instant, SystemTime};
 use poise::serenity_prelude::{ChannelId, MessageId, UserId};
 
 use super::queued_head::{SnapshotMeta, parse_snapshot};
+use super::source_generation::PendingQueueSourceGeneration;
 use super::{
     ChannelMailboxState, Intervention, InterventionMode, QueuePersistenceContext,
     SourceMessageQueuedGeneration, SourceMessageTextSegment,
 };
 use crate::services::provider::ProviderKind;
 
-mod queue_exit_debt;
 mod queued_recovery;
-#[cfg(test)]
-pub(super) use queue_exit_debt::{
-    ExitWithDebt, PreparedQueueExitTransition, QueueExitCommitError, QueueExitPrepareError,
-    commit_queue_exit, read_back_fault,
-};
-pub(super) use queue_exit_debt::{QueueExitDebt, check_queue_exit_debts};
 pub(crate) use queued_recovery::load_pending_queues_checked;
 
 const STALE_PENDING_QUEUE_TMP_AGE: Duration = Duration::from_secs(60);
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
 
 /// Serializable form of a queued intervention for disk persistence.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -79,17 +69,6 @@ pub(crate) struct PendingQueueItem {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) voice_announcement: Option<crate::voice::prompt::VoiceTranscriptAnnouncement>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct PendingQueueSourceGeneration {
-    pub(crate) message_id: u64,
-    pub(crate) queued_generation: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) enqueued_at_epoch_us: Option<u64>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_false")]
-    pub(crate) preserve_on_cancel: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -385,6 +364,7 @@ pub(super) fn pending_queue_item_from_intervention(
             queued_generation: owner.queued_generation,
             enqueued_at_epoch_us: owner.enqueued_at_epoch_us,
             preserve_on_cancel: owner.preserve_on_cancel,
+            route: owner.route,
         })
         .collect();
     let source_text_segments: Vec<PendingQueueSourceTextSegment> = intervention
@@ -433,6 +413,20 @@ pub(super) fn pending_queue_item_from_intervention(
     }
 }
 
+/// Lets a metadata-free test write replace only a missing file or a legacy array.
+#[cfg(test)]
+fn refuse_metadata_loss(path: &Path) -> Result<(), String> {
+    match fs::read_to_string(path) {
+        Ok(content) if !matches!(parse_snapshot(&content), Ok((_, None))) => {
+            Err(format!("refusing to overwrite {}", path.display()))
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(format!("read {}: {error}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Write-through: save a single channel's queue to disk.
 /// If the queue is empty the file is removed.
 #[cfg(test)]
@@ -446,7 +440,7 @@ pub(crate) fn save_channel_queue(
     crate::services::discord::input_runtime::fence::write(provider, channel_id.get(), || {
         // This writer carries no metadata, so it must not replace or remove a V1 snapshot.
         if let Some(path) = pending_queue_file_path(provider, token_hash, channel_id) {
-            queue_exit_debt::refuse_metadata_loss(&path)?;
+            refuse_metadata_loss(&path)?;
         }
         save_channel_queue_locked(
             provider,
@@ -776,6 +770,7 @@ pub(super) fn pending_queue_item_to_intervention(
             },
             enqueued_at_epoch_us: owner.enqueued_at_epoch_us.or(legacy_enqueued_us),
             preserve_on_cancel: owner.preserve_on_cancel,
+            route: owner.route,
         })
         .collect();
     for message_id in &source_message_ids {
@@ -788,6 +783,7 @@ pub(super) fn pending_queue_item_to_intervention(
                 queued_generation,
                 enqueued_at_epoch_us: legacy_enqueued_us,
                 preserve_on_cancel: false,
+                route: None,
             });
         }
     }
@@ -1042,7 +1038,7 @@ pub(super) mod save_fault {
             .push(channel_id);
     }
 
-    pub(super) fn take(channel_id: ChannelId) -> bool {
+    pub(in crate::services::turn_orchestrator) fn take(channel_id: ChannelId) -> bool {
         let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
         let index = armed.iter().position(|armed| *armed == channel_id);
         index.map(|index| armed.swap_remove(index)).is_some()

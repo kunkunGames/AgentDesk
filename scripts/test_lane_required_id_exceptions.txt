@@ -50,6 +50,7 @@ services::discord::tmux::watcher_lifecycle::n4d2_entry_support | helper-module |
 services::discord::turn_bridge::before_start_stop::test_hooks | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::turn_bridge::cancel_backstop_test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::turn_bridge::replay_policy | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
+services::discord::turn_bridge::stream_loop::types::terminal_prepare_test | helper-module | #6903 | expires=2026-11-14 | Pauses actual terminal preparation for parked-custody boundary tests; declares no test id.
 services::discord::turn_bridge::terminal_outcome_delivery::empty_response_recovery::handler::output_growth | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::discord::zombie_foreground_release::cancel_backstop_test_support | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::session_host::herdr_host::windows_tests::an_unconfigured_herdr_host_refuses_every_operation | platform-unavailable | #5082 | expires=2027-10-12 | Windows-only platform test not run on Linux CI runner
@@ -65,10 +66,9 @@ services::tui_o::writer::host::transition::test_support | helper-module | #5340 
 services::tui_o::writer::rotation::probe | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::tui_prompt_dedupe::binding_events::presence_admission | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::tui_prompt_dedupe::test_clock | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
+services::turn_orchestrator::dispatch_reservation::marker_remove_fault | helper-module | #6995 | expires=2027-10-15 | fails a clear's dispatch marker removal before or after it for the reclaim tests; it holds no test of its own
 services::turn_orchestrator::pending_queue_persistence::fsync_fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::turn_orchestrator::pending_queue_persistence::post_save_fault | helper-module | #5082 | expires=2027-10-12 | Test helper module providing test utilities without defining tests directly
 services::turn_orchestrator::pending_queue_persistence::queue_exit_debt::read_back_fault | helper-module | #5340 | expires=2027-10-12 | lets the queue-exit commit tests change the file between a failed save and its re-read; it holds no test of its own
 services::turn_orchestrator::pending_queue_persistence::queued_recovery::scan_fault | helper-module | #6813 | expires=2027-10-12 | injects read_dir and entry failures for queued recovery acceptance tests; owns no test function
 services::turn_orchestrator::policy_close::test_hooks | helper-module | #5340 | expires=2027-10-12 | lets the before-start policy close tests observe and panic at each mailbox step stage; it holds no test of its own
-services::turn_orchestrator::registry_purge::recovery_custody::commit_fault | helper-module | #5340 | expires=2027-10-14 | lets the custody PG tests run a change between a custody write and its commit; it holds no test of its own
-services::turn_orchestrator::registry_purge::recovery_custody::seam | helper-module | #5340 | expires=2027-10-14 | pause points and an effect count on the apply path for the registry PG tests; it holds no test of its own
