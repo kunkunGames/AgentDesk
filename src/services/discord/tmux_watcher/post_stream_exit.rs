@@ -475,7 +475,8 @@ mod tests {
 
     #[test]
     fn cancelled_watcher_releases_its_slot_without_dispatch_failure_authority() {
-        let registry = TmuxWatcherRegistry::new();
+        let registry =
+            TmuxWatcherRegistry::new_with_coords(std::sync::Arc::new(dashmap::DashMap::new()));
         let channel = ChannelId::new(5072);
         let tmux = "AgentDesk-codex-cancelled";
         let handle = watcher_handle(tmux);

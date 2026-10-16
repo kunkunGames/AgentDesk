@@ -46,21 +46,11 @@ pub(crate) fn write_tmux_runtime_kind_marker_under_source_authority(
     runtime_kind: crate::services::agent_protocol::RuntimeHandoffKind,
 ) -> Result<(), String> {
     use crate::services::agent_protocol::RuntimeHandoffKind;
-    if !matches!(
-        runtime_kind,
-        RuntimeHandoffKind::ProcessBackend | RuntimeHandoffKind::ClaudeEAdapter
-    ) {
+    if !matches!(runtime_kind, RuntimeHandoffKind::ProcessBackend) {
         ensure_tmux_hosting_admitted_under_source_authority(authority)?;
     } else {
         let current = resolve_tmux_runtime_kind_marker(authority.session());
-        if current.is_some_and(|kind| {
-            matches!(
-                kind,
-                RuntimeHandoffKind::ProcessBackend | RuntimeHandoffKind::ClaudeEAdapter
-            ) && kind != runtime_kind
-        }) || (current.is_none()
-            && source_requires_native_preservation_under_authority(authority))
-        {
+        if current.is_none() && source_requires_native_preservation_under_authority(authority) {
             return Err("unresolved native or unknown hosting kind requires canonical release before mode change".into());
         }
     }
@@ -111,8 +101,7 @@ pub(crate) fn hosting_intent_at_path_requires_preservation(path: &Path) -> bool 
     use crate::services::agent_protocol::RuntimeHandoffKind;
     match std::fs::read_to_string(path) {
         Ok(raw) => match RuntimeHandoffKind::from_str(&raw) {
-            Some(RuntimeHandoffKind::ProcessBackend | RuntimeHandoffKind::ClaudeEAdapter)
-            | None => true,
+            Some(RuntimeHandoffKind::ProcessBackend) | None => true,
             Some(_) => false,
         },
         Err(error) => error.kind() != std::io::ErrorKind::NotFound,
@@ -263,19 +252,23 @@ mod tests {
             resolve_tmux_runtime_kind_marker(&session),
             Some(RuntimeHandoffKind::ProcessBackend)
         );
-        // The same conservative contract covers a known adapter kind, without
-        // claiming that its provider-specific launch entry has native PID proof.
-        assert!(
-            write_tmux_runtime_kind_marker(&session, RuntimeHandoffKind::ClaudeEAdapter).is_err()
-        );
+        // Retired adapter markers remain unknown ownership evidence. They
+        // cannot authorize a downgrade, a new native owner, or generic cleanup.
         let adapter_session = format!("{session}-adapter");
-        write_tmux_runtime_kind_marker(&adapter_session, RuntimeHandoffKind::ClaudeEAdapter)
-            .unwrap();
+        let adapter_marker = session_temp_path(&adapter_session, TMUX_RUNTIME_KIND_TEMP_EXT);
+        std::fs::write(&adapter_marker, "claude_e_adapter").unwrap();
+        assert_eq!(resolve_tmux_runtime_kind_marker(&adapter_session), None);
         assert!(require_tmux_hosting_admission(&adapter_session).is_err());
+        for kind in [
+            RuntimeHandoffKind::LegacyTmuxWrapper,
+            RuntimeHandoffKind::ProcessBackend,
+        ] {
+            assert!(write_tmux_runtime_kind_marker(&adapter_session, kind).is_err());
+        }
         cleanup_session_temp_files(&adapter_session);
         assert_eq!(
-            resolve_tmux_runtime_kind_marker(&adapter_session),
-            Some(RuntimeHandoffKind::ClaudeEAdapter)
+            std::fs::read_to_string(&adapter_marker).unwrap(),
+            "claude_e_adapter"
         );
     }
 }

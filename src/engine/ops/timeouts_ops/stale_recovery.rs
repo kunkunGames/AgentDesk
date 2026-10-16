@@ -47,10 +47,7 @@ pub(super) fn runtime_evidence(session_key: &str) -> Value {
     };
     let evidence = process_session_evidence(&name);
     let kind = runtime_kind_for_name(&name, evidence.registration);
-    let native = matches!(
-        kind,
-        Some(RuntimeHandoffKind::ProcessBackend | RuntimeHandoffKind::ClaudeEAdapter)
-    );
+    let native = matches!(kind, Some(RuntimeHandoffKind::ProcessBackend));
     let liveness = if native || evidence.registration == NativeRegistryPresence::Unknown {
         serde_json::to_value(evidence.liveness).unwrap_or(Value::Null)
     } else {
