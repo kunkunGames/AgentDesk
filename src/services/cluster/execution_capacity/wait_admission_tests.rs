@@ -74,7 +74,11 @@ fn attempt(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn campaign_capacity_wait_rechecks_node_policy_and_finalizes_refused_lease_pg() {
     const CHILD: &str = "AGENTDESK_CAPACITY_WAIT_TEST_CHILD";
+    const DATABASE: &str = "AGENTDESK_CAPACITY_WAIT_TEST_DATABASE";
     if std::env::var(CHILD).ok().as_deref() != Some("1") {
+        // The parent owns cleanup even if the child panics or its watchdog fires.
+        let fixture = TestPostgresDb::create().await;
+        fixture.connect_and_migrate().await.close().await;
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("config.yaml");
         let mut config = crate::config::Config::default();
@@ -88,30 +92,46 @@ async fn campaign_capacity_wait_rechecks_node_policy_and_finalizes_refused_lease
             "::campaign_capacity_wait_rechecks_node_policy_and_finalizes_refused_lease_pg"
         );
         let name = name.split_once("::").unwrap().1;
+        let log_path = root.path().join("child.log");
+        let log = std::fs::File::create(&log_path).unwrap();
         let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
         command
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .env(CHILD, "1")
+            .env(DATABASE, &fixture.database_url)
             .env("AGENTDESK_CONFIG", &path)
             .env("AGENTDESK_ROOT_DIR", root.path())
             .env("AGENTDESK_INSTANCE_ID", "wait-node")
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
             .kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(180), command.output())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+        let mut child = command.spawn().unwrap();
+        let status = match tokio::time::timeout(Duration::from_secs(180), child.wait()).await {
+            Ok(status) => status.unwrap(),
+            Err(_) => {
+                child.kill().await.unwrap();
+                child.wait().await.unwrap();
+                fixture.drop().await;
+                panic!(
+                    "admission child timed out: {}",
+                    std::fs::read_to_string(&log_path).unwrap()
+                );
+            }
+        };
+        fixture.drop().await;
+        let output = std::fs::read_to_string(log_path).unwrap();
+        assert!(status.success(), "{status}: {output}");
+        assert!(output.contains("1 passed; 0 failed"), "{output}");
         return;
     }
 
-    let fixture = TestPostgresDb::create().await;
-    let pool = fixture.connect_and_migrate().await;
+    let pool = crate::db::postgres::connect_test_pool_with_max_connections(
+        &std::env::var(DATABASE).unwrap(),
+        "campaign admission child",
+        4,
+    )
+    .await
+    .unwrap();
     for node in ["wait-node", "foreign-node"] {
         sqlx::query("INSERT INTO worker_nodes(instance_id,last_heartbeat_at,capabilities) VALUES($1,NOW(),$2)")
             .bind(node).bind(json!({"execution_capacity":{"version":1,"slots":1}}))
@@ -240,5 +260,4 @@ async fn campaign_capacity_wait_rechecks_node_policy_and_finalizes_refused_lease
         .await
         .unwrap();
     pool.close().await;
-    fixture.drop().await;
 }

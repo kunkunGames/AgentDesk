@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "30c33183cdd5042d9880bb72072e9b65be648cfc",
+  "measured_at_sha": "70184b25e9d0c1132ffc9c7a35c21ef5ed17062a",
   "records": [
     {
       "root": "migrations/postgres",
@@ -41171,6 +41171,42 @@
     {
       "root": "src",
       "kind": "RUST",
+      "path": "src/services/cluster/execution_capacity/wait_admission_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:48c1a40e8d9e51c4f98a3bb5923927aedc4987a1e63b974ba7bf35819e6aa5f5"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/execution_capacity/wait_admission_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:5b9209129b58427364f1009ac0d83694b1b8fb71a82e41db9b4a3fb98120fafc"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/execution_capacity/wait_admission_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:745854c99a006593891c3415e7e4f8a2c32065daf6106ab8280cfa64e9280e20"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/cluster/execution_capacity/wait_admission_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:819dcbd9c6fda5a11d9c25f27171878e08b1ad0078e2d1b3440a26a4b1b9f76c"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
       "path": "src/services/cluster/execution_requirements.rs",
       "api": "sqlx::query",
       "symbol": "query",
@@ -44902,6 +44938,222 @@
       "symbol": "query_scalar",
       "classification": "UNRESOLVED",
       "fingerprint": "sha256:451c20e94aef6a5ff481059e43369afcde91901753a76ae88dd146b0bfc220f4"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "UNRESOLVED",
+      "fingerprint": "sha256:f2a61f1d5abdbee190c82beb752aabd67e7416515b4316abe39d779f3baca321"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:34f87f36323f87d10594f5d63afe5c02b2ba4ffb15d6d3a5abe3153759495898"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:3808e312cc786c8a5d7e52c58165c18c0284d5907b8adb7d5dbf7a9a5fdf6501"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:481fb0faf93d0adf970e667e76e83c88c946d26592a4d1994b9f1feebb8ee7dd"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:51d50187e1c0baf5d5f3f706dbf3e64f157766af3cd832c8f1f378444514b318"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:76f364d3dafe00bc66f9a8f801b2d66eb8f3063b4f2e3c43fa01ad35dd408df5"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:8257b290e41fcb4d2d767617cfce7118e7121cda313e12a924c18a280591a811"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:841803e8a10717123949498c5d72fad0ea41b1e2fdada02cc40d5a66373e77d8"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:84f2a5ebcc70a6b39b161f7daeaff4818ab71181a99711d963f9214abc33dc95"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:94ba0230e2044ef51cae3cf4cd3cb4c2c09e0773abc11e2f5de0621ffe629df2"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:a020cd310a18847cf0135dfbc9a9ea506c8d42ad60a20b5725835fc8d82e252a"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:a14f87cfc2ad8044b31455166007a00af98765af8666983860e10ee7356ca7c7"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:b3b2699b4843db604149a6627767be8d666d060528311221284e57f1d4163ded"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:bb6a511bd7c9d6677938de136ffb1524354ffda8a9166cfcbc9c50492e645d65"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:c736ff637363ca3e5b46d618cc549409e505572315cb8de3728edec606e354e8"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:d02a9a2931d72bc6df98a61b7791070fbb5919910741b29fae7a494b7cb5eecd"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:e252b20d35403bfb1c3b0d76809635782e847fbca435c6f03bc4ca493f372e68"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:e3b7395251046194e224062376ca4b34d0bd830c5430a830b679bd1b91221722"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:e821ed8c5d8689cfdc92b825f2eb6f5e90055a1a6083f5ca2357b54af5a0db4e"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:fb6312851ea5afa5b183a85840c4a3d62d35ad7d02a578aa61c7865334ea9fa6"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:1dbf862b5fd867c8ff6d85261fb436123cbe75a68757dad1d35ef71bfa41f65d"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:8518a2ce95e9317b1c9845384ffccd35fa4c6a1a59a336f3af60743dd00b37d7"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:9c607f42f6fcf346e5ac71c053d7ed8fe72aa8120fed73e8853ab2d3c3d6b513"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:b913ba8b93ac00a5418b7078b0204162a32ce54dc6f232f5c1622c658c3aecf0"
     },
     {
       "root": "src",

@@ -81,6 +81,7 @@ NON_PG_SKIP_ARGS=(
   --skip services::cluster::channel_home_drain::tests
   --skip services::cluster::execution_capacity::managed_tests
   --skip services::cluster::execution_capacity::tests
+  --skip services::cluster::execution_capacity::wait_admission_tests
   --skip services::cluster::intake_preflight::tests
   --skip services::cluster::intake_router_hook::agent_execution_node_tests
   --skip services::cluster::intake_router_hook::attachment_tests
@@ -154,6 +155,7 @@ NON_PG_SKIP_ARGS=(
   --skip services::discord::router::message_handler::intake_turn::native_fresh_prompt_tests
   --skip services::discord::router::message_handler::intake_turn::replay_start_tests
   --skip services::discord::router::message_handler::intake_turn::runtime_transition::native_hold_tests
+  --skip services::discord::router::message_handler::provider_dispatch::campaign_admission::tests
   --skip services::discord::router::message_handler::provider_dispatch::codex_herdr_tests
   --skip services::discord::router::message_handler::provider_dispatch::herdr_tests
   --skip services::discord::router::message_handler::provider_dispatch::tests
