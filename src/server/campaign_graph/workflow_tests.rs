@@ -705,6 +705,139 @@ async fn workflow_success_revision_preserves_published_work_and_requires_new_qa_
 }
 
 #[tokio::test]
+async fn activated_manager_repair_does_not_publish_a_duplicate_planner_pg() {
+    let database = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
+    let pool = database.connect_and_migrate().await;
+    let (campaign, mut replacement, version) = accepted_prefix(&pool, true).await;
+    let failed = replacement.nodes[2].clone();
+    publish_work(&pool, &campaign.id, version, &failed).await;
+    let mut blocked = fixture_receipt("Fixture followup needs an explicit corrected artifact step");
+    blocked["campaign_receipt"]["outcome"] = json!("blocked");
+    blocked["campaign_receipt"]["failure_category"] = json!("plan");
+    let _failed_workspace = terminal_fixture(
+        &pool,
+        &failed.task_key,
+        "fixture-failed-followup",
+        &blocked,
+        None,
+    )
+    .await;
+    reconcile::observe(&pool, &campaign.id, &goal(), None)
+        .await
+        .unwrap();
+    super::replan_tests::settle(&pool).await;
+    acknowledge_fixture_status_reactions(&pool, &campaign.id, &["fixture-failed-followup"]).await;
+    let before = store::status(&pool, &campaign.id).await.unwrap();
+    let failure = before["failures"][0].clone();
+    assert_eq!(failure["category"], "plan");
+    let (frontier, key) = manager_turn(&pool, &campaign.id).await;
+    let mut repaired = failed.clone();
+    repaired.id = "repaired-produce".into();
+    repaired.task_key = "repo:corrected:produce".into();
+    repaired.details = "Use the accepted original inputs for the corrected fixture artifact".into();
+    let mut repaired_verifier = replacement.nodes[3].clone();
+    repaired_verifier.id = "repaired-verify".into();
+    repaired_verifier.task_key = "repo:corrected:verify".into();
+    repaired_verifier.dependencies = [repaired.id.clone()].into();
+    repaired_verifier.inputs[0].dependency = repaired.id.clone();
+    replacement.nodes.extend([repaired, repaired_verifier]);
+    replacement.validate(&goal()).unwrap();
+    let mut decision = fixture_receipt("Manager fixture repairs only the failed followup");
+    decision["workflow_decision"] = json!({
+        "snapshot_digest":frontier.digest().unwrap(),"action":"revise",
+        "failure_id":failure["id"],"reason":"Preserve accepted inputs and the original failed contract; use a new corrected key and independent QA"
+    });
+    decision["campaign_graph"] = serde_json::to_value(&replacement).unwrap();
+    let _manager_workspace =
+        terminal_fixture(&pool, &key, "fixture-manager-repair", &decision, None).await;
+    reconcile::observe(&pool, &campaign.id, &goal(), None)
+        .await
+        .unwrap();
+    let staged = store::status(&pool, &campaign.id).await.unwrap();
+    let candidate = staged["versions"][0]["version"].as_i64().unwrap();
+    assert_eq!(staged["versions"][0]["status"], "candidate");
+    assert_eq!(staged["versions"][0]["failure_id"], failure["id"]);
+    assert!(staged["versions"][0]["manager_task_key"].is_null());
+    assert_eq!(staged["versions"][0]["planner_agent_id"], goal().planner);
+    let manager = staged["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["task_key"] == key)
+        .unwrap();
+    assert_eq!(manager["accepted"], true);
+    assert_eq!(manager["observation"]["candidate_version"], candidate);
+    let suffix = candidate.to_string();
+    assert!(
+        control(
+            &pool,
+            &campaign.id,
+            &goal(),
+            "validate",
+            Some(candidate),
+            &suffix,
+            "Independent QA of the manager-authored fixture repair",
+        )
+        .await
+        .unwrap()
+    );
+    let qa_key = format!("{}:validate:{suffix}", campaign.id);
+    let mut qa = fixture_receipt("Independent fixture QA approves this repair candidate");
+    qa["graph_validation"] = json!({
+        "digest":staged["versions"][0]["digest"],"approved":true,
+        "reason":"The original contracts and failure remain; corrected artifact work has independent QA"
+    });
+    let _qa_workspace =
+        terminal_fixture(&pool, &qa_key, "fixture-manager-repair-qa", &qa, None).await;
+    reconcile::observe(&pool, &campaign.id, &goal(), None)
+        .await
+        .unwrap();
+    let current = campaigns::get(&pool, &campaign.id).await.unwrap();
+    store::activate(&pool, &campaign.id, candidate, current.revision)
+        .await
+        .unwrap();
+    let activated = store::status(&pool, &campaign.id).await.unwrap();
+    let before_counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM campaign_graph_tasks), (SELECT count(*) FROM auto_queue_entries)",
+    ).fetch_one(&pool).await.unwrap();
+    for _ in 0..2 {
+        assert!(
+            planning::publish_repair(
+                &pool,
+                &campaign.id,
+                &goal(),
+                &replacement,
+                candidate,
+                &activated,
+            )
+            .await
+            .unwrap()
+        );
+    }
+    let after = store::status(&pool, &campaign.id).await.unwrap();
+    assert_eq!(after["tasks"], activated["tasks"]);
+    assert_eq!(after["failures"], activated["failures"]);
+    assert_eq!(after["goal"], activated["goal"]);
+    let after_counts: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM campaign_graph_tasks), (SELECT count(*) FROM auto_queue_entries)",
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(after_counts, before_counts);
+    assert!(
+        !after["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["task_key"]
+                == format!("{}:plan:{}", campaign.id, failure["id"].as_str().unwrap()))
+    );
+    for original in before["tasks"].as_array().unwrap() {
+        assert!(after["tasks"].as_array().unwrap().contains(original));
+    }
+    pool.close().await;
+    database.drop().await;
+}
+
+#[tokio::test]
 async fn workflow_goal_completion_waits_for_cleanup_then_skips_unpublished_suffix_pg() {
     let database = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
     let pool = database.connect_and_migrate().await;

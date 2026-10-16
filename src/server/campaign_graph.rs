@@ -454,60 +454,8 @@ async fn tick(
             )
             .await?;
         }
-        // One deterministic planning task per failure; unchanged failures do not
-        // create new work on each tick. Infrastructure and unknown effects hold.
-        if !versions
-            .iter()
-            .any(|v| v["status"] == "candidate" || v["status"] == "validated")
-        {
-            for f in state["failures"].as_array().unwrap() {
-                let failed_control = tasks.iter().any(|t| {
-                    t["task_key"] == f["task_key"]
-                        && matches!(t["role"].as_str(), Some("plan" | "validate"))
-                        && t["version"].as_i64().is_some_and(|fv| fv >= v)
-                });
-                if !graph.nodes.iter().any(|n| f["task_key"] == n.task_key) && !failed_control {
-                    continue;
-                }
-                let repair_key = format!("{id}:plan:{}", f["id"].as_str().unwrap());
-                if tasks.iter().any(|t| t["task_key"] == repair_key) {
-                    continue;
-                }
-                if f["category"] != "code" && f["category"] != "plan" {
-                    continue;
-                }
-                if tasks.iter().filter(|t| t["role"] == "plan").count()
-                    > g.budget.max_evolutions as usize
-                    || versions.len() > g.budget.max_evolutions as usize
-                {
-                    // A terminal repair failure must remain inspectable when
-                    // no further evolution is allowed, rather than waiting
-                    // forever with an active but unfinishable graph.
-                    store::hold(pool, id, "Plan evolution budget exhausted").await?;
-                    return Ok(());
-                }
-                let prompt = format!(
-                    "Propose a corrected graph for captured failure {}. Preserve completed/in-flight contracts and their task keys. Change only the failed subgraph and affected inputs. Explicitly explain the causal change in your receipt. Existing graph:\n{}\nFailure evidence:\n{}\n{}",
-                    f["id"],
-                    version["graph"],
-                    reconcile::planning_evidence(pool, f).await?,
-                    GRAPH_SCHEMA
-                );
-                if !control(
-                    pool,
-                    id,
-                    &g,
-                    "plan",
-                    Some(v),
-                    f["id"].as_str().unwrap(),
-                    &prompt,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-                break;
-            }
+        if !planning::publish_repair(pool, id, &g, &graph, v, &state).await? {
+            return Ok(());
         }
     }
     activate_runs(pool, engine, id, &g).await
