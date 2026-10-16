@@ -42,6 +42,7 @@ pub(crate) mod idle_recap;
 mod idle_recap_interaction;
 mod idle_relay_drift;
 mod inflight;
+#[cfg(test)]
 pub(crate) use inflight::read_only_owner_snapshot::{
     CodexEpisodeOwnerSnapshot, codex_episode_snapshot,
 };
@@ -110,17 +111,10 @@ mod role_map;
 mod role_map_enrichment;
 mod router;
 mod runtime_bootstrap;
-#[cfg(test)]
-pub use runtime_bootstrap::boot_retirement;
 pub(in crate::services::discord) mod semantic_boundaries;
 mod skills_scan;
 mod turn_presence;
-pub(crate) use turn_presence::entrypoints::{
-    Lease as PresenceLease, withdraw_target as presence_withdraw_target,
-    withdraw_unmounted as presence_withdraw_unmounted,
-};
-#[cfg(all(test, unix))]
-pub(crate) use turn_presence::lifecycle::Runtime as PresenceRuntime;
+pub(crate) use turn_presence::entrypoints::Lease as PresenceLease;
 mod turn_teardown_clearance;
 // #1446 stall-deadlock recovery: shared post-clear bookkeeping for the THREAD-GUARD
 // + stall-watchdog cleanup paths so neither leaks `global_active` / cancel tokens.
@@ -157,12 +151,6 @@ mod terminal_ui_obligation;
 #[cfg(unix)]
 mod tmux;
 #[cfg(all(test, unix))]
-pub use tmux::{
-    OOnlyInstallOutcome, OOnlyInstallReason, OOnlyInstallRequest, install_retired_o_watcher,
-};
-#[cfg(unix)]
-pub use tmux::{RetiredOWatcherRestore, restore_retired_o_watchers};
-#[cfg(all(test, unix))]
 pub(crate) fn claim_cross_channel_tmux_watcher_for_high_risk_test(
     requested_channel_id: ChannelId,
     existing_channel_id: ChannelId,
@@ -194,8 +182,6 @@ mod tmux_watcher_registry;
 #[cfg(test)]
 mod tmux_watcher_registry_restore_tests;
 pub(crate) mod input_runtime;
-#[allow(dead_code)]
-mod input_transition;
 #[cfg(test)]
 mod relay_coord_tests;
 pub(crate) mod terminal_delivery_custody;
@@ -226,7 +212,6 @@ mod voice_sensitivity;
 #[path = "watchers/lifecycle_decision.rs"]
 mod watcher_lifecycle_decision;
 pub(crate) mod zombie_foreground_release; // #5176 cancel/mailbox-release authority
-
 #[allow(unused_imports)]
 pub(in crate::services::discord) use tmux_watcher_registry::{
     TMUX_WATCHER_STALE_HEARTBEAT_MS, TmuxWatcherBinding, TmuxWatcherHandle, TmuxWatcherRegistry,

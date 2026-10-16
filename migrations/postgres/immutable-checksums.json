@@ -717,6 +717,11 @@
       "version": 140
     },
     {
+      "path": "migrations/postgres/0141_sessions_hosted_execution_archive.sql",
+      "sha256": "8bd647f7c3fd5298e37eeea2d88634fa78ebf93dc35dfc8bf052b159067132e7",
+      "version": 141
+    },
+    {
       "path": "migrations/postgres/0146_campaign_upstream_convergence.sql",
       "sha256": "71558d99a81c07ec54304be349249b7e89b49bf6643a2e6ee15eec3de5926e75",
       "version": 146
@@ -798,7 +803,7 @@
     },
     {
       "path": "migrations/postgres_campaign_v5/0146_campaign_upstream_convergence.sql",
-      "sha256": "50ddc52e37b4fe138edbac102f8e5b9776114f7b74918382d614d028ebbff14d",
+      "sha256": "9c7c859dcb72aae6b1846aaa2c672f89541d510f7ec7ded1b3655f5e33f0f3fe",
       "version": 146
     }
   ],

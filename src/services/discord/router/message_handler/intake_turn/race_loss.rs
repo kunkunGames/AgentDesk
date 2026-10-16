@@ -153,6 +153,7 @@ pub(super) async fn handle_race_loss_enqueue(
     turn_start_attempt: Option<crate::services::discord::turn_view_reconciler::TurnStartAttempt>,
     preserve_on_cancel: bool,
     cause: QueuedIntakeCause,
+    route: crate::services::turn_orchestrator::QueuedRoute,
 ) -> Result<(), Error> {
     let bot_owner_provider = crate::services::discord::resolve_discord_bot_provider(token);
     let want_queued_card = !turn_kind.is_background_trigger() && channel_id == original_channel_id;
@@ -189,7 +190,8 @@ pub(super) async fn handle_race_loss_enqueue(
             // `dispatch_queued_turn` can reinsert it before re-entering
             // `handle_text_message`, restoring voice-transcript framing.
             voice_announcement.clone(),
-        ),
+        )
+        .with_route(route),
         cause,
     )
     .await;
@@ -299,11 +301,6 @@ pub(super) async fn handle_race_loss_enqueue(
             // QUEUED — its "📬" card is a trailing notice that must wait
             // behind any in-flight multi-chunk answer flush.
             true,
-            crate::services::tui_o::n1_observation::Context {
-                provider: provider.as_str(),
-                origin: "discord_race",
-                input_message_id: Some(user_msg_id.get()),
-            },
         )
         .await;
 

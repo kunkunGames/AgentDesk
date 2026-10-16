@@ -865,3 +865,9 @@ CREATE INDEX IF NOT EXISTS channel_recovery_custody_open
 
 -- END migrations/postgres/0140_channel_recovery_custody.sql
 
+-- BEGIN migrations/postgres/0141_sessions_hosted_execution_archive.sql sha256=8bd647f7c3fd5298e37eeea2d88634fa78ebf93dc35dfc8bf052b159067132e7
+-- Keep the returned execution on its canonical row without changing legacy NULL semantics.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS returned_hosted_execution JSONB;
+
+-- END migrations/postgres/0141_sessions_hosted_execution_archive.sql
+

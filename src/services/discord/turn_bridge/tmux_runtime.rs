@@ -615,11 +615,6 @@ async fn stop_active_turn_on(
     cleanup_policy: TmuxCleanupPolicy,
     reason: &str,
 ) -> StopOutcome {
-    // Withdrawn as the stop starts; its late completion never looks up a successor.
-    if let Some(name) = target.legacy_name() {
-        let withdraw = crate::services::discord::turn_presence::entrypoints::withdraw_session;
-        withdraw(name.as_str(), "turn_stop");
-    }
     // Keep Qwen wrapper ancestry until generation-fenced cleanup observes its descendants.
     if matches!(provider, ProviderKind::Qwen)
         && cleanup_policy.should_cleanup_tmux()

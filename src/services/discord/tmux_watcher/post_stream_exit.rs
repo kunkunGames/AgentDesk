@@ -383,7 +383,8 @@ mod tests {
     // `tmux_watchers.remove(&channel_id)` kills this test.
     #[test]
     fn stale_post_stream_exit_preserves_a_replacement_watcher_entry() {
-        let registry = TmuxWatcherRegistry::new();
+        let registry =
+            TmuxWatcherRegistry::new_with_coords(std::sync::Arc::new(dashmap::DashMap::new()));
         let channel = ChannelId::new(1_504_468_805_772_902_471);
         let tmux = "AgentDesk-claude-adk-cc";
 
@@ -419,7 +420,8 @@ mod tests {
     // entry down even though it never belonged to the exiting watcher.
     #[test]
     fn stale_post_stream_exit_preserves_a_rebound_channel_entry() {
-        let registry = TmuxWatcherRegistry::new();
+        let registry =
+            TmuxWatcherRegistry::new_with_coords(std::sync::Arc::new(dashmap::DashMap::new()));
         let channel = ChannelId::new(4794);
         let old_tmux = "AgentDesk-claude-adk-cc";
         let new_tmux = "AgentDesk-claude-adk-cc-t4794";
@@ -453,7 +455,8 @@ mod tests {
     // two tests above but dies here.
     #[test]
     fn post_stream_exit_releases_its_own_registry_entry() {
-        let registry = TmuxWatcherRegistry::new();
+        let registry =
+            TmuxWatcherRegistry::new_with_coords(std::sync::Arc::new(dashmap::DashMap::new()));
         let channel = ChannelId::new(5071);
         let tmux = "AgentDesk-codex-adk-cc";
 

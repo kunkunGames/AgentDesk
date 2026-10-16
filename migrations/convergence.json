@@ -1,7 +1,51 @@
 {
-  "schema": "agentdesk.postgres-convergence.v1",
-  "version": 146,
   "profiles": {
+    "campaign_v5": {
+      "output": "migrations/postgres_campaign_v5/0146_campaign_upstream_convergence.sql",
+      "sha256": "9c7c859dcb72aae6b1846aaa2c672f89541d510f7ec7ded1b3655f5e33f0f3fe",
+      "sources": [
+        {
+          "path": "migrations/postgres/0131_sessions_hosted_execution.sql",
+          "sha256": "48b3814552340658f95f27ec23ee689a8af8a0a8c803bb419b44594e1b30d76d"
+        },
+        {
+          "path": "migrations/postgres/0133_o_channel_homes.sql",
+          "sha256": "8abee1a7c56480b0f90954c1c64bb0a725104313e143d8d66bcd67941b6b79c2"
+        },
+        {
+          "path": "migrations/postgres/0134_channel_home_epochs.sql",
+          "sha256": "bce70458c71e133d49de7d1f77215d4d56053c8f452c2f9a530e432b09c88e77"
+        },
+        {
+          "path": "migrations/postgres/0135_channel_clear_boundary_native_correlation.sql",
+          "sha256": "174c706f1328c48b7d46104d63cdd2f3394338b65b07ec7852af00a6f546dba8"
+        },
+        {
+          "path": "migrations/postgres/0136_request_replay_disposition.sql",
+          "sha256": "c8ed6585fadc1ec23945145ff609c4989e9bfc8e36d8f5ae28ef9aacc71a2d48"
+        },
+        {
+          "path": "migrations/postgres/0137_request_replay_exact_attempt.sql",
+          "sha256": "d333ad80e1bce3e99c590d406f21682a5ca2ea7a97894663a36ee11a557d0634"
+        },
+        {
+          "path": "migrations/postgres/0138_o_piece_delivery.sql",
+          "sha256": "7e834babe7a018f9a7313d1944d530a9c8e9da77e9b50c36ea39fc517274e528"
+        },
+        {
+          "path": "migrations/postgres/0139_imsg_reply_obligations.sql",
+          "sha256": "f86980b491854f579e65fb1f168db329d863eaa8a8247fc886dfe5ba8a6fd041"
+        },
+        {
+          "path": "migrations/postgres/0140_channel_recovery_custody.sql",
+          "sha256": "2adcb4f9c929b223537b6ea4126a8cf8797a0aaea10314b63490a494bc578bc2"
+        },
+        {
+          "path": "migrations/postgres/0141_sessions_hosted_execution_archive.sql",
+          "sha256": "8bd647f7c3fd5298e37eeea2d88634fa78ebf93dc35dfc8bf052b159067132e7"
+        }
+      ]
+    },
     "upstream": {
       "output": "migrations/postgres/0146_campaign_upstream_convergence.sql",
       "sha256": "71558d99a81c07ec54304be349249b7e89b49bf6643a2e6ee15eec3de5926e75",
@@ -67,48 +111,8 @@
           "sha256": "09980d2c3b59e6d2095af02d2bd979fb8b10f33c0088a9a6eb17b4dd7b69b596"
         }
       ]
-    },
-    "campaign_v5": {
-      "output": "migrations/postgres_campaign_v5/0146_campaign_upstream_convergence.sql",
-      "sha256": "50ddc52e37b4fe138edbac102f8e5b9776114f7b74918382d614d028ebbff14d",
-      "sources": [
-        {
-          "path": "migrations/postgres/0131_sessions_hosted_execution.sql",
-          "sha256": "48b3814552340658f95f27ec23ee689a8af8a0a8c803bb419b44594e1b30d76d"
-        },
-        {
-          "path": "migrations/postgres/0133_o_channel_homes.sql",
-          "sha256": "8abee1a7c56480b0f90954c1c64bb0a725104313e143d8d66bcd67941b6b79c2"
-        },
-        {
-          "path": "migrations/postgres/0134_channel_home_epochs.sql",
-          "sha256": "bce70458c71e133d49de7d1f77215d4d56053c8f452c2f9a530e432b09c88e77"
-        },
-        {
-          "path": "migrations/postgres/0135_channel_clear_boundary_native_correlation.sql",
-          "sha256": "174c706f1328c48b7d46104d63cdd2f3394338b65b07ec7852af00a6f546dba8"
-        },
-        {
-          "path": "migrations/postgres/0136_request_replay_disposition.sql",
-          "sha256": "c8ed6585fadc1ec23945145ff609c4989e9bfc8e36d8f5ae28ef9aacc71a2d48"
-        },
-        {
-          "path": "migrations/postgres/0137_request_replay_exact_attempt.sql",
-          "sha256": "d333ad80e1bce3e99c590d406f21682a5ca2ea7a97894663a36ee11a557d0634"
-        },
-        {
-          "path": "migrations/postgres/0138_o_piece_delivery.sql",
-          "sha256": "7e834babe7a018f9a7313d1944d530a9c8e9da77e9b50c36ea39fc517274e528"
-        },
-        {
-          "path": "migrations/postgres/0139_imsg_reply_obligations.sql",
-          "sha256": "f86980b491854f579e65fb1f168db329d863eaa8a8247fc886dfe5ba8a6fd041"
-        },
-        {
-          "path": "migrations/postgres/0140_channel_recovery_custody.sql",
-          "sha256": "2adcb4f9c929b223537b6ea4126a8cf8797a0aaea10314b63490a494bc578bc2"
-        }
-      ]
     }
-  }
+  },
+  "schema": "agentdesk.postgres-convergence.v1",
+  "version": 146
 }

@@ -7,7 +7,7 @@ make a different catalog appear compatible.
 
 | History | Immutable catalog | Convergence |
 | --- | --- | --- |
-| Upstream | `migrations/postgres` through 140 | Upstream 146 adds campaign capabilities |
+| Upstream | `migrations/postgres` through 141 | Upstream 146 adds campaign capabilities |
 | Campaign v5 | Common upstream 1–130, then `migrations/postgres_campaign_v5` 131–145 | Campaign 146 adds upstream capabilities |
 
 Both 146 migrations are ordered, exact copies of the missing historical SQL.
@@ -15,6 +15,7 @@ Both 146 migrations are ordered, exact copies of the missing historical SQL.
 `python scripts/check_migration_convergence.py` verifies coverage and bytes.
 Campaign convergence excludes upstream 132, which deletes legacy Office data.
 Those unused tables remain available for retention and recovery.
+Campaign 146 also includes upstream 141's nullable returned-hosted-execution archive column.
 
 Every subsequent migration belongs in `migrations/postgres_shared`, starting at
 147. Do not append to either historical catalog. The shared catalog must behave

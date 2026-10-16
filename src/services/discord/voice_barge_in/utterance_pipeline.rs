@@ -1,99 +1,4 @@
 use super::*;
-use crate::services::provider_hosting::RetiredRuntimeError;
-
-/// The voice foreground runtime authority: the effective foreground provider with no channel,
-/// exactly what its simple model call resolves.
-pub(super) fn foreground_runtime(
-    foreground: &EffectiveVoiceForegroundConfig,
-) -> Result<(), RetiredRuntimeError> {
-    let provider = ProviderKind::from_str_or_unsupported(&foreground.provider);
-    crate::services::provider_hosting::ensure_runtime_executable(&provider, None)
-}
-
-/// Posts the retired-runtime notice; `false` when Discord did not accept it.
-pub(super) async fn post_retired_notice(
-    http: &serenity::http::Http,
-    channel_id: ChannelId,
-    retired: RetiredRuntimeError,
-) -> bool {
-    let notice = retired.to_string();
-    let sent = crate::services::discord::http::send_channel_message(http, channel_id, &notice);
-    if let Err(error) = sent.await {
-        tracing::warn!(
-            error = %error,
-            channel_id = channel_id.get(),
-            "voice runtime retirement notice was not delivered"
-        );
-        return false;
-    }
-    true
-}
-
-/// A transcript announcement's notice, kept apart from its durable claim: only a sent notice is
-/// `Delivered`, a failed one stays `Pending` for the next observation of the same message.
-enum RetiredNotice {
-    InFlight,
-    Pending(Arc<serenity::http::Http>, RetiredRuntimeError),
-    Delivered,
-}
-
-pub(super) type RetiredNoticeKey = (u64, String);
-
-static RETIRED_NOTICES: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<RetiredNoticeKey, RetiredNotice>>,
-> = std::sync::LazyLock::new(Default::default);
-
-fn retired_notices() -> std::sync::MutexGuard<'static, HashMap<RetiredNoticeKey, RetiredNotice>> {
-    RETIRED_NOTICES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// One send per notice at a time; the state lock is never held across the HTTP call.
-pub(super) async fn attempt_retired_notice(
-    key: RetiredNoticeKey,
-    http: Arc<serenity::http::Http>,
-    retired: RetiredRuntimeError,
-) {
-    {
-        let mut notices = retired_notices();
-        if matches!(
-            notices.get(&key),
-            Some(RetiredNotice::InFlight | RetiredNotice::Delivered)
-        ) {
-            return;
-        }
-        notices.insert(key.clone(), RetiredNotice::InFlight);
-    }
-    let delivered = post_retired_notice(&http, ChannelId::new(key.0), retired).await;
-    let mut notices = retired_notices();
-    if delivered {
-        // Bounded: delivered entries only suppress repeats, so they may be dropped.
-        if notices.len() > 1024 {
-            notices.retain(|_, state| !matches!(state, RetiredNotice::Delivered));
-        }
-        notices.insert(key, RetiredNotice::Delivered);
-    } else {
-        notices.insert(key, RetiredNotice::Pending(http, retired));
-    }
-}
-
-impl VoiceBargeInRuntime {
-    /// Re-sends a pending notice for a duplicate announcement; the handler never runs again.
-    pub(in crate::services::discord) async fn retry_retired_voice_notice(
-        channel_id: ChannelId,
-        utterance_id: &str,
-    ) {
-        let key = (channel_id.get(), utterance_id.to_string());
-        let pending = match retired_notices().get(&key) {
-            Some(RetiredNotice::Pending(http, retired)) => Some((Arc::clone(http), *retired)),
-            _ => None,
-        };
-        if let Some((http, retired)) = pending {
-            attempt_retired_notice(key, http, retired).await;
-        }
-    }
-}
 
 impl VoiceBargeInRuntime {
     /// F6 (#2046): `Config` 핫캐시. TTL 안이면 캐시된 `Arc<Config>` 반환,
@@ -290,23 +195,52 @@ impl VoiceBargeInRuntime {
         provider: &ProviderKind,
         channel_id: ChannelId,
     ) -> bool {
-        if !self.barge_in_enabled {
+        if !self.deferred_drainable() {
             return false;
         }
-        // A retired target keeps the buffered prompt in place and enqueues nothing.
-        let target = Some(channel_id.get());
-        if crate::services::provider_hosting::ensure_runtime_executable(provider, target).is_err() {
-            tracing::warn!(
-                channel_id = channel_id.get(),
-                "voice deferred prompt held: the target runtime is retired"
-            );
-            return false;
-        }
-
         let Some(drain) = self.take_deferred_prompt(channel_id).await else {
             return false;
         };
+        self.enqueue_deferred(shared, provider, channel_id, drain)
+            .await
+    }
 
+    /// Whether a finished turn may drain its deferred prompt now.
+    pub(in crate::services::discord) fn deferred_drainable(&self) -> bool {
+        self.barge_in_enabled
+    }
+
+    /// Takes the channel's buffer out of the map, so a later utterance starts a fresh one.
+    pub(in crate::services::discord) fn detach_deferred(
+        &self,
+        channel_id: ChannelId,
+    ) -> Option<Arc<Mutex<DeferredBargeInBuffer>>> {
+        let detached = self.channels.deferred_buffers.remove(&channel_id.get());
+        detached.map(|(_, buffer)| buffer)
+    }
+
+    /// Drains a buffer already detached for this channel and enqueues its prompt once.
+    pub(in crate::services::discord) async fn drain_detached(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        provider: &ProviderKind,
+        channel_id: ChannelId,
+        buffer: Arc<Mutex<DeferredBargeInBuffer>>,
+    ) -> bool {
+        let Some(drain) = self.drain_buffer(&buffer).await else {
+            return false;
+        };
+        self.enqueue_deferred(shared, provider, channel_id, drain)
+            .await
+    }
+
+    async fn enqueue_deferred(
+        self: &Arc<Self>,
+        shared: &Arc<SharedData>,
+        provider: &ProviderKind,
+        channel_id: ChannelId,
+        drain: DeferredBargeInDrain,
+    ) -> bool {
         if let Some(acknowledgement) = drain.acknowledgement {
             if let Some(path) = self
                 .synthesize_acknowledgement(&acknowledgement, channel_id)
@@ -337,6 +271,13 @@ impl VoiceBargeInRuntime {
             .deferred_buffers
             .get(&channel_id.get())
             .map(|entry| entry.value().clone())?;
+        self.drain_buffer(&buffer).await
+    }
+
+    async fn drain_buffer(
+        &self,
+        buffer: &Mutex<DeferredBargeInBuffer>,
+    ) -> Option<DeferredBargeInDrain> {
         let mut buffer = buffer.lock().await;
         let ack = &self.acknowledgement;
         let acknowledgement = buffer
@@ -347,6 +288,27 @@ impl VoiceBargeInRuntime {
             acknowledgement,
             prompt,
         })
+    }
+
+    /// Defers `text` for `channel` as a processing barge-in would.
+    #[cfg(test)]
+    pub(in crate::services::discord) async fn defer_for_test(
+        &self,
+        channel: ChannelId,
+        text: &str,
+    ) {
+        let buffer = self.buffer_for_channel(channel);
+        assert!(buffer.lock().await.push_transcript(text));
+    }
+
+    /// The channel's current deferred buffer, if one is in the map.
+    #[cfg(test)]
+    pub(in crate::services::discord) fn deferred_for_test(
+        &self,
+        channel: ChannelId,
+    ) -> Option<Arc<Mutex<DeferredBargeInBuffer>>> {
+        let buffer = self.channels.deferred_buffers.get(&channel.get());
+        buffer.map(|entry| entry.value().clone())
     }
 
     pub(super) fn buffer_for_channel(

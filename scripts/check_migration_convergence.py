@@ -15,7 +15,7 @@ def verify(root: Path) -> None:
         raise ValueError("both convergence histories are required")
     for profile, contract in manifest["profiles"].items():
         versions = [int(Path(item["path"]).name[:4]) for item in contract["sources"]]
-        expected = list(range(131, 146)) if profile == "upstream" else [131, *range(133, 141)]
+        expected = list(range(131, 146)) if profile == "upstream" else [131, *range(133, 142)]
         if versions != expected:
             raise ValueError(f"{profile}: convergence source order or coverage changed")
         parts = [

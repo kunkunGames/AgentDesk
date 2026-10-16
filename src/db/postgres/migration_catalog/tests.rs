@@ -81,7 +81,7 @@ fn immutable_catalogs_preserve_gaps_up_checksums_and_convergence() {
     assert!(
         super::super::POSTGRES_MIGRATOR
             .iter()
-            .all(|m| m.version <= 140 || m.version == 146)
+            .all(|m| m.version <= 141 || m.version == 146)
     );
     assert!(SHARED.iter().all(|m| m.version >= 147));
 }
@@ -133,6 +133,7 @@ async fn native_history_and_office_rows_survive_convergence_and_reentry_pg() {
     let objects: bool = sqlx::query_scalar("SELECT to_regclass('channel_recovery_custody') IS NOT NULL AND to_regclass('campaign_graph_occurrences') IS NOT NULL")
         .fetch_one(&pool).await.unwrap();
     assert!(objects);
+    assert_returned_execution_archive_column(&pool).await;
     migrate(&pool).await.unwrap();
     assert_eq!(ledger(&pool).await, after);
     assert!(
@@ -146,8 +147,29 @@ async fn native_history_and_office_rows_survive_convergence_and_reentry_pg() {
 
 #[tokio::test]
 async fn upstream_history_converges_and_concurrent_starters_apply_once_pg() {
+    // Both the previous upstream floor and its new archive-column migration
+    // must converge without rewriting an already installed receipt.
+    for version in [140, 141] {
+        upstream_history_converges_from(version).await;
+    }
+}
+
+async fn assert_returned_execution_archive_column(pool: &PgPool) {
+    let column: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+         WHERE table_schema=current_schema() AND table_name='sessions' \
+         AND column_name='returned_hosted_execution' AND data_type='jsonb' \
+         AND is_nullable='YES' AND column_default IS NULL)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(column, "both histories must retain legacy NULL semantics");
+}
+
+async fn upstream_history_converges_from(version: i64) {
     let (fixture, pool) = empty_fixture().await;
-    install_fixture(&pool, Lineage::Upstream, 140).await;
+    install_fixture(&pool, Lineage::Upstream, version).await;
     let before = ledger(&pool).await;
     let other = crate::db::postgres::connect_test_pool_with_max_connections(
         &fixture.database_url,
@@ -166,11 +188,12 @@ async fn upstream_history_converges_and_concurrent_starters_apply_once_pg() {
     );
     assert_eq!(
         after.as_array().unwrap().len(),
-        before.as_array().unwrap().len() + 1
+        before.as_array().unwrap().len() + if version == 140 { 2 } else { 1 }
     );
     let tables: bool = sqlx::query_scalar("SELECT to_regclass('campaign_graph_occurrences') IS NOT NULL AND to_regclass('offices') IS NULL")
         .fetch_one(&pool).await.unwrap();
     assert!(tables);
+    assert_returned_execution_archive_column(&pool).await;
     other.close().await;
     close(fixture, pool).await;
 }
