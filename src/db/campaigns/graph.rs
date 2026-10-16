@@ -74,14 +74,8 @@ pub struct Graph {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SettledEffectGate {
-    /// SHA256 of the authenticated settled-effect audit, in lowercase hex.
-    #[schemars(length(min = 64, max = 64), regex(pattern = r"^[a-f0-9]{64}$"))]
     pub audit_sha256: String,
-    /// The inspection node's Task.id in this graph, never its persistent task_key.
-    #[schemars(length(min = 1, max = 64), regex(pattern = r"^[A-Za-z0-9_.-]+$"))]
     pub inspection: String,
-    /// The independent verification node's Task.id in this graph, never its task_key.
-    #[schemars(length(min = 1, max = 64), regex(pattern = r"^[A-Za-z0-9_.-]+$"))]
     pub verification: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]

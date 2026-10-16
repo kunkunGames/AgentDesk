@@ -177,6 +177,11 @@ async fn control(
     } else {
         String::new()
     };
+    let graph_references = if matches!(role, "plan" | "manage") {
+        crate::db::campaigns::graph::schema::GRAPH_REFERENCE_RULES
+    } else {
+        ""
+    };
     let input = if matches!(role, "manage" | "finish") {
         Some(crate::db::campaigns::graph::workflow::store::freeze(pool, id, g).await?)
     } else if role == "plan" {
@@ -193,7 +198,7 @@ async fn control(
         ""
     };
     let prompt = format!(
-        "{}\n{}\n{prompt}\n{formal}\n{advice}\nControl budget observed at publication (re-read current /execution before concluding; estimates are not minimum runtimes):\n{}",
+        "{}\n{}\n{prompt}\n{formal}\n{graph_references}\n{advice}\nControl budget observed at publication (re-read current /execution before concluding; estimates are not minimum runtimes):\n{}",
         occurrence_context::attach(pool, id, contract_prompt(g)?).await?,
         occurrence_context::control_authority(id, g, role, &agent, authority.as_ref())?,
         serde_json::to_string(&budget)?

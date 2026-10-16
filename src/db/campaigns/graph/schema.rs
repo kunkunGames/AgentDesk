@@ -9,6 +9,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+// Keep semantic guidance outside document(): historical execution profiles pin
+// the entire generated schema, including descriptions, for audited recovery.
+pub const GRAPH_REFERENCE_RULES: &str = "Graph reference contract: settled_effect_gates[].inspection and .verification must name distinct existing graph-local node.id (Task.id) values, never persistent task_key values. When recovering an authenticated settled-effect audit, bind its audit_sha256 (64 lowercase hex characters) to a read-only Inspect root and directly dependent independent Verify node. Preserve existing committed gates and their task contracts. Introducing new external-effect contracts under that recovery requires fresh unpublished inspection and verification, and those effects must depend on that target QA. Without an authenticated settled-effect audit, do not invent gates or audit hashes.";
+
 #[derive(JsonSchema, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Outcome {
@@ -109,19 +113,21 @@ mod tests {
     }
 
     #[test]
-    fn settled_effect_schema_exposes_graph_local_node_id_contract() {
+    fn settled_effect_guidance_preserves_historical_schema_digest() {
         let schema = document().unwrap();
+        // Native schema v1 from the installed budget8 release. New prompt
+        // guidance must not invalidate retained initial-plan or Finish profiles.
+        assert_eq!(
+            super::super::contract_digest(&schema).unwrap(),
+            "3011c2cce468be37030f665c0b433d694fd9a8e6e917bd6ec955800856e883b5"
+        );
         for contract in ["graph", "result"] {
             let properties = &schema[contract]["$defs"]["SettledEffectGate"]["properties"];
-            for field in ["inspection", "verification"] {
-                let property = &properties[field];
-                let description = property["description"].as_str().unwrap();
-                assert!(description.contains("Task.id"));
-                assert!(description.contains("task_key"));
-                assert_eq!(property["maxLength"], 64);
-                assert_eq!(property["pattern"], "^[A-Za-z0-9_.-]+$");
-            }
-            assert_eq!(properties["audit_sha256"]["pattern"], "^[a-f0-9]{64}$");
+            assert_eq!(
+                properties,
+                &json!({"audit_sha256":{"type":"string"},
+                    "inspection":{"type":"string"},"verification":{"type":"string"}})
+            );
         }
     }
 }
