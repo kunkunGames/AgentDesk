@@ -82,6 +82,14 @@ async fn stale_busy_heal_finalizes_only_a_turn_the_host_guard_admits_pg() {
         )
         .await;
         busy_turn(&shared, channel, &name).await;
+        shared
+            .mailbox(channel)
+            .age_active_turn_for_test(super::STALE_BUSY_START_GRACE)
+            .await;
+        shared.turn_start_times.insert(
+            channel,
+            std::time::Instant::now() - super::STALE_BUSY_START_GRACE,
+        );
         turns.push((channel, name, stored));
     }
     shared

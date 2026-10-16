@@ -20,6 +20,8 @@ mod stale_dispatch_guard;
 mod voice_intake;
 mod worker_entry;
 
+#[cfg(test)]
+mod future_size_tests;
 #[cfg(all(test, unix))]
 mod native_fresh_prompt_tests;
 #[cfg(all(test, unix))]
@@ -33,6 +35,7 @@ pub(in crate::services::discord) use context::IntakeDeps;
 #[cfg(test)]
 mod input_effect_tests {
     use super::*;
+
     use crate::services::discord::input_runtime::fence::{self, Gate};
     use futures::FutureExt;
 
@@ -927,7 +930,8 @@ async fn handle_text_message_admitted(
     );
     let user_text_owned = user_text.to_owned();
     let request_owner_name_owned = request_owner_name.to_owned();
-    crate::services::discord::input_runtime::fence::effect::run(final_permit, async move {
+    // Keep the large admitted turn out of nested effect wrapper futures.
+    crate::services::discord::input_runtime::fence::effect::run(final_permit, Box::pin(async move {
     let (http, cache, ctx_for_chained_dispatch, shared, token) = (
         &http_owned, cache_owned.as_ref(), ctx_owned.as_ref(), &shared_owned, token_owned.as_str(),
     );
@@ -1086,7 +1090,7 @@ async fn handle_text_message_admitted(
     let execution_permit = crate::services::discord::input_runtime::fence::effect::admit(
         &provider, channel_id.get(),
     ).map_err(|failure| format!("execution input admission refused: {failure:?}"))?;
-    crate::services::discord::input_runtime::fence::effect::scope(execution_permit, async {
+    crate::services::discord::input_runtime::fence::effect::scope(execution_permit, Box::pin(async {
     {
         let channel_name_for_isolation = {
             let data = shared.core.lock().await;
@@ -1646,6 +1650,12 @@ async fn handle_text_message_admitted(
     let (wip_warning, reply_context) =
         take_and_merge_wip_warning(shared, &provider, channel_id, reply_context);
 
+    let campaign_graph_prompt = context::campaign_graph_prompt(
+        shared.pg_pool.as_ref(),
+        active_dispatch_id_for_prompt.as_deref(),
+    )
+    .await?;
+
     // #3813 Phase 1a: the intake placeholder POST returned a live id.
     intake_latency.mark_placeholder_posted();
     crate::services::discord::increment_global_active(shared, "intake_after_mailbox_slot");
@@ -1721,16 +1731,7 @@ async fn handle_text_message_admitted(
     }
     .build();
     // Build Discord context info
-    let discord_context = {
-        let data = shared.core.lock().await;
-        let session = data.sessions.get(&channel_id);
-        build_system_discord_context(
-            session.and_then(|s| s.channel_name.as_deref()),
-            session.and_then(|s| s.category_name.as_deref()),
-            channel_id,
-            false,
-        )
-    };
+    let discord_context = context::discord_context(shared, channel_id).await;
     // Claude keeps SAK in the system prompt for prefix-cache stability.
     // Non-Claude providers receive SAK in the user context instead.
     let sak_for_system = memory_injection_plan.sak_for_system_prompt();
@@ -1742,6 +1743,7 @@ async fn handle_text_message_admitted(
             dispatch_context: info.context.as_deref(),
             card_title: info.card_title.as_deref(),
             github_issue_url: info.github_issue_url.as_deref(),
+            campaign_graph_prompt: campaign_graph_prompt.as_deref(),
         }
     });
     let recovery_context_for_manifest =
@@ -2602,8 +2604,8 @@ async fn handle_text_message_admitted(
     }
 
     Ok(IntakeExecution::Executed)
-    }).await
-    }).await
+    })).await
+    })).await
 }
 
 #[cfg(test)]

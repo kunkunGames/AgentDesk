@@ -396,7 +396,7 @@ impl ManagedResetVerdict {
         #[cfg(unix)]
         if let Some(name) = self.tmux_name.as_deref() {
             if provider.uses_managed_tmux_backend() {
-                super::commands::reset_managed_process_session(name);
+                super::commands::reset_managed_process_session(&shared, name);
             }
         }
         ManagedReset::Applied(self.tmux_name)

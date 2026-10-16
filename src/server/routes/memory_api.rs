@@ -826,10 +826,20 @@ mod request_body_tests {
 
     #[tokio::test]
     async fn local_memory_migration_preserves_preexisting_route_table_rows() {
-        let Some(pg_db) = MemoryApiPostgresDb::try_create().await else {
-            return;
-        };
-        let pool = pg_db.connect().await;
+        // Lock environment before the PostgreSQL lifecycle, as migration selection
+        // reads this explicit lineage while the pre-divergence receipts are shared.
+        let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
+        let _lineage = crate::config::TestEnvVarGuard::set_value_after_shared_test_env_lock(
+            "AGENTDESK_PG_MIGRATION_LINEAGE",
+            std::ffi::OsStr::new("upstream"),
+        );
+        let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
+        let pool = crate::db::postgres::connect_test_pool(&pg_db.database_url, PG_TEST_LABEL)
+            .await
+            .expect("connect pre-migration database");
+        // The route-created table predates migration 74, but the application
+        // database already has its verified schema history through 73.
+        crate::db::postgres::install_campaign_fixture_through(&pool, 73).await;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS local_memory (

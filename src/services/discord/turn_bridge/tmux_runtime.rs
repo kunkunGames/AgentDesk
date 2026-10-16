@@ -503,8 +503,8 @@ fn bind_judged_legacy(
 }
 
 fn bind_token_name(provider: &ProviderKind, token: &CancelToken, tmux_session_name: &str) {
-    if matches!(provider, ProviderKind::Claude) {
-        token.bind_claude_tmux_session(tmux_session_name);
+    if matches!(provider, ProviderKind::Claude | ProviderKind::Qwen) {
+        token.bind_interrupt_session(provider.clone(), tmux_session_name);
     } else {
         token.bind_unmanaged_session_name(tmux_session_name);
     }
@@ -516,6 +516,14 @@ fn register_legacy_pid(
     tmux_session_name: &str,
     reason: &str,
 ) -> Option<u32> {
+    // Recovery must retain the same wrapper ownership as a fresh Qwen launch.
+    // A CLI PID alone omits the parent wrapper and its other tool descendants.
+    if matches!(provider, ProviderKind::Qwen)
+        && let Some(pid) = crate::services::platform::tmux::pane_pid(tmux_session_name)
+    {
+        token.store_child_pid_if_empty(pid);
+    }
+
     let tracked_child_pid = token.child_pid_value();
     let provider_pid = provider_cli_pid_in_tmux(tmux_session_name, provider, tracked_child_pid);
     if let Some(pid) = provider_pid {
@@ -538,6 +546,9 @@ fn register_legacy_pid(
     provider_pid
 }
 
+#[cfg(all(test, unix))]
+mod qwen_generation_tests;
+
 /// Standard turn-stop sequence: send the provider abort key (e.g. C-c) FIRST,
 /// give the CLI ~750ms to settle / send SIGINT fallback, and THEN flip the
 /// cooperative cancel flag + SIGKILL the wrapper PID.
@@ -551,6 +562,11 @@ fn register_legacy_pid(
 /// resumed runs) the SIGKILL is a no-op and only the C-c can stop the CLI.
 /// In that case the wrong order leaves the provider running and the user
 /// sees stop "fail".
+///
+/// Qwen session destruction is different: its CLI runs in a separate process
+/// group, so interrupting the wrapper first can destroy the ancestry needed to
+/// stop that CLI and its tools. A tracked Qwen wrapper is cleaned behind the
+/// token's generation fence before any pane interrupt.
 ///
 /// Every user-initiated stop (⏳ reaction removal, `/stop`, `!stop`, `/clear`, watchdog timeouts)
 /// runs this sequence, here or through a judged `ChannelStop`, never by pairing the primitives.
@@ -599,6 +615,17 @@ async fn stop_active_turn_on(
     cleanup_policy: TmuxCleanupPolicy,
     reason: &str,
 ) -> StopOutcome {
+    // Keep Qwen wrapper ancestry until generation-fenced cleanup observes its descendants.
+    if matches!(provider, ProviderKind::Qwen)
+        && cleanup_policy.should_cleanup_tmux()
+        && token.child_pid_value().is_some()
+    {
+        let cleanup = cancel_active_token_on(Some(target), token, cleanup_policy, reason);
+        return StopOutcome {
+            termination_recorded: cleanup.termination_confirmed(),
+            settlement: target.settlement(cleanup.host_refused),
+        };
+    }
     let interrupt_outcome = interrupt_on(target, provider, token, reason).await;
     let cleanup = cancel_active_token_on(Some(target), token, cleanup_policy, reason);
     let outcome = &interrupt_outcome;
@@ -991,21 +1018,23 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _ = process_table::take_sigint_test_events();
+        let owned = crate::services::session_backend::OwnedTestProcess::new();
+        let pid = owned.pid();
         let session_name = format!("pipe-cancel-{}", uuid::Uuid::new_v4());
         let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         crate::services::session_backend::insert_process_session(
             session_name.clone(),
-            crate::services::session_backend::SessionHandle::TestProcess { pid: 4112, alive },
+            crate::services::session_backend::SessionHandle::TestProcess { pid, alive },
         );
         let token = std::sync::Arc::new(CancelToken::new());
-        token.store_child_pid(4112);
+        token.store_child_pid(pid);
 
         let outcome =
             interrupt_provider_cli_turn(&ProviderKind::Claude, &token, "explicit_stop").await;
 
-        assert_eq!(process_table::take_sigint_test_events(), vec![4112]);
+        assert_eq!(process_table::take_sigint_test_events(), vec![pid]);
         assert_eq!(outcome.tmux_session, None);
-        assert_eq!(outcome.fallback_sigint_pid, Some(4112));
+        assert_eq!(outcome.fallback_sigint_pid, Some(pid));
         assert!(outcome.missing_tmux_session);
         assert!(!outcome.sigint_target_missing);
         assert!(crate::services::session_backend::process_session_was_stopped(&session_name));

@@ -1,4 +1,5 @@
 use super::*;
+use crate::services::tmux_diagnostics::tmux_session_has_live_pane;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -46,12 +47,26 @@ pub(super) async fn run_post_stream_exit(ctx: PostStreamExitContext) {
     // Cleanup: release this watcher's registry slot.
     // #243: When a watcher is cancelled (replaced by a new watcher or shutdown),
     // the replacement already occupies the slot — removing would delete the new entry.
-    release_registry_slot_at_exit(
+    if !release_registry_slot_at_exit(
         &shared.tmux_watchers,
         channel_id,
         &tmux_session_name,
         &cancel,
-    );
+    ) {
+        tracing::debug!(%tmux_session_name, watcher_instance_id,
+            "retired watcher has no authority to fail dispatches or clean up its successor");
+        return;
+    }
+
+    // Stream retirement is not evidence of CLI death. In particular, a Codex
+    // TUI handoff can replace its watcher while the pane and turn remain live.
+    let pane_name = tmux_session_name.clone();
+    if tokio::task::spawn_blocking(move || tmux_session_has_live_pane(&pane_name))
+        .await
+        .unwrap_or(true)
+    {
+        return;
+    }
 
     if !legacy_mode.is_legacy() {
         tracing::info!(
@@ -318,11 +333,11 @@ pub(super) fn release_registry_slot_at_exit(
     channel_id: ChannelId,
     tmux_session_name: &str,
     cancel: &Arc<AtomicBool>,
-) {
+) -> bool {
     let Some((owner_channel_id, _handle)) =
         tmux_watchers.remove_tmux_session_if_current(tmux_session_name, cancel)
     else {
-        return;
+        return false;
     };
     tracing::debug!(
         channel_id = channel_id.get(),
@@ -330,6 +345,7 @@ pub(super) fn release_registry_slot_at_exit(
         tmux_session_name,
         "post-stream exit removed its own watcher registry entry"
     );
+    !cancel.load(std::sync::atomic::Ordering::Acquire)
 }
 
 #[cfg(test)]
@@ -383,7 +399,12 @@ mod tests {
         registry.insert(channel, new_handle);
         assert!(!old_cancel.load(std::sync::atomic::Ordering::Relaxed));
 
-        release_registry_slot_at_exit(&registry, channel, tmux, &old_cancel);
+        assert!(!release_registry_slot_at_exit(
+            &registry,
+            channel,
+            tmux,
+            &old_cancel
+        ));
 
         let still_registered = registered_cancel(&registry, tmux)
             .expect("the replacement watcher entry must survive the stale exit");
@@ -413,7 +434,12 @@ mod tests {
         let new_cancel = new_handle.cancel.clone();
         registry.insert(channel, new_handle);
 
-        release_registry_slot_at_exit(&registry, channel, old_tmux, &old_cancel);
+        assert!(!release_registry_slot_at_exit(
+            &registry,
+            channel,
+            old_tmux,
+            &old_cancel
+        ));
 
         let still_registered = registered_cancel(&registry, new_tmux)
             .expect("the rebound session's entry must survive the stale exit");
@@ -438,10 +464,28 @@ mod tests {
         let cancel = handle.cancel.clone();
         registry.insert(channel, handle);
 
-        release_registry_slot_at_exit(&registry, channel, tmux, &cancel);
+        assert!(release_registry_slot_at_exit(
+            &registry, channel, tmux, &cancel
+        ));
 
         assert!(registered_cancel(&registry, tmux).is_none());
         assert_eq!(registry.owner_channel_for_tmux_session(tmux), None);
         assert!(!registry.contains_key(&channel));
+    }
+
+    #[test]
+    fn cancelled_watcher_releases_its_slot_without_dispatch_failure_authority() {
+        let registry =
+            TmuxWatcherRegistry::new_with_coords(std::sync::Arc::new(dashmap::DashMap::new()));
+        let channel = ChannelId::new(5072);
+        let tmux = "AgentDesk-codex-cancelled";
+        let handle = watcher_handle(tmux);
+        let cancel = handle.cancel.clone();
+        registry.insert(channel, handle);
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        assert!(!release_registry_slot_at_exit(
+            &registry, channel, tmux, &cancel
+        ));
+        assert!(registered_cancel(&registry, tmux).is_none());
     }
 }

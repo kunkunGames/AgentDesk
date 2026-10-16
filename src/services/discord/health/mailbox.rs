@@ -19,6 +19,7 @@ use super::{HealthRegistry, ProviderEntry};
 #[cfg(unix)]
 use super::reachability::composite::RelayVerdictReport;
 use super::recovery::ProviderMailboxState;
+use super::session_enrichment::RelayBacklogEvidence;
 use super::stall_verdict::StallVerdict;
 
 #[derive(Debug, Serialize)]
@@ -51,6 +52,7 @@ pub(super) struct MailboxHealthSnapshot {
     /// input to `RelayStallClassifier` and to the recovery decisions, and an
     /// observation-only field has no business within their reach.
     pub(super) frontier_provenance: FrontierProvenanceReport,
+    pub(super) relay_backlog: RelayBacklogEvidence,
     pub(super) relay_stall_state: RelayStallState,
     #[serde(default, skip_serializing_if = "super::TailObservation::is_unmeasured")]
     pub(super) tail_observation: super::TailObservation,

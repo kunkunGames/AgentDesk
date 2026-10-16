@@ -73,14 +73,16 @@ pub(in crate::services::discord) struct TurnBridgeContext {
 mod tests {
     #[test]
     fn intake_completion_waiter_discards_typed_payload_and_only_maps_recv_error() {
-        let source = include_str!("../router/message_handler/intake_turn.rs");
+        let source = include_str!("../router/message_handler/intake_turn.rs").replace("\r\n", "\n");
         let start = source
             .find("    if let Some(rx) = completion_rx {")
             .expect("intake completion wait remains present");
-        let waiter = source[start..].split("#[cfg(test)]").next().unwrap();
+        let (waiter, _) = source[start..]
+            .split_once("\n    Ok(IntakeExecution::Executed)")
+            .expect("intake returns Executed after waiting for bridge completion");
         assert_eq!(
             waiter.trim(),
-            "if let Some(rx) = completion_rx {\n        rx.await\n            .map_err(|_| \"queued turn completion wait failed\".to_string())?;\n    }\n\n    Ok(IntakeExecution::Executed)\n    }).await\n    }).await\n}"
+            "if let Some(rx) = completion_rx {\n        rx.await\n            .map_err(|_| \"queued turn completion wait failed\".to_string())?;\n    }"
         );
     }
 }

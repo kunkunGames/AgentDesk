@@ -144,6 +144,12 @@ var reviewAutomation = {
     }
     var entry = agentdesk.review.entryContext(card.id);
     if (!entry) return;
+    var disposition = agentdesk.review.disposition(card.id);
+    if (disposition === "await_checks" || disposition === "await_human") return;
+    if (disposition === "ready_to_commit") {
+      agentdesk.kanban.setStatus(card.id, terminalState, true);
+      return;
+    }
 
     // #128: If card entered review with awaiting_dod (DoD incomplete),
     // skip review dispatch — timeouts.js [D] will escalate to dilemma_pending after 15 min
@@ -154,7 +160,7 @@ var reviewAutomation = {
 
     // Check if review is enabled — if not, complete immediately
     var reviewEnabled = agentdesk.config.get("review_enabled");
-    if (reviewEnabled === "false" || reviewEnabled === false) {
+    if (disposition === "unmanaged" && (reviewEnabled === "false" || reviewEnabled === false)) {
       agentdesk.kanban.setStatus(card.id, terminalState, true);
       agentdesk.kanban.setReviewStatus(card.id, null, {blocked_reason: null});
       agentdesk.log.info("[review] Review disabled, card " + card.id + " → " + terminalState);
@@ -167,6 +173,7 @@ var reviewAutomation = {
     // there is no alternate provider/channel to dispatch a review to.
     var counterChannelId = agentdesk.agents.resolveCounterModelChannel(card.assigned_agent_id);
     if (!counterChannelId) {
+      if (disposition !== "unmanaged") return;
       agentdesk.kanban.setStatus(card.id, terminalState, true);
       agentdesk.kanban.setReviewStatus(card.id, null, {blocked_reason: null});
       agentdesk.log.info("[review] No alternate review channel for " + card.id + " → " + terminalState);

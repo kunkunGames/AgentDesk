@@ -254,6 +254,65 @@ pub fn ensure_worktree_for_issue(
     })
 }
 
+/// Cards without a GitHub issue still need an isolated, durable Git workspace.
+/// Identity comes from the canonical card, never from an invented issue number.
+pub(crate) fn find_worktree_for_card(repo_dir: &str, card_id: &str) -> Option<WorktreeInfo> {
+    uuid::Uuid::parse_str(card_id).ok()?;
+    let branch = format!("adk/auto/card-{card_id}");
+    parse_worktree_list(repo_dir)
+        .into_iter()
+        .find(|wt| wt.branch == branch)
+}
+
+pub(crate) fn ensure_worktree_for_card(
+    repo_dir: &str,
+    card_id: &str,
+) -> Result<EnsuredWorktreeInfo, String> {
+    let root = managed_worktrees_root(repo_dir)
+        .ok_or_else(|| "cannot resolve AgentDesk runtime root for card worktree".to_string())?;
+    ensure_card_workspace_at(repo_dir, card_id, &root)
+}
+
+fn ensure_card_workspace_at(
+    repo_dir: &str,
+    card_id: &str,
+    root: &Path,
+) -> Result<EnsuredWorktreeInfo, String> {
+    uuid::Uuid::parse_str(card_id)
+        .map_err(|_| "card workspace requires a canonical UUID".to_string())?;
+    if let Some(existing) = find_worktree_for_card(repo_dir, card_id) {
+        return Ok(existing.into());
+    }
+    std::fs::create_dir_all(root).map_err(|error| format!("create card worktree root: {error}"))?;
+    let path = root.join(format!("card-{card_id}"));
+    let branch = format!("adk/auto/card-{card_id}");
+    let output = git_command()
+        .args(["worktree", "add", "-b", &branch])
+        .arg(&path)
+        .arg(upstream_base_ref(repo_dir))
+        .current_dir(repo_dir)
+        .output()
+        .map_err(|error| format!("create card worktree: {error}"))?;
+    if !output.status.success() {
+        // Another admission can win creation; only reuse a registered worktree
+        // for this exact card in this exact repository. Never reset a branch.
+        return find_worktree_for_card(repo_dir, card_id)
+            .map(Into::into)
+            .ok_or_else(|| {
+                format!(
+                    "create card worktree: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+            });
+    }
+    let worktree = find_worktree_for_card(repo_dir, card_id)
+        .ok_or_else(|| "created card worktree is not registered".to_string())?;
+    Ok(EnsuredWorktreeInfo {
+        created: true,
+        ..worktree.into()
+    })
+}
+
 // ── Automation-candidate worktree helpers ────────────────────────────────────
 
 /// Canonical branch name for an automation candidate iteration.
@@ -452,6 +511,55 @@ pub fn cleanup_managed_worktree(repo_dir: &str, worktree_path: &str) -> ManagedW
 #[cfg(test)]
 mod automation_worktree_tests {
     use super::*;
+
+    #[test]
+    fn issue_less_card_workspace_is_isolated_reused_and_preserves_edits() {
+        let temp = tempfile::tempdir().expect("fixture directory");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        ] {
+            assert!(
+                git_command()
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let root = temp.path().join("workspaces");
+        let id = uuid::Uuid::new_v4().to_string();
+        let first = ensure_card_workspace_at(repo.to_str().unwrap(), &id, &root).unwrap();
+        assert!(first.created);
+        assert!(Path::new(&first.path).starts_with(&root));
+        let owned = Path::new(&first.path).join("preserved.txt");
+        std::fs::write(&owned, "unfinished progress").unwrap();
+        let reused = ensure_card_workspace_at(repo.to_str().unwrap(), &id, &root).unwrap();
+        assert!(!reused.created);
+        assert_eq!(first.path, reused.path);
+        assert_eq!(
+            std::fs::read_to_string(owned).unwrap(),
+            "unfinished progress"
+        );
+        assert!(ensure_card_workspace_at(repo.to_str().unwrap(), "../escape", &root).is_err());
+        assert!(
+            find_worktree_for_card(repo.to_str().unwrap(), &uuid::Uuid::new_v4().to_string())
+                .is_none()
+        );
+    }
 
     #[test]
     fn branch_name_format() {

@@ -291,6 +291,8 @@ fn register_exec_ops_with_runner<'js>(
                                     "updated_at": data.get("updated_at").and_then(|v| v.as_str()).unwrap_or(""),
                                     "channel_name": channel_name,
                                     "tmux_session_name": tmux_name,
+                                    "runtime_kind": data.get("runtime_kind").cloned().unwrap_or(serde_json::Value::Null),
+                                    "process_liveness": serde_json::to_value(crate::services::session_backend::process_session_liveness(tmux_name)).unwrap_or(serde_json::Value::Null),
                                     "session_id": data.get("session_id").cloned().unwrap_or(serde_json::Value::Null),
                                     "request_owner_user_id": data.get("request_owner_user_id").cloned().unwrap_or_else(|| serde_json::json!(0)),
                                     "user_msg_id": data.get("user_msg_id").cloned().unwrap_or_else(|| serde_json::json!(0)),

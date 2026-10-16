@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -80,8 +81,8 @@ pub struct PersistTurnOwned {
     pub provider: Option<String>,
     pub session_id: Option<String>,
     pub dispatch_id: Option<String>,
-    pub started_at: Option<String>,
-    pub finished_at: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
     pub duration_ms: Option<i64>,
     pub token_usage: TurnTokenUsage,
 }
@@ -111,8 +112,10 @@ async fn upsert_turn_owned_pg(pool: &PgPool, entry: &PersistTurnOwned) -> Result
     let provider = normalized_opt(entry.provider.as_deref());
     let session_id = normalized_opt(entry.session_id.as_deref());
     let dispatch_id = normalized_opt(entry.dispatch_id.as_deref());
-    let started_at = normalized_opt(entry.started_at.as_deref()).unwrap_or_else(now_string);
-    let finished_at = normalized_opt(entry.finished_at.as_deref()).unwrap_or_else(now_string);
+    // Bind instants directly. Parsing a local clock string inside PostgreSQL
+    // would reinterpret it using the connection's TimeZone.
+    let started_at = entry.started_at.unwrap_or_else(Utc::now);
+    let finished_at = entry.finished_at.unwrap_or_else(Utc::now);
     let agent_id = resolve_agent_id_for_session_pg(
         pool,
         entry.agent_id.as_deref(),
@@ -144,8 +147,8 @@ async fn upsert_turn_owned_pg(pool: &PgPool, entry: &PersistTurnOwned) -> Result
             output_tokens
          ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9,
-            CAST($10 AS timestamptz),
-            CAST($11 AS timestamptz),
+            $10,
+            $11,
             $12, $13, $14, $15, $16
          )
          ON CONFLICT(turn_id) DO UPDATE SET
@@ -207,10 +210,9 @@ fn normalized_opt(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn now_string() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
 fn u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
+
+#[cfg(test)]
+mod postgres_tests;

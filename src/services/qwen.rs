@@ -6,17 +6,19 @@ mod followup_reader;
 use followup_reader::send_followup_to_tmux;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::Duration;
-use uuid::Uuid;
 
 mod fresh_session;
+pub(crate) mod protocol;
+mod system_settings;
+pub(crate) use system_settings::{QwenSystemSettingsOverride, create_system_settings_override};
 #[allow(clippy::too_many_arguments)]
 mod session_lifecycle;
 
@@ -76,6 +78,20 @@ pub(crate) const QWEN_STREAM_STARTUP_WATCHDOG: Duration = Duration::from_secs(24
 // Allow up to 120 s of silence after progress has been seen: covers long-running tool calls
 // (e.g. cargo build, test suites) where the model is waiting for a tool result between turns.
 pub(crate) const QWEN_MAX_SESSION_RETRIES: usize = 1;
+
+#[cfg(all(test, unix))]
+pub(crate) mod retry_fixture;
+#[cfg(all(test, unix))]
+mod retry_tests;
+
+/// A fresh retry can repeat external effects once the provider has progressed.
+/// Only an initial handshake failure may be retried without an operator decision.
+pub(crate) fn can_retry_session(
+    meaningful_progress_seen: bool,
+    terminal_result_seen: bool,
+) -> bool {
+    !meaningful_progress_seen && !terminal_result_seen
+}
 const TMUX_PROMPT_B64_PREFIX: &str = "__AGENTDESK_B64__:";
 pub(crate) const QWEN_CODE_SYSTEM_SETTINGS_ENV: &str = "QWEN_CODE_SYSTEM_SETTINGS_PATH";
 pub(crate) const QWEN_SUPPORTED_ALLOWED_TOOLS: &[&str] = &[
@@ -149,23 +165,6 @@ impl QwenStreamWatchdog {
             "Qwen stream produced no output for {} seconds before first progress",
             self.startup_watchdog.as_secs()
         )
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct QwenSystemSettingsOverride {
-    path: PathBuf,
-}
-
-impl QwenSystemSettingsOverride {
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for QwenSystemSettingsOverride {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -505,6 +504,16 @@ fn execute_qwen_streaming_attempt(
         QwenStreamLoopResult::RetrySession { message } => {
             lifecycle.terminate(&mut child);
             let stderr = finish_reader(&stderr_handle);
+            if !can_retry_session(state.meaningful_progress_seen, state.terminal_result_seen) {
+                flush_buffered_stream_messages(&sender, &mut state);
+                let _ = sender.send(StreamMessage::Error {
+                    message,
+                    stdout: state.raw_stdout,
+                    stderr,
+                    exit_code: None,
+                });
+                return Ok(QwenAttemptResult::Completed);
+            }
             return Ok(QwenAttemptResult::RetrySession {
                 message,
                 stdout: state.raw_stdout,
@@ -653,7 +662,7 @@ fn qwen_read_output_file_until_result_tracked(
             observe_qwen_user_prompt_line(line, tmux_session_name.as_deref());
             process_stream_line(line, &line_sender, state)
         },
-        |state| state.final_result.is_some(),
+        StreamLineState::has_terminal_result,
         move |state| {
             synthetic_sender
                 .send(StreamMessage::Done {
@@ -737,7 +746,7 @@ fn process_qwen_stream_line(line: &str, state: &mut QwenAttemptState) {
 fn process_qwen_json_event(json: &Value, state: &mut QwenAttemptState) {
     match json.get("type").and_then(|v| v.as_str()) {
         Some("system") => {
-            if json.get("subtype").and_then(|v| v.as_str()) == Some("session_start") {
+            if protocol::is_session_start(json) {
                 track_session_id(state, json.get("session_id").and_then(|v| v.as_str()));
                 state.current_model = json
                     .get("model")
@@ -752,7 +761,7 @@ fn process_qwen_json_event(json: &Value, state: &mut QwenAttemptState) {
             }
         }
         Some("stream_event") => {
-            state.partial_stream_seen = true;
+            state.partial_stream_seen |= protocol::is_partial_content(json);
             process_qwen_partial_event(
                 json.get("event").unwrap_or(&Value::Null),
                 json.get("session_id").and_then(|v| v.as_str()),
@@ -1102,6 +1111,19 @@ fn finalize_qwen_attempt(
         };
     }
 
+    if !can_retry_session(state.meaningful_progress_seen, terminal_result_seen) {
+        return QwenFinalState::Error {
+            message: if exit_code.unwrap_or(0) == 0 && stderr.trim().is_empty() {
+                "Qwen stream ended after progress without a terminal result".to_string()
+            } else {
+                derive_error_message(&raw_stdout, &stderr, exit_code, "Qwen")
+            },
+            stdout: raw_stdout,
+            stderr,
+            exit_code,
+        };
+    }
+
     if exit_code.unwrap_or(0) != 0 {
         return QwenFinalState::RetrySession {
             message: derive_error_message(&raw_stdout, &stderr, exit_code, "Qwen"),
@@ -1240,31 +1262,6 @@ pub(crate) fn resolve_allowed_core_tools(
     }
 
     Ok(Some(core_tools))
-}
-
-pub(crate) fn create_system_settings_override(
-    allowed_core_tools: Option<&[String]>,
-) -> Result<Option<QwenSystemSettingsOverride>, String> {
-    let Some(allowed_core_tools) = allowed_core_tools.filter(|tools| !tools.is_empty()) else {
-        return Ok(None);
-    };
-
-    let settings_dir = std::env::temp_dir().join("agentdesk-qwen");
-    std::fs::create_dir_all(&settings_dir)
-        .map_err(|e| format!("Failed to create Qwen settings temp dir: {}", e))?;
-
-    let path = settings_dir.join(format!("system-settings-{}.json", Uuid::new_v4()));
-    let payload = json!({
-        "tools": {
-            "core": allowed_core_tools,
-        }
-    });
-    let content = serde_json::to_vec_pretty(&payload)
-        .map_err(|e| format!("Failed to serialize Qwen system settings: {}", e))?;
-    std::fs::write(&path, content)
-        .map_err(|e| format!("Failed to write Qwen system settings override: {}", e))?;
-
-    Ok(Some(QwenSystemSettingsOverride { path }))
 }
 
 fn build_simple_exec_args(prompt: &str) -> Vec<String> {
@@ -1537,6 +1534,63 @@ fn render_qwen_value(value: &Value) -> String {
 #[cfg(test)]
 mod qwen_provider_lifecycle_tests {
     #[test]
+    fn terminal_error_finishes_live_wrapper_without_synthetic_success() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live-wrapper.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,",
+                "\"result\":null,\"errors\":[\"Loop detection halted the run\"]}\n",
+                "{\"type\":\"ready_for_input\"}\n"
+            ),
+        )
+        .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let (finished, completion) = mpsc::channel();
+        let cancel = Arc::new(CancelToken::new());
+        let reader_cancel = cancel.clone();
+        let reader = std::thread::spawn(move || {
+            finished
+                .send(qwen_read_output_file_until_result(
+                    path.to_str().unwrap(),
+                    0,
+                    sender,
+                    Some(reader_cancel),
+                    SessionProbe {
+                        is_alive: Box::new(|| true),
+                        is_ready_for_input: Box::new(|| false),
+                    },
+                    None,
+                ))
+                .unwrap();
+        });
+        let result = completion.recv_timeout(std::time::Duration::from_secs(2));
+        cancel
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        reader.join().unwrap();
+        assert!(matches!(
+            result.unwrap().unwrap(),
+            ReadOutputResult::Completed { .. }
+        ));
+        let messages: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, StreamMessage::Error { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, StreamMessage::Done { .. }))
+        );
+    }
+
+    #[test]
     fn accepted_quiet_turn_survives_virtual_day() {
         let mut watchdog = super::QwenStreamWatchdog::new(
             std::time::Duration::from_secs(3600),
@@ -1635,19 +1689,22 @@ mod child_exit_tests {
                 None,
             )
             .unwrap();
+            let messages: Vec<_> = rx.try_iter().collect();
             assert_eq!(
-                rx.try_iter()
+                messages
+                    .iter()
                     .any(|m| matches!(m, StreamMessage::Done { .. })),
                 normal
             );
             if !normal {
-                assert!(matches!(
-                    result,
-                    QwenAttemptResult::RetrySession {
-                        exit_code: Some(7),
-                        ..
-                    }
-                ));
+                assert!(matches!(result, QwenAttemptResult::Completed));
+                // This fixture emitted assistant progress before exiting. The
+                // failure must be delivered, never replayed as a fresh session.
+                assert!(
+                    messages
+                        .iter()
+                        .any(|m| matches!(m, StreamMessage::Error { .. }))
+                );
             }
             fixture.verify_return(mode);
         }

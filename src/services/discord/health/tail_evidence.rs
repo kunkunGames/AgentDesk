@@ -133,7 +133,8 @@ mod tests {
             if let Some(contents) = contents {
                 std::fs::write(&output, contents).unwrap();
             }
-            let row = inflight::InflightTurnState::new(
+            let token = Arc::new(CancelToken::new());
+            let mut row = inflight::InflightTurnState::new(
                 provider.clone(),
                 channel.get(),
                 None,
@@ -147,6 +148,9 @@ mod tests {
                 None,
                 0,
             );
+            // The persisted row and mailbox describe the same live episode;
+            // an unrelated constructor nonce cannot establish runtime ownership.
+            row.turn_nonce = token.turn_nonce().map(str::to_owned);
             inflight::save_inflight_state(&row).unwrap();
             let row_path = inflight::inflight_state_path(
                 &discord::runtime_store::discord_inflight_root().unwrap(),
@@ -154,14 +158,13 @@ mod tests {
                 channel.get(),
             );
             let row_bytes = std::fs::read(&row_path).unwrap();
-            let token = Arc::new(CancelToken::new());
             assert!(
                 discord::mailbox_try_start_turn(
                     &shared,
                     channel,
                     token.clone(),
-                    UserId::new(2),
-                    MessageId::new(channel.get() + 1),
+                    UserId::new(row.request_owner_user_id),
+                    MessageId::new(row.user_msg_id),
                 )
                 .await
             );

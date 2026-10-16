@@ -24,7 +24,12 @@ use finalize::finalize_stale_busy_turn;
 use host_guard::{
     HostGate, keyed_host_gate, routine_teardown, tmux_session_not_missing, unified_thread_target,
 };
-use stale_busy_identity::{recorded_inflight_tmux_session_name, stale_busy_turn_is_still_reapable};
+#[cfg(test)]
+use stale_busy_identity::{STALE_BUSY_START_GRACE, stale_busy_start_grace_elapsed};
+use stale_busy_identity::{
+    recorded_inflight_tmux_session_name, stale_busy_mailbox_start_is_expired,
+    stale_busy_turn_is_still_reapable,
+};
 
 macro_rules! input_boundary {
     ($stage:literal, $name:expr) => {
@@ -72,21 +77,30 @@ async fn heal_stale_busy_mailbox_with_probe(
     }
 
     let observed = mailbox_snapshot(shared, channel_id).await;
-    if observed.cancel_token.is_none() {
+    let Some(observed_actor) = observed.cancel_token.as_ref() else {
+        return false;
+    };
+    if observed.active_turn_nonce.as_deref() != observed_actor.turn_nonce() {
         return false;
     }
     let Some(observed_user_msg_id) = observed.active_user_message_id else {
         // An ambiguous id-0 release is explicitly forbidden for this recovery.
         return false;
     };
+    if !stale_busy_mailbox_start_is_expired(shared, channel_id, &observed) {
+        return false;
+    }
 
     // #4634: probe the runtime tmux session RECORDED on the in-flight row, never
     // a name reconstructed from `channel_name`. When the row recorded no name (or
     // was already removed) SKIP — falling back to the reconstructed name is what
     // false-finalizes a live routine turn ("routine tmux 오염").
-    let Some(observed_tmux_session_name) =
-        recorded_inflight_tmux_session_name(provider, channel_id)
-    else {
+    let Some(observed_tmux_session_name) = recorded_inflight_tmux_session_name(
+        provider,
+        channel_id,
+        observed_user_msg_id,
+        observed.active_turn_nonce.as_deref(),
+    ) else {
         return false;
     };
     if !host_gate(shared, provider, channel_id, &observed_tmux_session_name).await {
@@ -99,20 +113,42 @@ async fn heal_stale_busy_mailbox_with_probe(
 
     // Close all yielding windows: a newer mailbox owner, a respawned tmux
     // session, OR a fresh turn that re-recorded a DIFFERENT runtime session name
-    // between the two snapshots must all survive. The finalizer/mailer actor
+    // between the two snapshots must all survive. The finalizer/mailbox actor
     // closes the remaining identity race at the token mutation itself.
-    let current_user_msg_id = mailbox_snapshot(shared, channel_id)
-        .await
-        .active_user_message_id;
-    let current_tmux_session_name = recorded_inflight_tmux_session_name(provider, channel_id);
+    let current = mailbox_snapshot(shared, channel_id).await;
+    if current.active_turn_nonce != observed.active_turn_nonce
+        || current
+            .cancel_token
+            .as_ref()
+            .is_none_or(|actor| !Arc::ptr_eq(actor, observed_actor))
+        || !stale_busy_mailbox_start_is_expired(shared, channel_id, &current)
+    {
+        return false;
+    }
     let has_session = probe(observed_tmux_session_name.clone()).await;
+    // Both probes yield. Refresh all evidence after the second one as well: a
+    // same-nonce RecoveryKickoff can publish its new recovery_started_at while
+    // the channel admission map and durable row remain unchanged.
+    let current = mailbox_snapshot(shared, channel_id).await;
+    let current_tmux_session_name = recorded_inflight_tmux_session_name(
+        provider,
+        channel_id,
+        observed_user_msg_id,
+        observed.active_turn_nonce.as_deref(),
+    );
     if !stale_busy_turn_is_still_reapable(
         observed_user_msg_id,
-        current_user_msg_id,
+        current.active_user_message_id,
         has_session,
         &observed_tmux_session_name,
         current_tmux_session_name.as_deref(),
-    ) || (respect_watcher_authority && shared.tmux_watchers.contains_key(&channel_id))
+    ) || current.active_turn_nonce != observed.active_turn_nonce
+        || current
+            .cancel_token
+            .as_ref()
+            .is_none_or(|actor| !Arc::ptr_eq(actor, observed_actor))
+        || !stale_busy_mailbox_start_is_expired(shared, channel_id, &current)
+        || (respect_watcher_authority && shared.tmux_watchers.contains_key(&channel_id))
     {
         return false;
     }
@@ -128,7 +164,7 @@ async fn heal_stale_busy_mailbox_with_probe(
         provider,
         channel_id,
         observed_user_msg_id,
-        observed.active_turn_nonce,
+        observed_actor.clone(),
         &observed_tmux_session_name,
         trigger,
     )
@@ -241,8 +277,15 @@ async fn clean_orphan_sessions(shared: &Arc<SharedData>, output: &[String]) {
     let provider = shared.settings.read().await.provider.clone();
     let current_owner_marker = current_tmux_owner_marker();
     let mut protected_dispatch_orphans = Vec::new();
-    let orphans: Vec<(String, KeyedTeardown)> = {
+    let owned_sessions: std::collections::HashSet<String> = {
         let data = shared.core.lock().await;
+        data.sessions
+            .values()
+            .filter_map(|s| s.channel_name.as_ref())
+            .map(|name| provider.build_tmux_session_name(name))
+            .collect()
+    };
+    let orphans: Vec<(String, KeyedTeardown)> = {
         let mut result = Vec::new();
 
         for session_name in output.iter().map(|s| s.trim()) {
@@ -260,13 +303,7 @@ async fn clean_orphan_sessions(shared: &Arc<SharedData>, output: &[String]) {
             }
 
             // Check if any active channel maps to this session
-            let has_owner = data.sessions.iter().any(|(_, session)| {
-                session
-                    .channel_name
-                    .as_ref()
-                    .map(|ch_name| provider.build_tmux_session_name(ch_name) == session_name)
-                    .unwrap_or(false)
-            });
+            let has_owner = owned_sessions.contains(session_name);
 
             if !has_owner {
                 if crate::services::tmux_common::read_tmux_channel_binding(session_name)
@@ -322,6 +359,15 @@ async fn clean_orphan_sessions(shared: &Arc<SharedData>, output: &[String]) {
                 if pane != PaneLiveness::DeadOrAbsent {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::info!("  [{ts}]   skipped orphan (live pane): {}", session_name);
+                    continue;
+                }
+                // The probe yielded; a recovered channel may now own the session.
+                let now_owned = shared.core.lock().await.sessions.values().any(|s| {
+                    s.channel_name
+                        .as_ref()
+                        .is_some_and(|name| provider.build_tmux_session_name(name) == session_name)
+                });
+                if now_owned {
                     continue;
                 }
 
@@ -852,113 +898,30 @@ async fn reap_orphan_tmux_wrapper_processes() {
 }
 
 #[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OrphanTmuxWrapperProcess {
-    pid: i32,
-    provider: ProviderKind,
-    tmux_session_name: Option<String>,
-}
-
+mod orphan_wrapper;
 #[cfg(unix)]
-fn list_orphan_tmux_wrapper_processes() -> Vec<OrphanTmuxWrapperProcess> {
-    let output = match std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,command="])
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return Vec::new(),
-    };
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(parse_orphan_tmux_wrapper_process_line)
-        .collect()
-}
-
-#[cfg(unix)]
-fn parse_orphan_tmux_wrapper_process_line(line: &str) -> Option<OrphanTmuxWrapperProcess> {
-    let trimmed = line.trim_start();
-    let first_end = trimmed.find(char::is_whitespace)?;
-    let pid = trimmed[..first_end].parse::<i32>().ok()?;
-    let rest = trimmed[first_end..].trim_start();
-    let second_end = rest.find(char::is_whitespace)?;
-    let ppid = rest[..second_end].parse::<i32>().ok()?;
-    let command = rest[second_end..].trim_start();
-
-    if ppid != 1 {
-        return None;
-    }
-
-    let argv: Vec<&str> = command.split_whitespace().collect();
-    if !command_invokes_agentdesk_binary(&argv) {
-        return None;
-    }
-    let provider = argv
-        .iter()
-        .find_map(|token| provider_for_managed_tmux_wrapper_subcommand(token))?;
-
-    if extract_arg_value(&argv, "--output-file").is_none() {
-        return None;
-    }
-
-    let has_input_fifo = extract_arg_value(&argv, "--input-fifo").is_some();
-    let has_pipe_input_mode = extract_arg_value(&argv, "--input-mode") == Some("pipe");
-    if !has_input_fifo && !has_pipe_input_mode {
-        return None;
-    }
-
-    Some(OrphanTmuxWrapperProcess {
-        pid,
-        provider,
-        tmux_session_name: extract_tmux_session_name_from_wrapper_command(command),
-    })
-}
-
-#[cfg(unix)]
-fn command_invokes_agentdesk_binary(argv: &[&str]) -> bool {
-    argv.first()
-        .and_then(|exe| std::path::Path::new(exe).file_name())
-        .and_then(|basename| basename.to_str())
-        == Some("agentdesk")
-}
-
-#[cfg(unix)]
-fn provider_for_managed_tmux_wrapper_subcommand(token: &str) -> Option<ProviderKind> {
-    crate::services::provider::provider_registry()
-        .iter()
-        .filter(|entry| entry.managed_tmux_backend)
-        .find(|entry| entry.managed_tmux_wrapper_subcommand == Some(token))
-        .and_then(|entry| ProviderKind::from_str(entry.id))
-}
-
-#[cfg(unix)]
-fn extract_arg_value<'a>(argv: &'a [&str], flag: &str) -> Option<&'a str> {
-    argv.windows(2)
-        .find_map(|window| (window[0] == flag).then_some(window[1]))
-}
-
-#[cfg(unix)]
-fn extract_tmux_session_name_from_wrapper_command(command: &str) -> Option<String> {
-    let argv: Vec<&str> = command.split_whitespace().collect();
-    let output_path = extract_arg_value(&argv, "--output-file")?;
-    let basename = std::path::Path::new(output_path).file_name()?.to_str()?;
-    let stem = basename.strip_suffix(".jsonl").unwrap_or(basename);
-    let pos = stem.find("AgentDesk-")?;
-    Some(stem[pos..].to_string())
-}
+use orphan_wrapper::list_orphan_tmux_wrapper_processes;
+#[cfg(all(test, unix))]
+use orphan_wrapper::{
+    extract_tmux_session_name_from_wrapper_command, parse_orphan_tmux_wrapper_process_line,
+    provider_for_managed_tmux_wrapper_subcommand,
+};
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        extract_tmux_session_name_from_wrapper_command, finalize_stale_busy_turn,
+        STALE_BUSY_START_GRACE, extract_tmux_session_name_from_wrapper_command,
+        finalize_stale_busy_turn, heal_stale_busy_mailbox_with_probe,
         parse_orphan_tmux_wrapper_process_line, provider_for_managed_tmux_wrapper_subcommand,
-        reap_stale_busy_mailboxes_with_probe, stale_busy_turn_is_still_reapable,
+        reap_stale_busy_mailboxes_with_probe, stale_busy_start_grace_elapsed,
+        stale_busy_turn_is_still_reapable,
     };
     use crate::services::provider::{CancelToken, ProviderKind};
     use futures::future::BoxFuture;
     use poise::serenity_prelude::{ChannelId, MessageId, UserId};
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     struct RuntimeRootGuard;
 
@@ -996,6 +959,65 @@ mod tests {
         assert!(absent_only_if_missing(HostPresence::Missing));
         assert!(!absent_only_if_missing(HostPresence::Present));
         assert!(!absent_only_if_missing(HostPresence::ProbeFailed));
+    }
+
+    #[test]
+    fn stale_busy_start_grace_uses_monotonic_deadline_and_conservative_fallback() {
+        let now = Instant::now();
+        let wall_now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let wall_old = wall_now - chrono::Duration::seconds(60);
+        for (age, expired) in [
+            (STALE_BUSY_START_GRACE - Duration::from_nanos(1), false),
+            (STALE_BUSY_START_GRACE, true),
+            (STALE_BUSY_START_GRACE + Duration::from_nanos(1), true),
+        ] {
+            assert_eq!(
+                stale_busy_start_grace_elapsed(Some(now - age), Some(wall_old), now, wall_now),
+                expired,
+                "monotonic startup deadline at age {age:?}"
+            );
+        }
+        assert!(
+            !stale_busy_start_grace_elapsed(
+                Some(now + Duration::from_secs(1)),
+                Some(wall_old),
+                now,
+                wall_now
+            ),
+            "a future monotonic origin cannot prove an expired start"
+        );
+        assert!(!stale_busy_start_grace_elapsed(None, None, now, wall_now));
+        assert!(!stale_busy_start_grace_elapsed(
+            None,
+            Some(wall_now + chrono::Duration::seconds(1)),
+            now,
+            wall_now
+        ));
+        assert!(!stale_busy_start_grace_elapsed(
+            None,
+            Some(wall_now - chrono::Duration::seconds(59)),
+            now,
+            wall_now
+        ));
+        assert!(stale_busy_start_grace_elapsed(
+            None,
+            Some(wall_old),
+            now,
+            wall_now
+        ));
+        // Wall-clock changes cannot extend or truncate an admitted monotonic window.
+        assert!(stale_busy_start_grace_elapsed(
+            Some(now - STALE_BUSY_START_GRACE),
+            Some(wall_now + chrono::Duration::days(1)),
+            now,
+            wall_now
+        ));
+        assert!(!stale_busy_start_grace_elapsed(
+            Some(now),
+            Some(wall_old),
+            now,
+            wall_now
+        ));
     }
 
     #[test]
@@ -1076,6 +1098,14 @@ mod tests {
             .await
         );
         shared.restart.global_active.store(1, Ordering::Relaxed);
+        seed_recorded_inflight_tmux_session(
+            &ProviderKind::Claude,
+            channel_id,
+            "test-4485",
+            user_msg_id,
+            "AgentDesk-claude-test-4485",
+            token.turn_nonce(),
+        );
 
         assert!(
             finalize_stale_busy_turn(
@@ -1083,7 +1113,7 @@ mod tests {
                 &ProviderKind::Claude,
                 channel_id,
                 user_msg_id,
-                token.turn_nonce().map(str::to_owned),
+                token.clone(),
                 "AgentDesk-claude-test-4485",
                 "test",
             )
@@ -1111,6 +1141,7 @@ mod tests {
         let channel_id = ChannelId::new(4_485_301);
         let stale_user_msg_id = MessageId::new(4_485_302);
         let live_user_msg_id = MessageId::new(4_485_303);
+        let stale_token = Arc::new(CancelToken::new());
         let live_token = Arc::new(CancelToken::new());
         assert!(
             crate::services::discord::mailbox_try_start_turn(
@@ -1123,6 +1154,14 @@ mod tests {
             .await
         );
         shared.restart.global_active.store(1, Ordering::Relaxed);
+        seed_recorded_inflight_tmux_session(
+            &ProviderKind::Claude,
+            channel_id,
+            "test-4485",
+            stale_user_msg_id,
+            "AgentDesk-claude-test-4485",
+            stale_token.turn_nonce(),
+        );
 
         assert!(
             !finalize_stale_busy_turn(
@@ -1130,7 +1169,7 @@ mod tests {
                 &ProviderKind::Claude,
                 channel_id,
                 stale_user_msg_id,
-                None,
+                stale_token,
                 "AgentDesk-claude-test-4485",
                 "test",
             )
@@ -1224,7 +1263,11 @@ agents:
             channel_name,
             user_msg_id,
             &live_tmux_name,
+            token.turn_nonce(),
         );
+        shared
+            .turn_start_times
+            .insert(channel_id, Instant::now() - STALE_BUSY_START_GRACE);
         shared.restart.global_active.store(1, Ordering::Relaxed);
 
         let probed_names = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1265,8 +1308,9 @@ agents:
         channel_name: &str,
         user_msg_id: MessageId,
         tmux_session_name: &str,
+        turn_nonce: Option<&str>,
     ) {
-        let state = crate::services::discord::inflight::InflightTurnState::new(
+        let mut state = crate::services::discord::inflight::InflightTurnState::new(
             provider.clone(),
             channel_id.get(),
             Some(channel_name.to_string()),
@@ -1280,8 +1324,596 @@ agents:
             None,
             0,
         );
+        state.turn_nonce = turn_nonce.map(str::to_owned);
         crate::services::discord::inflight::save_inflight_state(&state)
             .expect("seed recorded inflight tmux session");
+    }
+
+    async fn seed_busy_reaper_turn(
+        shared: &Arc<super::SharedData>,
+        channel_id: ChannelId,
+        user_msg_id: MessageId,
+        session_name: &str,
+        age: Duration,
+    ) -> Arc<CancelToken> {
+        let channel_name = "reaper-start-lifecycle";
+        shared.settings.write().await.provider = ProviderKind::Claude;
+        shared.core.lock().await.sessions.insert(
+            channel_id,
+            crate::services::discord::DiscordSession {
+                session_id: None,
+                memento_context_loaded: false,
+                memento_reflected: false,
+                current_path: None,
+                history: Vec::new(),
+                pending_uploads: Vec::new(),
+                cleared: false,
+                remote_profile_name: None,
+                channel_id: Some(channel_id.get()),
+                channel_name: Some(channel_name.to_string()),
+                category_name: None,
+                last_active: tokio::time::Instant::now(),
+                worktree: None,
+                born_generation: shared.restart.current_generation,
+            },
+        );
+        let token = Arc::new(CancelToken::new());
+        assert!(
+            crate::services::discord::mailbox_try_start_turn(
+                shared,
+                channel_id,
+                token.clone(),
+                UserId::new(17),
+                user_msg_id
+            )
+            .await
+        );
+        shared
+            .mailbox(channel_id)
+            .age_active_turn_for_test(age)
+            .await;
+        shared
+            .turn_start_times
+            .insert(channel_id, Instant::now() - age);
+        seed_recorded_inflight_tmux_session(
+            &ProviderKind::Claude,
+            channel_id,
+            channel_name,
+            user_msg_id,
+            session_name,
+            token.turn_nonce(),
+        );
+        shared.restart.global_active.store(1, Ordering::Relaxed);
+        token
+    }
+
+    async fn replace_with_same_episode_recovery(
+        shared: &Arc<super::SharedData>,
+        channel: ChannelId,
+        message: MessageId,
+        observed_actor: Arc<CancelToken>,
+    ) -> Arc<CancelToken> {
+        let released = crate::services::discord::mailbox_finish::mailbox_finish_turn_if_matches_episode_started_before_with_actor_without_completion(
+            shared,
+            &ProviderKind::Claude,
+            channel,
+            message,
+            observed_actor.turn_nonce().map(str::to_owned),
+            Instant::now(),
+            Some(observed_actor.clone()),
+        )
+        .await;
+        assert!(
+            released
+                .removed_token
+                .as_ref()
+                .is_some_and(|removed| Arc::ptr_eq(removed, &observed_actor))
+        );
+        let recovery = Arc::new(CancelToken::from_persisted_turn_nonce(
+            observed_actor.turn_nonce().map(str::to_owned),
+        ));
+        let result = shared
+            .mailbox(channel)
+            .recovery_kickoff(recovery.clone(), UserId::new(18), Some(message))
+            .await;
+        assert!(
+            result.activated_turn(),
+            "the guarded release left an empty slot"
+        );
+        let snapshot = crate::services::discord::mailbox_snapshot(shared, channel).await;
+        assert!(snapshot.recovery_started_at.is_some());
+        assert_eq!(snapshot.active_user_message_id, Some(message));
+        assert_eq!(
+            snapshot.active_turn_nonce.as_deref(),
+            observed_actor.turn_nonce()
+        );
+        assert!(
+            snapshot
+                .cancel_token
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &recovery))
+        );
+        recovery
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_busy_reaper_refreshes_same_nonce_recovery_after_second_probe() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::tempdir().expect("runtime root");
+        let _root = RuntimeRootGuard::set(root.path());
+        for keep_old_admission_map in [true, false] {
+            let shared = crate::services::discord::make_shared_data_for_tests();
+            let channel = ChannelId::new(4_635_601 + u64::from(keep_old_admission_map));
+            let message = MessageId::new(4_635_611 + u64::from(keep_old_admission_map));
+            let session = "AgentDesk-claude-reaper-recovery-probe-race";
+            let original =
+                seed_busy_reaper_turn(&shared, channel, message, session, STALE_BUSY_START_GRACE)
+                    .await;
+            if !keep_old_admission_map {
+                shared.turn_start_times.remove(&channel);
+            }
+            let admission_before = shared
+                .turn_start_times
+                .get(&channel)
+                .map(|entry| *entry.value());
+            let probes = Arc::new(AtomicUsize::new(0));
+            let calls = probes.clone();
+            let during_probe = shared.clone();
+            let observed_actor = original.clone();
+            let probe = move |_name: String| -> BoxFuture<'static, bool> {
+                let call = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                let shared = during_probe.clone();
+                let observed_actor = observed_actor.clone();
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    if call == 2 {
+                        replace_with_same_episode_recovery(
+                            &shared,
+                            channel,
+                            message,
+                            observed_actor,
+                        )
+                        .await;
+                    }
+                    false
+                })
+            };
+            assert!(
+                !heal_stale_busy_mailbox_with_probe(
+                    &shared,
+                    &ProviderKind::Claude,
+                    channel,
+                    "test",
+                    true,
+                    &probe,
+                    &admit_any_host,
+                )
+                .await
+            );
+            assert_eq!(probes.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                shared
+                    .turn_start_times
+                    .get(&channel)
+                    .map(|entry| *entry.value()),
+                admission_before,
+                "RecoveryKickoff must be protected with an unchanged or absent admission map"
+            );
+            let current = crate::services::discord::mailbox_snapshot(&shared, channel).await;
+            let recovery = current
+                .cancel_token
+                .expect("recovery actor must remain active");
+            assert!(!Arc::ptr_eq(&recovery, &original));
+            assert!(!recovery.cancelled.load(Ordering::Relaxed));
+            assert!(current.recovery_started_at.is_some());
+            assert_eq!(current.active_user_message_id, Some(message));
+            assert_eq!(current.active_turn_nonce.as_deref(), original.turn_nonce());
+            assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 1);
+            let row = crate::services::discord::inflight::load_inflight_state(
+                &ProviderKind::Claude,
+                channel.get(),
+            )
+            .expect("recovery row must remain intact");
+            assert_eq!(row.turn_nonce.as_deref(), original.turn_nonce());
+            assert_eq!(row.tmux_session_name.as_deref(), Some(session));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_busy_finalize_cannot_adopt_same_nonce_recovery_after_observation() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::tempdir().expect("runtime root");
+        let _root = RuntimeRootGuard::set(root.path());
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let channel = ChannelId::new(4_635_621);
+        let message = MessageId::new(4_635_622);
+        let session = "AgentDesk-claude-reaper-recovery-finalize-race";
+        let observed_actor =
+            seed_busy_reaper_turn(&shared, channel, message, session, STALE_BUSY_START_GRACE).await;
+        shared.turn_start_times.remove(&channel);
+        // This replacement occurs after the detector's final snapshot. The
+        // finalizer's own observation cutoff would be newer than the recovery,
+        // so the captured actor pointer must survive transport and its CAS.
+        let recovery =
+            replace_with_same_episode_recovery(&shared, channel, message, observed_actor.clone())
+                .await;
+        let mut events =
+            crate::services::discord::turn_completion_events::subscribe_turn_completion_events(
+                &shared,
+            );
+        for _ in 0..2 {
+            assert!(
+                !finalize_stale_busy_turn(
+                    &shared,
+                    &ProviderKind::Claude,
+                    channel,
+                    message,
+                    observed_actor.clone(),
+                    session,
+                    "test",
+                )
+                .await,
+                "both normal finalization and ledger-duplicate repair must preserve the replacement actor"
+            );
+            let current = crate::services::discord::mailbox_snapshot(&shared, channel).await;
+            assert!(
+                current
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &recovery))
+            );
+            assert!(!recovery.cancelled.load(Ordering::Relaxed));
+            assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 1);
+            assert!(
+                events.try_recv().is_err(),
+                "a guard miss must not publish a release"
+            );
+            let row = crate::services::discord::inflight::load_inflight_state(
+                &ProviderKind::Claude,
+                channel.get(),
+            )
+            .expect("actor mismatch must not retire the recovery row");
+            assert_eq!(row.turn_nonce.as_deref(), recovery.turn_nonce());
+            assert_eq!(row.tmux_session_name.as_deref(), Some(session));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn periodic_reaper_preserves_pending_start_then_recovers_abandoned_start() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::tempdir().expect("runtime root");
+        let _root = RuntimeRootGuard::set(root.path());
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let channel = ChannelId::new(4_635_101);
+        let message = MessageId::new(4_635_102);
+        let token = seed_busy_reaper_turn(
+            &shared,
+            channel,
+            message,
+            "AgentDesk-claude-reaper-start-pending",
+            Duration::ZERO,
+        )
+        .await;
+        let probes = Arc::new(AtomicUsize::new(0));
+        let calls = probes.clone();
+        let probe = move |_name: String| -> BoxFuture<'static, bool> {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { false })
+        };
+
+        reap_stale_busy_mailboxes_with_probe(&shared, &probe, &admit_any_host).await;
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            0,
+            "a planned name must not imply prior launch"
+        );
+        assert!(!token.cancelled.load(Ordering::Relaxed));
+        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            crate::services::discord::mailbox_snapshot(&shared, channel)
+                .await
+                .active_user_message_id,
+            Some(message)
+        );
+
+        // Advance the canonical admission origins without waiting in real time.
+        shared
+            .mailbox(channel)
+            .age_active_turn_for_test(STALE_BUSY_START_GRACE)
+            .await;
+        shared
+            .turn_start_times
+            .insert(channel, Instant::now() - STALE_BUSY_START_GRACE);
+        reap_stale_busy_mailboxes_with_probe(&shared, &probe, &admit_any_host).await;
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            2,
+            "expired starts still require both absence probes"
+        );
+        assert!(token.cancelled.load(Ordering::Relaxed));
+        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
+        assert!(
+            crate::services::discord::mailbox_snapshot(&shared, channel)
+                .await
+                .active_user_message_id
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_busy_reaper_preserves_admission_published_during_either_absence_probe() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::tempdir().expect("runtime root");
+        let _root = RuntimeRootGuard::set(root.path());
+        for refresh_on_probe in [1, 2] {
+            let shared = crate::services::discord::make_shared_data_for_tests();
+            let channel = ChannelId::new(4_635_200 + refresh_on_probe);
+            let message = MessageId::new(4_635_210 + refresh_on_probe);
+            let token = seed_busy_reaper_turn(
+                &shared,
+                channel,
+                message,
+                "AgentDesk-claude-reaper-start-race",
+                STALE_BUSY_START_GRACE,
+            )
+            .await;
+            let probes = Arc::new(AtomicUsize::new(0));
+            let calls = probes.clone();
+            let during_probe = shared.clone();
+            let probe = move |_name: String| -> BoxFuture<'static, bool> {
+                let call = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                let shared = during_probe.clone();
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    if call == refresh_on_probe as usize {
+                        shared.turn_start_times.insert(channel, Instant::now());
+                    }
+                    false
+                })
+            };
+            assert!(
+                !heal_stale_busy_mailbox_with_probe(
+                    &shared,
+                    &ProviderKind::Claude,
+                    channel,
+                    "test",
+                    true,
+                    &probe,
+                    &admit_any_host,
+                )
+                .await
+            );
+            assert_eq!(probes.load(Ordering::Relaxed), refresh_on_probe as usize);
+            assert!(!token.cancelled.load(Ordering::Relaxed));
+            assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_busy_reaper_recovers_old_disappeared_session_without_monotonic_map() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::tempdir().expect("runtime root");
+        let _root = RuntimeRootGuard::set(root.path());
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let channel = ChannelId::new(4_635_301);
+        let message = MessageId::new(4_635_302);
+        let token = seed_busy_reaper_turn(
+            &shared,
+            channel,
+            message,
+            "AgentDesk-claude-reaper-old-disappeared",
+            STALE_BUSY_START_GRACE,
+        )
+        .await;
+        shared.turn_start_times.remove(&channel);
+        let probe = |_name: String| -> BoxFuture<'static, bool> { Box::pin(async { false }) };
+        assert!(
+            heal_stale_busy_mailbox_with_probe(
+                &shared,
+                &ProviderKind::Claude,
+                channel,
+                "test",
+                true,
+                &probe,
+                &admit_any_host,
+            )
+            .await
+        );
+        assert!(token.cancelled.load(Ordering::Relaxed));
+        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_busy_reaper_cannot_use_a_predecessor_episode_row() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::tempdir().expect("runtime root");
+        let _root = RuntimeRootGuard::set(root.path());
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let channel = ChannelId::new(4_635_401);
+        let message = MessageId::new(4_635_402);
+        let token = seed_busy_reaper_turn(
+            &shared,
+            channel,
+            message,
+            "AgentDesk-claude-reaper-predecessor",
+            STALE_BUSY_START_GRACE,
+        )
+        .await;
+        seed_recorded_inflight_tmux_session(
+            &ProviderKind::Claude,
+            channel,
+            "reaper-start-lifecycle",
+            message,
+            "AgentDesk-claude-reaper-predecessor",
+            Some("predecessor-episode"),
+        );
+        let probes = Arc::new(AtomicUsize::new(0));
+        let calls = probes.clone();
+        let probe = move |_name: String| -> BoxFuture<'static, bool> {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { false })
+        };
+        assert!(
+            !heal_stale_busy_mailbox_with_probe(
+                &shared,
+                &ProviderKind::Claude,
+                channel,
+                "test",
+                true,
+                &probe,
+                &admit_any_host,
+            )
+            .await
+        );
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
+        assert!(!token.cancelled.load(Ordering::Relaxed));
+        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_busy_reaper_preserves_respawn_name_watcher_and_episode_races() {
+        let _lock = crate::config::shared_test_env_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let root = tempfile::tempdir().expect("runtime root");
+        let _root = RuntimeRootGuard::set(root.path());
+        for (index, race) in ["respawn", "name", "watcher", "episode"]
+            .into_iter()
+            .enumerate()
+        {
+            let shared = crate::services::discord::make_shared_data_for_tests();
+            let channel = ChannelId::new(4_635_500 + index as u64);
+            let message = MessageId::new(4_635_510 + index as u64);
+            let token = seed_busy_reaper_turn(
+                &shared,
+                channel,
+                message,
+                "AgentDesk-claude-reaper-existing-race",
+                STALE_BUSY_START_GRACE,
+            )
+            .await;
+            let probes = Arc::new(AtomicUsize::new(0));
+            let calls = probes.clone();
+            let during_probe = shared.clone();
+            let original_nonce = token.turn_nonce().map(str::to_owned);
+            let probe = move |_name: String| -> BoxFuture<'static, bool> {
+                let call = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                let shared = during_probe.clone();
+                let original_nonce = original_nonce.clone();
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    if call == 1 {
+                        match race {
+                            "name" => seed_recorded_inflight_tmux_session(
+                                &ProviderKind::Claude,
+                                channel,
+                                "reaper-start-lifecycle",
+                                message,
+                                "AgentDesk-claude-reaper-replaced-name",
+                                original_nonce.as_deref(),
+                            ),
+                            "watcher" => {
+                                shared.tmux_watchers.insert(
+                                    channel,
+                                    super::TmuxWatcherHandle {
+                                        tmux_session_name: "AgentDesk-claude-reaper-existing-race"
+                                            .into(),
+                                        output_path: "/runtime/reaper-race.jsonl".into(),
+                                        paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                        resume_offset: Arc::new(std::sync::Mutex::new(None)),
+                                        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                        pause_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                                        turn_delivered: Arc::new(
+                                            std::sync::atomic::AtomicBool::new(false),
+                                        ),
+                                        last_heartbeat_ts_ms: Arc::new(
+                                            std::sync::atomic::AtomicI64::new(0),
+                                        ),
+                                    },
+                                );
+                            }
+                            "episode" => {
+                                let released =
+                                    crate::services::discord::mailbox_finish_turn_if_matches(
+                                        &shared,
+                                        &ProviderKind::Claude,
+                                        channel,
+                                        message,
+                                    )
+                                    .await;
+                                assert!(released.removed_token.is_some());
+                                let successor = Arc::new(CancelToken::new());
+                                assert!(
+                                    crate::services::discord::mailbox_try_start_turn(
+                                        &shared,
+                                        channel,
+                                        successor.clone(),
+                                        UserId::new(18),
+                                        message,
+                                    )
+                                    .await
+                                );
+                                // Keep age expired so this case exercises the episode fence itself.
+                                shared
+                                    .mailbox(channel)
+                                    .age_active_turn_for_test(STALE_BUSY_START_GRACE)
+                                    .await;
+                                seed_recorded_inflight_tmux_session(
+                                    &ProviderKind::Claude,
+                                    channel,
+                                    "reaper-start-lifecycle",
+                                    message,
+                                    "AgentDesk-claude-reaper-existing-race",
+                                    successor.turn_nonce(),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    race == "respawn" && call == 2
+                })
+            };
+            assert!(
+                !heal_stale_busy_mailbox_with_probe(
+                    &shared,
+                    &ProviderKind::Claude,
+                    channel,
+                    "test",
+                    true,
+                    &probe,
+                    &admit_any_host,
+                )
+                .await,
+                "race={race}"
+            );
+            let current = crate::services::discord::mailbox_snapshot(&shared, channel).await;
+            assert_eq!(current.active_user_message_id, Some(message), "race={race}");
+            assert!(
+                !current
+                    .cancel_token
+                    .unwrap()
+                    .cancelled
+                    .load(Ordering::Relaxed),
+                "race={race}"
+            );
+            assert_eq!(
+                shared.restart.global_active.load(Ordering::Relaxed),
+                1,
+                "race={race}"
+            );
+        }
     }
 
     /// #4634 CORE FIX: a `fresh` routine turn runs in a DISTINCT `…---pe` session
@@ -1348,7 +1980,11 @@ agents:
             channel_name,
             user_msg_id,
             &recorded_alive_name,
+            token.turn_nonce(),
         );
+        shared
+            .turn_start_times
+            .insert(channel_id, Instant::now() - STALE_BUSY_START_GRACE);
         shared.restart.global_active.store(1, Ordering::Relaxed);
 
         let probed_names = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1619,7 +2255,15 @@ agents:
             &name,
             msg,
             &session,
+            token.turn_nonce(),
         );
+        shared
+            .mailbox(channel_id)
+            .age_active_turn_for_test(STALE_BUSY_START_GRACE)
+            .await;
+        shared
+            .turn_start_times
+            .insert(channel_id, Instant::now() - STALE_BUSY_START_GRACE);
         token
     }
 

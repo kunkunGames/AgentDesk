@@ -6,6 +6,13 @@
 //! - normalized output-file tailing/parsing for wrapper JSONL streams
 
 pub(crate) mod auth_profiles;
+mod liveness;
+#[cfg(test)]
+pub(crate) use liveness::with_process_registry_busy_for_test;
+pub(crate) use liveness::{
+    NativeRegistryPresence, native_registry_presence_for_source_stem, process_session_evidence,
+    process_session_liveness,
+};
 mod output;
 pub(crate) use output::capture_process_output;
 
@@ -164,6 +171,22 @@ pub trait SessionBackend: Send + Sync {
 // ─── ProcessBackend ───────────────────────────────────────────────────────────
 
 pub struct ProcessBackend;
+
+/// Serialize synchronous native preparation with same-session source recovery.
+/// Callers hold this authority before touching auth markers or the registry and
+/// release it after input/publication, before polling output. Registry helpers
+/// deliberately do not reacquire this non-reentrant authority.
+pub(crate) fn with_process_session_launch_authority<R>(
+    session_name: &str,
+    preparation: impl FnOnce() -> Result<R, String>,
+) -> Result<R, String> {
+    crate::services::tmux_common::with_tmux_source_authority(session_name, |authority| {
+        // A crash must not expose a historical TUI marker after this native
+        // turn starts. This durable intent is not PID/liveness/adoption proof.
+        crate::services::tmux_common::persist_process_backend_hosting_intent(authority)?;
+        preparation()
+    })
+}
 
 impl ProcessBackend {
     pub fn new() -> Self {
@@ -332,6 +355,48 @@ impl SessionHandle {
 
 static PROCESS_SESSIONS: LazyLock<Mutex<ProcessSessionRegistry>> =
     LazyLock::new(|| Mutex::new(ProcessSessionRegistry::default()));
+
+/// A test PID must belong to a real unreaped child when testing identity gates.
+#[cfg(test)]
+pub(crate) struct OwnedTestProcess {
+    child: Child,
+}
+
+#[cfg(test)]
+impl OwnedTestProcess {
+    pub(crate) fn new() -> Self {
+        #[cfg(unix)]
+        let mut command = Command::new("/bin/sleep");
+        #[cfg(unix)]
+        command.arg("120");
+        #[cfg(windows)]
+        let mut command = Command::new("cmd.exe");
+        #[cfg(windows)]
+        command.args(["/d", "/c", "pause"]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        Self {
+            child: command.spawn().expect("owned identity test child"),
+        }
+    }
+
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+#[cfg(test)]
+impl Drop for OwnedTestProcess {
+    fn drop(&mut self) {
+        // The unreaped Child reserves its PID; this fixture has no tool tree.
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
 
 fn process_sessions() -> MutexGuard<'static, ProcessSessionRegistry> {
     PROCESS_SESSIONS.lock().unwrap_or_else(|error| {
@@ -651,20 +716,22 @@ mod process_registry_stop_tests {
 
     #[test]
     fn issue_4112_stopped_process_session_by_pid_is_removed_and_guarded_from_followup() {
+        let owned = OwnedTestProcess::new();
+        let pid = owned.pid();
         let session_name = format!("process-stop-{}", uuid::Uuid::new_v4());
         let alive = Arc::new(AtomicBool::new(true));
         insert_process_session(
             session_name.clone(),
             SessionHandle::TestProcess {
-                pid: 424_242,
+                pid,
                 alive: alive.clone(),
             },
         );
 
         assert!(process_session_is_alive(&session_name));
-        assert_eq!(process_session_pid(&session_name), Some(424_242));
+        assert_eq!(process_session_pid(&session_name), Some(pid));
 
-        let stopped = mark_process_sessions_stopped_by_pid(424_242);
+        let stopped = mark_process_sessions_stopped_by_pid(pid);
 
         assert_eq!(stopped, vec![session_name.clone()]);
         assert!(process_session_was_stopped(&session_name));
@@ -935,7 +1002,7 @@ pub fn read_output_file_until_result_with_harvest(
             let _ = offset_sender.send(StreamMessage::OutputOffset { offset });
         },
         move |line, state| process_stream_line(line, &line_sender, state),
-        |state| state.final_result.is_some(),
+        StreamLineState::has_terminal_result,
         move |state| {
             synthetic_sender
                 .send(StreamMessage::Done {
@@ -964,7 +1031,7 @@ pub fn read_output_file_until_result_with_harvest(
     let stats = ReadHarvestStats {
         forwarded_messages: state.forwarded_message_count,
         assistant_text_bytes: state.forwarded_assistant_text_bytes,
-        decoded_terminal: state.final_result.is_some(),
+        decoded_terminal: state.has_terminal_result(),
         source_file,
     };
     result.map(|result| (result, stats))

@@ -14,6 +14,8 @@ use super::liveness_authority::{CaptureCoordinateObservation, CoordinateStatus};
 #[path = "probe_runtime.rs"]
 mod probe_runtime;
 use probe_runtime::{HealthProbeRuntime, ProbeOutcome};
+mod relay_backlog;
+pub(super) use relay_backlog::RelayBacklogEvidence;
 
 pub(super) const WATCHER_STATE_DESYNC_STALE_MS: i64 = 30_000;
 
@@ -156,6 +158,7 @@ struct CoordFrontierReading {
     /// entry witnesses none — never stamped, or the stamp moved under the read
     /// (see [`observe_frontier_triple`]).
     live_generation_ns: Option<i64>,
+    reset_incarnation: Option<u64>,
 }
 
 /// #5071 relay-tail S1 r3 (legA P1): what one entry's raw
@@ -208,6 +211,9 @@ fn read_coord_frontier(shared: &SharedData, channel: ChannelId) -> CoordFrontier
         let generation_before = coord.confirmed_end_generation_mtime_ns.load(Acquire);
         let confirmed_end_offset = coord.confirmed_end_offset.load(Acquire);
         let generation_after = coord.confirmed_end_generation_mtime_ns.load(Acquire);
+        // Read the existing entry only. SharedData::relay_frontier_token would
+        // create a coordinate for a missing channel, which an observer cannot do.
+        let token = coord.frontier_token();
         (
             (generation_before, confirmed_end_offset, generation_after),
             (
@@ -215,13 +221,16 @@ fn read_coord_frontier(shared: &SharedData, channel: ChannelId) -> CoordFrontier
                 coord.last_relay_ts_ms.load(Acquire),
                 coord.reconnect_count.load(Acquire),
             ),
+            (token.committed_offset == confirmed_end_offset).then_some(token.reset_incarnation),
         )
     });
-    let (observation, live_generation_ns) = observe_frontier_triple(read.map(|(triple, _)| triple));
+    let (observation, live_generation_ns) =
+        observe_frontier_triple(read.map(|(triple, _, _)| triple));
     CoordFrontierReading {
         observation,
-        entry: read.map(|(_, entry)| entry),
+        entry: read.map(|(_, entry, _)| entry),
         live_generation_ns,
+        reset_incarnation: read.and_then(|(_, _, incarnation)| incarnation),
     }
 }
 
@@ -281,6 +290,9 @@ pub(super) struct SessionEnrichment {
     pub tail_observation: super::TailObservation,
     pub relay_stale: bool,
     pub capture_lagged: bool,
+    /// Eligibility, coverage and conservative pending age, independently of
+    /// raw capture growth and outbound progress heartbeats.
+    pub relay_backlog: RelayBacklogEvidence,
     /// Descriptive witnesses for health detail; frontier sources and polarity stay unchanged.
     pub frontier_provenance: FrontierProvenance,
 }
@@ -368,11 +380,11 @@ impl SessionEnrichment {
             .as_ref()
             .and_then(|state| state.output_path.as_deref())
             .map(str::to_string);
-        let capture_coordinate = match output_path_for_metadata {
-            Some(path) => tokio::task::spawn_blocking(move || capture_coordinate_for_path(&path))
+        let (capture_coordinate, capture_modified) = match output_path_for_metadata {
+            Some(path) => tokio::task::spawn_blocking(move || capture_sample_for_path(&path))
                 .await
-                .unwrap_or_else(|_| CaptureCoordinateObservation::missing(None)),
-            None => CaptureCoordinateObservation::missing(None),
+                .unwrap_or_else(|_| (CaptureCoordinateObservation::missing(None), None)),
+            None => (CaptureCoordinateObservation::missing(None), None),
         };
         let last_capture_offset = capture_coordinate.offset;
         let unread_bytes = relay_state_matches_inflight
@@ -390,14 +402,44 @@ impl SessionEnrichment {
         let relay_stale = relay_stale_anchor_ms
             .map(|anchor_ms| now_ms.saturating_sub(anchor_ms) >= WATCHER_STATE_DESYNC_STALE_MS)
             .unwrap_or(false);
-        let capture_lagged = last_capture_offset
-            .map(|capture| {
-                relay_state_matches_inflight
-                    && inflight_state_present
-                    && capture != last_relay_offset
-                    && relay_stale
-            })
-            .unwrap_or(false);
+        let mut relay_backlog = relay_backlog::observe(relay_backlog::RelayObservation {
+            provider: provider_kind,
+            channel: channel.get(),
+            state: inflight.as_ref(),
+            watcher_path: watcher_output_path.as_deref(),
+            coordinate: &capture_coordinate,
+            capture_modified,
+            frontier: coord.entry.map(|entry| entry.0),
+            generation: live_generation_mtime_ns,
+            reset_incarnation: coord.reset_incarnation,
+            binding_matches: relay_state_matches_inflight,
+        })
+        .await;
+        // A source read cannot lend a pending span to a replaced/reset relay
+        // binding while the blocking observer was in flight.
+        let current_coord = read_coord_frontier(shared, channel);
+        let current_watcher_binding = shared.tmux_watchers.channel_binding(&channel);
+        if current_coord.entry.map(|entry| entry.0) != coord.entry.map(|entry| entry.0)
+            || current_coord.live_generation_ns != live_generation_mtime_ns
+            || current_coord.reset_incarnation != coord.reset_incarnation
+            || watcher_output_path_from_binding(current_watcher_binding.as_ref())
+                != watcher_output_path
+            || current_watcher_binding
+                .as_ref()
+                .map(|binding| (&binding.tmux_session_name, binding.owner_channel_id))
+                != watcher_binding
+                    .as_ref()
+                    .map(|binding| (&binding.tmux_session_name, binding.owner_channel_id))
+        {
+            relay_backlog = RelayBacklogEvidence::unknown(
+                relay_backlog::BacklogUnknownReason::ObservationSuperseded,
+            );
+        }
+        let capture_lagged = eligible_capture_lagged(
+            relay_state_matches_inflight,
+            inflight_state_present,
+            &relay_backlog,
+        );
 
         let enrichment = Self {
             inflight,
@@ -419,6 +461,7 @@ impl SessionEnrichment {
             tail_observation: Default::default(),
             relay_stale,
             capture_lagged,
+            relay_backlog,
             frontier_provenance: FrontierProvenance::observe(
                 coord_observation,
                 durable_observation,
@@ -545,19 +588,32 @@ impl SessionEnrichment {
     }
 }
 
-fn capture_coordinate_for_path(path: &str) -> CaptureCoordinateObservation {
+fn eligible_capture_lagged(
+    binding_matches: bool,
+    inflight_present: bool,
+    evidence: &RelayBacklogEvidence,
+) -> bool {
+    binding_matches && inflight_present && evidence.overdue(WATCHER_STATE_DESYNC_STALE_MS)
+}
+
+fn capture_sample_for_path(
+    path: &str,
+) -> (CaptureCoordinateObservation, Option<std::time::SystemTime>) {
     use std::hash::{DefaultHasher, Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
     let path_hash = hasher.finish();
     let Ok(metadata) = std::fs::metadata(path) else {
-        return CaptureCoordinateObservation {
-            offset: None,
-            path_hash,
-            file_id: None,
-            status: CoordinateStatus::Missing,
-        };
+        return (
+            CaptureCoordinateObservation {
+                offset: None,
+                path_hash,
+                file_id: None,
+                status: CoordinateStatus::Missing,
+            },
+            None,
+        );
     };
     #[cfg(unix)]
     let file_id = {
@@ -566,12 +622,15 @@ fn capture_coordinate_for_path(path: &str) -> CaptureCoordinateObservation {
     };
     #[cfg(not(unix))]
     let file_id = None;
-    CaptureCoordinateObservation {
-        offset: Some(metadata.len()),
-        path_hash,
-        file_id,
-        status: CoordinateStatus::Observed,
-    }
+    (
+        CaptureCoordinateObservation {
+            offset: Some(metadata.len()),
+            path_hash,
+            file_id,
+            status: CoordinateStatus::Observed,
+        },
+        metadata.modified().ok(),
+    )
 }
 
 fn liveness_probe_session(inflight: Option<&str>, watcher: Option<&str>) -> Option<String> {

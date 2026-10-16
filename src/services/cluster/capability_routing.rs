@@ -57,7 +57,12 @@ pub(crate) fn explain_capability_match(
     if let Some(required) = hard_required.get("execution") {
         match super::execution_requirements::ExecutionRequirements::parse(required.clone()) {
             Ok(policy) => {
-                reasons.extend(policy.explain(node, chrono::Utc::now().timestamp_millis()))
+                reasons.extend(policy.explain(node, chrono::Utc::now().timestamp_millis()));
+                if let Some(providers) = hard_required.get("providers").and_then(Value::as_array) {
+                    for provider in providers.iter().filter_map(Value::as_str) {
+                        reasons.extend(policy.provider_reasons(node, provider));
+                    }
+                }
             }
             Err(reason) => reasons.push(reason),
         }

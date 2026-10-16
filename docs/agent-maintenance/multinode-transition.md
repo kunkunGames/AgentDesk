@@ -483,6 +483,10 @@
   lock and records a running row; `complete` records terminal evidence and can
   release the lock. Each phase/head SHA pair has an idempotent evidence row so
   later merge gates can require the exact tested commit before accepting a phase.
+  The [phase-run lifecycle contract](../test-phase-run-lifecycle.md) specifies
+  atomic start/completion, collector ownership, duplicate delivery, and stale
+  result rejection. The API coordinates receipts and leases; it does not launch
+  check processes or independently authenticate reported evidence.
 - Local telemetry capture and cache state: `src/services/memory/memento_throttle.rs:128`,
   `src/services/observability/mod.rs:460`, `src/services/observability/metrics.rs:238`.
 - #3262 Claude auto-compact `/compact` injection trigger state:

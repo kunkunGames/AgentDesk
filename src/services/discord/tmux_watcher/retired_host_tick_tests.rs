@@ -472,6 +472,18 @@ async fn retired_host_probe_requires_independent_tmux_and_native_source_evidence
         assert!(h.take_tmux_calls().is_empty(), "{case}");
         drop(observation);
         drop(busy);
+        if case == "unknown-runtime" {
+            // Unknown intent remains protected by launch admission. Remove only
+            // this fixture's injected marker before constructing the next case.
+            assert!(
+                write_tmux_runtime_kind_marker(&h.tmux, RuntimeHandoffKind::ClaudeTui).is_err()
+            );
+            std::fs::remove_file(session_temp_path(
+                &h.tmux,
+                crate::services::tmux_common::TMUX_RUNTIME_KIND_TEMP_EXT,
+            ))
+            .unwrap();
+        }
         if case == "missing-source" {
             std::fs::write(&h.path, "").unwrap();
         }

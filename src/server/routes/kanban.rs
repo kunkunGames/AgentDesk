@@ -222,35 +222,10 @@ pub(crate) async fn transition_card_to_backlog_with_cleanup(
     Ok(result)
 }
 
-fn pg_pool_required_error() -> AppError {
-    AppError::new(
-        StatusCode::SERVICE_UNAVAILABLE,
-        ErrorCode::Database,
-        "postgres backend required for kanban transition (#1384)",
-    )
-}
-
-fn database_error(message: impl Into<String>) -> AppError {
-    AppError::internal(message).with_code(ErrorCode::Database)
-}
-
-fn kanban_error(status: StatusCode, message: impl Into<String>) -> AppError {
-    AppError::new(status, ErrorCode::Kanban, message)
-}
-
-fn tuple_error(response: (StatusCode, Json<serde_json::Value>)) -> AppError {
-    let (status, Json(body)) = response;
-    let message = body
-        .get("error")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("kanban request failed")
-        .to_string();
-    kanban_error(status, message)
-}
-
-fn pg_pool_required_anyhow() -> anyhow::Error {
-    anyhow::anyhow!("postgres backend required for kanban transition (#1384)")
-}
+mod errors;
+use errors::{
+    database_error, kanban_error, pg_pool_required_anyhow, pg_pool_required_error, tuple_error,
+};
 
 fn execute_transition_intents_pg(
     state: &AppState,

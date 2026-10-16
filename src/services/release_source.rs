@@ -16,6 +16,7 @@ pub(crate) enum ReleaseSourceObservation {
         repo_head: Result<String, ReleaseSourceUnobservedReason>,
         latest_postgres_migration: Result<String, ReleaseSourceUnobservedReason>,
         repo_dirty: Result<String, ReleaseSourceUnobservedReason>,
+        build_provenance: BuildProvenance,
     },
     Unobserved {
         reason: ReleaseSourceUnobservedReason,
@@ -63,6 +64,20 @@ struct ReleaseSourceManifest {
     repo_head: Option<String>,
     latest_postgres_migration: Option<String>,
     repo_dirty: Option<String>,
+    #[serde(flatten)]
+    build_provenance: BuildProvenance,
+}
+
+/// Installer-declared archive identity, not proof of a Git checkout or of the
+/// currently executing image. Consumers can independently hash the installed file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub(crate) struct BuildProvenance {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    binary_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_manifest_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_mode: Option<String>,
 }
 
 pub(crate) fn observe() -> ReleaseSourceObservation {
@@ -103,6 +118,23 @@ fn read(path: impl AsRef<Path>) -> ReleaseSourceObservation {
     };
 
     let generated_at = nonempty(manifest.generated_at);
+    for hash in [
+        &manifest.build_provenance.binary_sha256,
+        &manifest.build_provenance.source_manifest_sha256,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if hash.len() != 64
+            || !hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return ReleaseSourceObservation::Unobserved {
+                reason: ReleaseSourceUnobservedReason::ManifestInvalidJson,
+            };
+        }
+    }
     // An absent value and an empty or whitespace-only string both use `repo_head_missing`.
     let repo_head = match nonempty(manifest.repo_head) {
         Some(value) if is_git_object_id(&value) => Ok(value),
@@ -141,6 +173,7 @@ fn read(path: impl AsRef<Path>) -> ReleaseSourceObservation {
         repo_head,
         latest_postgres_migration,
         repo_dirty,
+        build_provenance: manifest.build_provenance,
     }
 }
 
@@ -174,11 +207,16 @@ fn health_json_for(
             repo_head,
             latest_postgres_migration,
             repo_dirty,
+            build_provenance,
         } => {
             // `observed` means only that the parsed manifest supplied values accepted
             // by this reader, not that they are proven to match repository state.
             let mut health = serde_json::json!({ "observation_status": "observed" });
             let mut failures = Vec::new();
+            if build_provenance != BuildProvenance::default() {
+                health["declared_build_provenance"] =
+                    serde_json::to_value(build_provenance).expect("string metadata serializes");
+            }
             if let Some(value) = generated_at {
                 health["generated_at"] = serde_json::json!(value);
             }
@@ -248,6 +286,26 @@ mod tests {
     }
 
     #[test]
+    fn archive_identity_is_declared_without_manufacturing_git_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("manifest.json");
+        let hash = "a".repeat(64);
+        let mut manifest = serde_json::json!({"repo_head":null,"repo_dirty":"true","latest_postgres_migration":"0137_campaign_graph_reconciliation.sql","binary_sha256":hash,"source_manifest_sha256":"b".repeat(64),"source_mode":"archive with overlays"});
+        std::fs::write(&path, manifest.to_string()).unwrap();
+        let health = health_json_for(read(&path), false);
+        assert_eq!(health["observation_status"], "partial");
+        assert_eq!(
+            health["observation_failures"],
+            serde_json::json!(["repo_head_missing"])
+        );
+        assert!(health.get("deployed_repo_head").is_none());
+        assert_eq!(health["declared_build_provenance"]["binary_sha256"], hash);
+        manifest["binary_sha256"] = serde_json::json!("not-a-hash");
+        std::fs::write(&path, manifest.to_string()).unwrap();
+        assert_unobserved(&path, ReleaseSourceUnobservedReason::ManifestInvalidJson);
+    }
+
+    #[test]
     fn release_source_reads_confirmed_identity() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("manifest.json");
@@ -266,6 +324,7 @@ mod tests {
                 repo_head: Ok(REPO_HEAD.to_string()),
                 latest_postgres_migration: Ok("0104_example.sql".to_string()),
                 repo_dirty: Ok("false".to_string()),
+                build_provenance: BuildProvenance::default(),
             }
         );
     }

@@ -51,6 +51,7 @@ async fn hand_off_after_done(
     let (mut claim, mut handed_off, mut owns) = (WatcherHandoffClaimOutcome::None, false, false);
     let mut adopted_after_done = false;
     let (mut dirty, mut drain, mut heartbeat) = (false, None, None);
+    let persisted_inflight_baseline = state.inflight_state.clone();
     let _ = handle_runtime_handoff_loop_message(
         message,
         RuntimeHandoffLoopContext {
@@ -58,6 +59,7 @@ async fn hand_off_after_done(
             provider: &ProviderKind::Claude,
             channel_id,
             done: true,
+            persisted_inflight_baseline: &persisted_inflight_baseline,
             adk_session_name: &None,
         },
         RuntimeHandoffLoopState {

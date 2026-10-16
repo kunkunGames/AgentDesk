@@ -134,28 +134,36 @@ fn sql_snippet(sql: &str) -> String {
     if compact.len() <= 120 {
         compact
     } else {
-        format!("{}...", &compact[..117])
+        format!("{}...", &compact[..compact.floor_char_boundary(117)])
     }
 }
 
 fn update_kanban_cards_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)\bUPDATE\s+kanban_cards\b").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\bUPDATE\s+kanban_cards\b").expect("fixed SQL guard regex") // agentdesk-audit: allow-unwrap -- fixed literal; core-table write regression exercises initialization.
+    })
 }
 
 fn status_assign_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)(?:^|[\s,])status\s*=").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[\s,])status\s*=").expect("fixed SQL guard regex") // agentdesk-audit: allow-unwrap -- fixed literal; core-table write regression exercises initialization.
+    })
 }
 
 fn review_status_assign_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)(?:^|[\s,])review_status\s*=").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[\s,])review_status\s*=").expect("fixed SQL guard regex") // agentdesk-audit: allow-unwrap -- fixed literal; core-table write regression exercises initialization.
+    })
 }
 
 fn latest_dispatch_id_assign_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)(?:^|[\s,])latest_dispatch_id\s*=").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:^|[\s,])latest_dispatch_id\s*=").expect("fixed SQL guard regex") // agentdesk-audit: allow-unwrap -- fixed literal; core-table write regression exercises initialization.
+    })
 }
 
 fn task_dispatches_mutation_re() -> &'static Regex {
@@ -164,7 +172,7 @@ fn task_dispatches_mutation_re() -> &'static Regex {
         Regex::new(
             r"(?i)\b(?:INSERT(?:\s+OR\s+REPLACE)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+task_dispatches\b",
         )
-        .unwrap()
+        .expect("fixed SQL guard regex") // agentdesk-audit: allow-unwrap -- fixed literal; core-table write regression exercises initialization.
     })
 }
 
@@ -174,7 +182,7 @@ fn card_review_state_mutation_re() -> &'static Regex {
         Regex::new(
             r"(?i)\b(?:INSERT(?:\s+OR\s+REPLACE)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+card_review_state\b",
         )
-        .unwrap()
+        .expect("fixed SQL guard regex") // agentdesk-audit: allow-unwrap -- fixed literal; core-table write regression exercises initialization.
     })
 }
 
@@ -184,6 +192,58 @@ fn auto_queue_entries_mutation_re() -> &'static Regex {
         Regex::new(
             r"(?i)\b(?:INSERT(?:\s+OR\s+REPLACE)?\s+INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+auto_queue_entries\b",
         )
-        .unwrap()
+        .expect("fixed SQL guard regex") // agentdesk-audit: allow-unwrap -- fixed literal; core-table write regression exercises initialization.
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_table_writes_remain_blocked_by_each_guard() {
+        for (sql, target) in [
+            (
+                "UPDATE kanban_cards SET status='done'",
+                SqlGuardTarget::KanbanStatus,
+            ),
+            (
+                "UPDATE kanban_cards SET review_status='done'",
+                SqlGuardTarget::KanbanReviewStatus,
+            ),
+            (
+                "UPDATE kanban_cards SET latest_dispatch_id='new'",
+                SqlGuardTarget::KanbanLatestDispatchId,
+            ),
+            (
+                "DELETE FROM task_dispatches",
+                SqlGuardTarget::TaskDispatches,
+            ),
+            (
+                "INSERT INTO card_review_state VALUES ('new')",
+                SqlGuardTarget::CardReviewState,
+            ),
+            (
+                "UPDATE auto_queue_entries SET status='done'",
+                SqlGuardTarget::AutoQueueEntries,
+            ),
+        ] {
+            assert_eq!(
+                detect_core_table_write(sql),
+                Some(SqlGuardViolation { target })
+            );
+        }
+        assert!(detect_core_table_write("SELECT status FROM kanban_cards").is_none());
+    }
+
+    #[test]
+    fn warning_message_preserves_unicode_at_truncation_boundary() {
+        let sql = format!("UPDATE kanban_cards SET status='{}'", "한글".repeat(30));
+        let warning = detect_core_table_write(&sql)
+            .unwrap()
+            .warning_message("fixture", &sql);
+        assert!(warning.contains("kanban_cards.status"));
+        assert!(warning.ends_with("..."));
+        assert!(sql_snippet(&sql).len() <= 120);
+    }
 }

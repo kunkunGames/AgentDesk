@@ -68,12 +68,14 @@ RUST_API_RE = re.compile(
     )
     + r")(?![A-Za-z0-9_$])"
 )
+MIGRATION_ROOTS = ("migrations/postgres", "migrations/postgres_campaign_v5", "migrations/postgres_shared")
 MIGRATION_NON_SQL_ALLOWLIST = frozenset({
     "migrations/postgres/checksum-repair-allowlist.json",
     "migrations/postgres/immutable-checksums.json",
+    "migrations/postgres_shared/README.md",
 })
 LIMITS = (
-    "enumerated roots are only tracked src/**/*.rs, policies/**, and migrations/postgres/*; migrations/001_initial.sql is outside scope",
+    "enumerated roots are only tracked src/**/*.rs, policies/**, and each embedded PostgreSQL catalog/*; migrations/001_initial.sql is outside scope",
     "exact-spelling lexical calls only; no compiler, name resolution, or SQL semantic parsing",
     "unsupported aliases, re-exports, macros, indirection, eval, generated and untracked inputs may be absent",
     "runtime SQL, interpolation, format!/computed identifiers, reachability, commit, and DB state are not proven",
@@ -88,7 +90,7 @@ REPIN_GUIDANCE = (
     "리뷰 표면에 노출 → measured_at_sha 갱신 및 재핀 커밋 → 커밋 후 aggregate 재실행 "
     "(재핀 직후 커밋 전 aggregate dirty guard rc=1은 정상)"
 )
-REQUIRED_ROOTS = ("src", "policies", "migrations/postgres")
+REQUIRED_ROOTS = ("src", "policies", *MIGRATION_ROOTS)
 REWRITE_PATH = "src/engine/ops/db_ops.rs"
 GUARD_EXPECTED_CONTRACTS = (
     ("rotateActiveRunSweepCursor", "policies/lib/auto-queue-dispatch.js", "auto_queue_entries"),
@@ -159,10 +161,10 @@ def _record(
 
 
 def enumerate_tracked_inputs(repo_root: Path = REPO_ROOT) -> list[TrackedInput]:
-    """Return regular tracked inputs in the three design-enumerated roots."""
+    """Return regular tracked inputs in the source and immutable catalog roots."""
     repo_root = Path(repo_root).resolve()
     completed = subprocess.run(
-        ["git", "ls-files", "-z", "--", "src", "policies", "migrations/postgres"],
+        ["git", "ls-files", "-z", "--", "src", "policies", *MIGRATION_ROOTS],
         cwd=repo_root,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -189,9 +191,9 @@ def enumerate_tracked_inputs(repo_root: Path = REPO_ROOT) -> list[TrackedInput]:
             root = "policies"
             kind = "TEST" if rel_path.startswith("policies/__tests__/") else "POLICY"
             allowed = rel_path.endswith((".js", ".yaml", ".yml"))
-        elif rel_path.startswith("migrations/postgres/"):
-            root = "migrations/postgres"
-            if "/" in rel_path[len("migrations/postgres/") :]:
+        elif any(rel_path.startswith(root + "/") for root in MIGRATION_ROOTS):
+            root = next(root for root in MIGRATION_ROOTS if rel_path.startswith(root + "/"))
+            if "/" in rel_path[len(root) + 1 :]:
                 errors.append(f"nested tracked migration is outside the inventory: {rel_path}")
                 continue
             if rel_path.endswith(".sql"):
@@ -502,7 +504,7 @@ def scan_inventory(repo_root: Path = REPO_ROOT) -> list[SurfaceRecord]:
             records.extend(scan_rust_calls(tracked.path, repo_root))
         elif tracked.path.suffix == ".js":
             records.extend(scan_js_calls(tracked.path, repo_root))
-        elif tracked.root == "migrations/postgres":
+        elif tracked.root in MIGRATION_ROOTS:
             records.extend(scan_migrations(tracked))
     return validate_records(records)
 
@@ -690,7 +692,7 @@ def _auto_queue_runs_report(records: Sequence[SurfaceRecord], repo_root: Path) -
         record for record in records
         if record.kind == "MIGRATION" and b"auto_queue_runs" in (repo_root / record.path).read_bytes()
     ]
-    lines.append(f"  - root=migrations/postgres tracked_token_files={len(migrations)} (SQL meaning not parsed)")
+    lines.append(f"  - roots=postgres-catalogs tracked_token_files={len(migrations)} (SQL meaning not parsed)")
     dynamic = _rewrite_dynamic_records(records)
     detail = f"{REWRITE_PATH} rewrite_insert_conflict.table_name" if dynamic else "(not observed)"
     lines.append(f"  - UNRESOLVED dynamic_boundary={detail} records={len(dynamic)}")

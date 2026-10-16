@@ -58,6 +58,7 @@ pub(super) fn prepare_and_create_claude_tui_session(
     if guarded {
         refuse_over_unconfirmed_session(tmux_session_name)?;
     }
+    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)?;
     crate::services::tmux_common::cleanup_session_temp_files(tmux_session_name);
     write_tmux_owner_marker(tmux_session_name)?;
     crate::services::tmux_common::write_tmux_runtime_kind_marker(

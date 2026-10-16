@@ -131,11 +131,12 @@ async fn claim_task_dispatches_with_cluster_config(
         let id: String = row.get("id");
         let required_capabilities = row
             .try_get::<Option<Value>, _>("required_capabilities")
-            .ok()
-            .flatten();
+            .map_err(|error| format!("read required capabilities for dispatch {id}: {error}"))?;
 
-        if !required_capabilities_empty(required_capabilities.as_ref()) {
-            let required = required_capabilities.as_ref().expect("checked above");
+        if let Some(required) = required_capabilities
+            .as_ref()
+            .filter(|required| !required_capabilities_empty(Some(required)))
+        {
             let candidates = semaphore_aware_route_candidates_on_pg_tx(
                 &mut tx,
                 &worker_nodes,

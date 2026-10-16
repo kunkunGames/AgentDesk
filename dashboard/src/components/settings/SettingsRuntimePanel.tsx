@@ -76,6 +76,7 @@ export function SettingsRuntimePanel({
                 .map((meta) => {
                   const field = category.fields.find((item) => item.key === meta.key);
                   if (!field) return renderSettingRow(meta);
+                  if (field.inputKind === "text") return renderSettingRow(meta);
                   if (field.inputKind === "toggle") {
                     const isDefault = meta.effectiveValue === meta.defaultValue;
                     const trailingMeta = !isDefault ? (

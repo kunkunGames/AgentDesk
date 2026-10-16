@@ -14,6 +14,11 @@
 
 ## Pages
 
+- [`24x7-native-v5/OPERATING-READINESS.md`](../24x7-native-v5/OPERATING-READINESS.md) —
+  v5 specification-to-code audit, bounded execution contracts, source-pinned
+  verification, and the remaining operational acceptance boundaries. The
+  [Mac mini operations record](../24x7-native-v5/MAC-MINI-OPERATIONS-2026-09-28.md)
+  records the existing Qwen/OpenCode routine migration and actual run outcomes.
 - [`api-friction-extraction-plan.md`](api-friction-extraction-plan.md) —
   subdomain map and ordered extraction issues for splitting the giant
   `src/services/api_friction.rs` service module (#1789).
@@ -61,8 +66,9 @@
 
 ## Generated Companions (read-only)
 
-- [`docs/generated/module-inventory.md`](../generated/module-inventory.md) —
-  every Rust module with line count and giant-file flag. Source of truth for
+- `docs/generated/module-inventory.md` ([generation policy](../generated/README.md)) —
+  an untracked checkout-local view of every Rust module with line count and giant-file flag.
+  Generate it with the command below before reading it. Source of truth for
   the giant-file list in `change-surfaces.md`.
 - [`docs/generated/route-inventory.md`](../generated/route-inventory.md) — HTTP
   routes and the file/line where each is registered.

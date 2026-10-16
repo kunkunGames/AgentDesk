@@ -754,10 +754,18 @@ impl CancelToken {
         if tmux_session_name.is_empty() {
             return;
         }
-        *self
+        let mut binding = self
             .tmux_binding
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(
+            .unwrap_or_else(|error| error.into_inner());
+        // A compatibility/recovery caller must not discard ownership already
+        // published for this exact session, including an older stale generation.
+        if matches!(binding.as_ref(), Some(authority::TmuxBinding::Published { key, .. })
+            if key.name() == tmux_session_name)
+        {
+            return;
+        }
+        *binding = Some(
             super::cancel_token_cleanup::authority::TmuxBinding::NameOnly {
                 name: tmux_session_name.to_string(),
             },

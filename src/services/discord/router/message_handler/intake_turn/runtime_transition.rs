@@ -134,8 +134,21 @@ mod tests {
         *core.sessions.get_mut(&channel).unwrap() = session_with(&["U2"], true);
         drop(core);
         let _held = shared.session_transition_lock(channel).lock_owned().await;
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recorded = requests.clone();
+        let app = axum::Router::new().fallback(axum::routing::any(move || {
+            let recorded = recorded.clone();
+            async move {
+                recorded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({"code": 50013, "message": "fixture failure"})))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let http = Arc::new(serenity::HttpBuilder::new("test-token")
-            .proxy("http://127.0.0.1:1").ratelimiter_disabled(true).build());
+            .proxy(proxy).ratelimiter_disabled(true).build());
         // S3-19b: the held transition must reach the real busy enqueue path.
         let transition = tokio::time::timeout(std::time::Duration::from_secs(5),
             acquire_after_redirect_or_requeue(
@@ -143,7 +156,12 @@ mod tests {
                 (TurnKind::Foreground, UserId::new(1), MessageId::new(566_003), "A"),
                 (&None, false, false), (&mut owned, &None),
                 (false, &None, None, false, (false, route(channel))), (None, false, String::new()),
-            )).await.expect("busy handoff must finish").expect("busy enqueue must succeed");
+            )).await;
+        server.abort();
+        let _ = server.await;
+        let transition = transition.expect("busy handoff must finish").expect("busy enqueue must succeed");
+        assert!(requests.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the real enqueue must attempt its placeholder request against the owned fixture");
         assert!(transition.is_none(), "held transition must requeue, not acquire");
         let queued = crate::services::discord::mailbox_snapshot(&shared, channel).await;
         assert_eq!(queued.intervention_queue.len(), 1);

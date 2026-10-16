@@ -9,11 +9,61 @@ pub(super) fn spawn_server(
     password: &str,
     working_dir: &str,
     overlay: &crate::services::provider_auth_profile::ProviderAuthOverlay,
+    managed: bool,
 ) -> Result<OpenCodeServerProcess, String> {
     let mut cmd = Command::new(bin);
+    if managed {
+        if overlay.home.is_none() || overlay.is_default() {
+            return Err("managed OpenCode requires a named isolated auth profile".into());
+        }
+        // AgentDesk's database/control-plane credentials must not be inherited
+        // by a managed provider. Only platform bootstrap and the explicit
+        // provider overlay cross this boundary.
+        cmd.env_clear();
+        for name in [
+            "PATH",
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+            "LANG",
+            "LC_ALL",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
+        }
+    }
     crate::services::platform::apply_binary_resolution(&mut cmd, resolution);
     configure_child_process_group(&mut cmd);
     crate::services::provider_auth_profile::apply_overlay_to_command(&mut cmd, overlay);
+    let managed_runtime = if managed {
+        let boundary = crate::services::platform::managed_process::FilesystemBoundary::prepare(
+            std::path::Path::new(bin),
+            std::path::Path::new(working_dir),
+        )
+        .map_err(|error| format!("managed OpenCode filesystem boundary: {error}"))?;
+        let home = boundary.runtime_home();
+        // The service-owned profile and its credential/config files are never
+        // exposed as the provider's writable home. Only the validated snapshot
+        // and explicit credential environment cross into the process.
+        cmd.env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("XDG_CACHE_HOME", home.join("cache"))
+            .env("XDG_STATE_HOME", home.join("state"))
+            .env("TMPDIR", home);
+        Some(
+            boundary
+                .configure(&mut cmd)
+                .map_err(|error| format!("managed OpenCode child boundary: {error}"))?,
+        )
+    } else {
+        None
+    };
     cmd.arg("serve")
         .arg("--hostname")
         .arg("127.0.0.1")
@@ -25,9 +75,19 @@ pub(super) fn spawn_server(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    if managed {
+        // Match the probed native contract. Never reuse this process for a
+        // legacy request with project plugins or automatic auxiliary setup.
+        cmd.arg("--pure")
+            .env("OPENCODE_DISABLE_DEFAULT_PLUGINS", "true")
+            .env("OPENCODE_DISABLE_MODELS_FETCH", "true")
+            .env("OPENCODE_DISABLE_AUTOUPDATE", "true");
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn opencode serve: {e}"))?;
+    let identity = crate::services::process::ProcessIdentity::capture(child.id());
     let startup_output = Arc::new(Mutex::new(OpenCodeStartupOutput::default()));
     if let Some(stdout) = child.stdout.take() {
         drain_startup_output(stdout, startup_output.clone(), StartupStream::Stdout);
@@ -37,7 +97,9 @@ pub(super) fn spawn_server(
     }
     Ok(OpenCodeServerProcess {
         child,
+        identity,
         startup_output,
+        _managed_runtime: managed_runtime,
     })
 }
 

@@ -1126,6 +1126,13 @@ async fn completed_queue_review_drift_reconcile_promotes_only_stale_done_entries
         .execute(&pool)
         .await
         .expect("seed completed implementation dispatch");
+
+        sqlx::query("UPDATE kanban_cards SET latest_dispatch_id=$2 WHERE id=$1")
+            .bind(card_id)
+            .bind(format!("dispatch-{card_id}"))
+            .execute(&pool)
+            .await
+            .expect("bind completed implementation as the card's latest dispatch");
     }
 
     sqlx::query(

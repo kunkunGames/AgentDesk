@@ -17,6 +17,10 @@ pub(crate) struct ExecutionRequirements {
     pub repositories: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub backends: Vec<String>,
+    /// Operator-owned per-attempt limits shared across providers. Admission
+    /// additionally requires the selected adapter's native protocol support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_limits: Option<super::execution_capacity::ExecutionLimits>,
 }
 
 impl ExecutionRequirements {
@@ -27,6 +31,9 @@ impl ExecutionRequirements {
     pub(crate) fn parse(value: Value) -> Result<Self, String> {
         let policy: Self = serde_json::from_value(value)
             .map_err(|e| format!("invalid execution requirements: {e}"))?;
+        if let Some(limits) = &policy.execution_limits {
+            limits.validate()?;
+        }
         for values in [
             &policy.os,
             &policy.arch,
@@ -91,6 +98,14 @@ impl ExecutionRequirements {
             return Vec::new();
         }
         let mut reasons = Vec::new();
+        if self.execution_limits.is_some()
+            && !node
+                .pointer("/capabilities/execution_capacity/managed_providers")
+                .and_then(Value::as_object)
+                .is_some_and(|providers| providers.values().any(|version| version == 1))
+        {
+            reasons.push("managed_execution_protocol_missing".into());
+        }
         if node["status"] != "online" {
             reasons.push("node_offline".into());
         }
@@ -128,11 +143,37 @@ impl ExecutionRequirements {
         reasons
     }
 
-    pub(crate) fn intake_reasons(&self, node: &Value) -> Vec<String> {
+    pub(crate) fn provider_reasons(&self, node: &Value, provider: &str) -> Vec<String> {
+        if self.execution_limits.is_none() {
+            return Vec::new();
+        }
+        let kind = crate::services::provider::ProviderKind::from_str(provider);
+        let expected = kind
+            .as_ref()
+            .and_then(|kind| kind.execution_adapter())
+            .and_then(|adapter| adapter.managed_execution_protocol());
+        if expected.is_none() {
+            return vec![format!("managed_execution_provider_unsupported:{provider}")];
+        }
+        let advertised = node
+            .pointer("/capabilities/execution_capacity/managed_providers")
+            .and_then(|providers| kind.as_ref().and_then(|kind| providers.get(kind.as_str())))
+            .and_then(Value::as_u64);
+        if advertised != expected {
+            vec![format!(
+                "managed_execution_provider_protocol_missing:{provider}"
+            )]
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub(crate) fn intake_reasons(&self, node: &Value, provider: &str) -> Vec<String> {
         if self.is_empty() {
             return Vec::new();
         }
         let mut reasons = self.explain(node, chrono::Utc::now().timestamp_millis());
+        reasons.extend(self.provider_reasons(node, provider));
         if !node
             .pointer("/capabilities/intake_worker/features")
             .and_then(Value::as_array)
@@ -190,6 +231,7 @@ pub(crate) fn validate_worker(
     let node = super::readiness::local_node();
     let now = chrono::Utc::now().timestamp_millis();
     let mut reasons = requirements.explain(&node, now);
+    reasons.extend(requirements.provider_reasons(&node, &row.provider));
     reasons.extend(
         super::readiness::evaluate(
             &node,

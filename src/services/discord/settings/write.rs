@@ -144,7 +144,10 @@ fn patch_bot_settings_yaml(
         allowed_channel_ids: Some(settings.allowed_channel_ids.clone()),
         require_mention_channel_ids: Some(settings.require_mention_channel_ids.clone()),
         allowed_user_ids: Some(settings.allowed_user_ids.clone()),
-        allowed_tools: Some(normalize_allowed_tools(&settings.allowed_tools)),
+        allowed_tools: Some(normalize_tools_for_provider(
+            &settings.provider,
+            &settings.allowed_tools,
+        )),
         allow_all_users: Some(settings.allow_all_users),
         allowed_bot_ids: Some(settings.allowed_bot_ids.clone()),
     };
@@ -360,7 +363,10 @@ fn save_runtime_bot_settings_checked(
         } else {
             entry.insert(
                 "allowed_tools".to_string(),
-                serde_json::json!(normalize_allowed_tools(&settings.allowed_tools)),
+                serde_json::json!(normalize_tools_for_provider(
+                    &settings.provider,
+                    &settings.allowed_tools
+                )),
             );
         }
         if settings.allow_all_users {
@@ -706,6 +712,30 @@ relay_authority_dial_from_a_newer_binary: enforce\n"
     }
 
     #[test]
+    fn opencode_categories_survive_yaml_write_and_runtime_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("config")).unwrap();
+        let path = dir.path().join("config/agentdesk.yaml");
+        fs::write(&path, FIXTURE).unwrap();
+        let _root_env = crate::config::set_agentdesk_root_for_test(dir.path());
+        let _config_env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+            "AGENTDESK_CONFIG",
+            &path,
+        );
+        let mut settings = settings_with_new_allowlist();
+        settings.provider = ProviderKind::OpenCode;
+        settings.allowed_tools = ["read", "edit", "list", "todowrite", "custom-unsupported"]
+            .map(str::to_string)
+            .to_vec();
+        persist_bot_auth_to_yaml_checked(BOT_TOKEN, &settings).unwrap();
+        let reloaded = load_bot_settings(BOT_TOKEN);
+        assert_eq!(reloaded.provider, ProviderKind::OpenCode);
+        // Unknown input must reach the strict native validator, never vanish
+        // or accidentally broaden the policy during a settings round trip.
+        assert_eq!(reloaded.allowed_tools, settings.allowed_tools);
+    }
+
+    #[test]
     fn scalar_server_token_is_preserved() {
         for token in ["0777", "0x0777"] {
             let actual = round_trip(&FIXTURE.replace("dashboard-secret-token", token));
@@ -726,7 +756,10 @@ relay_authority_dial_from_a_newer_binary: enforce\n"
             allowed_channel_ids: Some(settings.allowed_channel_ids),
             require_mention_channel_ids: Some(settings.require_mention_channel_ids),
             allowed_user_ids: Some(settings.allowed_user_ids),
-            allowed_tools: Some(normalize_allowed_tools(&settings.allowed_tools)),
+            allowed_tools: Some(normalize_tools_for_provider(
+                &settings.provider,
+                &settings.allowed_tools,
+            )),
             allow_all_users: Some(settings.allow_all_users),
             allowed_bot_ids: Some(settings.allowed_bot_ids),
         };

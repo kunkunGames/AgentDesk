@@ -107,9 +107,16 @@ def package(root: Path, binary: Path, target: str, output: Path, dashboard: bool
         binary_name = "agentdesk.exe" if system == "windows" else "agentdesk"
         copy_file(binary, staging / binary_name, binary.parent)
         (staging / binary_name).chmod(0o755)
-        assets = git(root, "ls-files", "-z", "--", *RUNTIME_ASSETS).split("\0")
-        for relative in filter(None, assets):
+        executable_members = {f"{name}/{binary_name}"}
+        assets = git(root, "ls-files", "--stage", "-z", "--", *RUNTIME_ASSETS).split("\0")
+        for entry in filter(None, assets):
+            metadata, relative = entry.split("\t", 1)
+            mode, _, index_stage = metadata.split()
+            if mode not in {"100644", "100755"} or index_stage != "0":
+                raise ValueError(f"release asset must be a resolved tracked regular file: {relative}")
             copy_file(root / relative, staging / relative, root)
+            if mode == "100755" or relative.endswith(".sh"):
+                executable_members.add(f"{name}/{relative}")
         if dashboard:
             dashboard_root = root / "dashboard/dist"
             for source in sorted(dashboard_root.rglob("*")):
@@ -137,8 +144,14 @@ def package(root: Path, binary: Path, target: str, output: Path, dashboard: bool
                     if path.is_file():
                         bundle.write(path, path.relative_to(scratch).as_posix())
         else:
+            def native_member(member: tarfile.TarInfo) -> tarfile.TarInfo:
+                # Windows chmod/stat cannot represent POSIX execute bits. Encode
+                # tracked execute bits explicitly, independent of host OS.
+                member.mode = 0o755 if member.isdir() or member.name in executable_members else 0o644
+                return member
+
             with tarfile.open(archive, "w:gz", compresslevel=9) as bundle:
-                bundle.add(staging, arcname=name)
+                bundle.add(staging, arcname=name, filter=native_member)
         digest = sha256(archive)
         os.replace(archive, output / filename)
         (output / f"{filename}.sha256").write_text(f"{digest}  {filename}\n", encoding="utf-8", newline="\n")

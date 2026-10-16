@@ -27,6 +27,7 @@ from typing import Any
 
 DEFAULT_MANIFEST = Path("migrations/postgres/immutable-checksums.json")
 DEFAULT_ALLOWLIST = Path("migrations/postgres/checksum-repair-allowlist.json")
+CATALOGS = ("postgres", "postgres_campaign_v5", "postgres_shared")
 MIGRATION_NAME_RE = re.compile(r"^(?P<version>[0-9]{4})_.+\.sql$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -72,30 +73,28 @@ def validate_migration_relpath(path: str) -> str | None:
     rel = Path(path)
     if rel.is_absolute() or ".." in rel.parts:
         return f"path must be repository-relative and stay inside the repo: {path}"
-    if rel.parts[:2] != ("migrations", "postgres"):
-        return f"path must live under migrations/postgres: {path}"
+    if len(rel.parts) != 3 or rel.parts[0] != "migrations" or rel.parts[1] not in CATALOGS:
+        return f"path must live directly under a PostgreSQL catalog: {path}"
     if migration_version_from_path(path) is None:
         return f"path is not a numbered postgres migration: {path}"
     return None
 
 
 def find_migrations(root: Path) -> dict[str, Migration]:
-    migrations_dir = root / "migrations" / "postgres"
     migrations: dict[str, Migration] = {}
-    if not migrations_dir.is_dir():
-        raise ValueError(f"missing migrations directory: {migrations_dir}")
-    for path in sorted(migrations_dir.iterdir()):
-        if not path.is_file():
+    for catalog in CATALOGS:
+        migrations_dir = root / "migrations" / catalog
+        if not migrations_dir.is_dir():
+            if catalog == "postgres":
+                raise ValueError(f"missing migrations directory: {migrations_dir}")
             continue
-        match = MIGRATION_NAME_RE.match(path.name)
-        if not match:
-            continue
-        rel_path = path.relative_to(root).as_posix()
-        migrations[rel_path] = Migration(
-            path=rel_path,
-            version=int(match.group("version")),
-            sha256=sha256_file(path),
-        )
+        for path in sorted(migrations_dir.iterdir()):
+            if not path.is_file():
+                continue
+            match = MIGRATION_NAME_RE.match(path.name)
+            if match:
+                rel_path = path.relative_to(root).as_posix()
+                migrations[rel_path] = Migration(rel_path, int(match.group("version")), sha256_file(path))
     return migrations
 
 
@@ -286,7 +285,7 @@ def load_base_manifest_from_git(
         base_tree = subprocess.run(
             [
                 "git", "-C", str(root), "ls-tree", "-r", "--name-only", "-z",
-                merge_base.stdout.strip(), "--", "migrations/postgres",
+                merge_base.stdout.strip(), "--", *["migrations/" + name for name in CATALOGS],
             ],
             check=False,
             capture_output=True,

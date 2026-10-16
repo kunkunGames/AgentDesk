@@ -133,7 +133,7 @@ async fn reset_body(
         if reset_provider_state {
             match managed_session_reset_behavior(provider) {
                 ManagedSessionResetBehavior::ResetManagedProcess => {
-                    reset_managed_process_session(name);
+                    reset_managed_process_session(&shared, name);
                 }
                 ManagedSessionResetBehavior::Noop => {}
             }

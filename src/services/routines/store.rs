@@ -6,6 +6,9 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod campaign;
+pub use campaign::AdoptCampaignOperation;
+
 use crate::api_caller_observability::{
     IdentityConsumptionFields, RequestPrincipal, emit_identity_consumption,
     identity_consumption_fields,
@@ -13,7 +16,7 @@ use crate::api_caller_observability::{
 use crate::services::automation_candidate_contract::{
     PIPELINE_STAGE_ID, has_complete_loop_contract,
 };
-use crate::services::scheduling::{next_due_after, next_due_after_anchor, validate_schedule};
+use crate::services::scheduling::{next_due_after, next_due_after_anchor};
 use crate::utils::api::clamp_api_limit;
 
 pub const ROUTINE_RUN_LEASE_SECS: u64 = 30 * 60;
@@ -825,6 +828,7 @@ impl RoutineStore {
                    created_at, updated_at
             FROM routines
             WHERE status = 'paused'
+              AND campaign_id IS NULL
               AND updated_at < $1
             ORDER BY updated_at ASC
             LIMIT 500
@@ -854,6 +858,7 @@ impl RoutineStore {
                    created_at, updated_at
             FROM routines
             WHERE status = 'paused'
+              AND campaign_id IS NULL
               AND pause_reason = $1
               AND updated_at < $2
               -- Skip schedule-less rows with no next_due_at: they can never be
@@ -902,6 +907,7 @@ impl RoutineStore {
             FROM routines
             WHERE id = $1
               AND status = 'paused'
+              AND campaign_id IS NULL
               AND pause_reason = $2
               AND updated_at < $3
             FOR UPDATE
@@ -937,6 +943,7 @@ impl RoutineStore {
                 updated_at = NOW()
             WHERE id = $1
               AND status = 'paused'
+              AND campaign_id IS NULL
               AND pause_reason = $2
               AND updated_at < $3
             "#,
@@ -3425,64 +3432,12 @@ impl RoutineStore {
     }
 }
 
-fn validate_execution_strategy(strategy: &str) -> Result<()> {
-    match strategy {
-        "fresh" | "persistent" => Ok(()),
-        other => Err(anyhow!(
-            "unsupported routine execution_strategy '{other}'; expected fresh or persistent"
-        )),
-    }
-}
-
-pub fn validate_routine_schedule(schedule: &str) -> Result<()> {
-    validate_schedule(schedule)
-}
-
-fn normalize_schedule(schedule: Option<String>) -> Result<Option<String>> {
-    schedule
-        .map(|schedule| {
-            let schedule = schedule.trim().to_string();
-            validate_routine_schedule(&schedule)?;
-            Ok(schedule)
-        })
-        .transpose()
-}
-
-fn normalize_optional_text(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn normalize_new_routine_status(status: Option<&str>) -> Result<&'static str> {
-    match status.map(str::trim).filter(|value| !value.is_empty()) {
-        None | Some("enabled") => Ok("enabled"),
-        Some("paused") => Ok("paused"),
-        Some(other) => Err(anyhow!(
-            "routine initial status must be enabled or paused, got {other}"
-        )),
-    }
-}
-
-fn validate_timeout_secs(timeout_secs: Option<i32>) -> Result<()> {
-    if let Some(value) = timeout_secs
-        && value <= 0
-    {
-        return Err(anyhow!("routine timeout_secs must be greater than zero"));
-    }
-    Ok(())
-}
-
-fn validate_max_retries(max_retries: Option<i32>) -> Result<()> {
-    if let Some(value) = max_retries
-        && value < 0
-    {
-        return Err(anyhow!(
-            "routine max_retries must be greater than or equal to zero"
-        ));
-    }
-    Ok(())
-}
+mod validation;
+pub use validation::validate_routine_schedule;
+use validation::{
+    normalize_new_routine_status, normalize_optional_text, normalize_schedule,
+    validate_execution_strategy, validate_max_retries, validate_timeout_secs,
+};
 
 fn preserve_fresh_context_evidence(
     mut closing_result: Option<Value>,

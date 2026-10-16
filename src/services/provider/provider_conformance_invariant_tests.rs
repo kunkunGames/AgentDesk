@@ -32,6 +32,20 @@ fn provider_exec_registry_conformance_invariant() {
             "{} execution adapter is wired to another provider",
             entry.id
         );
+        let intake_provider = match provider.legacy_streaming_dispatch_kind() {
+            super::LegacyDispatchKind::Claude => "claude",
+            super::LegacyDispatchKind::Codex => "codex",
+            super::LegacyDispatchKind::Gemini => "gemini",
+            super::LegacyDispatchKind::OpenCode => "opencode",
+            super::LegacyDispatchKind::Qwen => "qwen",
+            super::LegacyDispatchKind::StreamJsonCli(dialect) => dialect.provider_id(),
+            super::LegacyDispatchKind::Unsupported(_) => panic!("registered provider rejected"),
+        };
+        assert_eq!(
+            intake_provider, entry.id,
+            "{} intake/headless dispatch must agree with the canonical execution adapter",
+            entry.id
+        );
         assert_eq!(
             execution_adapter.supported_capabilities(),
             entry.capabilities,

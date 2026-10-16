@@ -830,160 +830,15 @@ pub(super) fn reset_stale_local_relay_offset_if_output_regressed(
     true
 }
 
-fn source_authority_stem_for_orphan_file(filename: &str) -> &str {
-    [
-        ".codex-tui-rollout.json",
-        ".claude-tui-settings.json",
-        ".claude-tui.sh",
-    ]
-    .into_iter()
-    .find_map(|suffix| filename.strip_suffix(suffix))
-    .or_else(|| filename.rsplit_once('.').map(|(stem, _)| stem))
-    .unwrap_or(filename)
-}
+#[path = "tmux_session_files/orphan_sweep.rs"]
+mod orphan_sweep;
 
-/// Remove jsonl/input/prompt/owner/etc files in the persistent sessions
-/// directory that no longer belong to a running tmux session. Conservative:
-/// require an owner marker (or the jsonl) to be older than
-/// `ORPHAN_MIN_AGE_SECS` and require the session to be absent from tmux
-/// before deleting. Legacy `/tmp/` files are *never* swept at startup —
-/// pre-migration wrappers may still be writing into them.
-pub(super) async fn sweep_orphan_session_files() {
-    // Global file GC waits for the last protection to release and a later sweep.
-    if boot_skip(BootTarget::Unknown) {
-        return;
-    }
-    let Some(dir) = crate::services::tmux_common::persistent_sessions_dir() else {
-        return;
-    };
-    if !dir.exists() {
-        return;
-    }
-
-    // List live tmux sessions.
-    let live: std::collections::HashSet<String> = match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::task::spawn_blocking(crate::services::platform::tmux::list_session_names),
-    )
-    .await
-    {
-        Ok(Ok(Ok(names))) => names.into_iter().collect(),
-        _ => return, // tmux unavailable — skip sweep rather than risk false positives
-    };
-    sweep_orphan_session_files_in(&dir, &live);
-}
-
-/// Sweeps `dir` given the live tmux session names.
-fn sweep_orphan_session_files_in(dir: &std::path::Path, live: &std::collections::HashSet<String>) {
-    if boot_skip(BootTarget::Unknown) {
-        return;
-    }
-    #[cfg(test)]
-    input_fence_tests::scan_started();
-    const ORPHAN_MIN_AGE_SECS: u64 = 10 * 60; // 10 minutes
-
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    // Group files under the sessions dir by the `agentdesk-<hash>-<host>-<session>`
-    // prefix. Any prefix whose session name is not in `live` *and* whose
-    // oldest file mtime is older than ORPHAN_MIN_AGE_SECS is swept.
-    let mut groups: std::collections::HashMap<String, (String, std::time::SystemTime)> =
-        std::collections::HashMap::new();
-    for entry in entries.flatten() {
-        let Ok(name) = entry.file_name().into_string() else {
-            continue;
-        };
-        if !name.starts_with("agentdesk-") {
-            continue;
-        }
-        // Strip the complete extension, including the multi-dot source marker.
-        let stem = source_authority_stem_for_orphan_file(&name).to_string();
-        // Session name is the last token after the fourth dash — but our
-        // prefix format is `agentdesk-<12hex>-<host>-<session>` and host
-        // may contain dashes. The simplest robust approach: split_once on
-        // `agentdesk-<hash>-<host>-` is hard to reverse, so instead we use
-        // the owner file's prefix as the grouping key directly — any file
-        // whose stem matches some live session (ends with `-<live>`) is kept.
-        let mtime = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or_else(|_| std::time::SystemTime::now());
-        groups
-            .entry(stem.clone())
-            .and_modify(|slot| {
-                if mtime < slot.1 {
-                    *slot = (stem.clone(), mtime);
-                }
-            })
-            .or_insert((stem, mtime));
-    }
-
-    let now = std::time::SystemTime::now();
-    let mut swept = 0usize;
-    for (stem, (_, oldest_mtime)) in groups {
-        // Is this stem associated with any live tmux session? We check
-        // whether ANY live session name appears as a suffix of the stem.
-        // Since session names are distinctive (provider:channel shape), a
-        // conservative suffix match keeps ambiguity low; we also require
-        // that the match is preceded by a dash so we don't match e.g.
-        // "claude:foo" against a stem ending with "-thisisnotclaude:foo".
-        let is_live = live.iter().any(|live_name| {
-            let needle = format!("-{}", live_name);
-            stem.ends_with(&needle) || stem == *live_name
-        });
-        if is_live {
-            continue;
-        }
-        // Conservative: require age threshold.
-        let age = now
-            .duration_since(oldest_mtime)
-            .unwrap_or(std::time::Duration::ZERO);
-        if age.as_secs() < ORPHAN_MIN_AGE_SECS {
-            continue;
-        }
-        // A protected channel's files, or ones no binding places while any channel is
-        // protected, stay for that channel's move or handback.
-        let ext = crate::services::tmux_common::TMUX_CHANNEL_TEMP_EXT;
-        let channel = std::fs::read_to_string(dir.join(format!("{stem}.{ext}")));
-        let channel = channel.ok().and_then(|id| id.trim().parse().ok());
-        let target = channel
-            .filter(|id| *id != 0)
-            .map_or(BootTarget::Unknown, BootTarget::AnyProvider);
-        if boot_skip(target) {
-            continue;
-        }
-        // Delete every file under this stem.
-        let Ok(iter) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        let swept_group =
-            crate::services::tmux_common::with_session_temp_source_authority(&stem, || {
-                if boot_skip(BootTarget::Unknown) {
-                    return false;
-                }
-                for entry in iter.flatten() {
-                    if let Ok(fname) = entry.file_name().into_string() {
-                        if fname.starts_with(&format!("{}.", stem)) {
-                            crate::services::tmux_common::invalidate_session_temp_source(&stem);
-                            let _ = std::fs::remove_file(entry.path());
-                        }
-                    }
-                }
-                true
-            });
-        swept += usize::from(swept_group);
-    }
-    if swept > 0 {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!(
-            "  [{ts}] 🧹 Swept {} orphan session file group(s) from {}",
-            swept,
-            dir.display()
-        );
-    }
-}
+pub(super) use orphan_sweep::sweep_orphan_session_files;
+#[cfg(test)]
+use orphan_sweep::{
+    capture_orphan_group, remove_judged_orphan_group_under_source_authority,
+    source_authority_stem_for_orphan_file, sweep_orphan_session_files_in,
+};
 
 #[cfg(test)]
 #[path = "tmux_session_files/input_fence_tests.rs"]
@@ -1223,6 +1078,113 @@ mod tests {
         let nonce = stamp_spawn_markers(&session, Some(&p)).unwrap();
         assert_eq!(nonce, p.context.execution_nonce);
         assert_eq!(read_spawn_nonce(&session).as_deref(), Some(nonce.as_str()));
+    }
+
+    #[test]
+    fn orphan_sweep_rechecks_durable_native_intent_and_busy_registry_after_judgment() {
+        use crate::services::agent_protocol::RuntimeHandoffKind;
+        use crate::services::tmux_common as tc;
+        let (_root, _env) = isolated_runtime_root();
+        let session = unique_session("orphan-native-intent");
+        tc::write_tmux_runtime_kind_marker(&session, RuntimeHandoffKind::LegacyTmuxWrapper)
+            .unwrap();
+        let output = std::path::PathBuf::from(tc::session_temp_path(&session, "jsonl"));
+        std::fs::write(&output, "owned fixture bytes").unwrap();
+        let dir = output.parent().unwrap();
+        let stem = tc::session_temp_prefix(&session);
+        let judged = capture_orphan_group(dir, &stem).unwrap();
+        tc::with_tmux_source_authority(&session, |authority| {
+            tc::persist_process_backend_hosting_intent(authority)
+        })
+        .unwrap();
+        tc::with_session_temp_source_authority(&stem, || {
+            assert!(!remove_judged_orphan_group_under_source_authority(
+                dir,
+                &stem,
+                &judged,
+                std::time::Duration::ZERO
+            ));
+            // An equal fresh file snapshot is still not native-death evidence.
+            let current = capture_orphan_group(dir, &stem).unwrap();
+            assert!(!remove_judged_orphan_group_under_source_authority(
+                dir,
+                &stem,
+                &current,
+                std::time::Duration::ZERO
+            ));
+        });
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "owned fixture bytes"
+        );
+        let busy_session = unique_session("orphan-registry-unknown");
+        let busy_output = std::path::PathBuf::from(tc::session_temp_path(&busy_session, "jsonl"));
+        std::fs::write(&busy_output, "unknown fixture bytes").unwrap();
+        let busy_stem = tc::session_temp_prefix(&busy_session);
+        let busy_judged = capture_orphan_group(dir, &busy_stem).unwrap();
+        tc::with_session_temp_source_authority(&busy_stem, || {
+            crate::services::session_backend::with_process_registry_busy_for_test(|| {
+                assert!(!remove_judged_orphan_group_under_source_authority(
+                    dir,
+                    &busy_stem,
+                    &busy_judged,
+                    std::time::Duration::ZERO
+                ));
+            });
+        });
+        assert_eq!(
+            std::fs::read_to_string(&busy_output).unwrap(),
+            "unknown fixture bytes"
+        );
+    }
+
+    #[test]
+    fn orphan_sweep_preserves_replaced_generation_or_new_files_after_snapshot() {
+        use crate::services::tmux_common as tc;
+        let (_root, _env) = isolated_runtime_root();
+        for replace_generation in [true, false] {
+            let session = unique_session("orphan-source-aba");
+            let generation =
+                std::path::PathBuf::from(tc::session_temp_path(&session, "generation"));
+            std::fs::write(&generation, "1111").unwrap();
+            let dir = generation.parent().unwrap();
+            let stem = tc::session_temp_prefix(&session);
+            let judged = capture_orphan_group(dir, &stem).unwrap();
+            if replace_generation {
+                let prior_mtime = std::fs::metadata(&generation).unwrap().modified().unwrap();
+                let mut replacement = tempfile::NamedTempFile::new_in(dir).unwrap();
+                replacement.write_all(b"2222").unwrap();
+                replacement
+                    .as_file()
+                    .set_times(std::fs::FileTimes::new().set_modified(prior_mtime))
+                    .unwrap();
+                replacement.persist(&generation).unwrap();
+            } else {
+                std::fs::write(
+                    tc::session_temp_path(&session, SPAWN_NONCE_SUFFIX),
+                    "new owned generation",
+                )
+                .unwrap();
+            }
+            tc::with_session_temp_source_authority(&stem, || {
+                assert!(!remove_judged_orphan_group_under_source_authority(
+                    dir,
+                    &stem,
+                    &judged,
+                    std::time::Duration::ZERO
+                ));
+                assert!(generation.exists());
+                let current = capture_orphan_group(dir, &stem).unwrap();
+                // Control: an unchanged entirely owned fixture can be removed.
+                assert!(remove_judged_orphan_group_under_source_authority(
+                    dir,
+                    &stem,
+                    &current,
+                    std::time::Duration::ZERO
+                ));
+            });
+            assert!(!generation.exists());
+        }
     }
 
     #[test]

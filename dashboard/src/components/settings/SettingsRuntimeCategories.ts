@@ -4,7 +4,7 @@ export interface ConfigField {
   labelEn: string;
   descriptionKo: string;
   descriptionEn: string;
-  inputKind?: "number" | "toggle";
+  inputKind?: "number" | "toggle" | "text";
   unit?: string;
   min?: number;
   max?: number;
@@ -47,6 +47,14 @@ export const CATEGORIES: Array<{
     descriptionEn: "Controls retry ceilings and recovery behavior for auto-queue entries.",
     fields: [
       {
+        key: "internalTasksEnabled",
+        labelKo: "내부 칸반 작업 허용",
+        labelEn: "Allow internal Kanban tasks",
+        descriptionKo: "켜면 GitHub 이슈 없이도 칸반 작업을 오토 큐로 실행합니다. 기본값은 꺼짐입니다.",
+        descriptionEn: "Allows Auto Queue to run Kanban tasks without a GitHub issue. Off by default.",
+        inputKind: "toggle",
+      },
+      {
         key: "maxEntryRetries",
         labelKo: "Entry 최대 재시도 횟수",
         labelEn: "Entry max retries",
@@ -75,6 +83,28 @@ export const CATEGORIES: Array<{
         min: 80,
         max: 100,
         step: 1,
+      },
+    ],
+  },
+  {
+    id: "campaignDag",
+    titleKo: "캠페인 DAG",
+    titleEn: "Campaign DAG",
+    descriptionKo: "최초 계획과 템플릿 승격 검토 담당 및 검증된 DAG 축적 기준을 설정합니다.",
+    descriptionEn: "Configures the bootstrap planner, template reviewer and verified DAG accumulation threshold.",
+    fields: [
+      {
+        key: "campaignSuperiorAgentId", inputKind: "text",
+        labelKo: "상위 에이전트 ID", labelEn: "Superior agent ID",
+        descriptionKo: "최초 DAG와 템플릿 승격을 검토하는 등록 에이전트입니다. 기본값은 codex입니다. 후속 계획과 업무는 기존 담당자가 처리합니다.",
+        descriptionEn: "Existing agent assigned to the first DAG and template promotion review. Defaults to codex; later plans and work keep their enrolled agents.",
+      },
+      {
+        key: "campaignDagTemplateMinSamples",
+        labelKo: "템플릿 검토 전 DAG 축적 수", labelEn: "Verified DAGs per template review",
+        descriptionKo: "실행과 독립 검증이 완료된 회차를 한 건씩 셉니다. 기본 10건이며 재시도·수정 버전은 중복 집계하지 않습니다.",
+        descriptionEn: "Counts each independently verified completed occurrence once. Defaults to 10; retries and revisions do not add samples.",
+        min: 1, max: 100, step: 1,
       },
     ],
   },

@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 use super::AppState;
 use crate::db::campaigns::{self, Campaign, CampaignError, CampaignInput, CampaignStatus};
 use crate::error::{AppError, AppResult, ErrorCode};
+
+mod settled_effect_auth;
 
 /// A ledger write carries the whole DAG, so campaign routes need far more than the
 /// axum default body limit; below it every checkpoint write is refused.
@@ -47,10 +49,232 @@ pub struct ReplaceCampaign {
     pub campaign: CampaignInput,
 }
 
+#[derive(Deserialize)]
+pub struct EnrollGraph {
+    pub expected_revision: i64,
+    pub goal: campaigns::graph::Goal,
+    #[serde(default = "manager_default")]
+    pub manager_enabled: bool,
+}
+fn manager_default() -> bool {
+    true
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPolicy {
+    pub expected_revision: i64,
+    pub enabled: bool,
+}
+pub async fn configure_manager(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<WorkflowPolicy>,
+) -> AppResult<Json<Value>> {
+    let revision = campaigns::graph::workflow::store::configure(
+        pool(&state)?,
+        &id,
+        body.expected_revision,
+        body.enabled,
+    )
+    .await
+    .map_err(|error| AppError::conflict(error.to_string()))?;
+    Ok(Json(
+        json!({"revision":revision,"manager_enabled":body.enabled}),
+    ))
+}
+#[derive(Deserialize)]
+pub struct ActivateGraph {
+    pub expected_revision: i64,
+    pub version: i64,
+}
+pub async fn graph_schema() -> AppResult<Json<Value>> {
+    campaigns::graph::schema::document()
+        .map(Json)
+        .map_err(|error| AppError::internal(error.to_string()))
+}
+pub async fn extend_budget(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<campaigns::graph::revision::budget::BudgetRevision>,
+) -> AppResult<Json<Value>> {
+    let revision = campaigns::graph::revision::budget::extend(pool(&state)?, &id, &body)
+        .await
+        .map_err(|e| AppError::conflict(e.to_string()))?;
+    Ok(Json(json!({"revision":revision,"contracts_preserved":true,
+        "independent_validation_required":true})))
+}
+pub async fn revise_goal(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<campaigns::graph::revision::Revision>,
+) -> AppResult<Json<Value>> {
+    let revision = campaigns::graph::revision::revise(pool(&state)?, &id, &body)
+        .await
+        .map_err(|e| AppError::conflict(e.to_string()))?;
+    Ok(Json(
+        json!({"revision":revision,"independent_validation_required":true}),
+    ))
+}
+pub async fn reconcile_graph(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<campaigns::graph::recovery::Reconcile>,
+) -> AppResult<Json<Value>> {
+    let version = campaigns::graph::recovery::reconcile(pool(&state)?, &id, &body)
+        .await
+        .map_err(|e| AppError::conflict(e.to_string()))?;
+    Ok(Json(
+        json!({"candidate_version":version,"independent_validation_required":true}),
+    ))
+}
+pub async fn request_replan(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<campaigns::graph::recovery::replan::Replan>,
+) -> AppResult<Json<Value>> {
+    let repair = if body.settled_effect.is_some() {
+        settled_effect_auth::require(&state.config, &headers)?;
+        campaigns::graph::recovery::replan::request_as_server_admin(pool(&state)?, &id, &body).await
+    } else {
+        campaigns::graph::recovery::replan::request(pool(&state)?, &id, &body).await
+    }
+    .map_err(|e| AppError::conflict(e.to_string()))?;
+    serde_json::to_value(repair)
+        .map(Json)
+        .map_err(|e| AppError::internal(e.to_string()))
+}
+pub async fn recover_finish(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<campaigns::graph::recovery::finish::Recovery>,
+) -> AppResult<Json<Value>> {
+    settled_effect_auth::require_finish_recovery(&state.config, &headers)?;
+    let recovered =
+        campaigns::graph::recovery::finish::request_as_server_admin(pool(&state)?, &id, &body)
+            .await
+            .map_err(|e| AppError::conflict(e.to_string()))?;
+    serde_json::to_value(recovered)
+        .map(Json)
+        .map_err(|e| AppError::internal(e.to_string()))
+}
+pub async fn activate_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<campaigns::graph::schedule::activation::Activation>,
+) -> Result<Json<Value>, AppError> {
+    let revision = campaigns::graph::schedule::activation::activate(pool(&state)?, &id, &body)
+        .await
+        .map_err(|e| AppError::bad_request(e.to_string()))?;
+    Ok(Json(json!({"revision":revision,"scheduled":true})))
+}
+
+pub async fn execution(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let pg = pool(&state)?;
+    campaigns::get(pg, &id).await.map_err(error)?;
+    campaigns::graph::store::status(pg, &id)
+        .await
+        .map(Json)
+        .map_err(|e| AppError::conflict(e.to_string()))
+}
+/// A bounded observation of explicitly selected native ownership. This GET
+/// does not grant mutation authority, authenticate an executing provider or
+/// certify that historical operating-system processes have exited.
+pub async fn effect_ownership(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<campaigns::graph::effect_ownership::Query>,
+) -> AppResult<Response> {
+    query
+        .validate(&id)
+        .map_err(|_| AppError::bad_request("invalid bounded native ownership identities"))?;
+    campaigns::graph::effect_ownership::inspect(pool(&state)?, &id, &query)
+        .await
+        .map(|projection| {
+            (
+                [(axum::http::header::CACHE_CONTROL, "no-store")],
+                Json(projection),
+            )
+                .into_response()
+        })
+        .map_err(|_| {
+            AppError::conflict(
+                "native ownership snapshot unavailable; external effects remain blocked",
+            )
+        })
+}
+pub async fn enroll_execution(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<EnrollGraph>,
+) -> AppResult<Json<Value>> {
+    campaigns::graph::store::enroll_with_manager(
+        pool(&state)?,
+        &id,
+        body.expected_revision,
+        &body.goal,
+        body.manager_enabled,
+    )
+    .await
+    .map_err(|e| AppError::conflict(e.to_string()))?;
+    Ok(Json(
+        json!({"enrolled":true,"manager_enabled":body.manager_enabled}),
+    ))
+}
+pub async fn activate_graph(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ActivateGraph>,
+) -> AppResult<Json<Value>> {
+    campaigns::graph::store::activate(pool(&state)?, &id, body.version, body.expected_revision)
+        .await
+        .map_err(|e| AppError::conflict(e.to_string()))?;
+    Ok(Json(json!({"active_version":body.version})))
+}
+
 #[derive(Default, Deserialize)]
 pub struct ListQuery {
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+}
+
+fn operations_store(state: &AppState) -> AppResult<crate::services::routines::RoutineStore> {
+    Ok(
+        crate::services::routines::RoutineStore::new_with_timezone_and_checkpoint_limit(
+            std::sync::Arc::new(pool(state)?.clone()),
+            state.config.routines.default_timezone.clone(),
+            state.config.routines.max_checkpoint_bytes,
+        ),
+    )
+}
+
+pub async fn operations(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    campaigns::get(pool(&state)?, &id).await.map_err(error)?;
+    operations_store(&state)?
+        .campaign_operations(&id)
+        .await
+        .map(Json)
+        .map_err(|e| AppError::internal(format!("Campaign operations: {e}")))
+}
+
+pub async fn adopt_operation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<crate::services::routines::store::AdoptCampaignOperation>,
+) -> AppResult<Json<Value>> {
+    super::routines::ensure_routine_runtime_runnable(&state.config.routines)?;
+    operations_store(&state)?
+        .adopt_campaign_operation(&id, body)
+        .await
+        .map(Json)
+        .map_err(|e| AppError::conflict(format!("Campaign adoption held: {e}")))
 }
 
 fn pool(state: &AppState) -> AppResult<&sqlx::PgPool> {

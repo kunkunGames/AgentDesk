@@ -1,6 +1,9 @@
 //! Local Qwen process/tmux lifecycle and fresh-session recreation.
 use super::*;
 
+#[cfg(all(test, unix))]
+mod tests;
+
 #[cfg(unix)]
 pub(super) fn execute_streaming_local_tmux(
     prompt: &str,
@@ -16,6 +19,7 @@ pub(super) fn execute_streaming_local_tmux(
     report_provider: Option<ProviderKind>,
     force_fresh_provider_session: bool,
 ) -> Result<(), String> {
+    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)?;
     let auth_overlay = crate::services::discord::org_schema::overlay_from_tmux_session(
         ProviderKind::Qwen,
         tmux_session_name,
@@ -146,13 +150,17 @@ pub(super) fn execute_streaming_local_tmux(
             exec_path.replace('\'', "'\\''")
         ));
     }
-    if let Ok(root_dir) = std::env::var("AGENTDESK_ROOT_DIR") {
-        let trimmed = root_dir.trim();
-        if !trimmed.is_empty() {
-            env_lines.push_str(&format!(
-                "export AGENTDESK_ROOT_DIR='{}'\n",
-                trimmed.replace('\'', "'\\''")
-            ));
+    // tmux may predate the service profile. Carry the selected native settings
+    // into its wrapper so per-turn tool narrowing preserves execution limits.
+    for key in ["AGENTDESK_ROOT_DIR", QWEN_CODE_SYSTEM_SETTINGS_ENV] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                env_lines.push_str(&format!(
+                    "export {key}='{}'\n",
+                    trimmed.replace('\'', "'\\''")
+                ));
+            }
         }
     }
     if let Some(channel_id) = report_channel_id {
@@ -217,6 +225,12 @@ pub(super) fn execute_streaming_local_tmux(
         tmux_session_name,
         prompt,
     );
+    if let Some(ref token) = cancel_token {
+        token.bind_interrupt_session(ProviderKind::Qwen, tmux_session_name);
+        if cancel_requested(Some(token)) {
+            return Err(QWEN_CANCELLED_MESSAGE.to_string());
+        }
+    }
     let tmux_result = crate::services::platform::tmux::create_session(
         tmux_session_name,
         Some(working_dir),
@@ -238,6 +252,14 @@ pub(super) fn execute_streaming_local_tmux(
         return Err(format!("tmux error: {}", stderr));
     }
 
+    // Capture the owned wrapper before any later setup can fail or block.
+    if let Some(ref token) = cancel_token {
+        if let Err(error) = bind_qwen_wrapper_pid(token, tmux_session_name) {
+            token.publish_cancel_if_source_absent("qwen_wrapper_identity_unavailable");
+            token.cancel_with_tmux_cleanup();
+            return Err(error);
+        }
+    }
     crate::services::tmux_common::write_tmux_session_auth_profile(
         tmux_session_name,
         &auth_overlay.profile_id,
@@ -246,10 +268,6 @@ pub(super) fn execute_streaming_local_tmux(
 
     // #3087: stamp the provider spawn markers before reading the session output.
     super::stamp_qwen_spawn_markers(tmux_session_name);
-
-    if let Some(ref token) = cancel_token {
-        token.bind_unmanaged_session_name(tmux_session_name);
-    }
 
     let read_result = match qwen_read_output_file_until_result(
         &output_path,
@@ -291,14 +309,22 @@ pub(super) fn execute_streaming_local_tmux(
                 tmux_session_name,
                 prompt,
             );
-            let _ = sender.send(StreamMessage::Done {
-                result: "⚠ 세션이 종료되었습니다. 새 메시지를 보내면 새 세션이 시작됩니다."
-                    .to_string(),
-                session_id: None,
-            });
+            let _ = sender.send(StreamMessage::session_ended("Qwen"));
         }
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(super) fn bind_qwen_wrapper_pid(token: &CancelToken, session: &str) -> Result<(), String> {
+    let pid = crate::services::platform::tmux::pane_pid(session)
+        .ok_or_else(|| format!("cannot capture Qwen wrapper PID for {session}"))?;
+    register_child_pid(Some(token), pid);
+    if cancel_requested(Some(token)) {
+        token.cancel_with_tmux_cleanup();
+        return Err(QWEN_CANCELLED_MESSAGE.to_string());
+    }
     Ok(())
 }
 pub(super) fn execute_streaming_local_process(
@@ -313,20 +339,8 @@ pub(super) fn execute_streaming_local_process(
     allowed_core_tools: Option<&[String]>,
     force_fresh_provider_session: bool,
 ) -> Result<(), String> {
-    use crate::services::session_backend::{ProcessBackend, SessionBackend, SessionConfig};
-
-    let overlay = crate::services::discord::org_schema::overlay_from_tmux_session(
-        ProviderKind::Qwen,
-        session_name,
-    )?;
-    let profile_matches =
-        crate::services::session_backend::auth_profiles::prepare(session_name, &overlay.profile_id);
-    let force_fresh_provider_session = force_fresh_provider_session || !profile_matches;
-
-    let resume_session_id = if force_fresh_provider_session {
-        None
-    } else {
-        validated_resume_session_id(session_id)?
+    use crate::services::session_backend::{
+        ProcessBackend, SessionBackend, SessionConfig, with_process_session_launch_authority,
     };
     let output_path = format!(
         "{}/agentdesk-{}.jsonl",
@@ -339,114 +353,109 @@ pub(super) fn execute_streaming_local_process(
         session_name
     );
 
-    if force_fresh_provider_session {
-        // A fresh routine must not send its prompt to a warm pipe-mode wrapper.
-        // Drop and terminate any registered process before creating the new one.
-        let _ = terminate_process_session(session_name);
-    } else if process_session_is_alive(session_name) {
-        let start_offset = std::fs::metadata(&output_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let encoded = format!(
-            "{}{}",
-            TMUX_PROMPT_B64_PREFIX,
-            BASE64_STANDARD.encode(prompt.as_bytes())
-        );
-        send_process_session_input(session_name, &encoded, cancel_token.as_deref())?;
-        let read_result = qwen_read_output_file_until_result(
-            &output_path,
-            start_offset,
-            sender.clone(),
-            cancel_token,
-            process_session_probe(session_name),
-            None,
-        )?;
+    let start_offset =
+        with_process_session_launch_authority(session_name, || -> Result<u64, String> {
+            let overlay = crate::services::discord::org_schema::overlay_from_tmux_session(
+                ProviderKind::Qwen,
+                session_name,
+            )?;
+            let profile_matches = crate::services::session_backend::auth_profiles::prepare(
+                session_name,
+                &overlay.profile_id,
+            );
+            let force_fresh_provider_session = force_fresh_provider_session || !profile_matches;
+            let resume_session_id = if force_fresh_provider_session {
+                None
+            } else {
+                validated_resume_session_id(session_id)?
+            };
 
-        match read_result {
-            ReadOutputResult::Completed { offset } | ReadOutputResult::Cancelled { offset } => {
-                let _ = sender.send(StreamMessage::ProcessReady {
-                    output_path: output_path.to_string(),
-                    session_name: session_name.to_string(),
-                    last_offset: offset,
-                });
-            }
-            ReadOutputResult::SessionDied { .. } => {
-                let _ = sender.send(StreamMessage::Done {
-                    result: "⚠ 세션이 종료되었습니다.".to_string(),
-                    session_id: None,
-                });
-                remove_process_session(session_name);
-            }
-        }
-        return Ok(());
-    }
-
-    let _ = std::fs::remove_file(&output_path);
-    let _ = std::fs::remove_file(&prompt_path);
-    std::fs::write(&prompt_path, prompt)
-        .map_err(|e| format!("Failed to write prompt file: {}", e))?;
-
-    let qwen_bin = qwen_resolution
-        .resolved_path
-        .as_deref()
-        .ok_or_else(|| "Qwen CLI not found".to_string())?;
-    let exe =
-        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
-
-    let config = SessionConfig {
-        session_name: session_name.to_string(),
-        working_dir: working_dir.to_string(),
-        agentdesk_exe: exe.display().to_string(),
-        output_path: output_path.clone(),
-        prompt_path: prompt_path.clone(),
-        wrapper_subcommand: "qwen-tmux-wrapper".to_string(),
-        wrapper_args: {
-            let mut args = vec!["--qwen-bin".to_string(), qwen_bin.to_string()];
-            if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
-                args.push("--qwen-model".to_string());
-                args.push(model.to_string());
-            }
             if force_fresh_provider_session {
-                args.push("--fresh-session".to_string());
+                // A fresh routine must not send its prompt to a warm pipe-mode wrapper.
+                // Drop and terminate any registered process before creating the new one.
+                let _ = terminate_process_session(session_name);
+            } else if process_session_is_alive(session_name) {
+                let start_offset = std::fs::metadata(&output_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let encoded = format!(
+                    "{}{}",
+                    TMUX_PROMPT_B64_PREFIX,
+                    BASE64_STANDARD.encode(prompt.as_bytes())
+                );
+                send_process_session_input(session_name, &encoded, cancel_token.as_deref())?;
+                return Ok(start_offset);
             }
-            if let Some(session_id) = resume_session_id {
-                args.push("--resume-session-id".to_string());
-                args.push(session_id.to_string());
-            }
-            if let Some(core_tools) = allowed_core_tools {
-                for tool in core_tools {
-                    args.push("--qwen-core-tool".to_string());
-                    args.push(tool.to_string());
-                }
-            }
-            args
-        },
-        env_vars: crate::services::provider_auth_profile::merge_overlay_env(
-            qwen_resolution
-                .exec_path
-                .as_ref()
-                .map(|exec_path| vec![("PATH".to_string(), exec_path.clone())])
-                .unwrap_or_default(),
-            &overlay,
-        ),
-        unset_env: crate::services::provider_auth_profile::overlay_unset_keys(&overlay),
-    };
 
-    let backend = ProcessBackend::new();
-    let handle = backend.create_session(&config)?;
-    let handle = crate::services::session_backend::auth_profiles::record_launch(
-        session_name,
-        &overlay.profile_id,
-        handle,
-    )?;
+            let _ = std::fs::remove_file(&output_path);
+            let _ = std::fs::remove_file(&prompt_path);
+            std::fs::write(&prompt_path, prompt)
+                .map_err(|e| format!("Failed to write prompt file: {}", e))?;
 
-    register_child_pid(cancel_token.as_deref(), handle.pid());
+            let qwen_bin = qwen_resolution
+                .resolved_path
+                .as_deref()
+                .ok_or_else(|| "Qwen CLI not found".to_string())?;
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("Failed to get executable path: {}", e))?;
 
-    insert_process_session(session_name.to_string(), handle);
+            let config = SessionConfig {
+                session_name: session_name.to_string(),
+                working_dir: working_dir.to_string(),
+                agentdesk_exe: exe.display().to_string(),
+                output_path: output_path.clone(),
+                prompt_path: prompt_path.clone(),
+                wrapper_subcommand: "qwen-tmux-wrapper".to_string(),
+                wrapper_args: {
+                    let mut args = vec!["--qwen-bin".to_string(), qwen_bin.to_string()];
+                    if let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) {
+                        args.push("--qwen-model".to_string());
+                        args.push(model.to_string());
+                    }
+                    if force_fresh_provider_session {
+                        args.push("--fresh-session".to_string());
+                    }
+                    if let Some(session_id) = resume_session_id {
+                        args.push("--resume-session-id".to_string());
+                        args.push(session_id.to_string());
+                    }
+                    if let Some(core_tools) = allowed_core_tools {
+                        for tool in core_tools {
+                            args.push("--qwen-core-tool".to_string());
+                            args.push(tool.to_string());
+                        }
+                    }
+                    args
+                },
+                env_vars: crate::services::provider_auth_profile::merge_overlay_env(
+                    qwen_resolution
+                        .exec_path
+                        .as_ref()
+                        .map(|exec_path| vec![("PATH".to_string(), exec_path.clone())])
+                        .unwrap_or_default(),
+                    &overlay,
+                ),
+                unset_env: crate::services::provider_auth_profile::overlay_unset_keys(&overlay),
+            };
 
+            let backend = ProcessBackend::new();
+            let handle = backend.create_session(&config)?;
+            let handle = crate::services::session_backend::auth_profiles::record_launch(
+                session_name,
+                &overlay.profile_id,
+                handle,
+            )?;
+
+            register_child_pid(cancel_token.as_deref(), handle.pid());
+
+            insert_process_session(session_name.to_string(), handle);
+            Ok(0)
+        })?;
+
+    // Keep recovery/launch serialization out of the output wait.
     let read_result = qwen_read_output_file_until_result(
         &output_path,
-        0,
+        start_offset,
         sender.clone(),
         cancel_token,
         process_session_probe(session_name),
@@ -462,10 +471,7 @@ pub(super) fn execute_streaming_local_process(
             });
         }
         ReadOutputResult::SessionDied { .. } => {
-            let _ = sender.send(StreamMessage::Done {
-                result: "⚠ 프로세스가 종료되었습니다.".to_string(),
-                session_id: None,
-            });
+            let _ = sender.send(StreamMessage::session_ended("Qwen"));
             remove_process_session(session_name);
         }
     }

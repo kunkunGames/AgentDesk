@@ -257,17 +257,25 @@ pub(crate) fn issue_number_matcher(issue_number: i64) -> Option<Regex> {
 }
 
 pub(crate) fn upstream_base_ref(repo_dir: &str) -> String {
-    let check = git_command()
-        .args(["rev-parse", "--verify", "origin/main"])
-        .current_dir(repo_dir)
-        .output();
-    if let Ok(out) = check {
-        if out.status.success() {
-            return "origin/main".to_string();
-        }
-    }
-    "main".to_string()
+    // Follow the repository's advertised default before conventional names.
+    // A local mainline can be ahead of the remote; new work must start from
+    // the remote baseline when it exists, including master/custom defaults.
+    [
+        "origin/HEAD",
+        "origin/main",
+        "origin/master",
+        "main",
+        "master",
+    ]
+    .into_iter()
+    .find(|candidate| git_ref_exists(repo_dir, &format!("{candidate}^{{commit}}")))
+    .unwrap_or("origin/HEAD")
+    .to_string()
 }
+
+#[cfg(test)]
+#[path = "commit_resolver/base_ref_tests.rs"]
+mod base_ref_tests;
 
 /// Find the newest mainline commit whose subject references the given issue number.
 ///

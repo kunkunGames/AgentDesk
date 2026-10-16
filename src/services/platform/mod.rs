@@ -5,6 +5,7 @@
 
 pub mod binary_resolver;
 mod dump_tool;
+pub(crate) mod managed_process;
 pub(crate) mod network;
 pub mod shell;
 pub mod tmux;

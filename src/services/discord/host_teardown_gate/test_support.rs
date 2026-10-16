@@ -126,7 +126,7 @@ pub(crate) async fn busy_turn(
         user_msg,
     );
     assert!(started.await, "the seeded turn must start");
-    let row = inflight::InflightTurnState::new(
+    let mut row = inflight::InflightTurnState::new(
         ProviderKind::Claude,
         channel_id.get(),
         None,
@@ -140,6 +140,7 @@ pub(crate) async fn busy_turn(
         None,
         0,
     );
+    row.turn_nonce = token.turn_nonce().map(str::to_owned);
     inflight::save_inflight_state_create_new(&row).expect("persist the inflight row");
     token
 }

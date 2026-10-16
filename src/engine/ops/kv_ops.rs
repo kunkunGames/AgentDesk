@@ -125,8 +125,7 @@ pub(super) fn register_kv_ops<'js>(ctx: &Ctx<'js>, pg_pool: Option<PgPool>) -> J
         "#,
         )?;
 
-        let rs_obj: rquickjs::Value = ctx.eval("agentdesk.reviewState")?;
-        let rs_obj: Object = rs_obj.into_object().unwrap();
+        let rs_obj: Object = ctx.eval("agentdesk.reviewState")?;
         rs_obj.set("__syncRaw", sync_raw)?;
     }
 

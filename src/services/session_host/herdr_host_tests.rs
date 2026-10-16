@@ -796,20 +796,83 @@ fn literal_end(chars: &[char], i: usize) -> Option<usize> {
     }
 }
 
+/// A direct `test` conjunct makes an item unavailable in every production build.
+/// Other cfg expressions remain visible unless that implication is explicit.
+fn test_cfg_gate_len(chars: &[char]) -> Option<usize> {
+    if !chars.starts_with(&['#', '[']) {
+        return None;
+    }
+    let end = chars.iter().position(|c| *c == ']')? + 1;
+    let attribute: String = chars[..end].iter().filter(|c| !c.is_whitespace()).collect();
+    if attribute == "#[cfg(test)]" {
+        return Some(end);
+    }
+    let predicates = attribute.strip_prefix("#[cfg(all(")?.strip_suffix("))]")?;
+    let chars: Vec<char> = predicates.chars().collect();
+    let (mut depth, mut start, mut at) = (0usize, 0usize, 0usize);
+    let is_test = |start: usize, end: usize| chars[start..end] == ['t', 'e', 's', 't'];
+    while at < chars.len() {
+        if let Some(end) = literal_end(&chars, at) {
+            at = end;
+            continue;
+        }
+        match chars[at] {
+            '(' => depth += 1,
+            ')' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                if is_test(start, at) {
+                    return Some(end);
+                }
+                start = at + 1;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    (depth == 0 && is_test(start, chars.len())).then_some(end)
+}
+
+#[test]
+fn production_census_recognizes_conjunctive_test_cfg() {
+    for gate in [
+        "#[cfg(test)]",
+        "#[cfg(all(test, unix))]",
+        "#[cfg(all(unix, test))]",
+        "#[cfg(all(any(unix, windows), test))]",
+        "#[ cfg ( all ( test , unix ) ) ]",
+    ] {
+        let source = format!("{gate} mod tests {{ fn hidden() {{}} }} fn live() {{}}");
+        let (code, _) = production_text(&source);
+        assert!(!code.contains("hidden"), "{gate}");
+        assert!(code.contains("live"), "{gate}");
+        let (code, modules) = production_text(&format!("{gate} mod fixtures;"));
+        assert!(code.is_empty(), "{gate}");
+        assert_eq!(modules, vec![("fixtures".into(), None)], "{gate}");
+    }
+    for gate in [
+        "#[cfg(any(test, unix))]",
+        "#[cfg(not(test))]",
+        "#[cfg(all(unix, any(test, windows)))]",
+        "#[cfg(all(unix, feature = \"test\"))]",
+        "#[cfg(all(unix, feature = \"prefix,test,suffix\"))]",
+    ] {
+        let (code, _) = production_text(&format!("{gate} fn live() {{}}"));
+        assert!(code.contains("live"), "{gate}");
+    }
+}
+
 /// Source with every `#[cfg(test)]` item removed, plus the `mod x;` files it gated:
 /// a `#[path]` value (relative to the file's directory) or the bare module name.
 fn production_text(text: &str) -> (String, Vec<(String, Option<String>)>) {
-    const GATE: &str = "#[cfg(test)]";
     let chars: Vec<char> = text.chars().collect();
-    let gate: Vec<char> = GATE.chars().collect();
     let (mut out, mut test_mods, mut i) = (String::new(), Vec::new(), 0);
     while i < chars.len() {
         if let Some(end) = literal_end(&chars, i) {
             out.extend(&chars[i..end.min(chars.len())]);
             i = end;
-        } else if chars[i..].starts_with(&gate) {
+        } else if let Some(gate_len) = test_cfg_gate_len(&chars[i..]) {
             // An item ends at `;`/`,` or its closing `}`; an enclosing closer ends it unconsumed.
-            let (mut k, mut depth) = (i + gate.len(), 0usize);
+            let (mut k, mut depth) = (i + gate_len, 0usize);
             while k < chars.len() {
                 if let Some(end) = literal_end(&chars, k) {
                     k = end;
@@ -824,7 +887,7 @@ fn production_text(text: &str) -> (String, Vec<(String, Option<String>)>) {
                     }
                     '}' | ')' | ']' => depth -= 1,
                     ';' | ',' if depth == 0 => {
-                        let head: String = chars[i + gate.len()..k].iter().collect();
+                        let head: String = chars[i + gate_len..k].iter().collect();
                         let words: Vec<&str> = head.split_whitespace().collect();
                         if let [.., "mod", name] = words.as_slice() {
                             let path = head

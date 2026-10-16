@@ -34,6 +34,16 @@ pub enum ProviderExecutionAdapter {
 }
 
 impl ProviderExecutionAdapter {
+    /// Adapter protocol support, not operational/24-hour acceptance. Each
+    /// adapter must enforce admission before effects and verify its terminal.
+    /// The first implementation only admits OpenCode's native read/edit set.
+    pub(crate) const fn managed_execution_protocol(self) -> Option<u64> {
+        match self {
+            Self::OpenCode => Some(1),
+            _ => None,
+        }
+    }
+
     pub const fn execution_surface(self) -> &'static str {
         match self {
             Self::Claude => "claude",

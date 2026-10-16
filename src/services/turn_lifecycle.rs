@@ -231,6 +231,12 @@ pub(crate) struct ForceKillVerdict {
 }
 
 impl ForceKillVerdict {
+    /// The dispatch owner holds this runtime's transition gate through cleanup.
+    pub(crate) fn uses_runtime(&self, expected: &Arc<SharedData>) -> bool {
+        self.host
+            .approved(&self.target.tmux_name)
+            .is_some_and(|(shared, _)| Arc::ptr_eq(shared, expected))
+    }
     /// The host guard keeps the session: the caller must change nothing for this kill.
     pub(crate) fn kept(&self) -> bool {
         matches!(self.host, ForceKillHost::Gate(ChannelTeardown::Kept, _))
@@ -304,6 +310,21 @@ pub(crate) async fn force_kill_turn_with_verdict(
 ) -> TurnLifecycleStopResult {
     let code = termination_reason_code;
     force_kill_on_verdict(health_registry, verdict, reason, code, true).await
+}
+
+/// Dispatch cancellation retains the already judged runtime and does not emit a second cancel event.
+pub(crate) async fn force_kill_dispatch_with_verdict(
+    registry: &HealthRegistry,
+    verdict: ForceKillVerdict,
+) -> TurnLifecycleStopResult {
+    force_kill_on_verdict(
+        Some(registry),
+        verdict,
+        "Cancelled finite campaign dispatch",
+        "campaign_dispatch_cancelled",
+        false,
+    )
+    .await
 }
 
 async fn force_kill_on_verdict(

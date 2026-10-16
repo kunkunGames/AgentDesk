@@ -394,7 +394,7 @@ impl NativeClearEffects for Crashing {
     fn composer_empty(&self, _: &str, _: Instant) -> bool {
         true
     }
-    fn reset_process(&self, tmux: &str) {
+    fn reset_process(&self, _shared: &crate::services::discord::SharedData, tmux: &str) {
         self.calls.lock().unwrap().push(format!("reset:{tmux}"));
     }
 }

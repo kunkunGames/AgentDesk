@@ -112,6 +112,18 @@ pub(super) async fn cleanup_terminal_managed_worktrees_pg(
     card_id: &str,
 ) -> Result<crate::services::platform::shell::ManagedWorktreeCleanup> {
     let mut summary = crate::services::platform::shell::ManagedWorktreeCleanup::default();
+    // Graph outputs are captured by the Campaign collector after the canonical
+    // terminal event. Preserve the workspace for capture, independent review,
+    // and later graph evolution; terminal status alone cannot release it.
+    if sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM campaign_graph_tasks WHERE card_id=$1)",
+    )
+    .bind(card_id)
+    .fetch_one(pg_pool)
+    .await?
+    {
+        return Ok(summary);
+    }
     let repo_id: Option<String> =
         sqlx::query_scalar("SELECT repo_id FROM kanban_cards WHERE id = $1")
             .bind(card_id)

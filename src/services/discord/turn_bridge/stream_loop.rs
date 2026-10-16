@@ -17,6 +17,7 @@ use tool_arms::{
     handle_stream_tool_message, reconcile_exact_stream_frame_after_tool_outcome,
     stop_on_tool_authority_loss,
 };
+mod cancel;
 mod content_arms;
 pub(super) mod exit_reconcile;
 mod expected_identity;
@@ -150,30 +151,14 @@ pub(super) async fn run_stream_loop(
     // Callers must then exit `'outer` (explicitly or by fallthrough) into cancel post-processing.
     macro_rules! finalize_cancel_inner {
         () => {{
-            let previous_restart_mode = inflight_state.restart_mode;
-            let previous_restart_generation = inflight_state.restart_generation;
-            if sync_inflight_restart_mode_from_cancel(cancel_token.as_ref(), &mut inflight_state) {
-                let outcome =
-                    crate::services::discord::inflight::patch_restart_mode_if_matches_identity(
-                        &inflight_state,
-                        &stream_tick_expected_identity,
-                        previous_restart_mode,
-                        previous_restart_generation,
-                        "turn_bridge::stream_loop::cancel_restart_mode",
-                    );
-                refresh_stream_tick_expected_identity_after_handoff(
-                    &mut stream_tick_expected_identity,
-                    &mut persisted_inflight_baseline,
-                    &inflight_state,
-                    Some(outcome),
-                );
-            }
-            cancelled = true;
-            close_all_tracked_background_children(
-                shared_owned.pg_pool.as_ref(),
+            cancel::finalize_cancelled_stream_turn(
+                shared_owned.as_ref(),
+                cancel_token.as_ref(),
+                &mut inflight_state,
+                &mut persisted_inflight_baseline,
+                &mut stream_tick_expected_identity,
+                &mut cancelled,
                 &mut active_background_child_session_ids,
-                "aborted",
-                "turn cancel",
             )
             .await;
         }};
@@ -205,22 +190,12 @@ pub(super) async fn run_stream_loop(
             break 'outer;
         }
 
-        // #2426: timeout is only a safety wake; handoff frames wake immediately.
-        let stream_wait = turn_bridge_stream_wait_duration(
+        rx.queue_next_frame(
+            &mut pending_stream_messages,
             done,
             terminal_control_drain_until,
-            std::time::Instant::now(),
-        );
-        if stream_wait.is_zero() {
-            if let Ok(msg) = rx.try_recv() {
-                pending_stream_messages.push_back(msg);
-            }
-        } else {
-            match tokio::time::timeout(stream_wait, rx.recv()).await {
-                Ok(Some(msg)) => pending_stream_messages.push_back(msg),
-                Ok(None) | Err(_) => {}
-            }
-        }
+        )
+        .await;
 
         if !done && cancel_requested(Some(cancel_token.as_ref())) {
             finalize_cancel_inner!();
@@ -396,6 +371,12 @@ pub(super) async fn run_stream_loop(
                             input,
                             tool_use_id,
                         } => {
+                            let graph_event_id = tool_use_id.clone();
+                            let graph_fingerprint =
+                                crate::db::campaigns::graph::contract_digest(&serde_json::json!([
+                                    &name, &input
+                                ]))
+                                .ok();
                             let outcome = handle_stream_tool_message(
                                 StreamToolArmMessage::ToolUse {
                                     name,
@@ -453,12 +434,26 @@ pub(super) async fn run_stream_loop(
                             )
                             .await;
                             stop_on_tool_authority_loss!(outcome, loop_outcome, 'outer);
+                            if matches!(outcome, StreamToolArmOutcome::Continue)
+                                && let Some(fingerprint) = graph_fingerprint
+                            {
+                                crate::db::campaigns::graph::progress::tool_use(
+                                    shared_owned.pg_pool.as_ref(),
+                                    dispatch_id.as_deref(),
+                                    graph_event_id.as_deref(),
+                                    &fingerprint,
+                                )
+                                .await;
+                            }
                         }
                         StreamMessage::ToolResult {
                             content,
                             is_error,
                             tool_use_id,
                         } => {
+                            let graph_event_id = tool_use_id.clone();
+                            let graph_output =
+                                crate::db::campaigns::graph::digest(content.as_bytes());
                             let retry_frame = StreamMessage::ToolResult {
                                 content: content.clone(),
                                 is_error,
@@ -530,6 +525,15 @@ pub(super) async fn run_stream_loop(
                                 break;
                             }
                             stop_on_tool_authority_loss!(outcome, loop_outcome, 'outer);
+                            if matches!(outcome, StreamToolArmOutcome::Continue) {
+                                crate::db::campaigns::graph::progress::tool_result(
+                                    shared_owned.pg_pool.as_ref(),
+                                    dispatch_id.as_deref(),
+                                    graph_event_id.as_deref(),
+                                    &graph_output,
+                                )
+                                .await;
+                            }
                         }
                         StreamMessage::TaskNotification {
                             tool_use_id,
@@ -616,6 +620,7 @@ pub(super) async fn run_stream_loop(
                                     provider: &provider,
                                     channel_id,
                                     done,
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     adk_session_name: &adk_session_name,
                                 },
                                 RuntimeHandoffLoopState {
@@ -657,6 +662,7 @@ pub(super) async fn run_stream_loop(
                                     provider: &provider,
                                     channel_id,
                                     done,
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     adk_session_name: &adk_session_name,
                                 },
                                 RuntimeHandoffLoopState {
@@ -706,6 +712,7 @@ pub(super) async fn run_stream_loop(
                                     provider: &provider,
                                     channel_id,
                                     done,
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     adk_session_name: &adk_session_name,
                                 },
                                 RuntimeHandoffLoopState {
@@ -746,6 +753,7 @@ pub(super) async fn run_stream_loop(
                                     provider: &provider,
                                     channel_id,
                                     done,
+                                    persisted_inflight_baseline: &persisted_inflight_baseline,
                                     adk_session_name: &adk_session_name,
                                 },
                                 RuntimeHandoffLoopState {

@@ -60,6 +60,30 @@ async fn dispatch_process_handoff_with_pin(
     done: bool,
     initial_watcher_delivery_pin: Option<WatcherClaimIncarnation>,
 ) -> HandoffObservation {
+    let baseline = state.clone();
+    dispatch_handoff_from_persisted_baseline(
+        shared,
+        provider,
+        state,
+        message,
+        state_dirty,
+        done,
+        initial_watcher_delivery_pin,
+        &baseline,
+    )
+    .await
+}
+
+async fn dispatch_handoff_from_persisted_baseline(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    state: &mut InflightTurnState,
+    message: RuntimeHandoffLoopMessage,
+    state_dirty: &mut bool,
+    done: bool,
+    initial_watcher_delivery_pin: Option<WatcherClaimIncarnation>,
+    persisted_inflight_baseline: &InflightTurnState,
+) -> HandoffObservation {
     let channel_id = ChannelId::new(state.channel_id);
     let mut terminal_control_ready_observed = false;
     let mut tmux_last_offset = initial_watcher_delivery_pin
@@ -87,6 +111,7 @@ async fn dispatch_process_handoff_with_pin(
             provider,
             channel_id,
             done,
+            persisted_inflight_baseline,
             adk_session_name: &None,
         },
         RuntimeHandoffLoopState {
@@ -133,6 +158,84 @@ async fn dispatch_process_handoff(
 ) -> HandoffObservation {
     dispatch_process_handoff_with_pin(shared, provider, state, message, state_dirty, done, None)
         .await
+}
+
+#[tokio::test]
+async fn late_terminal_session_identity_uses_persisted_baseline_and_fences_competing_handoffs() {
+    let _lock = crate::config::shared_test_env_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let root = tempfile::tempdir().expect("runtime root");
+    let _env_reset = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
+        "AGENTDESK_ROOT_DIR",
+        root.path(),
+    );
+    let provider = ProviderKind::Qwen;
+    for (index, message) in [
+        RuntimeHandoffLoopMessage::TmuxReady {
+            output_path: "/runtime/qwen-late-session.jsonl".into(),
+            input_fifo_path: "/runtime/qwen-late-session.input".into(),
+            tmux_session_name: "AgentDesk-qwen-late-session".into(),
+            last_offset: 4096,
+        },
+        RuntimeHandoffLoopMessage::ProcessReady {
+            output_path: "/runtime/qwen-late-session.jsonl".into(),
+            session_name: "AgentDesk-qwen-late-session".into(),
+            last_offset: 4096,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut baseline = runtime_seed(provider.clone(), 42_593_100 + index as u64);
+        baseline.session_id = None;
+        baseline.output_path = None;
+        baseline.tmux_session_name = Some("AgentDesk-qwen-late-session".into());
+        baseline.full_response = "completed native response".into();
+        save_inflight_state(&baseline).expect("persist pre-terminal state");
+        let mut local = baseline.clone();
+        local.session_id = Some("late-qwen-session".into());
+        let shared = crate::services::discord::make_shared_data_for_tests();
+        let mut dirty = true;
+        let observed = dispatch_handoff_from_persisted_baseline(
+            &shared,
+            &provider,
+            &mut local,
+            message.clone(),
+            &mut dirty,
+            true,
+            None,
+            &baseline,
+        )
+        .await;
+        assert_eq!(observed.outcome, Some(GuardedSaveOutcome::Saved));
+        assert!(observed.terminal_control_drain_until.is_none());
+        let persisted = load_inflight_state(&provider, baseline.channel_id).unwrap();
+        assert_eq!(persisted.session_id.as_deref(), Some("late-qwen-session"));
+        assert_eq!(persisted.full_response, "completed native response");
+
+        // A stale same-turn snapshot must still lose to the committed binding.
+        let mut competing = baseline.clone();
+        competing.session_id = Some("uncommitted-competing-session".into());
+        let declined = dispatch_handoff_from_persisted_baseline(
+            &shared,
+            &provider,
+            &mut competing,
+            message,
+            &mut dirty,
+            true,
+            None,
+            &baseline,
+        )
+        .await;
+        assert_eq!(declined.outcome, Some(GuardedSaveOutcome::AuthorityPinned));
+        assert_eq!(
+            load_inflight_state(&provider, baseline.channel_id)
+                .unwrap()
+                .session_id,
+            persisted.session_id,
+        );
+    }
 }
 
 #[tokio::test]

@@ -8,6 +8,27 @@ pub(in crate::services::discord) struct StreamMessageReceiverAdapter {
 }
 
 impl StreamMessageReceiverAdapter {
+    // #2426: timeout is only a safety wake; handoff frames wake immediately.
+    pub(super) async fn queue_next_frame(
+        &mut self,
+        pending: &mut std::collections::VecDeque<StreamMessage>,
+        done: bool,
+        terminal_control_drain_until: Option<std::time::Instant>,
+    ) {
+        let stream_wait = turn_bridge_stream_wait_duration(
+            done,
+            terminal_control_drain_until,
+            std::time::Instant::now(),
+        );
+        if stream_wait.is_zero() {
+            if let Ok(msg) = self.try_recv() {
+                pending.push_back(msg);
+            }
+        } else if let Ok(Some(msg)) = tokio::time::timeout(stream_wait, self.recv()).await {
+            pending.push_back(msg);
+        }
+    }
+
     pub(super) async fn recv(&mut self) -> Option<StreamMessage> {
         self.rx.recv().await
     }
@@ -63,47 +84,5 @@ pub(in crate::services::discord) fn turn_bridge_stream_wait_duration(
 }
 
 #[cfg(test)]
-mod ready_drain_unit_tests {
-    use super::*;
-
-    #[test]
-    fn done_wait_uses_remaining_drain_window_as_safety_wake() {
-        let now = std::time::Instant::now();
-        assert_eq!(
-            turn_bridge_stream_wait_duration(
-                true,
-                Some(now + std::time::Duration::from_millis(123)),
-                now,
-            ),
-            std::time::Duration::from_millis(123)
-        );
-        assert_eq!(
-            turn_bridge_stream_wait_duration(true, None, now),
-            std::time::Duration::from_millis(0)
-        );
-        assert_eq!(
-            turn_bridge_stream_wait_duration(false, None, now),
-            std::time::Duration::from_secs(1)
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stream_receiver_adapter_wakes_on_ready_frame() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut async_rx = spawn_stream_message_receiver_adapter(rx);
-        tx.send(StreamMessage::TmuxReady {
-            output_path: "/tmp/out.jsonl".to_string(),
-            input_fifo_path: "/tmp/in.fifo".to_string(),
-            tmux_session_name: "adk-test".to_string(),
-            last_offset: 12,
-        })
-        .expect("send ready frame");
-
-        let received = tokio::time::timeout(std::time::Duration::from_millis(50), async_rx.recv())
-            .await
-            .expect("ready frame should wake without a poll tick")
-            .expect("adapter should forward ready frame");
-
-        assert!(matches!(received, StreamMessage::TmuxReady { .. }));
-    }
-}
+#[path = "stream_receiver/tests.rs"]
+mod ready_drain_unit_tests;

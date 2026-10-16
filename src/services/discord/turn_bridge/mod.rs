@@ -99,7 +99,7 @@ pub(super) use cancel_finalize_policy::{
 pub(crate) use completion_guard::build_work_dispatch_completion_result;
 pub(super) use completion_guard::{
     fail_dispatch_auth_expired, fail_dispatch_tmux_session_died, fail_dispatch_with_retry,
-    guard_review_dispatch_completion, queue_dispatch_followup_with_handles,
+    guard_review_dispatch_completion, native_campaign_result, queue_dispatch_followup_with_handles,
     runtime_db_fallback_complete_with_result, streaming_final_complete_dispatch_with_result,
 };
 pub(super) use recovery_text::{
@@ -268,7 +268,7 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
     );
     #[cfg(all(test, unix))]
     let probe_channel = bridge.channel_id;
-    let _bridge_task = super::task_supervisor::spawn_observed("discord_turn_bridge", super::input_runtime::fence::effect::detached(super::input_runtime::fence::effect::current(), async move {
+    let _bridge_task = super::task_supervisor::spawn_observed("discord_turn_bridge", super::input_runtime::fence::effect::detached(super::input_runtime::fence::effect::current(), Box::pin(async move {
         let _original_registration = original_registration;
         #[cfg(test)]
         #[cfg(unix)]
@@ -979,7 +979,7 @@ pub(in crate::services::discord) fn spawn_turn_bridge_with_pin(
         .await;
 
         // completion_tx is sent automatically by CompletionGuard on drop
-    }.instrument(bridge_span)));
+    }.instrument(bridge_span))));
     #[cfg(test)]
     #[cfg(unix)]
     cancel_backstop_test_support::record(probe_channel, _bridge_task.abort_handle());

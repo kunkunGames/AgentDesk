@@ -69,8 +69,9 @@ fn required_block(detail: String) -> IntakeRouterDecision {
 fn required_node_reasons(
     node: &serde_json::Value,
     requirements: &ExecutionRequirements,
+    provider: &str,
 ) -> Vec<String> {
-    requirements.intake_reasons(node)
+    requirements.intake_reasons(node, provider)
 }
 
 async fn check_required_target(
@@ -92,7 +93,7 @@ async fn check_required_target(
             "required target {target} is not registered"
         )));
     };
-    let mut reasons = required_node_reasons(node, requirements);
+    let mut reasons = required_node_reasons(node, requirements, ctx.provider);
     let agent = match agent_id_and_preferred_labels(pool, ctx.policy_channel_id).await {
         Ok(Some((agent, _, _))) => agent,
         Ok(None) => String::new(),

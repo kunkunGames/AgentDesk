@@ -304,7 +304,83 @@ async fn validate_channel_thread_maps_on_startup_with_base_url_pg(
     token: &str,
     base_url: &str,
 ) -> (usize, usize) {
-    let rows: Vec<ThreadMapValidationRow> = match sqlx::query(
+    let mut checked = 0usize;
+    let mut cleared = 0usize;
+    loop {
+        wait_for_startup_thread_map_admission(pool).await;
+        let rows = match startup_thread_map_rows(pool).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    "[dispatch] startup thread-map validation deferred (postgres query): {error}"
+                );
+                tokio::time::sleep(STARTUP_THREAD_MAP_ADMISSION_RECHECK).await;
+                continue;
+            }
+        };
+        let mut revalidate = false;
+        for row in rows {
+            let Ok(Some(admission)) = startup_thread_map_admission(pool).await else {
+                revalidate = true;
+                break;
+            };
+            let Some(outcome) =
+                validate_thread_map_validation_row(pool, client, token, base_url, &row, &admission)
+                    .await
+            else {
+                revalidate = true;
+                break;
+            };
+            checked += outcome.checked;
+            if !outcome.persist {
+                continue;
+            }
+            match persist_startup_thread_map_if_admitted(pool, &row, &outcome, &admission).await {
+                Ok(true) => cleared += outcome.cleared,
+                Ok(false) => {
+                    // Discard a result captured before a closed fence or changed
+                    // card. Its next attempt reads both the card and HTTP anew.
+                    revalidate = true;
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "[dispatch] failed to persist postgres startup thread-map cleanup for {}: {}",
+                        row.card_id,
+                        error
+                    );
+                    revalidate = true;
+                    break;
+                }
+            }
+        }
+        if !revalidate {
+            return (checked, cleared);
+        }
+        tokio::time::sleep(STARTUP_THREAD_MAP_ADMISSION_RECHECK).await;
+    }
+}
+
+const STARTUP_THREAD_MAP_ADMISSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+async fn wait_for_startup_thread_map_admission(pool: &PgPool) {
+    loop {
+        if matches!(
+            crate::services::settings::internal_tasks_enabled(pool).await,
+            Ok(true)
+        ) {
+            return;
+        }
+        // Hygiene is deferred, not abandoned by the process-global once guard.
+        // No connection or card transaction remains open during this wait.
+        tokio::time::sleep(STARTUP_THREAD_MAP_ADMISSION_RECHECK).await;
+    }
+}
+
+async fn startup_thread_map_rows(
+    pool: &PgPool,
+) -> Result<Vec<ThreadMapValidationRow>, sqlx::Error> {
+    let rows = sqlx::query(
         "SELECT id, channel_thread_map::text AS channel_thread_map, active_thread_id
          FROM kanban_cards
          WHERE channel_thread_map IS NOT NULL
@@ -312,78 +388,146 @@ async fn validate_channel_thread_maps_on_startup_with_base_url_pg(
            AND BTRIM(channel_thread_map::text) != '{}'",
     )
     .fetch_all(pool)
-    .await
-    {
-        Ok(rows) => rows
-            .into_iter()
-            .filter_map(|row| {
-                Some(ThreadMapValidationRow {
-                    card_id: row.try_get::<String, _>("id").ok()?,
-                    map_json: row.try_get::<String, _>("channel_thread_map").ok()?,
-                    active_thread_id: row.try_get::<Option<String>, _>("active_thread_id").ok()?,
-                })
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ThreadMapValidationRow {
+                card_id: row.try_get("id")?,
+                map_json: row.try_get("channel_thread_map")?,
+                active_thread_id: row.try_get("active_thread_id")?,
             })
-            .collect(),
-        Err(error) => {
-            tracing::warn!(
-                "[dispatch] startup thread-map validation skipped (postgres query): {error}"
-            );
-            return (0, 0);
-        }
-    };
-
-    let mut checked = 0usize;
-    let mut cleared = 0usize;
-
-    for row in rows {
-        let outcome = validate_thread_map_validation_row(client, token, base_url, &row).await;
-        checked += outcome.checked;
-        cleared += outcome.cleared;
-
-        if !outcome.persist {
-            continue;
-        }
-
-        if let Err(error) = sqlx::query(
-            "UPDATE kanban_cards
-             SET channel_thread_map = $1::jsonb,
-                 active_thread_id = $2,
-                 updated_at = NOW()
-             WHERE id = $3",
-        )
-        .bind(outcome.new_map)
-        .bind(outcome.new_active_thread_id)
-        .bind(&row.card_id)
-        .execute(pool)
-        .await
-        {
-            tracing::warn!(
-                "[dispatch] failed to persist postgres startup thread-map cleanup for {}: {}",
-                row.card_id,
-                error
-            );
-        }
-    }
-
-    (checked, cleared)
+        })
+        .collect()
 }
 
+async fn startup_thread_map_admission_on_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<Option<String>, String> {
+    // SHARE conflicts with the public setting UPDATE/UPSERT. The row version
+    // also invalidates responses across a complete False -> True transition.
+    let generation: Option<String> =
+        sqlx::query_scalar("SELECT xmin::text FROM kv_meta WHERE key='runtime-config' FOR SHARE")
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| format!("lock startup thread-map admission: {error}"))?;
+    if generation.is_none() || !startup_thread_map_permission_on_tx(tx).await? {
+        return Ok(None);
+    }
+    Ok(generation)
+}
+
+async fn startup_thread_map_permission_on_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<bool, String> {
+    if !crate::services::settings::internal_tasks_enabled(&mut **tx).await? {
+        return Ok(false);
+    }
+    // The existing setting reader uses transaction NOW(). A lock wait must
+    // not extend a TTL that has already elapsed in real database time.
+    let unexpired: bool = sqlx::query_scalar(
+        "SELECT expires_at IS NULL OR expires_at > clock_timestamp()
+         FROM kv_meta WHERE key='runtime-config'",
+    )
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| format!("check startup thread-map admission expiry: {error}"))?;
+    Ok(unexpired)
+}
+
+async fn startup_thread_map_admission(pool: &PgPool) -> Result<Option<String>, String> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| format!("begin startup thread-map admission: {error}"))?;
+    let admission = startup_thread_map_admission_on_tx(&mut tx).await?;
+    tx.commit()
+        .await
+        .map_err(|error| format!("commit startup thread-map admission: {error}"))?;
+    Ok(admission)
+}
+
+async fn startup_thread_map_admission_matches(pool: &PgPool, admission: &str) -> bool {
+    matches!(startup_thread_map_admission(pool).await, Ok(Some(current)) if current == admission)
+}
+
+async fn persist_startup_thread_map_if_admitted(
+    pool: &PgPool,
+    row: &ThreadMapValidationRow,
+    outcome: &ThreadMapValidationOutcome,
+    admission: &str,
+) -> Result<bool, String> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| format!("begin startup thread-map cleanup: {error}"))?;
+    // Recheck on the same connection as the card write. No Discord request
+    // or deferred wait occurs while the setting row is locked.
+    if startup_thread_map_admission_on_tx(&mut tx)
+        .await?
+        .as_deref()
+        != Some(admission)
+    {
+        return Ok(false);
+    }
+    let card: Option<String> =
+        sqlx::query_scalar("SELECT id FROM kanban_cards WHERE id=$1 FOR UPDATE")
+            .bind(&row.card_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|error| format!("lock startup thread-map card: {error}"))?;
+    // The card lock can also wait. Check TTL only after both locks are held;
+    // no subsequent lock wait or network operation carries this admission.
+    // The existing SHARE lock keeps the admitted generation fixed. Read the
+    // policy again without reacquiring a row lock behind a waiting False CAS.
+    if card.is_none() || !startup_thread_map_permission_on_tx(&mut tx).await? {
+        return Ok(false);
+    }
+    let changed = sqlx::query(
+        "UPDATE kanban_cards
+         SET channel_thread_map = $1::text::jsonb,
+             active_thread_id = $2,
+             updated_at = NOW()
+         WHERE id = $3
+           AND channel_thread_map IS NOT DISTINCT FROM $4::text::jsonb
+           AND active_thread_id IS NOT DISTINCT FROM $5",
+    )
+    .bind(&outcome.new_map)
+    .bind(&outcome.new_active_thread_id)
+    .bind(&row.card_id)
+    .bind(&row.map_json)
+    .bind(&row.active_thread_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| format!("persist startup thread-map cleanup: {error}"))?
+    .rows_affected();
+    tx.commit()
+        .await
+        .map_err(|error| format!("commit startup thread-map cleanup: {error}"))?;
+    Ok(changed == 1)
+}
+
+#[cfg(test)]
+#[path = "thread_reuse/startup_validation_tests.rs"]
+mod startup_validation_tests;
+
 async fn validate_thread_map_validation_row(
+    pool: &PgPool,
     client: &reqwest::Client,
     token: &str,
     base_url: &str,
     row: &ThreadMapValidationRow,
-) -> ThreadMapValidationOutcome {
+    admission: &str,
+) -> Option<ThreadMapValidationOutcome> {
     let Ok(mut map) =
         serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&row.map_json)
     else {
-        return ThreadMapValidationOutcome {
+        return Some(ThreadMapValidationOutcome {
             checked: 0,
             cleared: 1,
             persist: true,
             new_map: None,
             new_active_thread_id: row.active_thread_id.clone(),
-        };
+        });
     };
 
     let mut checked = 0usize;
@@ -419,12 +563,20 @@ async fn validate_thread_map_validation_row(
         };
 
         let thread_info_url = format!("{}/channels/{}", base_url.trim_end_matches('/'), thread_id);
-        let response = match client
+        // A card can contain several bindings. Every request belongs to the
+        // same admitted pass; closing and reopening the fence discards it all.
+        if !startup_thread_map_admission_matches(pool, admission).await {
+            return None;
+        }
+        let response = client
             .get(&thread_info_url)
             .header("Authorization", format!("Bot {}", token))
             .send()
-            .await
-        {
+            .await;
+        if !startup_thread_map_admission_matches(pool, admission).await {
+            return None;
+        }
+        let response = match response {
             Ok(response) => response,
             Err(error) => {
                 tracing::info!(
@@ -459,7 +611,11 @@ async fn validate_thread_map_validation_row(
             continue;
         }
 
-        let body: serde_json::Value = match response.json().await {
+        let body = response.json::<serde_json::Value>().await;
+        if !startup_thread_map_admission_matches(pool, admission).await {
+            return None;
+        }
+        let body = match body {
             Ok(body) => body,
             Err(error) => {
                 tracing::info!(
@@ -502,13 +658,13 @@ async fn validate_thread_map_validation_row(
     }
 
     if !changed {
-        return ThreadMapValidationOutcome {
+        return Some(ThreadMapValidationOutcome {
             checked,
             cleared,
             persist: false,
             new_map: None,
             new_active_thread_id: row.active_thread_id.clone(),
-        };
+        });
     }
 
     let new_map = if map.is_empty() {
@@ -524,13 +680,13 @@ async fn validate_thread_map_validation_row(
         row.active_thread_id.clone()
     };
 
-    ThreadMapValidationOutcome {
+    Some(ThreadMapValidationOutcome {
         checked,
         cleared,
         persist: true,
         new_map,
         new_active_thread_id,
-    }
+    })
 }
 
 /// Try to reuse an existing Discord thread for a dispatch.

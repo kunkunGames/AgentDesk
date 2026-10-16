@@ -30,6 +30,7 @@ pub(super) async fn recreate_channel_tmux(
     else {
         return false;
     };
+    super::control::retire_managed_watcher(shared, session.name());
     if !crate::services::platform::tmux::has_session(session.name()) {
         return false;
     }

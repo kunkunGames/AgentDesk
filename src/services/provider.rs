@@ -259,15 +259,19 @@ impl ProviderKind {
     }
 
     pub(crate) fn legacy_streaming_dispatch_kind(&self) -> LegacyDispatchKind {
-        match self {
-            Self::Claude => LegacyDispatchKind::Claude,
-            Self::Codex => LegacyDispatchKind::Codex,
-            Self::Gemini => LegacyDispatchKind::Gemini,
-            Self::OpenCode => LegacyDispatchKind::OpenCode,
-            Self::Grok => LegacyDispatchKind::StreamJsonCli(StreamJsonDialectId::Grok),
-            Self::Qwen => LegacyDispatchKind::Qwen,
-            Self::Antigravity => LegacyDispatchKind::StreamJsonCli(StreamJsonDialectId::Agy),
-            Self::Unsupported(name) => LegacyDispatchKind::Unsupported(name.clone()),
+        // Human intake and headless execution use the same registry as one-shot
+        // dispatch. Grok previously took a detour through the OpenCode facade,
+        // which delegated to Grok again but lost the caller's fresh-session flag.
+        match self.execution_adapter() {
+            Some(ProviderExecutionAdapter::Claude) => LegacyDispatchKind::Claude,
+            Some(ProviderExecutionAdapter::Codex) => LegacyDispatchKind::Codex,
+            Some(ProviderExecutionAdapter::Gemini) => LegacyDispatchKind::Gemini,
+            Some(ProviderExecutionAdapter::OpenCode) => LegacyDispatchKind::OpenCode,
+            Some(ProviderExecutionAdapter::Qwen) => LegacyDispatchKind::Qwen,
+            Some(ProviderExecutionAdapter::StreamJsonCli(dialect)) => {
+                LegacyDispatchKind::StreamJsonCli(dialect)
+            }
+            None => LegacyDispatchKind::Unsupported(self.as_str().to_string()),
         }
     }
 
@@ -692,6 +696,11 @@ impl CancelSource {
 /// Cooperative cancellation token shared by provider runtimes and Discord orchestration.
 pub struct CancelToken {
     pub cancelled: AtomicBool,
+    /// Bound once by the existing execution lease owner before provider entry.
+    /// A new native session on the same attempt cannot reset these limits.
+    pub(crate) managed_execution: std::sync::OnceLock<
+        std::sync::Arc<crate::services::cluster::execution_capacity::ManagedAttempt>,
+    >,
     child_pid: Mutex<Option<CapturedProcess>>,
     cancel_source: Mutex<Option<String>>,
     cancel_source_kind: Mutex<Option<CancelSource>>,
@@ -751,6 +760,7 @@ impl CancelToken {
 
         Self {
             cancelled: AtomicBool::new(false),
+            managed_execution: std::sync::OnceLock::new(),
             child_pid: Mutex::new(None),
             cancel_source: Mutex::new(None),
             cancel_source_kind: Mutex::new(None),
@@ -1034,7 +1044,18 @@ impl CancelToken {
 }
 
 pub fn cancel_requested(token: Option<&CancelToken>) -> bool {
-    token.is_some_and(|token| token.cancelled.load(Ordering::Relaxed))
+    token.is_some_and(|token| {
+        if !token.cancelled.load(Ordering::Acquire)
+            && !token.is_completion_cleanup()
+            && token
+                .managed_execution
+                .get()
+                .is_some_and(|attempt| attempt.is_expired())
+        {
+            token.publish_cancel_if_source_absent("managed_attempt_watchdog_timeout");
+        }
+        token.cancelled.load(Ordering::Acquire)
+    })
 }
 
 pub fn register_child_pid(token: Option<&CancelToken>, child_pid: u32) {
@@ -1392,42 +1413,10 @@ where
 /// Read Codex model context_window from the local CLI cache file.
 /// Returns None only when the cache is missing/unreadable; resolution within a
 /// present-but-non-matching cache is handled by `codex_context_window_from_cache`.
-fn codex_model_context_window(model: &str) -> Option<u64> {
-    let cache_path = dirs::home_dir()?.join(".codex/models_cache.json");
-    let data = std::fs::read_to_string(cache_path).ok()?;
-    codex_context_window_from_cache(&data, model)
-}
-
-/// #3263: Resolve a Codex context window from the raw `models_cache.json` body.
-///
-/// 1. Exact slug match → that entry's `context_window`.
-/// 2. Cache present with models but no slug match (slug drift) → the MAX
-///    `context_window` across cached entries. The cache is authoritative and
-///    far fresher than the hardcoded last-resort, so we prefer it.
-/// 3. Cache empty / unparseable / no usable `context_window` → None, letting the
-///    caller fall back to `CODEX_FALLBACK_CONTEXT_WINDOW`.
-///
-/// Defensive: malformed JSON or unexpected shapes yield None, never a panic.
-fn codex_context_window_from_cache(data: &str, model: &str) -> Option<u64> {
-    let json: serde_json::Value = serde_json::from_str(data).ok()?;
-    let models = json.get("models")?.as_array()?;
-
-    let mut max_window: Option<u64> = None;
-    for entry in models {
-        let Some(window) = entry.get("context_window").and_then(|v| v.as_u64()) else {
-            continue;
-        };
-        // Only attempt an exact slug match when a real slug was supplied. An
-        // empty `model` (the `None` provider-default path) must NEVER exact-match
-        // — not even a blank-slug (`"slug": ""`) cache entry — and must always
-        // resolve via max-of-cache (cache present) or None (cache absent).
-        if !model.is_empty() && entry.get("slug").and_then(|s| s.as_str()) == Some(model) {
-            return Some(window);
-        }
-        max_window = Some(max_window.map_or(window, |m| m.max(window)));
-    }
-    max_window
-}
+mod codex_context_window;
+#[cfg(test)]
+use codex_context_window::codex_context_window_from_cache;
+use codex_context_window::codex_model_context_window;
 
 #[cfg(test)]
 mod codex_context_window_tests {
@@ -1819,6 +1808,17 @@ mod poll_output_file_tests {
         .unwrap();
 
         assert_eq!(result, ReadOutputResult::SessionDied { offset: 12 });
+        // A real transport disappearing before its first result must reach
+        // the bridge as a failure, never as a successful session notice.
+        let terminal = super::fold_read_output_result(
+            result,
+            |_| panic!("dead transport cannot be ready"),
+            |_| crate::services::agent_protocol::StreamMessage::session_ended("Qwen"),
+        );
+        assert!(matches!(
+            terminal,
+            crate::services::agent_protocol::StreamMessage::Error { .. }
+        ));
     }
 
     #[test]

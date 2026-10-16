@@ -90,6 +90,34 @@ async fn tick_once(
     claim_owner: &str,
 ) -> bool {
     let mut did_work = false;
+    // Mixed-version databases can contain sealed plans this worker cannot
+    // open. Report the capability wait without claiming or rewriting them.
+    static LAST_CAPABILITY_REPORT: std::sync::atomic::AtomicI64 =
+        std::sync::atomic::AtomicI64::new(0);
+    let now = Utc::now().timestamp();
+    let previous = LAST_CAPABILITY_REPORT.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(previous) >= 300
+        && LAST_CAPABILITY_REPORT
+            .compare_exchange(
+                previous,
+                now,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        let count = sqlx::query_scalar::<_,i64>("SELECT count(*) FROM scheduled_messages WHERE status='scheduled' AND scheduled_at<=NOW() AND to_jsonb(scheduled_messages)->>'external_delivery_plan_id' IS NOT NULL")
+            .fetch_one(pool).await;
+        if let Ok(waiting) = count {
+            if waiting > 0 {
+                tracing::warn!(
+                    waiting,
+                    reason_code = "sealed_plan_consumer_unavailable",
+                    "[smsg] reservations await a compatible sealed-plan consumer; supported definitions remain eligible"
+                );
+            }
+        }
+    }
 
     match db::recover_expired_leases_pg(pool).await {
         Ok(recovered) if recovered > 0 => {

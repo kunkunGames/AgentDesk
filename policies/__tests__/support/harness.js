@@ -8,6 +8,7 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 const INFLIGHT_PROJECTION_DEFAULTS = Object.freeze({
   channel_id: "", provider: "", started_at: "", updated_at: "", channel_name: "",
   tmux_session_name: "", session_id: null, request_owner_user_id: 0, user_msg_id: 0,
+  runtime_kind: null, process_liveness: { state: "unknown", reason: "registry_entry_absent" },
   any_tool_used: false, has_post_tool_text: false, rebind_origin: false,
   turn_source: null, session_key: "", dispatch_id: ""
 });
@@ -24,6 +25,10 @@ function projectInflight(row) {
 function clone(value) {
   if (value === undefined) return undefined;
   return JSON.parse(JSON.stringify(value));
+}
+
+function projectStaleSession(row) {
+  return { runtime_evidence: { runtime_kind: "legacy_tmux_wrapper", liveness: "unknown", reason: "tmux_probe_required" }, ...row };
 }
 
 function toPlain(value) {
@@ -169,6 +174,8 @@ function createAgentdeskMock(options) {
     timeoutDeadlockCandidateScans: [],
     timeoutHostObservations: [],
     timeoutRepairCalls: [],
+    timeoutMarkSessionIdleCalls: [],
+    timeoutStaleRecoveryCalls: [],
     timeoutDispatchTypeLookups: [],
     timeoutTerminationRecords: [],
     timeoutInactiveCounterCleanups: 0,
@@ -262,6 +269,9 @@ function createAgentdeskMock(options) {
       }
     },
     review: {
+      disposition(cardId) {
+        return (options.reviewDispositions || {})[cardId] || "unmanaged";
+      },
       entryContext(cardId) {
         if (typeof settings.reviewEntryContext === "function") {
           return settings.reviewEntryContext(cardId, state);
@@ -376,16 +386,25 @@ function createAgentdeskMock(options) {
       listStaleWorkingSessions(graceMinutes) {
         state.timeoutStaleWorkingScans.push({ graceMinutes });
         if (typeof timeouts.listStaleWorkingSessions === "function") {
-          return clone(timeouts.listStaleWorkingSessions(graceMinutes, state));
+          return clone(timeouts.listStaleWorkingSessions(graceMinutes, state).map(projectStaleSession));
         }
-        return clone(timeouts.staleWorkingSessions || []);
+        return clone((timeouts.staleWorkingSessions || []).map(projectStaleSession));
       },
       listDeadlockCandidates(staleScanMinutes, limit) {
         state.timeoutDeadlockCandidateScans.push({ staleScanMinutes, limit });
         if (typeof timeouts.listDeadlockCandidates === "function") {
-          return clone(timeouts.listDeadlockCandidates(staleScanMinutes, limit, state));
+          return clone(timeouts.listDeadlockCandidates(staleScanMinutes, limit, state).map(projectStaleSession));
         }
-        return clone(timeouts.deadlockCandidates || []);
+        return clone((timeouts.deadlockCandidates || []).map(projectStaleSession));
+      },
+      recoverStaleSession(payload) {
+        state.timeoutStaleRecoveryCalls.push(clone(payload));
+        if (typeof timeouts.recoverStaleSession === "function") {
+          return clone(timeouts.recoverStaleSession(payload, state));
+        }
+        state.timeoutMarkSessionIdleCalls.push({ sessionKey: payload.snapshot.session_key,
+          options: { clear_active_dispatch_id: payload.clear_active_dispatch_id } });
+        return { ok: true, applied: true, reason: "tmux_owner_proven_dead" };
       },
       observeSessionHost(sessionKey) {
         state.timeoutHostObservations.push(sessionKey);

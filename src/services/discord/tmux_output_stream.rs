@@ -1,4 +1,6 @@
 use super::*;
+#[path = "tmux_output_stream/graph_progress.rs"]
+mod graph_progress;
 
 /// Tracks tool/thinking status during watcher output processing.
 #[derive(Clone)]
@@ -21,6 +23,7 @@ pub(in crate::services::discord) struct WatcherToolState {
     placeholder_events: Vec<RecentPlaceholderEvent>,
     /// Provider-normalized status events for the status-panel-v2 message.
     status_events: Vec<StatusEvent>,
+    graph_events: graph_progress::GraphEvents,
     codex_rollout: crate::services::codex_tui::rollout_tail::RolloutRecordDecoder,
     native_codex_enabled: bool,
 }
@@ -37,6 +40,7 @@ impl WatcherToolState {
             prose_diagnostics_recorded: [false; ProviderProseDiagnostic::COUNT],
             placeholder_events: Vec::new(),
             status_events: Vec::new(),
+            graph_events: Default::default(),
             codex_rollout: Default::default(),
             native_codex_enabled: false,
         }
@@ -56,6 +60,7 @@ impl WatcherToolState {
     }
 
     fn record_placeholder_events_from_json(&mut self, value: &serde_json::Value) {
+        self.graph_events.record(value);
         self.placeholder_events.extend(events_from_json(value));
         self.status_events.extend(status_events_from_json(value));
     }
@@ -679,7 +684,9 @@ fn terminal_kind_for_json_evidence(value: &serde_json::Value) -> Option<WatcherT
     }
 }
 
-fn watcher_user_event_is_prompt_boundary(value: &serde_json::Value) -> bool {
+pub(in crate::services::discord) fn watcher_user_event_is_prompt_boundary(
+    value: &serde_json::Value,
+) -> bool {
     if value
         .get("isMeta")
         .and_then(serde_json::Value::as_bool)

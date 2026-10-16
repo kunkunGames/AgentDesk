@@ -1,7 +1,10 @@
 use super::EndpointDoc;
 
+mod campaign_graph;
+mod campaign_operations;
 mod cluster_execution;
 mod kakao_calendar;
+mod managed_checks;
 mod part_01;
 mod part_02;
 mod part_03;
@@ -28,6 +31,9 @@ pub(super) fn all() -> Vec<EndpointDoc> {
     endpoints.extend(part_09::endpoints());
     endpoints.extend(part_10::endpoints());
     endpoints.extend(part_11::endpoints());
+    endpoints.extend(campaign_graph::endpoints());
+    endpoints.extend(campaign_operations::endpoints());
+    endpoints.extend(managed_checks::endpoints());
     endpoints.extend(cluster_execution::endpoints());
     endpoints.extend(kakao_calendar::endpoints());
     endpoints.extend(session_evidence::endpoints());

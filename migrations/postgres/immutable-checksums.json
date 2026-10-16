@@ -720,6 +720,91 @@
       "path": "migrations/postgres/0141_sessions_hosted_execution_archive.sql",
       "sha256": "8bd647f7c3fd5298e37eeea2d88634fa78ebf93dc35dfc8bf052b159067132e7",
       "version": 141
+    },
+    {
+      "path": "migrations/postgres/0146_campaign_upstream_convergence.sql",
+      "sha256": "71558d99a81c07ec54304be349249b7e89b49bf6643a2e6ee15eec3de5926e75",
+      "version": 146
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0131_managed_execution_lifetime.sql",
+      "sha256": "225c906e3cc19cb304f4afe4ab8841d36aa91898a7538e0085fc3f4968f10dcc",
+      "version": 131
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0132_managed_check_completion.sql",
+      "sha256": "535c177b61f5feb6bccfd1720c36844331fe258ce22e6097e435d2462b54afe1",
+      "version": 132
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0133_campaign_execution_guards.sql",
+      "sha256": "bac9054e4fc846cb10ee509d9956436329aaa09896985afb0d4c5db27486128a",
+      "version": 133
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0134_campaign_operations.sql",
+      "sha256": "c3d075258cd20ec60012cde59b1169ba6cca86e91ef1a2365680039706cd1846",
+      "version": 134
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0135_campaign_graph_runtime.sql",
+      "sha256": "a2bc772c0fc9c1747f395e14315198e67306449be28419452b83356e3bbad236",
+      "version": 135
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0136_campaign_codex_executor.sql",
+      "sha256": "777e4a7794da0570a66a06e8974c0d38c492f6b4905a64ea5bd15e3e156f2d69",
+      "version": 136
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0137_campaign_graph_reconciliation.sql",
+      "sha256": "fdec2c62fbe9af6a161ed504130c0d65c59e393b3a1185f31f5d3466f634dae4",
+      "version": 137
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0138_campaign_goal_revisions.sql",
+      "sha256": "24c7b2a4b2e3f8c40d405111f59891874f33befa29f6485b76ff1b3d5e3273a1",
+      "version": 138
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0139_campaign_dag_templates.sql",
+      "sha256": "29cc9653f622dab7dbc599c5217d1cf4fdf086dce6e16cba18c948ec61b7144d",
+      "version": 139
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0140_campaign_learning_continuous_reviews.sql",
+      "sha256": "425295c352ae719af62ede300ce013362f6d6f8ac42a91c0e2bf0a17c33bf40c",
+      "version": 140
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0141_campaign_occurrence_budgets.sql",
+      "sha256": "f52e49c033e68d31007343fc7dcb973eb02aca67d23accef37bd66013d933b85",
+      "version": 141
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0142_campaign_control_ownership.sql",
+      "sha256": "0dc9005b7bfa7002ce4fec2b135159891c3ae2276a79ae0e484f4eab294af94a",
+      "version": 142
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0143_campaign_review_execution_policy.sql",
+      "sha256": "3003f193e5190e6552ea9dae0ce3b761e0997496404907320c512220f8e7c692",
+      "version": 143
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0144_campaign_graph_card_contract.sql",
+      "sha256": "d8cd5dafd4a455d38e132f98c97ae77ed88328516b834299bd13db108dead159",
+      "version": 144
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0145_campaign_workflow_manager.sql",
+      "sha256": "09980d2c3b59e6d2095af02d2bd979fb8b10f33c0088a9a6eb17b4dd7b69b596",
+      "version": 145
+    },
+    {
+      "path": "migrations/postgres_campaign_v5/0146_campaign_upstream_convergence.sql",
+      "sha256": "9c7c859dcb72aae6b1846aaa2c672f89541d510f7ec7ded1b3655f5e33f0f3fe",
+      "version": 146
     }
   ],
   "version": 1

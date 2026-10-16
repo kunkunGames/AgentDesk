@@ -2288,7 +2288,8 @@ mod tests {
     }
 
     fn pins_declared_before_retry_loop(source: &str) -> bool {
-        let body = pool_status_update_body(source);
+        let normalized = source.replace("\r\n", "\n");
+        let body = pool_status_update_body(&normalized);
         let Some(retry_loop) = body.find("\n    loop {") else {
             return false;
         };
@@ -2322,6 +2323,14 @@ pub async fn update_entry_status_on_pg(
             !pins_declared_before_retry_loop(RECOMPUTED_INSIDE_LOOP),
             "the lock must reject pins recomputed inside the retry loop"
         );
+        assert!(pins_declared_before_retry_loop(
+            &MODULE_SOURCE.replace("\r\n", "\n").replace('\n', "\r\n")
+        ));
+        assert!(!pins_declared_before_retry_loop(
+            &RECOMPUTED_INSIDE_LOOP
+                .replace("\r\n", "\n")
+                .replace('\n', "\r\n")
+        ));
     }
 
     #[tokio::test]

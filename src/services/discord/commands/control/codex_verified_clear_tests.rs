@@ -319,6 +319,7 @@ fn codex_verified_managed_reset_refuses_history_reset_and_recreation() {
 fn codex_verified_low_level_reset_and_unavailable_context_preserve_evidence() {
     let fixture = Fixture::new("verified");
     assert!(!reset_managed_process_session(
+        &runtime().block_on(fixture.shared()),
         &fixture.context.tmux_session
     ));
     fixture.assert_files_and_process_unchanged();
@@ -338,6 +339,7 @@ fn codex_verified_low_level_reset_and_unavailable_context_preserve_evidence() {
         );
     });
     assert!(!reset_managed_process_session(
+        &runtime().block_on(fixture.shared()),
         &fixture.context.tmux_session
     ));
     assert!(fixture.alive.load(Ordering::SeqCst));
@@ -357,7 +359,10 @@ fn legacy_codex_and_claude_clear_admission_remains_open() {
             None
         );
     });
-    assert!(reset_managed_process_session(&fixture.context.tmux_session));
+    assert!(reset_managed_process_session(
+        &runtime().block_on(fixture.shared()),
+        &fixture.context.tmux_session
+    ));
     assert!(
         !fixture.alive.load(Ordering::SeqCst),
         "legacy process reset still happens"

@@ -33,17 +33,16 @@ class SourceContractTests(unittest.TestCase):
         cls.baseline, cls.payload = ratchet.load_baseline(ROOT / ratchet.BASELINE_PATH)
 
     def test_registry_remeasurement_and_p2_1_classification_are_explicit(self) -> None:
-        # #5504 Stack A moved five channel-only handoff cleanup spellings behind
-        # exact cleanup helpers, so 8/3/3/2 became 3/5/4/2. The baseline
-        # comment stays at the historical no-growth ceiling; this assertion pins
-        # the safer checked-in tree without relaxing that ceiling.
+        # #5504 Stack A moved channel-only handoff cleanup spellings behind
+        # exact cleanup helpers. A regenerated baseline reports the measured
+        # checked-in tree, and the exact subcounts below preserve its contract.
         self.assertEqual(
             self.registry_subcounts,
             {
                 "direct_channel_remove": 3,
                 "remove_if_current": 5,
                 "cancel_and_remove_if_current": 4,
-                "remove_locked_helper": 2,
+                "remove_locked_helper": 3,
             },
         )
         watcher_backstop = ROOT / "src/services/discord/turn_finalizer/watcher_backstop.rs"
@@ -100,6 +99,21 @@ class SourceContractTests(unittest.TestCase):
             self.test_every_fenced_site_binds_both_s4_conjuncts()
         finally:
             self.payload = original
+
+    def test_warrant_docstring_declares_all_four_limits(self) -> None:
+        doc = ratchet.__doc__ or ""
+        self.assertIn("two-sided check, not a no-growth check", doc)
+        self.assertIn("paired deletion", doc)
+        self.assertIn("count-preserving relocation", doc)
+        self.assertIn("Return-value discard", doc)
+        self.assertIn("Argument identity", doc)
+        self.assertIn("Control-flow dominance", doc)
+        self.assertIn("Unused diagnostics are not enforcement", doc)
+        self.assertIn("ordinary unused-binding warning", doc)
+        self.assertIn("behavioral witness", doc)
+        self.assertIn("does not\nprove argument identity or control-flow dominance", doc)
+        self.assertNotIn("guarantees nothing", doc.lower())
+
 
 
 class RatchetDiscriminationTests(unittest.TestCase):

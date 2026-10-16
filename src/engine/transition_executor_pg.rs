@@ -5,17 +5,24 @@ pub(crate) async fn execute_pg_transition_intent(
     intent: &crate::engine::transition::TransitionIntent,
 ) -> Result<(), String> {
     match intent {
-        crate::engine::transition::TransitionIntent::UpdateStatus { card_id, to, .. } => {
-            sqlx::query(
+        crate::engine::transition::TransitionIntent::UpdateStatus { card_id, from, to } => {
+            let changed = sqlx::query(
                 "UPDATE kanban_cards
                  SET status = $1, updated_at = NOW()
-                 WHERE id = $2",
+                 WHERE id = $2 AND status = $3",
             )
             .bind(to)
             .bind(card_id)
+            .bind(from)
             .execute(&mut **tx)
             .await
-            .map_err(|error| format!("update status for {card_id}: {error}"))?;
+            .map_err(|error| format!("update status for {card_id}: {error}"))?
+            .rows_affected();
+            if changed != 1 {
+                return Err(format!(
+                    "card {card_id} changed before the transition could commit"
+                ));
+            }
         }
         crate::engine::transition::TransitionIntent::SetLatestDispatchId {
             card_id,

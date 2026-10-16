@@ -18,6 +18,7 @@ mod managed_reset;
 #[cfg(all(test, unix))]
 use managed_reset::VERIFIED_CODEX_RESET_REFUSAL;
 pub(in crate::services::discord) use managed_reset::reset_managed_process_session;
+pub(super) use managed_reset::retire_watcher as retire_managed_watcher;
 pub(in crate::services::discord) use managed_reset::{
     verified_codex_reset_refusal, verified_codex_reset_refusal_for_target,
 };
@@ -492,7 +493,7 @@ async fn clear_channel_session_state_body(
         (Some((armed, guard)), _) => native::complete(shared, channel_id, armed, guard).await?,
         (None, ManagedSessionClearBehavior::ResetManagedProcess) => {
             if let Some(name) = tmux_name {
-                reset_managed_process_session(&name);
+                reset_managed_process_session(shared, &name);
             }
         }
         (None, ManagedSessionClearBehavior::Noop) => {}

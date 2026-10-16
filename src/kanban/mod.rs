@@ -7,6 +7,7 @@ mod audit;
 mod github_sync;
 mod github_sync_target;
 mod hooks;
+mod native_campaign;
 mod review_tuning;
 mod state_machine;
 mod terminal_cleanup;

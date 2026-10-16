@@ -45,6 +45,8 @@ module.exports = function attachReviewAutoAccept(timeouts, helpers) {
       var aggregateNeeded = agentdesk.kv.get(reviewTuningAggregateRetryKey) === "pending";
       for (var s = 0; s < staleSuggestions.length; s++) {
         var sc = staleSuggestions[s];
+        var disposition = agentdesk.review.disposition(sc.id);
+        if (disposition !== "unmanaged" && disposition !== "run_local_review") continue;
         if (sc.assigned_agent_id) {
           // Try dispatch creation FIRST — only transition on success
           try {

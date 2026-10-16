@@ -2139,7 +2139,14 @@ mod tests {
         )
         .expect("runtime kind marker");
         let output_path = tmp.path().join("agentdesk-5396-redrive-reuse.jsonl");
-        std::fs::write(&output_path, vec![b'x'; 128]).expect("seed capture fixture");
+        std::fs::write(
+            &output_path,
+            concat!(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"pending relay text\"}]}}\n",
+                "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\"}\n",
+            ),
+        )
+        .expect("seed parsed, nonterminal capture fixture");
         let output_path = output_path.to_string_lossy().into_owned();
 
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -2181,8 +2188,7 @@ mod tests {
             .await,
             "the mailbox anchor must match the inflight row the circuit reserves"
         );
-        // Older than `WATCHER_STATE_DESYNC_STALE_MS`, so the frozen relay
-        // frontier reads as a desync rather than a still-warm turn.
+        // The old turn remains active; backlog age is measured separately below.
         let started_at = (chrono::Local::now() - chrono::Duration::seconds(600))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
@@ -2206,10 +2212,24 @@ mod tests {
         inflight.runtime_kind =
             Some(crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui);
         inflight.set_relay_owner_kind(crate::services::discord::inflight::RelayOwnerKind::Watcher);
+        super::super::watchdog_test_support::seed_source_generation(
+            &shared,
+            channel_id,
+            &mut inflight,
+        );
         crate::services::discord::inflight::save_inflight_state(&inflight)
             .expect("seed authoritative inflight");
         clear_redrive_test_state(&shared, &provider, channel_id, &tmux_session);
 
+        let pre = super::super::watchdog_test_support::wait_for_overdue_backlog(
+            &registry, &provider, &shared, channel_id,
+        )
+        .await;
+        assert_eq!(
+            pre.relay_stall_state,
+            RelayStallState::TmuxAliveRelayDead,
+            "parsed overdue relay text must make the reattach apply eligible",
+        );
         let base = chrono::Utc::now().timestamp();
         assert!(
             !registry

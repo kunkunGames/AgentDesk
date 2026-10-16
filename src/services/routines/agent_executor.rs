@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 
+#[cfg(test)]
+mod completion_pg_tests;
 pub(crate) mod reliability;
 pub(crate) mod start_deferral;
 use reliability::{current_attempt_started_at, provider_error_from_completion};
@@ -35,6 +37,7 @@ pub struct RoutineAgentExecutor {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct AgentTranscriptCompletionRow {
     assistant_message: String,
+    events_json: String,
     duration_ms: Option<i64>,
     created_at: DateTime<Utc>,
 }
@@ -1594,44 +1597,9 @@ async fn resolve_routine_thread_http(
     ))
 }
 
-fn routine_thread_title(routine_name: &str, agent_id: &str) -> String {
-    let base = format!(
-        "routine {} - {}",
-        compact_for_title(routine_name),
-        compact_for_title(agent_id)
-    );
-    base.chars().take(90).collect()
-}
-
-pub(crate) fn routine_agent_session_name(routine_name: &str, agent_id: &str) -> String {
-    // Put the distinguishing routine name FIRST: `build_tmux_session_name`
-    // truncates to 44 chars, so leading with `agent_id` made two routines on the
-    // same agent collide to one tmux session (reusing provider/transcript state)
-    // once the shared `routine <agent_id> - ` prefix consumed the budget (#3463).
-    // Routine-name-first keeps per-routine sessions distinct after truncation and
-    // matches `routine_thread_title`'s ordering.
-    let base = format!(
-        "routine {} - {}",
-        compact_for_title(routine_name),
-        compact_for_title(agent_id)
-    );
-    base.chars().take(90).collect()
-}
-
-fn compact_for_title(value: &str) -> String {
-    let value = value.trim();
-    if value.is_empty() {
-        "unnamed".to_string()
-    } else {
-        value
-            .chars()
-            .map(|ch| if ch.is_control() { ' ' } else { ch })
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
+mod identity;
+pub(crate) use identity::routine_agent_session_name;
+use identity::routine_thread_title;
 
 fn timeout_secs_for_run(run: &RunningAgentRoutineRun, default_completion_timeout_secs: u64) -> u64 {
     run.timeout_secs
@@ -2127,7 +2095,10 @@ fn assistant_message_is_no_reply(message: &str) -> bool {
 fn terminal_completion_from_quality_event(
     terminal: AgentQualityCompletionRow,
 ) -> Option<AgentTurnCompletion> {
-    if !is_no_deliverable_quality_event(&terminal.event_type, terminal.outcome.as_deref()) {
+    if !is_no_deliverable_quality_event(&terminal.event_type, terminal.outcome.as_deref())
+        && !(terminal.event_type == "turn_error"
+            && reliability::is_terminal_failure(terminal.outcome.as_deref()))
+    {
         return None;
     }
     Some(AgentTurnCompletion {

@@ -70,6 +70,8 @@ mod transcript_binding_stall;
 pub(in crate::services::discord) mod transcript_turn;
 mod turn_deliver;
 mod unpaired_active_token;
+#[cfg(all(test, unix))]
+pub(in crate::services::discord) mod watchdog_test_support;
 pub(in crate::services::discord) mod watcher_respawn;
 #[cfg(all(test, unix))]
 pub(in crate::services::discord) use watcher_respawn::lock_watcher_absence_for_test;
@@ -158,8 +160,8 @@ use runtime_resolve::{resolve_direct_meeting_runtime, resolve_direct_meeting_sha
 pub(crate) use runtime_resolve::{resolve_intake_worker_runtime, resolve_utility_bot_http};
 #[allow(unused_imports)]
 pub use snapshot::{
-    DiscordHealthSnapshot, HealthStatus, WatcherStateSnapshot, active_request_owner_for_channel,
-    build_health_snapshot, build_public_health_snapshot,
+    DiscordHealthSnapshot, HealthStatus, WatcherStateLookup, WatcherStateSnapshot,
+    active_request_owner_for_channel, build_health_snapshot, build_public_health_snapshot,
 };
 
 /// Per-provider snapshot for the health response.
