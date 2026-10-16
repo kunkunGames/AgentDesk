@@ -2,7 +2,7 @@
 //! Configuration and orchestration administration is composed separately.
 use super::super::{
     ApiRouter, AppState, agents, agents_crud, agents_turn_deliver, cluster, dispatched_sessions,
-    dispatches, dm_reply, health_api, idle_recap, monitoring, protected_api_domain,
+    dispatches, dm_reply, health_api, hooks, idle_recap, monitoring, protected_api_domain,
     provider_cli_api, queue_api, termination_events, turn_lease, voice_audio, voice_conductor,
 };
 use axum::{
@@ -149,6 +149,12 @@ pub(crate) fn router(state: AppState) -> ApiRouter {
             .route("/voice/conductor/jobs", get(voice_conductor::list_jobs))
             .route("/voice/conductor/jobs/{id}", get(voice_conductor::get_job))
             .route("/dm-reply/register", post(dm_reply::register_handler))
+            .route("/hook/reset-status", post(hooks::reset_status))
+            .route("/hook/skill-usage", post(hooks::skill_usage))
+            .route(
+                "/hook/session/{sessionKey}",
+                delete(hooks::disconnect_session),
+            )
             .route("/internal/node-probe", get(cluster::node_probe))
             .route(
                 "/o/transition",

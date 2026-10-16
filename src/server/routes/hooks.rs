@@ -140,12 +140,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hooks_routes_are_mounted_in_integrations_domain() {
-        use crate::server::routes::domains::integrations;
-        let _ = integrations::router;
-    }
-
-    #[test]
     fn test_skill_usage_body_deserialization() {
         let json_data = r#"{"skill_id": "test_skill", "agent_id": "agent_123"}"#;
         let parsed: SkillUsageBody = serde_json::from_str(json_data).unwrap();
