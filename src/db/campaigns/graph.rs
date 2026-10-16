@@ -12,6 +12,7 @@ pub(crate) mod result;
 pub(crate) mod revision;
 pub(crate) mod schedule;
 pub(crate) mod schema;
+mod settled_gate;
 pub(crate) mod store;
 pub(crate) mod workflow;
 use anyhow::{Result, ensure};
@@ -73,8 +74,14 @@ pub struct Graph {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SettledEffectGate {
+    /// SHA256 of the authenticated settled-effect audit, in lowercase hex.
+    #[schemars(length(min = 64, max = 64), regex(pattern = r"^[a-f0-9]{64}$"))]
     pub audit_sha256: String,
+    /// The inspection node's Task.id in this graph, never its persistent task_key.
+    #[schemars(length(min = 1, max = 64), regex(pattern = r"^[A-Za-z0-9_.-]+$"))]
     pub inspection: String,
+    /// The independent verification node's Task.id in this graph, never its task_key.
+    #[schemars(length(min = 1, max = 64), regex(pattern = r"^[A-Za-z0-9_.-]+$"))]
     pub verification: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, JsonSchema)]
@@ -275,25 +282,7 @@ impl Graph {
                 ensure!(paths.insert(&i.destination), "input/output path collision");
             }
         }
-        let mut audits = BTreeSet::new();
-        ensure!(
-            self.settled_effect_gates.len() <= 16,
-            "too many settled effect gates"
-        );
-        for gate in &self.settled_effect_gates {
-            ensure!(
-                gate.audit_sha256.len() == 64
-                    && gate
-                        .audit_sha256
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                    && audits.insert(&gate.audit_sha256)
-                    && gate.inspection != gate.verification
-                    && nodes.contains_key(&gate.inspection)
-                    && nodes.contains_key(&gate.verification),
-                "invalid or duplicate settled effect gate"
-            );
-        }
+        settled_gate::validate(&self.settled_effect_gates, &nodes)?;
         let mut ready = BTreeSet::new();
         loop {
             let previous = ready.len();

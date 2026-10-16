@@ -107,4 +107,21 @@ mod tests {
                 .all(|key| properties.contains_key(*key))
         );
     }
+
+    #[test]
+    fn settled_effect_schema_exposes_graph_local_node_id_contract() {
+        let schema = document().unwrap();
+        for contract in ["graph", "result"] {
+            let properties = &schema[contract]["$defs"]["SettledEffectGate"]["properties"];
+            for field in ["inspection", "verification"] {
+                let property = &properties[field];
+                let description = property["description"].as_str().unwrap();
+                assert!(description.contains("Task.id"));
+                assert!(description.contains("task_key"));
+                assert_eq!(property["maxLength"], 64);
+                assert_eq!(property["pattern"], "^[A-Za-z0-9_.-]+$");
+            }
+            assert_eq!(properties["audit_sha256"]["pattern"], "^[a-f0-9]{64}$");
+        }
+    }
 }
