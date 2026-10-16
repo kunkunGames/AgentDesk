@@ -302,7 +302,7 @@ async fn bounded_tmux_timeout_kills_descendants_before_reaping_live_or_exited_le
     for ending in ["wait", "exit 0"] {
         let fixture = Fixture::new();
         let mut command = fixture.command(&format!(
-            "(while [ ! -e \"$3\" ]; do sleep 0.01; done; printf late > \"$2\") & \
+            "(while [ ! -e \"$4\" ]; do sleep 0.01; done; printf late > \"$2\") & \
              printf '%s\\n' \"$!\" >> \"$1\"; {ending}"
         ));
         command.arg(fixture.path("release-effect"));
