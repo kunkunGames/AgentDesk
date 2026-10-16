@@ -266,7 +266,9 @@ impl ProcessIdentity {
         }
         ProcessIdentityProbe::ProbeError
     }
-    #[cfg(test)]
+    /// Restore a persisted baseline without recapturing the current PID owner.
+    /// Linux recovery uses this to distinguish the original runtime from PID reuse.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn from_persisted(starttime: Option<u128>, _lstart_hash: Option<u128>) -> Self {
         Self {
             starttime,
