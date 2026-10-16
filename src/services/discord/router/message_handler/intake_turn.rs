@@ -930,7 +930,8 @@ async fn handle_text_message_admitted(
     );
     let user_text_owned = user_text.to_owned();
     let request_owner_name_owned = request_owner_name.to_owned();
-    crate::services::discord::input_runtime::fence::effect::run(final_permit, async move {
+    // Keep the large admitted turn out of nested effect wrapper futures.
+    crate::services::discord::input_runtime::fence::effect::run(final_permit, Box::pin(async move {
     let (http, cache, ctx_for_chained_dispatch, shared, token) = (
         &http_owned, cache_owned.as_ref(), ctx_owned.as_ref(), &shared_owned, token_owned.as_str(),
     );
@@ -1089,7 +1090,7 @@ async fn handle_text_message_admitted(
     let execution_permit = crate::services::discord::input_runtime::fence::effect::admit(
         &provider, channel_id.get(),
     ).map_err(|failure| format!("execution input admission refused: {failure:?}"))?;
-    crate::services::discord::input_runtime::fence::effect::scope(execution_permit, async {
+    crate::services::discord::input_runtime::fence::effect::scope(execution_permit, Box::pin(async {
     {
         let channel_name_for_isolation = {
             let data = shared.core.lock().await;
@@ -2603,8 +2604,8 @@ async fn handle_text_message_admitted(
     }
 
     Ok(IntakeExecution::Executed)
-    }).await
-    }).await
+    })).await
+    })).await
 }
 
 #[cfg(test)]

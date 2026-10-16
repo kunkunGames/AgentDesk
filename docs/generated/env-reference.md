@@ -12,7 +12,7 @@ when the code has none).
 
 Regenerate with `python3 scripts/generate_env_reference.py`; CI fails when this file drifts.
 
-- AgentDesk variables (`AGENTDESK_*`, `ADK_*`): 122
+- AgentDesk variables (`AGENTDESK_*`, `ADK_*`): 125
 - Platform and third-party variables: 29
 
 ## AgentDesk variables
@@ -57,8 +57,10 @@ Regenerate with `python3 scripts/generate_env_reference.py`; CI fails when this 
 | `ADK_VOICE_SILENCE` | `src/services/discord/voice_barge_in/foreground_decision.rs` |  |
 | `AGENTDESK_API_URL` | `src/cli/client.rs`, `src/cli/monitoring.rs` | `env_hint` names the environment variable(s) the *caller's* `api_base()` actually honors — client.rs resolves `AGENTDESK_API_URL` only, while monitoring.rs pre… |
 | `AGENTDESK_BINDING_CONTEXT` | `src/services/tui_prompt_dedupe/binding_context.rs` | Hook capture reads this value without consulting mutable markers. |
+| `AGENTDESK_CAMPAIGN_REGISTRY` | `src/server/campaign_execution.rs` |  |
 | `AGENTDESK_CATCH_UP_POLL_SECS` | `src/services/discord/runtime_bootstrap/spawns.rs` |  |
 | `AGENTDESK_CATCH_UP_SCAN_PACE_MS` | `src/services/discord/catch_up.rs` | `AGENTDESK_CATCH_UP_SCAN_PACE_MS` overrides the gap (0 disables — used by tests and by operators who want the old unthrottled behaviour). |
+| `AGENTDESK_CHECK_REGISTRY` | `src/server/campaign_execution.rs`, `src/server/test_phase_runs/checks.rs` |  |
 | `AGENTDESK_CLAUDE_LIVE_BRIDGE_GUARD` | `src/services/discord/live_bridge.rs` | `0` lets watcher respawn take over a live Claude original again. |
 | `AGENTDESK_CLAUDE_PATH` | `src/services/discord/tui_prompt_relay/relay_e2e/mod.rs` | Dispatched turns must not reach a host `claude` or host config: a real CLI rejects the synthetic resume id and triggers a stale-resume re-dispatch. |
 | `AGENTDESK_CLAUDE_SUBMIT_GUARD_CHANNEL_IDS` | `src/config/session_hosts.rs` |  |
@@ -66,7 +68,7 @@ Regenerate with `python3 scripts/generate_env_reference.py`; CI fails when this 
 | `AGENTDESK_CLUSTER_API_BASE_URL` | `src/services/cluster/session_routing.rs` |  |
 | `AGENTDESK_CODEX_DIRECT_TUI_HOOKS` | `src/services/codex.rs` | Direct TUI hooks are on unless `AGENTDESK_CODEX_DIRECT_TUI_HOOKS` is "0", "false", "off" or "no". |
 | `AGENTDESK_CODEX_DIRECT_TUI_SOURCE_MODE` | `src/services/codex_tui/session/source_observation.rs` | Validated once at startup; no active nonce or new launch reparses mutable env. |
-| `AGENTDESK_CODEX_FIRST_EVENT_TIMEOUT_SECS` | `src/services/codex_tmux_wrapper.rs` |  |
+| `AGENTDESK_CODEX_FIRST_EVENT_TIMEOUT_SECS` | `src/services/codex_tmux_wrapper/launch_settings.rs` |  |
 | `AGENTDESK_CODEX_LIVE_BRIDGE_GUARD` | `src/services/discord/live_bridge.rs` |  |
 | `AGENTDESK_CODEX_REASONING_EFFORT` | `src/services/codex.rs` |  |
 | `AGENTDESK_CODEX_REMOTE_TMUX` | `src/services/codex.rs` |  |
@@ -96,7 +98,7 @@ Regenerate with `python3 scripts/generate_env_reference.py`; CI fails when this 
 | `AGENTDESK_HOOK_RELAY_TEST_ENDPOINT` | `src/services/claude_tui/hook_relay.rs` |  |
 | `AGENTDESK_HOOK_RELAY_TEST_MUTATION` | `src/services/claude_tui/hook_relay/ordered_queue.rs`, `src/services/claude_tui/hook_server/relay_receipts.rs` |  |
 | `AGENTDESK_HOOK_RELAY_TEST_STDOUT_PATH` | `src/services/claude_tui/hook_relay.rs` |  |
-| `AGENTDESK_INSTANCE_ID` | `src/services/cluster/node_registry.rs`, `src/services/tui_prompt_dedupe/binding_context.rs` | Resolve the self instance_id, preferring the value the cluster bootstrap registered (config-driven if present), falling back to the env-var/hostname pair only… |
+| `AGENTDESK_INSTANCE_ID` | `src/services/cluster/node_registry.rs`, `src/services/cluster/node_registry/identity.rs`, `src/services/tui_prompt_dedupe/binding_context.rs` | Resolve the self instance_id, preferring the value the cluster bootstrap registered (config-driven if present), falling back to the env-var/hostname pair only… |
 | `AGENTDESK_KAKAO_ACCOUNTS` | `src/services/kakao.rs` |  |
 | `AGENTDESK_KAKAO_CALENDAR_ACCOUNTS` | `src/services/kakao/account.rs` | Separate allowlist: enabling calendar never implicitly grants all message accounts. |
 | `AGENTDESK_KAKAO_CALENDAR_ENABLED` | `src/services/kakao/account.rs` |  |
@@ -111,6 +113,7 @@ Regenerate with `python3 scripts/generate_env_reference.py`; CI fails when this 
 | `AGENTDESK_N2B_TEST_MUTATION` | `src/services/claude_tui/source_verify.rs` | Test-only switch naming the one rule a mutation run disables. |
 | `AGENTDESK_OBSIDIAN_AGENTS_SRC` | `src/services/operator_connectors.rs`, `src/services/routines/migrated.rs` |  |
 | `AGENTDESK_OBSIDIAN_SKILL_ROOT` | `src/services/operator_connectors.rs`, `src/services/routines/migrated.rs` |  |
+| `AGENTDESK_PG_MIGRATION_LINEAGE` | `src/db/postgres/migration_catalog.rs` |  |
 | `AGENTDESK_POLICY_HARDENING` | `src/engine/loader.rs`, `src/engine/mod.rs` |  |
 | `AGENTDESK_POLICY_TRUST_ENFORCE` | `src/engine/loader.rs` |  |
 | `AGENTDESK_POLICY_TRUST_OVERRIDE` | `src/engine/loader.rs` |  |
@@ -127,12 +130,12 @@ Regenerate with `python3 scripts/generate_env_reference.py`; CI fails when this 
 | `AGENTDESK_REPO_DIR` | `src/services/git/repo_resolver.rs` | Priority: `AGENTDESK_REPO_DIR` env -> scan all known roots for a git workspace -> `~/AgentDesk`. |
 | `AGENTDESK_REQUIRE_PG` | `src/db/postgres.rs` | Every fixture that creates a database must use this authority; callers that can skip return `None`, while required lanes still get the hard failure below when… |
 | `AGENTDESK_REVIEW_MCP_ALLOWLIST` | `src/services/mcp_config.rs` |  |
-| `AGENTDESK_ROOT_DIR` | `src/cli/dcserver.rs`, `src/config.rs`, `src/config/test_env/teardown_probe.rs`, `src/services/claude/launch_env.rs`, `src/services/claude_tui/hook_relay/ordered_queue.rs`, `src/services/codex.rs`, `src/services/discord/runtime_store.rs`, `src/services/discord/tui_prompt_relay/relay_e2e/mod.rs`, `src/services/discord/watchers/lifecycle/n4d2_entry_test.rs`, `src/services/qwen/session_lifecycle.rs`, `src/services/routines/migrated.rs`, `src/services/tui_prompt_dedupe/handoff.rs` | Canonical runtime root: $AGENTDESK_ROOT_DIR → ~/.adk/release All code that needs the AgentDesk root directory MUST call this function instead of reimplementing… |
+| `AGENTDESK_ROOT_DIR` | `src/cli/dcserver.rs`, `src/config.rs`, `src/config/test_env/teardown_probe.rs`, `src/services/claude/launch_env.rs`, `src/services/claude_tui/hook_relay/ordered_queue.rs`, `src/services/codex.rs`, `src/services/discord/runtime_store.rs`, `src/services/discord/tui_prompt_relay/relay_e2e/mod.rs`, `src/services/discord/watchers/lifecycle/n4d2_entry_test.rs`, `src/services/routines/migrated.rs`, `src/services/tui_prompt_dedupe/handoff.rs` | Canonical runtime root: $AGENTDESK_ROOT_DIR → ~/.adk/release All code that needs the AgentDesk root directory MUST call this function instead of reimplementing… |
 | `AGENTDESK_SCHEMA_AHEAD_HOLD` | `src/cli/dcserver_pg_bootstrap.rs` | Whether the launchd environment leaves the schema-ahead hold on (default on). |
 | `AGENTDESK_SELF_WATCHDOG_MODE` | `src/services/discord/health/recovery/self_watchdog.rs` |  |
 | `AGENTDESK_SINGLE_MESSAGE_PANEL` | `src/services/discord/single_message_panel.rs` | The rollout gate previously short-circuited a missing env var to `false`, so any environment without an explicit `AGENTDESK_SINGLE_MESSAGE_PANEL=1` silently fe… |
 | `AGENTDESK_SOURCE_ZPROFILE` | `src/services/routines/migrated.rs` |  |
-| `AGENTDESK_STATUS_INTERVAL_SECS` | `src/services/discord/mod.rs` | Minimum interval between Discord placeholder progress edits (AGENTDESK_STATUS_INTERVAL_SECS, default 5s). |
+| `AGENTDESK_STATUS_INTERVAL_SECS` | `src/services/discord/runtime_tuning.rs` | Minimum interval between Discord placeholder progress edits (AGENTDESK_STATUS_INTERVAL_SECS, default 5s). |
 | `AGENTDESK_TEST_PG_RECLAIM_DENY_SERVERS` | `src/db/postgres/test_db_reclaim.rs` |  |
 | `AGENTDESK_TEST_PG_RECLAIM_LOG` | `src/db/postgres/test_db_reclaim.rs` |  |
 | `AGENTDESK_TEST_PG_RECLAIM_PAUSE_AT` | `src/db/postgres/test_db_reclaim.rs` | Test seam: a child process stops at this create stage until stdin yields a line. |
@@ -152,13 +155,13 @@ Regenerate with `python3 scripts/generate_env_reference.py`; CI fails when this 
 | `CLAUDE_CONFIG_DIR` | `src/services/claude_tui/hook_output_guard.rs`, `src/services/claude_tui/transcript_tail.rs`, `src/services/discord/mcp_credential_watcher.rs`, `src/services/discord/recovery_engine/manual_rebind_override.rs` | The Claude home this host reads rollout transcripts under, honouring the `CLAUDE_CONFIG_DIR` override. |
 | `CODEX_HOME` | `src/services/codex_tui/rollout_tail.rs` | The Codex home this host reads rollouts under, honouring the `CODEX_HOME` override. |
 | `COKACDIR_DEBUG` | `src/services/claude.rs` | Global runtime debug flag — togglable via `/debug` command or COKACDIR_DEBUG=1 env var. |
-| `COMPUTERNAME` | `src/services/tmux_common.rs` |  |
+| `COMPUTERNAME` | `src/services/tmux_common/namespace.rs` |  |
 | `DATABASE_URL` | `src/db/postgres.rs` |  |
 | `GEMINI_CLIENT_ID` | `src/server/mod.rs` | Gemini CLI OAuth app credentials, from env vars or the installed CLI bundle. |
 | `GEMINI_CLIENT_SECRET` | `src/server/mod.rs` | Gemini CLI OAuth app credentials, from env vars or the installed CLI bundle. |
 | `GEMINI_CLI_HOME` | `src/services/mcp_config.rs` |  |
 | `HOME` | `src/cli/doctor/orchestrator.rs`, `src/cli/utils.rs`, `src/services/discord/sidecar_interaction.rs`, `src/services/mcp_config.rs`, `src/services/observability/events.rs`, `src/services/operator_connectors.rs`, `src/services/qwen.rs`, `src/services/routines/migrated.rs` | #2655: handler for the `install-memento-session-hook` CLI surface. |
-| `HOSTNAME` | `src/server/outbox_worker.rs`, `src/services/scheduled_messages.rs`, `src/services/tmux_common.rs` |  |
+| `HOSTNAME` | `src/server/outbox_worker.rs`, `src/services/scheduled_messages.rs`, `src/services/tmux_common/namespace.rs` |  |
 | `LOCALAPPDATA` | `src/services/platform/binary_resolver.rs`, `src/services/stream_json_cli/dialects/agy.rs` |  |
 | `MEMENTO_WORKSPACE` | `src/server/routes/memory_api.rs`, `src/services/maintenance/jobs/memento_consolidation.rs` |  |
 | `OPENAI_API_KEY` | `src/server/rate_limit_sync.rs` | --- Codex: ~/.codex/auth.json (CLI subscription), else OPENAI_API_KEY --- |

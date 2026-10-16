@@ -9,7 +9,7 @@ fn intake_entry_futures_stay_within_worker_stack_budget() {
             &'static IntakeDeps<'static>,
             bool,
             IntakeRequest,
-            bool,
+            (bool, Option<adk_thread::Route>),
             PendingUploads,
             Option<VoiceTranscriptAnnouncement>,
         ) -> F,
