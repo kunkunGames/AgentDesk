@@ -297,6 +297,7 @@ async fn s2b1b_actual_driver_failures_cancel_and_stale_evidence_issue_nothing() 
         "wrong_uuid",
         "missing_source",
         "wrong_runtime_marker",
+        "unknown_runtime_marker",
         "missing_options",
         "missing_endpoint",
         "wrong_channel",
@@ -582,12 +583,16 @@ async fn actual_driver_case(mode: &'static str) {
                     .unwrap();
                 }
                 "missing_source" => std::fs::remove_file(&path).unwrap(),
-                "wrong_runtime_marker" => std::fs::write(
+                "wrong_runtime_marker" | "unknown_runtime_marker" => std::fs::write(
                     crate::services::tmux_common::session_temp_path(
                         tmux,
                         crate::services::tmux_common::TMUX_RUNTIME_KIND_TEMP_EXT,
                     ),
-                    "claude-tui",
+                    if mode == "wrong_runtime_marker" {
+                        crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui.as_str()
+                    } else {
+                        "claude-tui"
+                    },
                 )
                 .unwrap(),
                 "missing_options" => {
@@ -791,7 +796,29 @@ async fn actual_driver_case(mode: &'static str) {
         row_modified_after,
     ) in outcomes
     {
-        assert!(result.is_ok(), "{mode}: {result:?}; {calls:?}; {stages:?}");
+        if mode == "unknown_runtime_marker" {
+            assert_eq!(
+                result.as_ref().unwrap_err(),
+                "native or unknown hosting intent requires canonical release before tmux admission"
+            );
+            assert!(calls.is_empty(), "unknown hosting kind admits no transport");
+            assert!(
+                stages.is_empty(),
+                "unknown hosting kind admits no warm input"
+            );
+            assert!(frames.is_empty(), "unknown hosting kind emits no frames");
+            assert_eq!(
+                std::fs::read_to_string(crate::services::tmux_common::session_temp_path(
+                    tmux,
+                    crate::services::tmux_common::TMUX_RUNTIME_KIND_TEMP_EXT,
+                ))
+                .unwrap(),
+                "claude-tui",
+                "unknown hosting evidence survives the admission refusal"
+            );
+        } else {
+            assert!(result.is_ok(), "{mode}: {result:?}; {calls:?}; {stages:?}");
+        }
         assert!(
             !expired,
             "watchdog cannot be PASS: {mode}; {stages:?}; {calls:?}"
@@ -833,6 +860,8 @@ async fn actual_driver_case(mode: &'static str) {
             if matches!(mode, "s1w_initial" | "s1w_rollback" | "s1w_support") {
                 assert!(calls.is_empty(), "initial refusal before pane transport");
             }
+        }
+        if mode.starts_with("s1w_") || mode == "unknown_runtime_marker" {
             for (path, before) in identity_paths.iter().zip(&identity_before) {
                 assert_eq!(
                     &(

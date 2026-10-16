@@ -77,10 +77,12 @@ mod tests {
         let start = source
             .find("    if let Some(rx) = completion_rx {")
             .expect("intake completion wait remains present");
-        let waiter = source[start..].split("#[cfg(test)]").next().unwrap();
+        let (waiter, _) = source[start..]
+            .split_once("\n    Ok(IntakeExecution::Executed)")
+            .expect("intake returns Executed after waiting for bridge completion");
         assert_eq!(
             waiter.trim(),
-            "if let Some(rx) = completion_rx {\n        rx.await\n            .map_err(|_| \"queued turn completion wait failed\".to_string())?;\n    }\n\n    Ok(IntakeExecution::Executed)\n    }).await\n    }).await\n}"
+            "if let Some(rx) = completion_rx {\n        rx.await\n            .map_err(|_| \"queued turn completion wait failed\".to_string())?;\n    }"
         );
     }
 }
