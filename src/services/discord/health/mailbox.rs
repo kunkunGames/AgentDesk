@@ -54,6 +54,8 @@ pub(super) struct MailboxHealthSnapshot {
     pub(super) frontier_provenance: FrontierProvenanceReport,
     pub(super) relay_backlog: RelayBacklogEvidence,
     pub(super) relay_stall_state: RelayStallState,
+    #[serde(default, skip_serializing_if = "super::TailObservation::is_unmeasured")]
+    pub(super) tail_observation: super::TailObservation,
     pub(super) relay_health: RelayHealthSnapshot,
 }
 

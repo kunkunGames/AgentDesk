@@ -535,6 +535,7 @@ mod tests {
     fn session_fixture(updated_at: Option<&str>, attached: bool) -> SessionEnrichment {
         let inflight = updated_at.map(inflight_fixture);
         SessionEnrichment {
+            tail_observation: Default::default(),
             inflight,
             attached,
             watcher_attached: attached,
@@ -575,6 +576,7 @@ mod tests {
 
     fn watcher_fixture() -> WatcherStateSnapshot {
         WatcherStateSnapshot {
+            tail_observation: Default::default(),
             provider: ProviderKind::Codex.as_str().to_string(),
             attached: true,
             tmux_session: Some("AgentDesk-codex-fixture".to_string()),
@@ -636,7 +638,6 @@ mod tests {
         relay.mailbox_has_cancel_token = true;
         relay.tmux_alive = Some(true);
         relay.last_relay_ts_ms = None;
-
         let assessment =
             classify_runtime_signals_lossy(&relay, true, true, false, false, false, false, false)
                 .expect("applicable #4423 runtime signals");
@@ -770,14 +771,12 @@ mod tests {
             StallWatchdogLivenessAction::ProceedNoEvidence,
             StallWatchdogLivenessEvidence::default(),
         );
-
         let (verdict, reasons) = judgment_log_fields(
             &snapshot,
             Some(&decision),
             super::super::stall_liveness::STALL_WATCHDOG_POSITIVE_LIVENESS_SECS,
             false,
         );
-
         assert_eq!(verdict, "control_plane_desync");
         assert_eq!(reasons, "desynced");
     }
@@ -1365,6 +1364,7 @@ mod tests {
     fn health_detail_mailbox_serializes_unavailable_shadow_verdict_as_null() {
         let mailbox = MailboxHealthSnapshot {
             relay_backlog: super::super::session_enrichment::RelayBacklogEvidence::unobserved(),
+            tail_observation: Default::default(),
             provider: ProviderKind::Codex.as_str().to_string(),
             channel_id: 42,
             has_cancel_token: false,

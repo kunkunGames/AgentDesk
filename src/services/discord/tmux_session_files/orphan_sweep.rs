@@ -126,6 +126,7 @@ pub(super) fn remove_judged_orphan_group_under_source_authority(
         if OrphanFileIdentity::capture(&path).ok().as_ref() != Some(&identity) {
             return false;
         }
+        crate::services::tmux_common::invalidate_session_temp_source(stem);
         if std::fs::remove_file(path).is_err() {
             return false;
         }

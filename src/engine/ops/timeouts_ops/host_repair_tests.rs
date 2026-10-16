@@ -700,6 +700,19 @@ async fn section_i_defers_herdr_rows_and_repairs_legacy_rows_pg() {
         )))
     };
     seed(&pool, "legacy", 300, None, "pending").await;
+    #[cfg(unix)]
+    let tmux = {
+        use crate::services::discord::admin_host_guard::tests::{ModeTmux, Tmux};
+        let tmux = ModeTmux::install();
+        tmux.serve(Tmux::Dead);
+        crate::services::tmux_common::write_tmux_runtime_kind_marker(
+            &tmux_name("legacy"),
+            crate::services::agent_protocol::RuntimeHandoffKind::LegacyTmuxWrapper,
+        )
+        .unwrap();
+        tmux
+    };
+    let legacy_before = snapshot(&pool, "legacy").await;
     seed(&pool, "herdr-live", 301, herdr(301), "pending").await;
     seed(&pool, "herdr-idle", 302, herdr(302), "dispatched").await;
     let root = crate::cli::agentdesk_runtime_root().unwrap();
@@ -735,9 +748,29 @@ async fn section_i_defers_herdr_rows_and_repairs_legacy_rows_pg() {
         [tmux_name("legacy")],
         "only the legacy row is probed, once"
     );
-    assert_eq!(
-        snapshot(&pool, "legacy").await,
-        json!(["idle", "none", "Dispatch failed", "failed", STALE_REASON, 1])
+    let legacy_after = snapshot(&pool, "legacy").await;
+    if cfg!(unix) {
+        assert_eq!(
+            legacy_after,
+            json!([
+                "idle",
+                "none",
+                "Dispatch failed",
+                "failed",
+                "stale_tmux_owner_proven_dead",
+                1
+            ])
+        );
+    } else {
+        assert_eq!(
+            legacy_after, legacy_before,
+            "an unsupported runtime probe preserves ownership"
+        );
+    }
+    #[cfg(unix)]
+    assert!(
+        tmux.take_writes().is_empty(),
+        "recovery only observes the proven-dead owner"
     );
     let after = [
         snapshot(&pool, "herdr-live").await,

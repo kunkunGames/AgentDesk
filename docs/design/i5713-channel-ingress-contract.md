@@ -174,6 +174,7 @@ row_fresh := 0 <= age_upper < HOLD_FOR
 | `src/services/discord/turn_lease.rs` | admission | `registered_channel` → `admit_recovery` :155 |
 | `src/services/discord/turn_presence/admission.rs` | admission | `registered_channel` → `ownership`·`admit_post` :40·:58 |
 | `src/services/discord/turn_presence/entrypoints.rs` | admission | `HomeGate` 재노출 :7, `withdraw_unmounted` :96: Home mount가 바뀌면 이전 owner에 기댄 presence 승인만 거둔다. row·gate를 쓰지 않는다 |
+| `src/services/discord/health/o_transition.rs` | admission | 운영자 전환 요청의 Context 조달 `home_admission` :109: 같은 home lock 아래 `registered_channel`·`ownership`으로 epoch를 확인하고 `admit_at_epoch(…, recovery=false)`로 `CommandPermit`을 받는다. row·gate를 쓰지 않는다 |
 | `src/services/queue.rs` | admission | `admit_command`·`admit_unattributed` :243, `admit_command` :501 |
 | `src/services/session_forwarding/home_stop.rs` | 라우팅·admission | sender `read_home` :176, receiver `read_home` :335 → `registered` :368 |
 | `src/services/turn_host.rs` | admission·readiness | `home_refusal` :118, `for_turn` :130, `refusal_before_turn` :155 |

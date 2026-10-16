@@ -239,6 +239,7 @@ def calls(source, name):
 
 EXPECTED = {
     "health/snapshot.rs": {"get": 1, "iter": 2, "contains_key": 1},
+    "health/snapshot/channel_owner.rs": {"contains_key": 1, "iter": 1},
     "input_runtime/mapping.rs": {"iter": 1},
     "reaction_lifecycle.rs": {"declare": 1, "into_iter": 1, "iter": 1},
     "relay_recovery/apply.rs": {"len": 2, "retain": 1},

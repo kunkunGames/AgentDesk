@@ -1046,8 +1046,8 @@ targets = {
     "needs" => nil,
     "if" => nil,
     "runs_on" => "ubuntu-latest",
-    # Re-pinned after adding the ensure-swap step ahead of the first cargo step.
-    "job_sha256" => "ed40a15acfd519ffb3b280eec71f266e7f53855efa19a065ca7815e7ae9b13ac",
+    # Four shards retain every mutation with at most two rebuilds per 45m job.
+    "job_sha256" => "59af083473dc3654f1ef74d15c968c31f11aeffd05558a679e2fc6912589629a",
     "job_timeout_minutes" => 45,
     "cargo_steps" => {
       "Fetch Cargo dependencies" => {

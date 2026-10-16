@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::str::FromStr;
@@ -477,12 +479,12 @@ pub async fn health_check(pool: &PgPool) -> Result<(), String> {
 }
 
 mod migration_status;
+#[cfg(test)]
+use migration_status::checksum_hex;
 pub use migration_status::{
     AppliedMigrationInfo, MigrationChecksumMismatch, MigrationStatus,
     applied_migration_checksum_mismatch_details, migration_status, query_applied_migrations,
 };
-#[cfg(test)]
-use migration_status::checksum_hex;
 
 pub async fn register_repo(pool: &PgPool, repo_id: &str) -> Result<(), String> {
     sqlx::query(

@@ -223,7 +223,9 @@ pub(crate) async fn transition_card_to_backlog_with_cleanup(
 }
 
 mod errors;
-use errors::{database_error, kanban_error, pg_pool_required_anyhow, pg_pool_required_error, tuple_error};
+use errors::{
+    database_error, kanban_error, pg_pool_required_anyhow, pg_pool_required_error, tuple_error,
+};
 
 fn execute_transition_intents_pg(
     state: &AppState,

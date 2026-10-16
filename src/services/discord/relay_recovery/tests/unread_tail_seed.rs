@@ -241,7 +241,10 @@ async fn rowed_snapshot(
     let registry = &seed.registry;
     let channel = seed.channel.get();
     let mut snapshot = registry
-        .snapshot_watcher_state_for_provider(&seed.provider, channel)
+        // This fixture deliberately replaces the persisted birth while retaining
+        // its mailbox. Read the known runtime; owner selection must abstain on
+        // that mismatch and is exercised separately by channel-owner tests.
+        .snapshot_watcher_state_for_shared(&seed.provider, seed.shared.clone(), channel)
         .await
         .expect("fixture snapshot");
     (
