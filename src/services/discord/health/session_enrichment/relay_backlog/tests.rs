@@ -1011,6 +1011,7 @@ fn enrichment_from_evidence(
     let mut row = valid_state();
     row.started_at = "2000-01-01T00:00:00Z".into();
     super::super::SessionEnrichment {
+        tail_observation: Default::default(),
         inflight: Some(row),
         attached: true,
         watcher_attached: true,
