@@ -12,6 +12,7 @@ pub(crate) mod result;
 pub(crate) mod revision;
 pub(crate) mod schedule;
 pub(crate) mod schema;
+mod settled_gate;
 pub(crate) mod store;
 pub(crate) mod workflow;
 use anyhow::{Result, ensure};
@@ -275,25 +276,7 @@ impl Graph {
                 ensure!(paths.insert(&i.destination), "input/output path collision");
             }
         }
-        let mut audits = BTreeSet::new();
-        ensure!(
-            self.settled_effect_gates.len() <= 16,
-            "too many settled effect gates"
-        );
-        for gate in &self.settled_effect_gates {
-            ensure!(
-                gate.audit_sha256.len() == 64
-                    && gate
-                        .audit_sha256
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                    && audits.insert(&gate.audit_sha256)
-                    && gate.inspection != gate.verification
-                    && nodes.contains_key(&gate.inspection)
-                    && nodes.contains_key(&gate.verification),
-                "invalid or duplicate settled effect gate"
-            );
-        }
+        settled_gate::validate(&self.settled_effect_gates, &nodes)?;
         let mut ready = BTreeSet::new();
         loop {
             let previous = ready.len();

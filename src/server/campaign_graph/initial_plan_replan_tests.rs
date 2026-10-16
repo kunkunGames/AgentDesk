@@ -253,6 +253,25 @@ async fn initial_plan_capacity_replan_preserves_old_occurrence_and_issues_enroll
     let f = fixture(&pool).await;
     let before = store::status(&pool, &f.campaign.id).await.unwrap();
     let history = retained(&pool, &f).await;
+    let description = history["card"]["description"].as_str().unwrap();
+    assert!(description.contains(crate::db::campaigns::graph::schema::GRAPH_REFERENCE_RULES));
+    assert!(description.contains("node.id (Task.id) values, never persistent task_key"));
+    control(
+        &pool,
+        &f.campaign.id,
+        &store::goal(&pool, &f.campaign.id).await.unwrap(),
+        "plan",
+        None,
+        "initial",
+        "A later binary has different planning guidance",
+    )
+    .await
+    .unwrap();
+    assert_eq!(retained(&pool, &f).await, history);
+    assert_eq!(
+        store::status(&pool, &f.campaign.id).await.unwrap()["tasks"],
+        before["tasks"]
+    );
     assert!(history["dispatch"]["completed_at"].is_null());
     let original_raw = history["dispatch"]["result"].as_str().unwrap();
     let raw_sha = digest(original_raw.as_bytes());

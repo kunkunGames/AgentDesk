@@ -325,6 +325,13 @@ async fn manager_turn(pool: &PgPool, id: &str) -> (workflow::Frontier, String) {
         manager::Admission::Owned
     ));
     let key = format!("{id}:manage:{}-1", frontier.digest().unwrap());
+    let card = crate::db::kanban_cards::load_card_json_pg(pool, &store::card_id(&key))
+        .await
+        .unwrap()
+        .unwrap();
+    let description = card["description"].as_str().unwrap();
+    assert!(description.contains(crate::db::campaigns::graph::schema::GRAPH_REFERENCE_RULES));
+    assert!(description.contains("node.id (Task.id) values, never persistent task_key"));
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM campaign_graph_tasks WHERE task_key=$1 AND role='manage'"
@@ -467,6 +474,33 @@ async fn workflow_frozen_publication_is_once_and_stale_dispatch_is_rejected_pg()
             .fetch_one(&pool)
             .await
             .unwrap();
+    let original_card = crate::db::kanban_cards::load_card_json_pg(&pool, &card)
+        .await
+        .unwrap()
+        .unwrap();
+    let original_tasks = store::status(&pool, &campaign.id).await.unwrap()["tasks"].clone();
+    control(
+        &pool,
+        &campaign.id,
+        &goal(),
+        "manage",
+        Some(version),
+        &format!("{}-1", frontier.digest().unwrap()),
+        "A later binary has different manager guidance",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        crate::db::kanban_cards::load_card_json_pg(&pool, &card)
+            .await
+            .unwrap()
+            .unwrap(),
+        original_card
+    );
+    assert_eq!(
+        store::status(&pool, &campaign.id).await.unwrap()["tasks"],
+        original_tasks
+    );
     assert_eq!(
         profile["workflow_authority_state"],
         frontier.authority_state()
