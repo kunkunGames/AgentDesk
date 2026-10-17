@@ -85,7 +85,7 @@ async fn campaign_capacity_wait_rechecks_node_policy_and_finalizes_refused_lease
         config.cluster.enabled = true;
         config.cluster.execution_slots = Some(1);
         config.cluster.instance_id = Some("wait-node".into());
-        config.data.dir = root.path().join("data").to_string_lossy().into_owned();
+        config.data.dir = root.path().join("data");
         std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
         let name = concat!(
             module_path!(),
