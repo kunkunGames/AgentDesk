@@ -79,14 +79,16 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let policy = policy();
-    let started = Instant::now();
-    let deadline = started + policy.blackout_limit;
     let (request_tx, request_rx) = mpsc::channel();
+    let (server_ready_tx, server_ready_rx) = mpsc::channel();
+    let (server_deadline_tx, server_deadline_rx) = mpsc::channel();
+    let (armed_tx, armed_rx) = mpsc::channel();
     let mut threads = Threads::default();
     // Stop an unused listener before joining if a regression skips the probe.
     let server_guard = TcpFixtureGuard::default();
     let stopping = server_guard.0.clone();
     threads.0.push(std::thread::spawn(move || {
+        server_ready_tx.send(()).unwrap();
         let mut stream = loop {
             if stopping.load(Ordering::Relaxed) {
                 return;
@@ -106,6 +108,9 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
         let mut request = [0; 1024];
         assert!(stream.read(&mut request).unwrap() > 0);
         request_tx.send(Instant::now()).unwrap();
+        let deadline = server_deadline_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
         std::thread::sleep(
             (deadline + Duration::from_millis(220)).saturating_duration_since(Instant::now()),
         );
@@ -122,9 +127,17 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
     let (exit_tx, exit_rx) = mpsc::channel();
     let decisions = Arc::new(Mutex::new(Vec::new()));
     let recorded = decisions.clone();
-    let mut state = WatchdogState::new(started);
-    state.last_response_at = Some(started);
+    server_ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
     threads.0.push(std::thread::spawn(move || {
+        // Thread creation is fixture setup, not part of the measured blackout window.
+        let started = Instant::now();
+        let deadline = started + policy.blackout_limit;
+        server_deadline_tx.send(deadline).unwrap();
+        armed_tx.send((started, deadline)).unwrap();
+        let mut state = WatchdogState::new(started);
+        state.last_response_at = Some(started);
         driver::run(
             &policy,
             WatchdogMode::Enforce,
@@ -149,6 +162,7 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
             },
         );
     }));
+    let (started, deadline) = armed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     let requested_at = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(
         requested_at < deadline,

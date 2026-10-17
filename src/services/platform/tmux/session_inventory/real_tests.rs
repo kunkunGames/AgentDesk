@@ -46,7 +46,8 @@ impl Rig {
             .env_remove("TMUX")
             .env_remove("TMUX_PANE");
         if default {
-            command.env("TMUX_TMPDIR", self.root.path());
+            // tmux canonicalizes the default socket directory before reporting it.
+            command.env("TMUX_TMPDIR", self.root.path().canonicalize().unwrap());
         } else {
             command.arg("-S").arg(&self.socket);
         }
