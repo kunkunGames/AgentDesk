@@ -181,6 +181,20 @@ pub(super) fn producer_error(
     })
 }
 
+/// Run both intake and headless drivers under the same provider context and panic boundary.
+pub(super) fn execute_scoped(
+    context: crate::services::provider_cli::ProviderExecutionContext,
+    turn: StreamingTurn<'_>,
+    start: ReplayStart,
+    sender: Sender<StreamMessage>,
+) -> std::thread::Result<Result<(), String>> {
+    crate::services::platform::with_provider_execution_context(context, || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute(turn, start, sender)
+        }))
+    })
+}
+
 pub(super) fn execute(
     turn: StreamingTurn<'_>,
     start: ReplayStart,
