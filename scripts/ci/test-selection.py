@@ -52,6 +52,7 @@ FULL_TRIGGERS = (
     "migrations/*", "build.rs", "Cargo.toml", "Cargo.lock", ".cargo/*", "rust-toolchain*",
     "justfile", ".github/workflows/*", ".github/actions/*", "tests/*", "scripts/ci/*",
     "scripts/ci-script-checks.sh", "scripts/ci-timeout.py", "scripts/rust_lex.py",
+    "scripts/pg_test_dependencies.py",
     "scripts/lib_test_inventory_manifest.txt", "scripts/pg_test_lane_*",
     "scripts/known_test_failures.txt", "scripts/run_test_lane.py",
     "scripts/check_pg_test_lane_membership.py", "scripts/check_test_target_integrity.py",

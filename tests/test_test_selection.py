@@ -98,6 +98,7 @@ AUTHORITIES = (
     ".github/actions/ensure-swap/action.yml", "tests/test_x.py", "tests/run_x.sh",
     "tests/fixtures/pg_lane/x.json", "scripts/ci/non-pg-test-filter.sh",
     "scripts/ci-script-checks.sh", "scripts/ci-timeout.py", "scripts/rust_lex.py",
+    "scripts/pg_test_dependencies.py",
     "scripts/lib_test_inventory_manifest.txt", "scripts/pg_test_lane_manifest.txt",
     "scripts/known_test_failures.txt", "scripts/run_test_lane.py",
     "scripts/check_pg_test_lane_membership.py", "scripts/check_test_target_integrity.py",
@@ -483,7 +484,9 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_sweep(ids, **held, ledger=f"ignored | {replay} | lane=pg\n")
         child = "services::cluster::intake_worker::home_route_tests::s3_real::s3_node_child"
-        self.assertIn(child, set(ts.tools()[1].load_non_pg_filter_replay(REPO_ROOT)))
+        coverage = ts.tools()[1]
+        self.assertTrue(child in coverage.load_pg_manifest_tests(REPO_ROOT), "PG child must remain in the PG lane")
+        self.assertFalse(child in coverage.load_non_pg_filter_replay(REPO_ROOT), "PG child cannot be a pure replay test")
         self.assertIn(child, ts.declared_ignored(REPO_ROOT))
 
     def test_full_mode_runs_mains_commands_and_plan_writes_its_outputs(self) -> None:
