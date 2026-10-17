@@ -257,7 +257,7 @@ async fn inspect_inner(
                 .is_none()
             && matches!(
                 row.get::<Option<String>, _>("status").as_deref(),
-                Some("pending" | "dispatched" | "running")
+                Some("pending" | "dispatched")
             )
             && matches!(
                 row.get::<Option<String>, _>("dispatch_type").as_deref(),

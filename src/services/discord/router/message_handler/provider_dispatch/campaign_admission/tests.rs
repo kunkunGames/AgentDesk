@@ -57,8 +57,12 @@ async fn fixture(pool: &PgPool) -> (String, String, Goal) {
     )
     .await
     .unwrap();
-    sqlx::query("INSERT INTO task_dispatches(id,kanban_card_id,to_agent_id,dispatch_type,status,thread_id) VALUES($1,$2,'qwen','implementation','running',$3)")
+    sqlx::query("INSERT INTO task_dispatches(id,kanban_card_id,to_agent_id,dispatch_type,status,thread_id) VALUES($1,$2,'qwen','implementation','dispatched',$3)")
         .bind(DISPATCH).bind(&card).bind(CHANNEL.to_string()).execute(pool).await.unwrap();
+    assert!(
+        observe(pool).await.unwrap().is_some(),
+        "valid dispatch must be admitted before testing mutations"
+    );
     (campaign.id, card, goal)
 }
 
@@ -176,7 +180,7 @@ async fn campaign_capacity_policy_does_not_downgrade_missing_campaign_authority_
     let db = TestPostgresDb::create().await;
     let pool = db.connect_and_migrate().await;
     let (_, _, _) = fixture(&pool).await;
-    sqlx::query("INSERT INTO task_dispatches(id,status,dispatch_type) VALUES('ordinary','running','implementation')")
+    sqlx::query("INSERT INTO task_dispatches(id,status,dispatch_type) VALUES('ordinary','dispatched','implementation')")
         .execute(&pool).await.unwrap();
     assert!(
         inspect(&pool, "ordinary", &ProviderKind::Qwen, CHANNEL, None)
