@@ -1705,6 +1705,7 @@ server::routes::scheduled_messages::postgres_tests::postgres_scheduled_push_reje
 server::routes::scheduled_messages::postgres_tests::scheduled_message_bot_defaults_to_non_triggering_notify
 server::routes::scheduled_messages::postgres_tests::scheduled_push_rejects_agent_only_fields_but_allows_explicit_clears
 server::routes::scheduled_messages::provider_targets::tests::malformed_or_unknown_provider_target_fields_are_rejected
+server::routes::scheduled_messages::provider_targets::tests::unavailable_provider_reports_actionable_redacted_cause
 server::routes::scheduled_messages::tests::discord_mentions_are_normalized_and_reject_ambiguous_ids
 server::routes::scheduled_messages::tests::patch_realigns_stale_recurring_time
 server::routes::scheduled_messages::tests::patch_rejects_stale_effective_one_shot_time
@@ -11312,6 +11313,8 @@ services::imsg_reply::tests::obligations_flag_defaults_off_and_only_imessage_use
 services::imsg_reply::tests::s1b_started_contract_leads_only_a_marked_imessage_start
 services::issue_announcements::tests::renders_active_card_with_agent_and_timestamp
 services::issue_announcements::tests::renders_completed_card_for_pr_merge
+services::kakao::runtime::tests::cluster_admits_only_explicit_persistent_owner
+services::kakao::runtime::tests::standalone_remains_supported_and_explicit_pin_never_fails_over
 services::kakao::tests::account_ids_map_to_stable_non_colliding_environment_prefixes
 services::kakao::tests::configured_accounts_are_bounded_and_deduplicated
 services::kakao::tests::feature_is_disabled_by_default_and_parses_explicit_values

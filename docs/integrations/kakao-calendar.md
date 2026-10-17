@@ -7,9 +7,19 @@ KakaoTalk inbound bot, or general personal-calendar reader.
 
 ## Enable and connect
 
-The initial credential boundary is **one Unix AgentDesk process, cluster disabled**.
+The credential boundary is **one Unix AgentDesk process with a private token store**.
 Windows native durable storage and multi-node credential failover fail closed.
 The existing message-only feature continues to work without opting into storage.
+
+In a cluster, set `AGENTDESK_KAKAO_CREDENTIAL_OWNER_INSTANCE_ID` to the same
+fixed node ID on every Kakao-enabled node. Only the node with that persistent
+`cluster.instance_id` (or `AGENTDESK_INSTANCE_ID`) may serve calendar APIs or
+start calendar work. Missing, empty, mismatched or changed identity fails closed.
+The pin also fences message access to the shared token runtime. Leadership
+never transfers tokens: the calendar worker still requires leadership, so if
+another node becomes leader, calendar work waits for the pinned owner to return
+as leader. Configure Kakao credentials and the private store only on that owner;
+do not copy tokens or enable an automatic credential failover.
 
 1. In the Kakao app console, verify Kakao Login, applicable app membership/service
    permissions and the `talk_calendar` consent item. Each person must independently
@@ -49,7 +59,10 @@ The existing message-only feature continues to work without opting into storage.
    duplicate aliases for one identity, and bind aliases immutably in PostgreSQL.
 
 Calendar-only use does not require `AGENTDESK_KAKAO_ENABLED` or a message landing
-URL. Message delivery retains those requirements. Both features use the same
+URL. Message delivery retains those requirements. Its landing URL must use a
+public HTTPS domain registered in the Kakao application's product link settings;
+a localhost dashboard URL or the separate `kakao_friend_share` YAML fields do
+not configure this runtime. Both features use the same
 account runtime and refresh generation. Status `configured` is an offline setting
 check; only an explicit check reports current verified identity/consent.
 

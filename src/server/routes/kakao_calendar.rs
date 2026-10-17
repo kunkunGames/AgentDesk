@@ -18,13 +18,15 @@ const MAX_PAGE_SIZE: i64 = 100;
 
 fn operator<'a>(state: &'a AppState, headers: &HeaderMap) -> Result<&'a sqlx::PgPool, AppError> {
     verify_operator_token(state.config.server.auth_token.as_deref(), headers)?;
-    if state.config.cluster.enabled {
-        return Err(AppError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::Config,
-            "calendar supports a single credential-owning node",
-        ));
-    }
+    crate::services::kakao::runtime::require_calendar_owner(&state.config.cluster).map_err(
+        |error| {
+            AppError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Config,
+                error.to_string(),
+            )
+        },
+    )?;
     state
         .pg_pool_ref()
         .ok_or_else(|| AppError::internal("PostgreSQL unavailable"))
