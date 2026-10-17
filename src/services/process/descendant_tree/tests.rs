@@ -95,9 +95,16 @@ impl Drop for ToolTree {
 }
 
 fn wait_for_writes(path: &Path) {
+    wait_for_writes_after(path, 0);
+}
+
+fn wait_for_writes_after(path: &Path, observed: u64) {
     let deadline = Instant::now() + Duration::from_secs(5);
-    while std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) == 0 {
-        assert!(Instant::now() < deadline, "tool fixture never wrote");
+    while std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) <= observed {
+        assert!(
+            Instant::now() < deadline,
+            "tool fixture did not advance past {observed} writes"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -188,7 +195,7 @@ fn stale_root_identity_cannot_capture_or_kill_its_current_descendants() {
     assert!(capture(tree.root.id(), stale).is_empty());
     assert!(!kill_pid_tree_if_identity_matches(tree.root.id(), stale));
     let before = tree.writes();
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for_writes_after(&tree.files.path().join("writes"), before);
     assert!(
         tree.writes() > before,
         "stale cleanup interrupted the current tool"
