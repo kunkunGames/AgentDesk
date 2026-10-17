@@ -6,6 +6,12 @@ is disabled by default and reads secrets only from process environment
 variables; tokens are never accepted through the dashboard or serialized into
 runtime configuration responses.
 
+When `AGENTDESK_KAKAO_TOKEN_STORE_DIR` is configured, messages use the same
+owner-only persisted tokens and account lock as calendars. Stored tokens take
+precedence over bootstrap environment tokens. In a cluster, pin
+`AGENTDESK_KAKAO_CREDENTIAL_OWNER_INSTANCE_ID` to the credential node; see
+[managed calendars](kakao-calendar.md) for ownership and restart requirements.
+
 ## Kakao application prerequisites
 
 Create a Kakao Developers application and configure Kakao Login. Friend sends
@@ -35,6 +41,12 @@ KAKAO_REST_API_KEY=your-rest-api-key
 KAKAO_CLIENT_SECRET=your-client-secret
 KAKAO_REFRESH_TOKEN=the-user-refresh-token
 ```
+
+Use a public HTTPS landing URL whose domain is registered in the Kakao app's
+product link settings. Localhost URLs and the separate `kakao_friend_share`
+YAML configuration do not satisfy this delivery configuration. A scheduling
+503 reports the specific redacted cause (disabled delivery, missing landing URL,
+missing credentials or a credential-store failure).
 
 `KAKAO_CLIENT_SECRET` is optional when the Kakao application does not require
 one. `KAKAO_ACCESS_TOKEN` can be supplied as a short-lived fallback. When a

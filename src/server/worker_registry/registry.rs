@@ -277,7 +277,8 @@ impl SupervisedWorkerRegistry {
             ServerWorkerId::KakaoCalendar => {
                 // Parse errors still need lease recovery after a restart. The
                 // worker uses an empty claim allowlist when configuration is invalid.
-                if self.config.cluster.enabled
+                if crate::services::kakao::runtime::require_calendar_owner(&self.config.cluster)
+                    .is_err()
                     || matches!(
                         crate::services::kakao::account::calendar_enabled(),
                         Ok(false)
@@ -285,7 +286,7 @@ impl SupervisedWorkerRegistry {
                 {
                     self.log_skip(
                         spec,
-                        "calendar disabled or unsupported multi-node credential boundary",
+                        "calendar disabled or this node is not the pinned credential owner",
                     );
                     return Ok(None);
                 }
