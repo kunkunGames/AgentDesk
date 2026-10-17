@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "70184b25e9d0c1132ffc9c7a35c21ef5ed17062a",
+  "measured_at_sha": "6a156828b325185ba83889ccbb3d2a342ff2e4d3",
   "records": [
     {
       "root": "migrations/postgres",
@@ -7997,56 +7997,92 @@
     {
       "root": "src",
       "kind": "RUST",
-      "path": "src/db/campaigns/graph/recovery/replan/initial_plan.rs",
+      "path": "src/db/campaigns/graph/recovery/replan/pregraph_capacity.rs",
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:4af9a90b82dfa93987d8825e399a1e89714ae84b63ccd01de616ae11cb3ae1a3"
+      "fingerprint": "sha256:0d76b7879460c68fd9b094a67aa60f85a7534818616dd91a8e663f342b0c9ea0"
     },
     {
       "root": "src",
       "kind": "RUST",
-      "path": "src/db/campaigns/graph/recovery/replan/initial_plan.rs",
+      "path": "src/db/campaigns/graph/recovery/replan/pregraph_capacity.rs",
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:539870bd89fb15a8a1879cf04149d1011d300a6e17e94c66e7e9c5e904fdeda6"
+      "fingerprint": "sha256:68823d3aa366c287414f3c7a11f13fc1ab7e0cc879640c92dbe73e19ddea880f"
     },
     {
       "root": "src",
       "kind": "RUST",
-      "path": "src/db/campaigns/graph/recovery/replan/initial_plan.rs",
+      "path": "src/db/campaigns/graph/recovery/replan/pregraph_capacity.rs",
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:54f701b18b480a0247b730bd6fcb17f4902829076b54f9af7c9e1af77a3dfbf8"
+      "fingerprint": "sha256:8410a32890c4828db8b16e4e5d096406a21cd56bfa26e50eec084fa0d10baa6b"
     },
     {
       "root": "src",
       "kind": "RUST",
-      "path": "src/db/campaigns/graph/recovery/replan/initial_plan.rs",
+      "path": "src/db/campaigns/graph/recovery/replan/pregraph_capacity.rs",
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:98ef37e6d5eaaa5e0a5f4cb4f128c3826120b016272245e438dfb2753d32350d"
+      "fingerprint": "sha256:8fe54b5e85133403fc37f569593a65b904edbbafb1d41ab438a2bf6ac6f19605"
     },
     {
       "root": "src",
       "kind": "RUST",
-      "path": "src/db/campaigns/graph/recovery/replan/initial_plan.rs",
+      "path": "src/db/campaigns/graph/recovery/replan/pregraph_capacity.rs",
       "api": "sqlx::query_scalar",
       "symbol": "query_scalar",
       "classification": "STATIC",
-      "fingerprint": "sha256:8170f84a4d57b386af38dc7c60a7ece7187119ea07dc32c37ab8bd29c4e683cf"
+      "fingerprint": "sha256:30aa9f1dca53dbb979952b64fa23443f9c02d87b67d3d2f95366a0bc3f50e597"
     },
     {
       "root": "src",
       "kind": "RUST",
-      "path": "src/db/campaigns/graph/recovery/replan/initial_plan.rs",
+      "path": "src/db/campaigns/graph/recovery/replan/pregraph_plan.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:6734a3db2d7b7aa0b06467ea914757a59265370101e35cf214444960b6ebb6e7"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/db/campaigns/graph/recovery/replan/pregraph_plan.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:91ba0f57a8149faf56f1f1368ee9d28e534c948038e89c7feed9f7a836a0ff5e"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/db/campaigns/graph/recovery/replan/pregraph_plan.rs",
       "api": "sqlx::query_scalar",
       "symbol": "query_scalar",
       "classification": "STATIC",
-      "fingerprint": "sha256:ee74ea8d3ef64286123f69ec688c2ee1246c95a90d9edee9665e070c408c98cc"
+      "fingerprint": "sha256:8817c7ae0336fe9f68f06dc0c2f54efe29e49c8c4ce139135312479b1f14e8bb"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/db/campaigns/graph/recovery/replan/pregraph_plan.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:f14d15c092f25a8e7d94b3d701e1c1e0d18ec6722af98e253dcd115696d3065f"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/db/campaigns/graph/recovery/replan/pregraph_plan.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:f6fb941e683b111c2b62c80df330efa58b4fc5985c8f6e93ea7418d6e5378f82"
     },
     {
       "root": "src",
@@ -27577,6 +27613,303 @@
       "symbol": "query_scalar",
       "classification": "STATIC",
       "fingerprint": "sha256:5fe067d6f97a826b7e4b499d447f9cf1780788f7df3eabb72f94696ef9e2026a"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:06037abb944fe0aa7de6f81a283847eaef847e2075459eadb6626d11d1ff8541"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:0d1d8a5adea91cbca266e7a13ed5f02bc31ba2a090d157b5bb5e84320a6cf246"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:10e39f340acd9c7d5e565695e393b838e2349736d510975a69d6b3e16d353f81"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:212a03a3409d00f71236155dfc8ef920b3c3e951fea488337044c3d7613b6213"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:22b9478482b3bfe71d09baea5198d87cc05b668ca062dbcad1c4eb3dd9cd4e05"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:2c1fa4b00768463bf53d24b6de67da8436396fcdc980aeaf4815bcf8ed3efa97"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:3a94c023677a739a5d3419d517e4f066bd592f3159c0e1e675a84c710ce420fe"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:44821cef5498853b02424c702733e26b046f4b41cebaf1fb230707cab658ec44"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:54d6692c025945380cc7ddf5bb3784ac1d451c709e56a4649c5a756d4c9cff5b"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:63fa3e48b53d8f1874cb32191a2f94dc550dee8b9849f1aee3aef955d4d02577"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:774029671b1ea07491e9a1ffa07d036a7cfbc673233a9def404f968071e5511a"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:78e24f83d23342ea3fce522a997f40360376839f55d67235e52b656300e127f2"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:80f7f7903974fe54f41591b2ae0181d4aa991031da9f682eb24298cc73ffb640"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:b442b27dd53fd16a644dd3fe36e2e3df2c04cd9e9bb8a66055fd2cf0c75c6332"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:b666fbfd89135b3009d5c4860936105c13c89c0a974507abf8a85c72113d231a"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:c963da2561a0f199f99d810bf417ca63b0d9c9c7ad756dffa84c3e9b072c75dc"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:e51a763abffc0a222a4eca62d2c3de5905316e994c03ec9b20410c86285c635b"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:f311c203d598589ef87933688fa55818766e47c6704fa7f59eec1715deaaaa24"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "UNRESOLVED",
+      "fingerprint": "sha256:8946601a54c61dfc0a1ab0188138b078c55a681ba0eb3a4108da104ad78786ca"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "UNRESOLVED",
+      "fingerprint": "sha256:d5d82eaa09ef56b5e87d1b2f29f3edb3a0586f1f09fb9b8f69706c0611e99dee"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "UNRESOLVED",
+      "fingerprint": "sha256:dbc4dd3fefc556263362579382b53b0182d23e35900d7e655c6a32edcbd3248f"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "UNRESOLVED",
+      "fingerprint": "sha256:de7098aa848bd2ea387693850dcc86a54eff434dfa287a8e794a92c8a51744e0"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:cb5423026d403f1cd24ffe7c16a78087ce10ae0bcb232d5583106cf4738ae0bb"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query_as",
+      "symbol": "query_as",
+      "classification": "STATIC",
+      "fingerprint": "sha256:f33b7aa294f61701ab18eee06b658341afb9c8745445e090808c3102a9301b36"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:0461a17479c368f240e683e844416ed25196687c8078e1586ff1c1a440e59d18"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:11b415a1240199bc0860ea08173e385cbb9eb869e8df7cf44d9b8c1a5b624586"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:27f3021ab14ae09dfd8599fc16036ee2f2f0470da72a31e5542b460f5cb77bff"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:3e69a28071045e320925b51b9939b62c8b41a5c93aaa0768c2ebb15f36ec1958"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:ad6e841ac7aa7a1e201e9556680e7a37913519a211ffdcbc11b41af9e69d9814"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:d12ffc46199345d2da0522e9295603aba7128661787f45deb9109b2ecbb41eff"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "STATIC",
+      "fingerprint": "sha256:e9430991294ac1728d78b100b295ed89390606edf272666b74a12be09ab07cb0"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "UNRESOLVED",
+      "fingerprint": "sha256:0a9ecdef83d179eb251098db1b4a62b71e78e7160c8504e2924bd002911db3f3"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
+      "api": "sqlx::query_scalar",
+      "symbol": "query_scalar",
+      "classification": "UNRESOLVED",
+      "fingerprint": "sha256:4b519189b21b6ad170390a07b5bb17711403cb3c55fafea4ac45c0d2ec3cb846"
     },
     {
       "root": "src",

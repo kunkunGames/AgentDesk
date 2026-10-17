@@ -1,4 +1,4 @@
-//! Admit only a canonical capacity refusal before the first provider execution.
+//! Shared proof for a canonical capacity refusal before graph publication.
 //! This read-only proof does not accept the old plan or replay its failed card.
 use super::{FailureScope, Goal, contract_digest, digest, learning};
 use anyhow::{Result, ensure};
@@ -62,41 +62,14 @@ pub(super) async fn validate(
     scope: FailureScope<'_>,
 ) -> Result<()> {
     let FailureScope {
-        active,
         failure,
         evidence,
         goal,
-        unattempted_effect,
-        settled_effect,
-        rejected_validation,
-        cancelled_validation,
+        ..
     } = scope;
     let key: String = failure.get("task_key");
-    ensure!(
-        active.is_none()
-            && key == format!("{id}:plan:initial")
-            && failure.get::<String, _>("category") == "unknown"
-            && failure.get::<String, _>("role") == "plan"
-            && failure.get::<Option<i64>, _>("version").is_none()
-            && unattempted_effect.is_none()
-            && settled_effect.is_none()
-            && rejected_validation.is_none()
-            && cancelled_validation.is_none()
-            && goal.schedule.is_none(),
-        "only an unversioned initial planner without effect or validation claims may use capacity recovery"
-    );
-    ensure!(
-        !sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM campaign_graph_versions WHERE campaign_id=$1)
-             OR EXISTS(SELECT 1 FROM campaign_graph_tasks WHERE campaign_id=$1 AND task_key<>$2)
-             OR (SELECT COUNT(*) FROM campaign_graph_failures WHERE campaign_id=$1)<>1",
-        )
-        .bind(id)
-        .bind(&key)
-        .fetch_one(&mut **tx)
-        .await?,
-        "initial planner recovery requires no graph, other published work or additional failure"
-    );
+    let version: Option<i64> = failure.get("version");
+    let version_value = json!(version);
     let dispatch = evidence["dispatch_id"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("captured initial planner dispatch required"))?;
@@ -128,7 +101,7 @@ pub(super) async fn validate(
             && row.get::<String, _>("fingerprint") == fingerprint
             && row.get::<String, _>("node_id") == "plan"
             && row.get::<String, _>("role") == "plan"
-            && row.get::<Option<i64>, _>("version").is_none()
+            && row.get::<Option<i64>, _>("version") == version
             && !row.get::<bool, _>("accepted")
             && row.get::<Option<Value>, _>("artifact_manifest").is_none()
             && row.get::<Option<Value>, _>("observation").as_ref() == Some(evidence)
@@ -137,7 +110,7 @@ pub(super) async fn validate(
             && evidence["dispatch_reference"] == format!("/api/dispatches/{dispatch}")
             && evidence["external_effect_requires_reconciliation"] == false
             && evidence["runtime"]["role"] == "plan"
-            && evidence["runtime"].get("graph_version") == Some(&Value::Null)
+            && evidence["runtime"].get("graph_version") == Some(&version_value)
             && evidence["runtime"]["contract_digest"] == contract
             && evidence["runtime"].get("artifact_manifest") == Some(&Value::Null)
             && evidence["runtime"]["dispatch_status"] == "failed"
@@ -183,7 +156,7 @@ pub(super) async fn validate(
             && contract_digest(&description)? == contract
             && profile.as_object().is_some_and(|fields| fields.len() == 9)
             && profile["schema_version"] == 1
-            && profile.get("graph_version") == Some(&Value::Null)
+            && profile.get("graph_version") == Some(&version_value)
             && profile.get("template_id") == Some(&Value::Null)
             && profile["goal_digest"] == contract_digest(goal)?
             && profile["prompt_digest"] == digest(description.as_bytes())
@@ -192,7 +165,7 @@ pub(super) async fn validate(
             && profile["control_input_digest"] == contract_digest(manifest)?
             && metadata.as_ref().is_some_and(|m| m["campaign_id"] == id
                 && m["node_id"] == "plan"
-                && m["graph_version"].is_null()
+                && m.get("graph_version") == Some(&version_value)
                 && m["graph_task_key"] == key),
         "native initial planner executor, historical provider, goal, prompt or input profile changed"
     );
@@ -219,7 +192,12 @@ pub(super) async fn validate(
     .bind(&key)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some(authority) = authority {
+    if version.is_some() {
+        ensure!(
+            authority.is_none() && assigned.as_deref() == Some(goal.planner.as_str()),
+            "recovery planner must use its enrolled executor without bootstrap authority"
+        );
+    } else if let Some(authority) = authority {
         ensure!(
             authority.get::<String, _>("family_id") == family
                 && Some(authority.get::<String, _>("agent_id").as_str()) == assigned.as_deref()
@@ -275,11 +253,6 @@ pub(super) async fn validate(
         .fetch_one(&mut **tx)
         .await?,
         "observed provider tools cannot claim pre-provider initial capacity recovery"
-    );
-    super::super::settled_effect::require_no_campaign_owners(tx, id).await?;
-    ensure!(
-        super::super::super::super::workflow::lifecycle::settled(tx, id).await?,
-        "initial planner execution, delivery and durable cleanup must settle first"
     );
     Ok(())
 }

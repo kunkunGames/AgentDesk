@@ -765,6 +765,7 @@ PINNED_BASENAME_TEST_FILES = frozenset({
         "src/server/campaign_graph/finish_recovery_tests.rs",
         "src/server/campaign_graph/graph_card_identity_tests.rs",
         "src/server/campaign_graph/initial_plan_replan_tests.rs",
+        "src/server/campaign_graph/pregraph_plan_replan_tests.rs",
         "src/server/campaign_graph/learning_tests.rs",
         "src/server/campaign_graph/occurrence_context/tests.rs",
         "src/server/campaign_graph/planning_input_tests.rs",

@@ -33,14 +33,14 @@ async fn set_status(pool: &PgPool, id: &str, status: CampaignStatus) -> campaign
         .unwrap()
 }
 
-async fn acknowledge_reaction(pool: &PgPool) {
+async fn acknowledge_reaction(pool: &PgPool, attempt: &str) {
     use crate::db::dispatches::outbox::{mark_dispatch_outbox_claimed_pg, mark_outbox_done_pg};
     let mut tx = pool.begin().await.unwrap();
     let rows = sqlx::query(
         "SELECT id,status,claim_owner,claimed_at FROM dispatch_outbox
         WHERE dispatch_id=$1 AND action='status_reaction' FOR UPDATE",
     )
-    .bind(ATTEMPT)
+    .bind(attempt)
     .fetch_all(&mut *tx)
     .await
     .unwrap();
@@ -81,6 +81,13 @@ async fn acknowledge_reaction(pool: &PgPool) {
 }
 
 async fn fixture(pool: &PgPool) -> InitialFixture {
+    fixture_with_budget(pool, None).await
+}
+
+async fn fixture_with_budget(
+    pool: &PgPool,
+    occurrence_budget: Option<crate::db::campaigns::graph::Budget>,
+) -> InitialFixture {
     let parent = setup(pool).await;
     sqlx::query("INSERT INTO agents(id,name,provider) VALUES('codex','Superior','codex')")
         .execute(pool)
@@ -108,7 +115,7 @@ async fn fixture(pool: &PgPool) -> InitialFixture {
                 .into_iter()
                 .collect(),
             },
-            occurrence_budget: None,
+            occurrence_budget,
             activate: true,
         },
     )
@@ -165,7 +172,7 @@ async fn fixture(pool: &PgPool) -> InitialFixture {
         .await
         .unwrap();
     super::replan_tests::settle(pool).await;
-    acknowledge_reaction(pool).await;
+    acknowledge_reaction(pool, ATTEMPT).await;
     // Configuration drift is legal; the old profile is historical authority.
     // New work is still assigned to the unchanged enrolled planner, qwen.
     sqlx::query("UPDATE agents SET provider='opencode' WHERE id='codex'")
@@ -769,3 +776,6 @@ async fn initial_plan_capacity_replan_rejects_active_owners_cleanup_progress_gra
     pool.close().await;
     db.drop().await;
 }
+
+#[path = "pregraph_plan_replan_tests.rs"]
+mod pregraph_plan_replan_tests;
