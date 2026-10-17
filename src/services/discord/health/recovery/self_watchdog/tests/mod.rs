@@ -81,7 +81,7 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
     let policy = policy();
     let (request_tx, request_rx) = mpsc::channel();
     let (server_ready_tx, server_ready_rx) = mpsc::channel();
-    let (server_deadline_tx, server_deadline_rx) = mpsc::channel();
+    let (server_deadline_tx, server_deadline_rx) = mpsc::channel::<Instant>();
     let (armed_tx, armed_rx) = mpsc::channel();
     let mut threads = Threads::default();
     // Stop an unused listener before joining if a regression skips the probe.

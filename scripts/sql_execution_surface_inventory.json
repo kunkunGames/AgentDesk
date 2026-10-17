@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "measured_at_sha": "6a156828b325185ba83889ccbb3d2a342ff2e4d3",
+  "measured_at_sha": "289d6765e8f272c5e4446bcbdf4a37e88860673f",
   "records": [
     {
       "root": "migrations/postgres",
@@ -45288,6 +45288,24 @@
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
+      "fingerprint": "sha256:161533473cdc50e4e17b5705834c923d399320be2fe8156d7d5fc6f6bea8c3ae"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
+      "fingerprint": "sha256:2709fcf94c590ef8993ff5f08c2bbe56bff958e8fe6bc679b8b15db559d3e669"
+    },
+    {
+      "root": "src",
+      "kind": "RUST",
+      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
+      "api": "sqlx::query",
+      "symbol": "query",
+      "classification": "STATIC",
       "fingerprint": "sha256:34f87f36323f87d10594f5d63afe5c02b2ba4ffb15d6d3a5abe3153759495898"
     },
     {
@@ -45351,15 +45369,6 @@
       "api": "sqlx::query",
       "symbol": "query",
       "classification": "STATIC",
-      "fingerprint": "sha256:84f2a5ebcc70a6b39b161f7daeaff4818ab71181a99711d963f9214abc33dc95"
-    },
-    {
-      "root": "src",
-      "kind": "RUST",
-      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
-      "api": "sqlx::query",
-      "symbol": "query",
-      "classification": "STATIC",
       "fingerprint": "sha256:94ba0230e2044ef51cae3cf4cd3cb4c2c09e0773abc11e2f5de0621ffe629df2"
     },
     {
@@ -45415,15 +45424,6 @@
       "symbol": "query",
       "classification": "STATIC",
       "fingerprint": "sha256:d02a9a2931d72bc6df98a61b7791070fbb5919910741b29fae7a494b7cb5eecd"
-    },
-    {
-      "root": "src",
-      "kind": "RUST",
-      "path": "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
-      "api": "sqlx::query",
-      "symbol": "query",
-      "classification": "STATIC",
-      "fingerprint": "sha256:e252b20d35403bfb1c3b0d76809635782e847fbca435c6f03bc4ca493f372e68"
     },
     {
       "root": "src",
