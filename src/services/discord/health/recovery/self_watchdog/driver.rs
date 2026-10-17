@@ -5,6 +5,9 @@ use super::policy::{
 use crate::services::hang_forensics::{Breadcrumbs, HealthProbeOutcome};
 use std::time::{Duration, Instant};
 
+mod dump;
+pub(super) use dump::PreparedDump;
+
 pub(super) type Observation = (HealthProbeOutcome, Instant);
 
 pub(super) struct Sample {
@@ -14,10 +17,10 @@ pub(super) struct Sample {
     pub previous_failures: u32,
 }
 
-pub(super) struct Hooks<P, S, D, L, E> {
+pub(super) struct Hooks<P, S, L, E> {
     pub probe: P,
     pub snapshot: S,
-    pub dump: D,
+    pub dump: Option<PreparedDump>,
     pub log: L,
     pub exit: E,
 }
@@ -48,7 +51,6 @@ pub(super) fn run(
     hooks: Hooks<
         impl FnMut(Instant) -> Observation,
         impl FnMut() -> Breadcrumbs,
-        impl FnOnce() -> Result<(), String> + Send + 'static,
         impl FnMut(&WatchdogState, &Decision, Option<&Sample>, Instant),
         impl FnMut(Reason, Instant),
     >,
@@ -128,30 +130,22 @@ pub(super) fn run(
     }
 }
 
-fn wait_for_dump(
-    dump: impl FnOnce() -> Result<(), String> + Send + 'static,
-    limit: Duration,
-    deadline: Instant,
-) {
-    let started = Instant::now();
-    let dump_deadline = (started + limit).min(deadline);
-    if started >= dump_deadline {
-        return;
+pub(super) fn prepare_dump(
+    capture: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Option<PreparedDump> {
+    match PreparedDump::spawn(capture) {
+        Ok(dump) => Some(dump),
+        Err(error) => {
+            tracing::warn!("watchdog: dump helper could not start ({error})");
+            None
+        }
     }
-    let (sent, result) = std::sync::mpsc::sync_channel(1);
-    let spawned = std::thread::Builder::new()
-        .name("watchdog-dump".into())
-        .spawn(move || {
-            let _ = sent.send(dump());
-        });
-    if let Err(error) = spawned {
-        tracing::warn!("watchdog: dump helper could not start ({error})");
-        return;
-    }
-    // Recompute after thread creation so its setup cannot add a fresh wait budget.
-    match result.recv_timeout(dump_deadline.saturating_duration_since(Instant::now())) {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!("watchdog: dump capture failed ({error})"),
-        Err(error) => tracing::warn!("watchdog: dump wait ended ({error})"),
+}
+
+fn wait_for_dump(dump: Option<PreparedDump>, limit: Duration, deadline: Instant) {
+    if let Some(dump) = dump
+        && let Err(error) = dump.wait(limit, deadline)
+    {
+        tracing::warn!("watchdog: {error}");
     }
 }

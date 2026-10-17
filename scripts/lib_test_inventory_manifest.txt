@@ -4244,6 +4244,9 @@ services::discord::health::recovery::rebind_error_status_tests::runtime_binding_
 services::discord::health::recovery::rebind_error_status_tests::zero_channel_id_maps_to_bad_request
 services::discord::health::recovery::retired_channel_tests::stall_watchdog_skips_retired_channel_before_row_load
 services::discord::health::recovery::retirement_await_tests::stall_watchdog_rechecks_retirement_after_reattach
+services::discord::health::recovery::self_watchdog::driver::dump::tests::remaining_deadline_caps_a_blocked_capture
+services::discord::health::recovery::self_watchdog::driver::dump::tests::requested_capture_reports_its_failure_once
+services::discord::health::recovery::self_watchdog::driver::dump::tests::unused_prepared_captures_are_released_without_work
 services::discord::health::recovery::self_watchdog::policy::tests::a_response_at_deadline_is_observed_before_blackout_expires
 services::discord::health::recovery::self_watchdog::policy::tests::a_response_one_tick_after_deadline_does_not_reset_blackout
 services::discord::health::recovery::self_watchdog::policy::tests::a_soft_failure_breaks_the_fast_failure_streak
