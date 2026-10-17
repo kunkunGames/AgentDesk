@@ -39,6 +39,7 @@ pub(crate) async fn shared_client(
     account: &str,
     calendar: bool,
 ) -> Result<Arc<KakaoClient>, KakaoError> {
+    super::runtime::require_pinned_owner()?;
     let environment = if calendar {
         authorize_calendar(account)?;
         KakaoEnvironment::auth_from_process(Some(account))?

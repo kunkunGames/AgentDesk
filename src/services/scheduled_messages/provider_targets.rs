@@ -61,12 +61,6 @@ pub(crate) enum ProviderTargetError {
     Serialization,
 }
 
-impl ProviderTargetError {
-    pub(crate) fn is_unavailable(&self) -> bool {
-        matches!(self, Self::KakaoUnavailable(_))
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct ValidatedProviderTargets {
     pub stored: JsonValue,
