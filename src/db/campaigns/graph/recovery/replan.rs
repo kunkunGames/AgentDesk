@@ -178,6 +178,15 @@ async fn request_on_admin_boundary(
         settled_effect::require_no_campaign_owners(&mut tx, id).await?;
     }
     guards::settled(&mut tx, id, &request.failure_id, execution_failure).await?;
+    if state.get::<Option<i64>, _>("active_version").is_none()
+        && failure.get::<String, _>("role") == "plan"
+        && failure.get::<Option<i64>, _>("version") == Some(0)
+    {
+        ensure!(
+            request.budget.is_none(),
+            "pregraph repair must preserve the occurrence budget"
+        );
+    }
     guards::failure_scope(
         &mut tx,
         id,

@@ -5,8 +5,10 @@ use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
 
 #[path = "artifact.rs"]
 mod artifact;
-#[path = "initial_plan.rs"]
-mod initial_plan;
+#[path = "pregraph_capacity.rs"]
+mod pregraph_capacity;
+#[path = "pregraph_plan.rs"]
+mod pregraph_plan;
 
 pub(super) fn admission(hold: Option<&str>, failure: &PgRow) -> Result<bool> {
     ensure!(
@@ -110,8 +112,9 @@ pub(super) async fn failure_scope(
     } = scope;
     let rejected_plan = failure.get::<String, _>("role") == "validate"
         && failure.get::<String, _>("category") == "plan";
-    let initial_planner = failure.get::<String, _>("role") == "plan"
-        && failure.get::<Option<i64>, _>("version").is_none();
+    let pregraph_planner = failure.get::<String, _>("role") == "plan"
+        && active.is_none()
+        && matches!(failure.get::<Option<i64>, _>("version"), None | Some(0));
     ensure!(
         rejected_plan == rejected_validation.is_some(),
         "only a rejected validator planning failure requires an exact rejected-validation audit"
@@ -125,7 +128,7 @@ pub(super) async fn failure_scope(
                 )),
         "only an unknown cancelled candidate validator may use a cancelled-validation audit"
     );
-    if rejected_plan || cancelled_validation.is_some() || initial_planner {
+    if rejected_plan || cancelled_validation.is_some() || pregraph_planner {
         // Follow the native admission lock order. The card lock fences a later
         // dispatch FK insert; the task lock also fences acceptance drift.
         let owner = sqlx::query(
@@ -156,8 +159,8 @@ pub(super) async fn failure_scope(
           WHERE latest.kanban_card_id=t.card_id ORDER BY latest.created_at DESC,latest.id DESC LIMIT 1) FOR SHARE OF d,t")
         .bind(dispatch).bind(id).bind(failure.get::<String,_>("task_key")).fetch_one(&mut **tx).await?;
     let status: Option<String> = row.get("status");
-    if initial_planner {
-        return initial_plan::validate(tx, id, scope).await;
+    if pregraph_planner {
+        return pregraph_plan::validate(tx, id, scope).await;
     }
     let version: i64 = failure
         .get::<Option<i64>, _>("version")

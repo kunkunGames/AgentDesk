@@ -280,6 +280,7 @@ jobs:
               - 'src/server/campaign_graph/planning_input_tests.rs'
               - 'src/server/campaign_graph/planning_ownership_tests.rs'
               - 'src/server/campaign_graph/planning_recovery_tests.rs'
+              - 'src/server/campaign_graph/pregraph_plan_replan_tests.rs'
               - 'src/server/campaign_graph/proposal_identity_tests.rs'
               - 'src/server/campaign_graph/recovery_tests.rs'
               - 'src/server/campaign_graph/rejected_candidate_replan_tests.rs'
