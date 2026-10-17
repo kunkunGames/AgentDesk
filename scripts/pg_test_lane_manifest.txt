@@ -161,6 +161,7 @@ src/services/cluster/intake_worker/replay_hold_tests.rs
 src/services/cluster/intake_worker/s3_real_tests/drain_pg_tests.rs
 src/services/cluster/intake_worker/s3_real_tests/force_pg_tests.rs
 src/services/cluster/intake_worker/s3_real_tests/holder_pg_tests.rs
+src/services/cluster/intake_worker/s3_real_tests/mod.rs
 src/services/cluster/intake_worker/s3_real_tests/route_pg_tests.rs
 src/services/cluster/machine_resources/store.rs
 src/services/discord/admin_host_guard_tests.rs
@@ -294,6 +295,7 @@ src/services/discord/turn_bridge/tmux_runtime/process_force_kill_tests.rs
 src/services/discord/turn_bridge/tmux_runtime/stop_host_tests.rs
 src/services/discord/turn_bridge/turn_analytics.rs
 src/services/discord/turn_bridge/voice_completion_tests.rs
+src/services/discord/turn_presence/activity/tail_switch_tests.rs
 src/services/discord/turn_presence/activity/unbound/dormancy_tests.rs
 src/services/discord/turn_presence/activity/unbound/live_review_tests.rs
 src/services/discord/turn_presence/activity/unbound/unit_tests.rs
@@ -522,6 +524,7 @@ services::cluster::intake_router_hook::pg_tests
 services::cluster::intake_worker::dispatch_stamp_tests
 services::cluster::intake_worker::home_accept_tests
 services::cluster::intake_worker::home_route_tests
+services::cluster::intake_worker::home_route_tests::s3_real
 services::cluster::intake_worker::home_route_tests::s3_real::drain_pg
 services::cluster::intake_worker::home_route_tests::s3_real::force_pg
 services::cluster::intake_worker::home_route_tests::s3_real::holder_pg
@@ -673,6 +676,7 @@ services::discord::turn_bridge::tmux_runtime::process_backend_cancel::tests
 services::discord::turn_bridge::tmux_runtime::stop_host::tests
 services::discord::turn_bridge::turn_analytics::timestamp_tests
 services::discord::turn_bridge::voice_completion::voice_completion_tests
+services::discord::turn_presence::activity::tail::switch_tests
 services::discord::turn_presence::activity::unbound::dormancy_tests
 services::discord::turn_presence::activity::unbound::live::review_tests
 services::discord::turn_presence::activity::unbound::tests
@@ -1745,6 +1749,7 @@ services::cluster::intake_worker::home_route_tests::s3_real::route_pg::th8_home_
 services::cluster::intake_worker::home_route_tests::s3_real::route_pg::th8_home_moves_between_select_and_confirm_pg
 services::cluster::intake_worker::home_route_tests::s3_real::route_pg::th8_no_row_matches_legacy_pg
 services::cluster::intake_worker::home_route_tests::s3_real::route_pg::th8_two_routers_one_holder_pg
+services::cluster::intake_worker::home_route_tests::s3_real::s3_node_child
 services::cluster::intake_worker::input_effect_tests::c1_worker_afterclaim_closing_returns_only_own_claim_pg
 services::cluster::intake_worker::input_effect_tests::c1_worker_beforeclaim_excludes_closing_population_pg
 services::cluster::intake_worker::input_effect_tests::c1_worker_final_cas_miss_retains_effect_through_classification_pg
@@ -2413,6 +2418,7 @@ services::discord::turn_bridge::voice_completion::voice_completion_tests::backgr
 services::discord::turn_bridge::voice_completion::voice_completion_tests::background_completion_target_prefers_voice_turn_link_by_dispatch_id_pg
 services::discord::turn_bridge::voice_completion::voice_completion_tests::rehydrate_preserves_remaining_ttl_for_aged_rows_pg
 services::discord::turn_bridge::voice_completion::voice_completion_tests::voice_turn_link_playback_lookup_falls_back_to_announce_message_pg
+services::discord::turn_presence::activity::tail::switch_tests::s1_tail_off_preserves_real_unbound_absence_and_live_holds_pg
 services::discord::turn_presence::activity::unbound::dormancy_tests::u_active_entrypoints_collect_real_unbound_evidence_pg
 services::discord::turn_presence::activity::unbound::live::review_tests::s1e_actual_reading_revalidates_absence_and_has_no_busy_identity_pg
 services::discord::turn_presence::activity::unbound::live::review_tests::s1e_herdr_first_create_keeps_legacy_runtime_trace_pg
@@ -2588,6 +2594,18 @@ services::session_host::herdr_clear_adapter::tests::an_input_hold_refuses_the_cl
 services::session_host::herdr_clear_adapter::tests::an_unclear_clear_line_holds_without_a_second_and_its_late_pending_settles_pg
 services::session_host::herdr_clear_adapter::tests::an_unsettled_or_unread_rotation_refuses_the_clear_pg
 services::session_host::herdr_clear_adapter::tests::every_failed_check_refuses_before_any_change_pg
+services::session_host::herdr_gate::tests::m1_afterwrite_never_auto_retries_pg
+services::session_host::herdr_gate::tests::m1_confirmation_required_stops_pg
+services::session_host::herdr_gate::tests::m1_last_pane_is_allowed_pg
+services::session_host::herdr_gate::tests::m1_provider_survived_close_keeps_bound_pg
+services::session_host::herdr_gate::tests::m1_replaced_root_refuses_before_send_pg
+services::session_host::herdr_gate::tests::m1_retire_cas_failure_keeps_hold_pg
+services::session_host::herdr_gate::tests::m1_service_missing_pane_absent_provider_retires_pg
+services::session_host::herdr_gate::tests::m1_stale_a_never_releases_b_pg
+services::session_host::herdr_gate::tests::m1_unreadable_process_never_means_absent_pg
+services::session_host::herdr_gate::tests::m2_already_finalized_with_active_a_is_indeterminate_pg
+services::session_host::herdr_gate::tests::m2_settlement_mailbox_unreadable_is_indeterminate_pg
+services::session_host::herdr_gate::tests::m2_turn_changed_before_close_has_zero_effect_pg
 services::session_host::herdr_gate::tests::m2t_u8_stop_between_close_and_cas_then_rerun_pg
 services::session_host::herdr_terminate_real_tests::a_p11_m2_confirmation_required_has_no_escalation
 services::session_host::session_record::tests::only_a_found_null_record_admits_the_legacy_clear_pg
