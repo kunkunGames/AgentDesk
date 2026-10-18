@@ -1597,6 +1597,7 @@ jobs:
           python3 scripts/ci/lib-test-artifact.py run -- cargo test --lib services::discord::health::recovery::self_watchdog -- --test-threads=1
           # The other half of the same guard: that every Postgres await on the
           python3 scripts/ci/lib-test-artifact.py run -- cargo test --lib services::health_diagnostics::tests -- --test-threads=1
+          python3 scripts/ci/lib-test-artifact.py run -- cargo test --lib services::discord::router::message_handler::provider_dispatch::campaign_admission:: -- --test-threads=1
 
       # #5034: watchdog/operational alerts are notifications, not queued turns;
       - name: Operational alert intake admission regressions
@@ -2201,7 +2202,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=32ee00809a935c60a15d3e48240fbfd1b3a48d3236b82c433b93399f0aa3cca3
+          expected=b53b592c9235efd9d3a0031d2563d2d185b8bff51c144c1028c6393b2bf4677b
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"
@@ -2455,7 +2456,7 @@ jobs:
             exit 1
           fi
           gate_path=scripts/check-ci-runner-hardening.sh
-          expected=32ee00809a935c60a15d3e48240fbfd1b3a48d3236b82c433b93399f0aa3cca3
+          expected=b53b592c9235efd9d3a0031d2563d2d185b8bff51c144c1028c6393b2bf4677b
           actual="$(sha256sum "$gate_path" | cut -d ' ' -f 1)"
           if [ "$actual" != "$expected" ]; then
             echo "::error file=$gate_path::content hash mismatch: expected $expected, found $actual; review the gate and update both #5321 gate pins together"

@@ -165,7 +165,8 @@ class Fixture:
         for name, text in files.items():
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, "utf-8")
+            # The inventory contract requires LF bytes on every platform.
+            path.write_bytes(text.encode("utf-8"))
 
     def commit(self, message: str, files: dict[str, str] | None = None) -> str:
         self.write(files or {})
