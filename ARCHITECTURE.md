@@ -157,7 +157,8 @@ src/
 │   │   │   │   │   ├── control.rs
 │   │   │   │   │   ├── effect.rs
 │   │   │   │   │   ├── guards.rs
-│   │   │   │   │   ├── initial_plan.rs
+│   │   │   │   │   ├── pregraph_capacity.rs
+│   │   │   │   │   ├── pregraph_plan.rs
 │   │   │   │   │   └── settled_effect.rs
 │   │   │   │   ├── artifact.rs
 │   │   │   │   ├── captured.rs
@@ -194,6 +195,7 @@ src/
 │   │   │   ├── revision.rs
 │   │   │   ├── schedule.rs
 │   │   │   ├── schema.rs
+│   │   │   ├── settled_gate.rs
 │   │   │   ├── store.rs
 │   │   │   └── workflow.rs
 │   │   ├── graph.rs
@@ -445,6 +447,7 @@ src/
 │   │   ├── planning_input_tests.rs
 │   │   ├── planning_ownership_tests.rs
 │   │   ├── planning_recovery_tests.rs
+│   │   ├── pregraph_plan_replan_tests.rs
 │   │   ├── proposal_identity_tests.rs
 │   │   ├── reconcile.rs
 │   │   ├── recovery_tests.rs
@@ -881,7 +884,10 @@ src/
 │   │   │   ├── recovery.rs
 │   │   │   ├── renewal.rs
 │   │   │   ├── store.rs
-│   │   │   └── tests.rs
+│   │   │   ├── tests.rs
+│   │   │   ├── wait.rs
+│   │   │   ├── wait_admission_tests.rs
+│   │   │   └── wait_tests.rs
 │   │   ├── execution_requirements/
 │   │   │   └── tests.rs
 │   │   ├── intake_router_hook/
@@ -1170,12 +1176,15 @@ src/
 │   │   │   │   ├── live_agent_recovery/
 │   │   │   │   │   └── judged_finish_fence_tests.rs
 │   │   │   │   ├── self_watchdog/
+│   │   │   │   │   ├── driver/
+│   │   │   │   │   │   └── dump.rs
 │   │   │   │   │   ├── policy/
 │   │   │   │   │   │   └── tests/
 │   │   │   │   │   │       └── mod.rs
 │   │   │   │   │   ├── tests/
 │   │   │   │   │   │   └── mod.rs
 │   │   │   │   │   ├── driver.rs
+│   │   │   │   │   ├── logging.rs
 │   │   │   │   │   └── policy.rs
 │   │   │   │   ├── stop_judgement/
 │   │   │   │   │   └── judged_finish_tests.rs
@@ -1725,6 +1734,9 @@ src/
 │   │   │   │   │   ├── voice_intake.rs
 │   │   │   │   │   └── worker_entry.rs
 │   │   │   │   ├── provider_dispatch/
+│   │   │   │   │   ├── campaign_admission/
+│   │   │   │   │   │   └── tests.rs
+│   │   │   │   │   ├── campaign_admission.rs
 │   │   │   │   │   └── producer_error_test_support.rs
 │   │   │   │   ├── tui_followup/
 │   │   │   │   │   └── codex_observation.rs
@@ -2640,6 +2652,7 @@ src/
 │   ├── kakao/
 │   │   ├── account.rs
 │   │   ├── calendar.rs
+│   │   ├── runtime.rs
 │   │   ├── test_support.rs
 │   │   ├── token_store.rs
 │   │   └── transport_tests.rs

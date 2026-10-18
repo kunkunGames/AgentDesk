@@ -10,6 +10,7 @@ pub(super) use dump::PreparedDump;
 
 pub(super) type Observation = (HealthProbeOutcome, Instant);
 
+#[derive(Clone)]
 pub(super) struct Sample {
     pub observation: Observation,
     pub current: Breadcrumbs,
@@ -143,9 +144,9 @@ pub(super) fn prepare_dump(
 }
 
 fn wait_for_dump(dump: Option<PreparedDump>, limit: Duration, deadline: Instant) {
-    if let Some(dump) = dump
-        && let Err(error) = dump.wait(limit, deadline)
-    {
-        tracing::warn!("watchdog: {error}");
+    if let Some(dump) = dump {
+        // The wait can consume the remaining blackout budget. Reporting its
+        // result through a synchronous writer here would delay the exit again.
+        let _ = dump.wait(limit, deadline);
     }
 }

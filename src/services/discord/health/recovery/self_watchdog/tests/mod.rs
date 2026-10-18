@@ -80,6 +80,7 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
     let addr = listener.local_addr().unwrap().to_string();
     let policy = policy();
     let (request_tx, request_rx) = mpsc::channel();
+    let (probe_tx, probe_rx) = mpsc::channel();
     let (server_ready_tx, server_ready_rx) = mpsc::channel();
     let (server_deadline_tx, server_deadline_rx) = mpsc::channel::<Instant>();
     let (armed_tx, armed_rx) = mpsc::channel();
@@ -106,8 +107,9 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let mut request = [0; 1024];
-        assert!(stream.read(&mut request).unwrap() > 0);
-        request_tx.send(Instant::now()).unwrap();
+        let received = stream.read(&mut request).unwrap();
+        assert!(received > 0);
+        request_tx.send((Instant::now(), received)).unwrap();
         let deadline = server_deadline_rx
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
@@ -146,7 +148,14 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
             state,
             deadline - Duration::from_millis(150),
             driver::Hooks {
-                probe: |probe_deadline| driver::tcp_probe(&addr, "127.0.0.1", probe_deadline),
+                probe: |probe_deadline| {
+                    let client_started_at = Instant::now();
+                    let observation = driver::tcp_probe(&addr, "127.0.0.1", probe_deadline);
+                    probe_tx
+                        .send((client_started_at, observation.clone()))
+                        .unwrap();
+                    observation
+                },
                 snapshot: scheduling,
                 dump: Some(dump),
                 log: move |state: &WatchdogState,
@@ -163,12 +172,11 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
         );
     }));
     let (started, deadline) = armed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    let requested_at = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(
-        requested_at < deadline,
-        "TCP request must actually start before D"
-    );
-    assert!(requested_at >= deadline - Duration::from_millis(170));
+    let (client_started_at, (probe_outcome, observed_at)) = probe_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the real TCP probe must finish");
+    let (server_received_at, received_bytes) =
+        request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     let (reason, exited_at) = exit_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("OS observer must see exit sink");
@@ -178,10 +186,31 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
         .find(|(decision, _, _)| matches!(decision, Decision::Exit(_)))
         .unwrap();
     eprintln!(
-        "deadline crossing late={late_response} blocked_dump={blocked_dump}: request_ms={} decision_ms={} exit_sink_ms={} D_ms=600 OS_allowance_ms=120",
-        requested_at.duration_since(started).as_millis(),
+        "deadline crossing late={late_response} blocked_dump={blocked_dump}: client_start_ms={} observation_ms={} server_received_ms={} server_request_bytes={received_bytes} outcome={probe_outcome:?} decision_ms={} exit_sink_ms={} D_ms=600 OS_allowance_ms=120",
+        client_started_at.duration_since(started).as_millis(),
+        observed_at.duration_since(started).as_millis(),
+        server_received_at.duration_since(started).as_millis(),
         decided_at.duration_since(started).as_millis(),
         exited_at.duration_since(started).as_millis()
+    );
+    assert!(
+        client_started_at < deadline,
+        "the actual TCP probe must start before D"
+    );
+    assert!(client_started_at >= deadline - Duration::from_millis(170));
+    assert!(observed_at >= client_started_at);
+    assert!(
+        observed_at >= deadline,
+        "the real TCP probe must cross D before reporting no response"
+    );
+    assert!(observed_at <= *decided_at);
+    assert!(
+        received_bytes > 0,
+        "the server must receive the real request"
+    );
+    assert!(
+        matches!(probe_outcome, HealthProbeOutcome::NoResponse { .. }),
+        "connect or request-write failure cannot stand in for a silent response"
     );
     assert_eq!(reason, Reason::HealthResponseBlackoutLimit);
     assert!(*decided_at >= deadline);

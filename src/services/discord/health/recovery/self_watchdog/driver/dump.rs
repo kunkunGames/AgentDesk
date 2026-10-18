@@ -37,7 +37,12 @@ impl PreparedDump {
             .name("watchdog-dump".into())
             .spawn(move || {
                 if ready.send(()).is_ok() && requests.recv().is_ok() {
-                    let _ = finished.send(capture());
+                    let outcome = capture();
+                    let _ = finished.send(outcome.clone());
+                    // A blocked diagnostic writer must not hold the waiter.
+                    if let Err(error) = outcome {
+                        tracing::warn!("watchdog: dump capture failed ({error})");
+                    }
                 }
             })?;
         // Initialization is bounded, but occurs outside the monitored window.

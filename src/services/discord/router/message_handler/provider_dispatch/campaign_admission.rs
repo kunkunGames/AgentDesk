@@ -20,6 +20,13 @@ mod tests;
 pub(super) struct CampaignAdmission<'a> {
     pool: &'a PgPool,
     dispatch: &'a str,
+    owner: RequestOwner<'a>,
+    agent: String,
+    deadline: Instant,
+    identity: Value,
+}
+
+struct RequestOwner<'a> {
     provider: &'a ProviderKind,
     channel: u64,
     nonce: &'a str,
@@ -28,15 +35,70 @@ pub(super) struct CampaignAdmission<'a> {
     tmux: &'a str,
     user_message: u64,
     request_owner: u64,
-    agent: String,
-    deadline: Instant,
-    identity: Value,
+    source_ids: Vec<u64>,
 }
 
 struct Observed {
     identity: Value,
     deadline: DateTime<Utc>,
     now: DateTime<Utc>,
+}
+
+enum Inspection {
+    Ordinary,
+    TargetPending,
+    Campaign(Observed),
+}
+
+#[derive(Clone, Copy)]
+struct PostedTarget {
+    channel: u64,
+    message: u64,
+}
+
+enum MessageBinding {
+    Pending,
+    Unrelated,
+    Matched(PostedTarget),
+}
+
+fn message_binding(context: Option<&str>, source_ids: &[u64]) -> anyhow::Result<MessageBinding> {
+    use anyhow::{Context, ensure};
+    let context: Value = serde_json::from_str(context.unwrap_or("{}"))?;
+    ensure!(
+        context.is_object(),
+        "campaign dispatch context is not an object"
+    );
+    let message = context.get("discord_message_id");
+    let channel = context.get("discord_message_channel_id");
+    if message.is_none() && channel.is_none() {
+        return Ok(MessageBinding::Pending);
+    }
+    let message = message
+        .and_then(Value::as_str)
+        .context("campaign posted message ID is missing or invalid")?
+        .parse::<u64>()?;
+    let channel = channel
+        .and_then(Value::as_str)
+        .context("campaign posted message channel is missing or invalid")?
+        .parse::<u64>()?;
+    ensure!(
+        message != 0 && channel != 0,
+        "campaign posted message target is invalid"
+    );
+    Ok(if source_ids.contains(&message) {
+        MessageBinding::Matched(PostedTarget { channel, message })
+    } else {
+        MessageBinding::Unrelated
+    })
+}
+
+fn source_ids(state: &inflight::InflightTurnState) -> Vec<u64> {
+    let mut sources = state.source_message_ids.clone();
+    sources.push(state.user_msg_id);
+    sources.sort_unstable();
+    sources.dedup();
+    sources
 }
 
 impl<'a> CampaignAdmission<'a> {
@@ -47,38 +109,102 @@ impl<'a> CampaignAdmission<'a> {
         let pool = turn.pool.ok_or("campaign admission requires PostgreSQL")?;
         let agent = crate::services::platform::active_provider_context(turn.provider.as_str())
             .and_then(|context| context.agent_id);
-        let nonce = turn.cancel.turn_nonce();
         let started = Instant::now();
-        let observed = tokio::runtime::Handle::current().block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                inspect(
-                    pool,
-                    dispatch,
-                    turn.provider,
-                    turn.channel_id,
-                    agent.as_deref(),
-                ),
+        // Ordinary dispatches do not require a campaign runtime or mailbox.
+        // Keep the first input snapshot for authentication; only a campaign
+        // classification may construct its stronger ownership fence.
+        let state = inflight::load_inflight_state_read_only_result(turn.provider, turn.channel_id);
+        let request_sources = state
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(source_ids)
+            .unwrap_or_default();
+        let captured = tokio::runtime::Handle::current().block_on(async {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(started + Duration::from_secs(5)),
+                async {
+                    let mut owner = None;
+                    loop {
+                        let queried = Instant::now();
+                        let inspected = inspect(
+                            pool,
+                            dispatch,
+                            turn.provider,
+                            turn.channel_id,
+                            agent.as_deref(),
+                            &request_sources,
+                        )
+                        .await?;
+                        if matches!(inspected, Inspection::Ordinary) {
+                            return Ok::<_, String>(None);
+                        }
+                        if owner.is_none() {
+                            let state = state
+                                .as_ref()
+                                .map_err(|error| error.clone())?
+                                .as_ref()
+                                .ok_or("campaign admission inflight owner missing")?;
+                            owner = Some(RequestOwner::capture(turn, state)?);
+                        }
+                        owner
+                            .as_ref()
+                            .ok_or("campaign request owner missing")?
+                            .verify(dispatch)
+                            .await?;
+                        if let Inspection::Campaign(observed) = inspected {
+                            return Ok(Some((
+                                observed,
+                                queried,
+                                owner.take().ok_or("campaign request owner missing")?,
+                            )));
+                        }
+                        // Discord can deliver its event before the sender persists the
+                        // returned ID. A marker only selects this bounded lookup; the
+                        // posted message must match before capacity admission exists.
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                },
             )
             .await
             .map_err(|_| "campaign policy lookup timed out".to_string())?
         })?;
-        let Some(observed) = observed else {
+        let Some((observed, queried, owner)) = captured else {
             return Ok(None);
         };
         let remaining = (observed.deadline - observed.now)
             .to_std()
             .map_err(|_| "campaign original deadline elapsed".to_string())?;
-        let mailbox = ChannelMailboxRegistry::global_handle(ChannelId::new(turn.channel_id))
-            .ok_or("campaign admission mailbox missing")?;
-        let state = inflight::load_inflight_state_read_only_result(turn.provider, turn.channel_id)?
-            .ok_or("campaign admission inflight owner missing")?;
         let value = Self {
             pool,
             dispatch,
+            owner,
+            agent: agent.ok_or("campaign execution agent missing")?,
+            // Anchor at the final query's start, so lookup time never extends
+            // the server's original dispatch deadline.
+            deadline: queried + remaining,
+            identity: observed.identity,
+        };
+        if Instant::now() >= value.deadline {
+            return Err("campaign original deadline elapsed during lookup".into());
+        }
+        Ok(Some(value))
+    }
+}
+
+impl<'a> RequestOwner<'a> {
+    fn capture(
+        turn: &'a StreamingTurn<'a>,
+        state: &inflight::InflightTurnState,
+    ) -> Result<Self, String> {
+        let mailbox = ChannelMailboxRegistry::global_handle(ChannelId::new(turn.channel_id))
+            .ok_or("campaign admission mailbox missing")?;
+        Ok(Self {
             provider: turn.provider,
             channel: turn.channel_id,
-            nonce: nonce
+            nonce: turn
+                .cancel
+                .turn_nonce()
                 .filter(|value| !value.is_empty())
                 .ok_or("campaign turn nonce missing")?,
             token: &turn.cancel,
@@ -89,26 +215,18 @@ impl<'a> CampaignAdmission<'a> {
                 .ok_or("campaign admission runtime name missing")?,
             user_message: state.user_msg_id,
             request_owner: state.request_owner_user_id,
-            agent: agent.ok_or("campaign execution agent missing")?,
-            deadline: started + remaining,
-            identity: observed.identity,
-        };
-        tokio::runtime::Handle::current().block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(5)
-                    .min(value.deadline.saturating_duration_since(Instant::now())),
-                value.owner(),
-            )
-            .await
-            .map_err(|_| "campaign owner lookup timed out".to_string())?
-        })?;
-        if Instant::now() >= value.deadline {
-            return Err("campaign original deadline elapsed during lookup".into());
-        }
-        Ok(Some(value))
+            source_ids: source_ids(state),
+        })
     }
 
-    async fn owner(&self) -> Result<(), String> {
+    async fn verify(&self, dispatch: &str) -> Result<(), String> {
+        if self
+            .token
+            .cancelled
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("campaign admission cancelled".into());
+        }
         let current = ChannelMailboxRegistry::global_handle(ChannelId::new(self.channel))
             .ok_or("campaign admission mailbox missing")?;
         if !current.same_actor(&self.mailbox) {
@@ -123,7 +241,7 @@ impl<'a> CampaignAdmission<'a> {
             .ok_or("campaign admission inflight owner missing")?;
         if state.provider != self.provider.as_str()
             || state.channel_id != self.channel
-            || state.dispatch_id.as_deref() != Some(self.dispatch)
+            || state.dispatch_id.as_deref() != Some(dispatch)
             || state.turn_nonce.as_deref() != Some(self.nonce)
             || state.terminal_delivery_completed()
             || state.rebind_origin
@@ -132,6 +250,7 @@ impl<'a> CampaignAdmission<'a> {
             || self.request_owner == 0
             || state.user_msg_id != self.user_message
             || state.request_owner_user_id != self.request_owner
+            || source_ids(&state) != self.source_ids
             || active.active_turn_nonce.as_deref() != Some(self.nonce)
             || active.active_user_message_id.map(|id| id.get()) != Some(self.user_message)
             || active.active_request_owner.map(|id| id.get()) != Some(self.request_owner)
@@ -153,20 +272,23 @@ impl AdmissionCheck for CampaignAdmission<'_> {
 
     fn verify(&self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
-            self.owner().await?;
-            let observed = inspect(
+            self.owner.verify(self.dispatch).await?;
+            let Inspection::Campaign(observed) = inspect(
                 self.pool,
                 self.dispatch,
-                self.provider,
-                self.channel,
+                self.owner.provider,
+                self.owner.channel,
                 Some(&self.agent),
+                &self.owner.source_ids,
             )
             .await?
-            .ok_or("campaign admission task disappeared")?;
+            else {
+                return Err("campaign admission posted request or task changed".into());
+            };
             if observed.identity != self.identity || observed.now >= observed.deadline {
                 return Err("campaign admission policy or original deadline changed".into());
             }
-            self.owner().await
+            self.owner.verify(self.dispatch).await
         })
     }
 }
@@ -177,8 +299,9 @@ async fn inspect(
     provider: &ProviderKind,
     channel: u64,
     agent: Option<&str>,
-) -> Result<Option<Observed>, String> {
-    inspect_inner(pool, dispatch, provider, channel, agent)
+    source_ids: &[u64],
+) -> Result<Inspection, String> {
+    inspect_inner(pool, dispatch, provider, channel, agent, source_ids)
         .await
         .map_err(|error| error.to_string())
 }
@@ -189,10 +312,11 @@ async fn inspect_inner(
     provider: &ProviderKind,
     channel: u64,
     agent: Option<&str>,
-) -> anyhow::Result<Option<Observed>> {
+    source_ids: &[u64],
+) -> anyhow::Result<Inspection> {
     use anyhow::{Context, ensure};
     let rows = sqlx::query(&format!(
-        "SELECT d.status,d.completed_at,d.created_at,d.dispatch_type,d.thread_id,d.to_agent_id,
+        "SELECT d.status,d.completed_at,d.created_at,d.dispatch_type,d.thread_id,d.to_agent_id,d.context AS dispatch_context,
             t.task_key,t.campaign_id,t.role,t.version,t.contract_digest,t.execution_profile,t.accepted,t.observation,
             k.id AS card_id,k.assigned_agent_id,k.description,k.metadata,
             s.spec,s.hold_reason,c.id AS current_campaign,c.document->>'status' AS campaign_status,
@@ -223,7 +347,7 @@ async fn inspect_inner(
                 .is_none(),
             "campaign admission task disappeared"
         );
-        return Ok(None);
+        return Ok(Inspection::Ordinary);
     };
     let campaign: String = row.try_get("campaign_id")?;
     ensure!(
@@ -233,6 +357,15 @@ async fn inspect_inner(
             && row.try_get::<Option<Value>, _>("spec")?.is_some(),
         "campaign admission authority is missing"
     );
+    ensure!(
+        !source_ids.is_empty(),
+        "campaign admission input source identity missing"
+    );
+    let context: Option<String> = row.try_get("dispatch_context")?;
+    let binding = message_binding(context.as_deref(), source_ids)?;
+    if matches!(binding, MessageBinding::Unrelated) {
+        return Ok(Inspection::Ordinary);
+    }
     let profile: Value = row
         .get::<Option<Value>, _>("execution_profile")
         .context("campaign execution profile missing")?;
@@ -319,7 +452,10 @@ async fn inspect_inner(
         created <= now && now < deadline,
         "campaign original dispatch deadline elapsed"
     );
-    Ok(Some(Observed {
+    let MessageBinding::Matched(target) = binding else {
+        return Ok(Inspection::TargetPending);
+    };
+    Ok(Inspection::Campaign(Observed {
         deadline,
         now,
         identity: json!({
@@ -327,7 +463,8 @@ async fn inspect_inner(
             "card":row.get::<String,_>("card_id"),"created":created,"agent":assigned,"profile":profile,
             "contract":row.get::<String,_>("contract_digest"),"role":row.get::<String,_>("role"),
             "version":row.get::<Option<i64>,_>("version"),
-            "captured":captured,"deadline":deadline
+            "captured":captured,"deadline":deadline,
+            "posted_target":{"channel":target.channel,"message":target.message}
         }),
     }))
 }

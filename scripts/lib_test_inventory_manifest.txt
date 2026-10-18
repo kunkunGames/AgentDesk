@@ -4247,6 +4247,7 @@ services::discord::health::recovery::retirement_await_tests::stall_watchdog_rech
 services::discord::health::recovery::self_watchdog::driver::dump::tests::remaining_deadline_caps_a_blocked_capture
 services::discord::health::recovery::self_watchdog::driver::dump::tests::requested_capture_reports_its_failure_once
 services::discord::health::recovery::self_watchdog::driver::dump::tests::unused_prepared_captures_are_released_without_work
+services::discord::health::recovery::self_watchdog::logging::tests::blocked_diagnostic_writer_cannot_delay_blackout_exit_sink
 services::discord::health::recovery::self_watchdog::policy::tests::a_response_at_deadline_is_observed_before_blackout_expires
 services::discord::health::recovery::self_watchdog::policy::tests::a_response_one_tick_after_deadline_does_not_reset_blackout
 services::discord::health::recovery::self_watchdog::policy::tests::a_soft_failure_breaks_the_fast_failure_streak
@@ -7325,9 +7326,14 @@ services::discord::router::message_handler::pre_admission_control::pre_admission
 services::discord::router::message_handler::pre_admission_control::pre_admission_control_tests::intake_turn_keeps_the_gate_above_the_deferred_take
 services::discord::router::message_handler::pre_admission_control::pre_admission_control_tests::resolve_local_controls_clear_pending_turn_view
 services::discord::router::message_handler::pre_admission_control::pre_admission_control_tests::route_branch_table_is_pinned
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_binds_posted_target_and_exact_retry_sources_pg
 services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_does_not_downgrade_missing_campaign_authority_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_does_not_inherit_thread_or_marker_authority_pg
 services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_keeps_original_deadline_and_soft_pause_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_rechecks_changed_or_removed_posted_target_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_rejects_malformed_posted_targets_pg
 services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_rejects_stale_prompt_provider_terminal_and_deadline_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_requires_persisted_target_before_admission_pg
 services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_review_uses_frozen_policy_and_requires_control_authority_pg
 services::discord::router::message_handler::provider_dispatch::codex_herdr_tests::a_cancel_after_the_first_write_still_binds_its_own_start_and_ends_the_hold_pg
 services::discord::router::message_handler::provider_dispatch::codex_herdr_tests::a_cancel_before_the_first_write_leaves_the_pending_pane_for_the_next_prompt_pg

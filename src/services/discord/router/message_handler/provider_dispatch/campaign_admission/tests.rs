@@ -5,6 +5,7 @@ use crate::db::campaigns::{self, graph::store};
 const DISPATCH: &str = "capacity-admission-attempt";
 const TASK: &str = "capacity:plan:initial";
 const CHANNEL: u64 = 521_807;
+const POSTED_MESSAGE: u64 = 521_808;
 
 async fn fixture(pool: &PgPool) -> (String, String, Goal) {
     sqlx::query(
@@ -59,15 +60,43 @@ async fn fixture(pool: &PgPool) -> (String, String, Goal) {
     .unwrap();
     sqlx::query("INSERT INTO task_dispatches(id,kanban_card_id,to_agent_id,dispatch_type,status,thread_id) VALUES($1,$2,'qwen','implementation','dispatched',$3)")
         .bind(DISPATCH).bind(&card).bind(CHANNEL.to_string()).execute(pool).await.unwrap();
+    crate::db::dispatches::persist_dispatch_message_target_pg(
+        pool,
+        DISPATCH,
+        &CHANNEL.to_string(),
+        &POSTED_MESSAGE.to_string(),
+    )
+    .await
+    .unwrap();
     assert!(
-        observe(pool).await.unwrap().is_some(),
+        matches!(observe(pool).await.unwrap(), Inspection::Campaign(_)),
         "valid dispatch must be admitted before testing mutations"
     );
     (campaign.id, card, goal)
 }
 
-async fn observe(pool: &PgPool) -> Result<Option<Observed>, String> {
-    inspect(pool, DISPATCH, &ProviderKind::Qwen, CHANNEL, Some("qwen")).await
+async fn observe_sources(pool: &PgPool, source_ids: &[u64]) -> Result<Inspection, String> {
+    inspect(
+        pool,
+        DISPATCH,
+        &ProviderKind::Qwen,
+        CHANNEL,
+        Some("qwen"),
+        source_ids,
+    )
+    .await
+}
+
+async fn observe(pool: &PgPool) -> Result<Inspection, String> {
+    observe_sources(pool, &[POSTED_MESSAGE]).await
+}
+
+fn expect_campaign(observed: Inspection) -> Observed {
+    match observed {
+        Inspection::Campaign(observed) => observed,
+        Inspection::Ordinary => panic!("expected a campaign input, got ordinary intake"),
+        Inspection::TargetPending => panic!("expected the posted dispatch target to be durable"),
+    }
 }
 
 #[tokio::test]
@@ -75,7 +104,7 @@ async fn campaign_capacity_policy_keeps_original_deadline_and_soft_pause_pg() {
     let db = TestPostgresDb::create().await;
     let pool = db.connect_and_migrate().await;
     let (campaign, _, goal) = fixture(&pool).await;
-    let original = observe(&pool).await.unwrap().unwrap();
+    let original = expect_campaign(observe(&pool).await.unwrap());
     let created: DateTime<Utc> =
         sqlx::query_scalar("SELECT created_at FROM task_dispatches WHERE id=$1")
             .bind(DISPATCH)
@@ -93,7 +122,7 @@ async fn campaign_capacity_policy_keeps_original_deadline_and_soft_pause_pg() {
     .execute(&pool)
     .await
     .unwrap();
-    let paused = observe(&pool).await.unwrap().unwrap();
+    let paused = expect_campaign(observe(&pool).await.unwrap());
     assert_eq!(original.identity, paused.identity);
     assert_eq!(original.deadline, paused.deadline);
     sqlx::query(
@@ -144,15 +173,23 @@ async fn campaign_capacity_policy_rejects_stale_prompt_provider_terminal_and_dea
             DISPATCH,
             &ProviderKind::Qwen,
             CHANNEL + 1,
-            Some("qwen")
+            Some("qwen"),
+            &[POSTED_MESSAGE],
         )
         .await
         .is_err()
     );
     assert!(
-        inspect(&pool, DISPATCH, &ProviderKind::Qwen, CHANNEL, Some("qa"))
-            .await
-            .is_err()
+        inspect(
+            &pool,
+            DISPATCH,
+            &ProviderKind::Qwen,
+            CHANNEL,
+            Some("qa"),
+            &[POSTED_MESSAGE],
+        )
+        .await
+        .is_err()
     );
     sqlx::query("UPDATE task_dispatches SET created_at=NOW()-INTERVAL '121 seconds' WHERE id=$1")
         .bind(DISPATCH)
@@ -182,16 +219,81 @@ async fn campaign_capacity_policy_does_not_downgrade_missing_campaign_authority_
     let (_, _, _) = fixture(&pool).await;
     sqlx::query("INSERT INTO task_dispatches(id,status,dispatch_type) VALUES('ordinary','dispatched','implementation')")
         .execute(&pool).await.unwrap();
+    assert!(matches!(
+        inspect(
+            &pool,
+            "ordinary",
+            &ProviderKind::Qwen,
+            CHANNEL,
+            None,
+            &[POSTED_MESSAGE],
+        )
+        .await
+        .unwrap(),
+        Inspection::Ordinary
+    ));
+    let ordinary_pool = pool.clone();
+    tokio::task::spawn_blocking(move || {
+        // capture performs a read-only inflight snapshot before classifying
+        // the dispatch. Keep that lookup in an empty owned runtime root.
+        let root = tempfile::tempdir().unwrap();
+        let _root_guard = crate::config::set_agentdesk_root_for_test(root.path());
+        let provider = ProviderKind::OpenCode;
+        assert!(
+            inflight::load_inflight_state_read_only_result(&provider, CHANNEL)
+                .unwrap()
+                .is_none()
+        );
+        let host = crate::services::turn_host::TurnHost::Tmux;
+        let turn = StreamingTurn {
+            pool: Some(&ordinary_pool),
+            campaign_dispatch_id: Some("ordinary"),
+            provider: &provider,
+            prompt: "DISPATCH:ordinary [Task] - ordinary input without a tmux runtime",
+            session_id: None,
+            working_dir: root.path().to_str().unwrap(),
+            system_prompt: None,
+            allowed_tools: &[],
+            cancel: Arc::new(crate::services::provider::CancelToken::new()),
+            remote_profile: None,
+            tmux_session_name: None,
+            teardown: None,
+            host: &host,
+            channel_id: CHANNEL,
+            model: None,
+            native_fast_mode: None,
+            codex_goals: None,
+            compact_percent: None,
+            compact_lower_bound_tokens: 0,
+            compact_token_limit: None,
+            cache_ttl_minutes: None,
+            dispatch_type: Some("implementation"),
+            force_fresh: false,
+            submission: None,
+        };
+        assert!(
+            CampaignAdmission::capture(&turn).unwrap().is_none(),
+            "ordinary dispatches need neither a campaign owner nor a tmux runtime"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            0,
+            "ordinary admission must leave the isolated runtime root untouched"
+        );
+    })
+    .await
+    .unwrap();
     assert!(
-        inspect(&pool, "ordinary", &ProviderKind::Qwen, CHANNEL, None)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert!(
-        inspect(&pool, "missing", &ProviderKind::Qwen, CHANNEL, None)
-            .await
-            .is_err()
+        inspect(
+            &pool,
+            "missing",
+            &ProviderKind::Qwen,
+            CHANNEL,
+            None,
+            &[POSTED_MESSAGE],
+        )
+        .await
+        .is_err()
     );
     sqlx::query("UPDATE task_dispatches SET created_at=NULL WHERE id=$1")
         .bind(DISPATCH)
@@ -243,16 +345,226 @@ async fn campaign_capacity_review_uses_frozen_policy_and_requires_control_author
     );
     sqlx::query("INSERT INTO campaign_dag_control_assignments(task_key,family_id,agent_id,purpose) VALUES($1,'capacity-family','qwen','template_review')")
         .bind(TASK).execute(&pool).await.unwrap();
-    let original = observe(&pool).await.unwrap().unwrap();
+    let original = expect_campaign(observe(&pool).await.unwrap());
     assert_eq!(original.deadline, policy.deadline);
     sqlx::query("UPDATE campaign_execution_specs SET spec=jsonb_set(spec,'{budget,node_timeout_secs}','600') WHERE campaign_id=$1")
         .bind(&campaign).execute(&pool).await.unwrap();
     assert_eq!(
-        observe(&pool).await.unwrap().unwrap().identity,
+        expect_campaign(observe(&pool).await.unwrap()).identity,
         original.identity
     );
     sqlx::query("UPDATE campaign_dag_reviews SET status='failed' WHERE task_key=$1")
         .bind(TASK)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(observe(&pool).await.is_err());
+}
+
+#[tokio::test]
+async fn campaign_capacity_policy_does_not_inherit_thread_or_marker_authority_pg() {
+    let db = TestPostgresDb::create().await;
+    let pool = db.connect_and_migrate().await;
+    fixture(&pool).await;
+
+    let ordinary_message = POSTED_MESSAGE + 1;
+    assert!(
+        matches!(
+            observe_sources(&pool, &[ordinary_message]).await.unwrap(),
+            Inspection::Ordinary
+        ),
+        "a valid campaign on the same thread cannot authorize an ordinary followup"
+    );
+
+    let forged_input = format!("DISPATCH:{DISPATCH} [Plan] - copied header");
+    let parsed = crate::services::discord::adk_session::parse_dispatch_id(&forged_input).unwrap();
+    assert_eq!(parsed, DISPATCH);
+    assert!(
+        matches!(
+            inspect(
+                &pool,
+                &parsed,
+                &ProviderKind::Qwen,
+                CHANNEL,
+                Some("qwen"),
+                &[ordinary_message + 1],
+            )
+            .await
+            .unwrap(),
+            Inspection::Ordinary
+        ),
+        "copying a dispatch marker into a different Discord message grants no waiting authority"
+    );
+    assert!(matches!(
+        observe_sources(&pool, &[ordinary_message, ordinary_message + 1])
+            .await
+            .unwrap(),
+        Inspection::Ordinary
+    ));
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_dispatches WHERE id=$1")
+        .bind(DISPATCH)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 1,
+        "ordinary classification must not create another attempt"
+    );
+    assert!(matches!(
+        observe(&pool).await.unwrap(),
+        Inspection::Campaign(_)
+    ));
+}
+
+#[tokio::test]
+async fn campaign_capacity_policy_binds_posted_target_and_exact_retry_sources_pg() {
+    let db = TestPostgresDb::create().await;
+    let pool = db.connect_and_migrate().await;
+    fixture(&pool).await;
+    let original = expect_campaign(observe(&pool).await.unwrap());
+
+    // Queued and exact-retry intake retain the original posted message among
+    // their sources even when their representative message has changed.
+    for sources in [
+        vec![POSTED_MESSAGE],
+        vec![POSTED_MESSAGE + 1, POSTED_MESSAGE],
+        vec![POSTED_MESSAGE, POSTED_MESSAGE + 1, POSTED_MESSAGE],
+    ] {
+        let retry = expect_campaign(observe_sources(&pool, &sources).await.unwrap());
+        assert_eq!(retry.identity, original.identity);
+        assert_eq!(
+            retry.deadline, original.deadline,
+            "preserving input lineage cannot renew the original campaign deadline"
+        );
+    }
+
+    // A dispatch posted in a parent channel can enter its resolved thread.
+    // Message identity remains the authority while d.thread_id still fences
+    // execution to CHANNEL; the posted source channel is not that thread.
+    crate::db::dispatches::persist_dispatch_message_target_pg(
+        &pool,
+        DISPATCH,
+        &(CHANNEL - 1).to_string(),
+        &POSTED_MESSAGE.to_string(),
+    )
+    .await
+    .unwrap();
+    let redirected = expect_campaign(observe(&pool).await.unwrap());
+    assert_eq!(redirected.deadline, original.deadline);
+    assert_ne!(redirected.identity, original.identity);
+}
+
+#[tokio::test]
+async fn campaign_capacity_policy_requires_persisted_target_before_admission_pg() {
+    let db = TestPostgresDb::create().await;
+    let pool = db.connect_and_migrate().await;
+    fixture(&pool).await;
+    let original = expect_campaign(observe(&pool).await.unwrap());
+    sqlx::query("UPDATE task_dispatches SET context=NULL WHERE id=$1")
+        .bind(DISPATCH)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        matches!(observe(&pool).await.unwrap(), Inspection::TargetPending),
+        "a posted request racing its target persistence has no campaign admission yet"
+    );
+
+    // Missing message identity must not bypass the existing policy checks.
+    sqlx::query("UPDATE campaign_execution_specs SET hold_reason='unknown outcome' WHERE campaign_id=(SELECT campaign_id FROM campaign_graph_tasks WHERE task_key=$1)")
+        .bind(TASK).execute(&pool).await.unwrap();
+    assert!(observe(&pool).await.is_err());
+    sqlx::query("UPDATE campaign_execution_specs SET hold_reason=NULL WHERE campaign_id=(SELECT campaign_id FROM campaign_graph_tasks WHERE task_key=$1)")
+        .bind(TASK).execute(&pool).await.unwrap();
+    assert!(matches!(
+        observe(&pool).await.unwrap(),
+        Inspection::TargetPending
+    ));
+
+    crate::db::dispatches::persist_dispatch_message_target_pg(
+        &pool,
+        DISPATCH,
+        &CHANNEL.to_string(),
+        &POSTED_MESSAGE.to_string(),
+    )
+    .await
+    .unwrap();
+    let persisted = expect_campaign(observe(&pool).await.unwrap());
+    assert_eq!(persisted.identity, original.identity);
+    assert_eq!(persisted.deadline, original.deadline);
+}
+
+#[tokio::test]
+async fn campaign_capacity_policy_rechecks_changed_or_removed_posted_target_pg() {
+    let db = TestPostgresDb::create().await;
+    let pool = db.connect_and_migrate().await;
+    fixture(&pool).await;
+    let original = expect_campaign(observe(&pool).await.unwrap());
+    let replacement = POSTED_MESSAGE + 1;
+    crate::db::dispatches::persist_dispatch_message_target_pg(
+        &pool,
+        DISPATCH,
+        &CHANNEL.to_string(),
+        &replacement.to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(observe(&pool).await.unwrap(), Inspection::Ordinary),
+        "the old source must lose admission when the posted target changes"
+    );
+    let changed = expect_campaign(observe_sources(&pool, &[replacement]).await.unwrap());
+    assert_ne!(
+        changed.identity, original.identity,
+        "periodic admission verification must detect a changed posted target"
+    );
+    assert_eq!(changed.deadline, original.deadline);
+
+    sqlx::query("UPDATE task_dispatches SET context='{}' WHERE id=$1")
+        .bind(DISPATCH)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        observe_sources(&pool, &[replacement]).await.unwrap(),
+        Inspection::TargetPending
+    ));
+}
+
+#[tokio::test]
+async fn campaign_capacity_policy_rejects_malformed_posted_targets_pg() {
+    let db = TestPostgresDb::create().await;
+    let pool = db.connect_and_migrate().await;
+    fixture(&pool).await;
+    let channel = CHANNEL.to_string();
+    let message = POSTED_MESSAGE.to_string();
+    let invalid = [
+        json!({"discord_message_channel_id":channel}),
+        json!({"discord_message_id":message}),
+        json!({"discord_message_channel_id":channel,"discord_message_id":null}),
+        json!({"discord_message_channel_id":null,"discord_message_id":message}),
+        json!({"discord_message_channel_id":null,"discord_message_id":null}),
+        json!({"discord_message_channel_id":channel,"discord_message_id":POSTED_MESSAGE}),
+        json!({"discord_message_channel_id":CHANNEL,"discord_message_id":message}),
+        json!({"discord_message_channel_id":channel,"discord_message_id":"0"}),
+        json!({"discord_message_channel_id":"0","discord_message_id":message}),
+        json!({"discord_message_channel_id":channel,"discord_message_id":"not-a-message"}),
+        json!({"discord_message_channel_id":channel,"discord_message_id":"18446744073709551616"}),
+        json!([]),
+        json!("not-an-object"),
+    ];
+    for context in invalid {
+        sqlx::query("UPDATE task_dispatches SET context=$2 WHERE id=$1")
+            .bind(DISPATCH)
+            .bind(context.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(observe(&pool).await.is_err(), "invalid target: {context}");
+    }
+    sqlx::query("UPDATE task_dispatches SET context='invalid-json' WHERE id=$1")
+        .bind(DISPATCH)
         .execute(&pool)
         .await
         .unwrap();

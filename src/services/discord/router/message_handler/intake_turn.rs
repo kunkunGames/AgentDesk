@@ -2460,7 +2460,9 @@ async fn handle_text_message_admitted(
     let provider_for_blocking = provider.clone();
     let execution_pool = shared.pg_pool.clone();
     let producer_registration = original_registration.clone();
-    let campaign_dispatch_id = dispatch_id.clone();
+    // Thread lookup still supplies task context. Only the original input's
+    // marker selects campaign authentication, which also checks its posted ID.
+    let campaign_dispatch_id = dispatch_id_for_thread.clone();
     let teardown_clearance = super::super::super::turn_teardown_clearance::for_turn(
         shared.pg_pool.as_ref(),
         &provider,
