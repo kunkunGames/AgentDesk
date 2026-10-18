@@ -9555,6 +9555,15 @@ services::discord::tui_prompt_relay::tests::claude_rehydrate_start_offset_return
 services::discord::tui_prompt_relay::tests::claude_rehydrate_start_offset_uses_current_eof
 services::discord::tui_prompt_relay::tests::claude_rehydrate_thread_session_rejects_non_numeric_suffix
 services::discord::tui_prompt_relay::tests::claude_rehydrate_thread_session_resolves_thread_channel_id
+services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::answer_edits::tests::a_new_message_instead_of_an_edit_is_rejected
+services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::answer_edits::tests::a_repeated_terminal_edit_is_rejected
+services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::answer_edits::tests::a_second_anchor_is_rejected
+services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::answer_edits::tests::an_empty_delivery_is_rejected
+services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::answer_edits::tests::observed_progress_then_terminal_is_one_answer
+services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::answer_edits::tests::one_terminal_edit_is_one_answer
+services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::answer_edits::tests::progress_after_the_terminal_answer_is_rejected
+services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::answer_edits::tests::progress_without_a_terminal_answer_is_rejected
+services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::answer_edits::tests::several_progress_edits_keep_one_terminal_answer
 services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::codex_6903_discovery_keeps_live_input_out_of_bootstrap_history
 services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::codex_direct_answer_ends_at_its_own_abort_after_an_early_stop_hook
 services::discord::tui_prompt_relay::tests::codex_direct_owner_tests::boundary_tests::codex_direct_answer_ends_at_its_own_interrupted_turn
