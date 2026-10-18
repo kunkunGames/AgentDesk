@@ -91,10 +91,10 @@ pub(super) async fn apply_patch(
 }
 
 fn map_provider_error(error: ProviderTargetError) -> AppError {
-    if error.is_unavailable() {
+    if let ProviderTargetError::KakaoUnavailable(source) = &error {
         app_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Kakao delivery must be enabled with valid account credentials before scheduling",
+            format!("Kakao delivery unavailable: {source}"),
         )
     } else if matches!(&error, ProviderTargetError::Serialization) {
         app_error(
@@ -109,6 +109,22 @@ fn map_provider_error(error: ProviderTargetError) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_provider_reports_actionable_redacted_cause() {
+        use crate::services::kakao::KakaoError;
+        for cause in [
+            KakaoError::Disabled,
+            KakaoError::InvalidConfiguration("landing URL is missing"),
+            KakaoError::CredentialPersistence,
+            KakaoError::MissingCredentials,
+        ] {
+            let expected = cause.to_string();
+            let error = map_provider_error(ProviderTargetError::KakaoUnavailable(cause));
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(error.message().contains(&expected));
+        }
+    }
 
     #[test]
     fn malformed_or_unknown_provider_target_fields_are_rejected() {

@@ -74,7 +74,17 @@ fn alpha_policy_handoffs_without_observer() {
         for (provider, channel) in [("Claude", "57153"), ("claude", "057153")] {
             let invalid = root.join(provider).join(format!("{channel}.json"));
             std::fs::create_dir_all(invalid.parent().unwrap()).unwrap();
-            std::fs::copy(root.join("claude/57153.json"), &invalid).unwrap();
+            let original = root.join("claude/57153.json");
+            // Case-insensitive filesystems already resolve "Claude" to the original row.
+            // Copying a file onto that alias would truncate the fixture before the policy runs.
+            if invalid.try_exists().unwrap() {
+                assert_eq!(
+                    invalid.canonicalize().unwrap(),
+                    original.canonicalize().unwrap()
+                );
+            } else {
+                std::fs::copy(original, &invalid).unwrap();
+            }
             let before = std::fs::read(&invalid).unwrap();
             let result: String = ctx
                 .eval(format!(
@@ -90,7 +100,7 @@ fn alpha_policy_handoffs_without_observer() {
             .eval("JSON.stringify(agentdesk.inflight.remove('claude',57153))")
             .unwrap();
         let result: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(result["ok"], true);
+        assert_eq!(result["ok"], true, "{result}");
     });
     assert_eq!(
         crate::services::discord::policy_op::unlink_hook::attempts(),

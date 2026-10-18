@@ -171,6 +171,26 @@ impl Drop for Lab {
 // create call as before, and a Herdr channel reaches no tmux at all.
 #[test]
 fn claude_launch_sizes_only_the_allowlisted_channel_and_keeps_the_rest_unchanged() {
+    const CHILD: &str = "AGENTDESK_CLAUDE_GEOMETRY_FIXTURE_CHILD";
+    const EXACT: &str = "services::claude::tui_session_launch::guarded_geometry_tests::claude_launch_sizes_only_the_allowlisted_channel_and_keeps_the_rest_unchanged";
+    // Admission reads a process-global registry that unrelated parallel tests also mutate.
+    // A fresh process exercises that real guard without replacing its registry or verdict.
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", EXACT, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+            "isolated geometry test: status={}\nstdout={stdout}\nstderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let _lock = dedupe::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let lab = Lab::new();

@@ -394,6 +394,147 @@ class NonPgFilterContract(unittest.TestCase):
 
 
 class DetectionMutation(FixtureCase):
+    def test_relative_imports_respect_local_modules_and_root_fallback(self) -> None:
+        self.fx.write_source(
+            "src/lib.rs",
+            "#[cfg(test)] mod support { pub fn connect() { TestPostgresDb::create(); } }\n"
+            "#[cfg(test)] mod service { pub struct Service; impl Service { pub fn start() {} } }\n"
+            "#[cfg(test)] mod tests {\n"
+            "mod service { pub struct Service { db: TestPostgresDb } impl Service { pub fn start() { TestPostgresDb::create(); } } }\n"
+            "use service::{Service};\n"
+            "#[test] fn local_pg() { Service::start(); }\n"
+            "#[test] fn explicit_root_plain() { crate::service::Service::start(); }\n"
+            "#[test] fn local_import_pg() { use service::Service as Db; Db::start(); }\n"
+            "#[test] fn root_fallback_pg() { use support::connect; connect(); }\n"
+            "}\n",
+        )
+        self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {
+            "tests::local_pg", "tests::local_import_pg", "tests::root_fallback_pg",
+        })
+
+    def test_local_pure_module_shadows_root_postgres_and_external_paths(self) -> None:
+        self.fx.write_source(
+            "src/lib.rs",
+            "#[cfg(test)] mod support { pub fn connect() { TestPostgresDb::create(); } }\n"
+            "#[cfg(test)] mod tests {\n"
+            "mod support { pub fn connect() {} } use support::connect;\n"
+            "#[test] fn plain() { connect(); support::connect(); external::support::connect(); }\n"
+            "#[test] fn root_pg() { crate::support::connect(); }\n"
+            "}\n",
+        )
+        self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {"tests::root_pg"})
+
+    def test_plain_variable_names_do_not_reference_test_nodes(self) -> None:
+        self.fx.write_source("src/lib.rs", "#[cfg(test)] mod tests { "
+                             "#[test] fn postgres() { TestPostgresDb::create(); } "
+                             "#[test] fn plain() { let postgres = false; assert!(!postgres); } }")
+        self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {"tests::postgres"})
+
+    def child_fixture(self, body: str, *, imports: str = "use std::process::Command;") -> None:
+        self.fx.write_source(
+            "src/lib.rs",
+            "#[cfg(test)] mod children { #[test] fn postgres() { TestPostgresDb::create(); } #[test] fn pure() {} }\n"
+            "#[cfg(test)] mod tests { " + imports + "\n#[test] fn caller() { " + body + " } }\n",
+        )
+
+    @staticmethod
+    def exact_child(receiver: str = "Command", executable: str = "std::env::current_exe", target: str = "target") -> str:
+        return (receiver + "::new(" + executable + "().unwrap())"
+                '.args(["--exact", ' + target + ', "--nocapture"])'
+                '.env_remove("TMUX").output().unwrap();')
+
+    def test_literal_exact_children_and_transitive_helpers_are_pg_dependencies(self) -> None:
+        body = 'for target in ["children::postgres", r#"children::pure"#] { ' + self.exact_child() + " }"
+        self.child_fixture(body)
+        self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {"children::postgres", "tests::caller"})
+        self.child_fixture('for target in ["children::pure"] { ' + self.exact_child() + " }")
+        self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {"children::postgres"})
+        self.fx.write_source(
+            "src/lib.rs",
+            "#[cfg(test)] mod children { #[test] fn postgres() { TestPostgresDb::create(); } }\n"
+            "#[cfg(test)] mod tests { use std::process::Command as Process; fn helper() { "
+            + 'for target in ["children::postgres"] { ' + self.exact_child("Process") + " } }\n"
+            + "#[test] fn caller() { helper(); } }\n",
+        )
+        self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {"children::postgres", "tests::caller"})
+
+    def test_exact_child_requires_real_chain_and_the_unshadowed_loop_binding(self) -> None:
+        call = self.exact_child()
+        variants = {
+            "diagnostic": 'eprintln!(r#"for target in ["children::postgres"] { ' + call + ' }"#);',
+            "comment": '/* for target in ["children::postgres"] { ' + call + " } */",
+            "unused_array": 'let targets = ["children::postgres"];',
+            "different_command": 'for target in ["children::postgres"] { Command::new("echo").args(["--exact", target, "--nocapture"]).output(); }',
+            "split_chain": 'for target in ["children::postgres"] { let child = Command::new(std::env::current_exe().unwrap()); child.args(["--exact", target, "--nocapture"]).output(); }',
+            "rebound": 'for target in ["children::postgres"] { let target = "children::pure"; ' + call + " }",
+            "closure_shadow": 'for target in ["children::postgres"] { (|target| { ' + call + ' })("children::pure"); }',
+            "different_executable": 'for target in ["children::postgres"] { ' + self.exact_child(executable="fake::current_exe") + " }",
+            "different_receiver": 'for target in ["children::postgres"] { ' + self.exact_child(receiver="FakeCommand") + " }",
+            "qualified_receiver": 'for target in ["children::postgres"] { ' + self.exact_child(receiver="fake::Command") + " }",
+            "qualified_std_receiver": 'for target in ["children::postgres"] { ' + self.exact_child(receiver="fake::std::process::Command") + " }",
+            "changed_args": 'for target in ["children::postgres"] { ' + call.replace('.output()', '.arg("children::pure").output()') + " }",
+            "dynamic_target": 'for target in [dynamic_target()] { ' + call + " }",
+            "uncalled_local_helper": 'fn unused() { for target in ["children::postgres"] { ' + call + " } }",
+        }
+        for name, body in variants.items():
+            with self.subTest(name=name):
+                self.child_fixture(body)
+                self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {"children::postgres"})
+
+    def test_exact_child_rejects_local_command_or_standard_library_shadow(self) -> None:
+        body = 'for target in ["children::postgres"] { ' + self.exact_child() + " }"
+        for imports in (
+            "use crate::fake::Command;",
+            "mod std { pub mod process { pub struct Command; } } use std::process::Command;",
+        ):
+            with self.subTest(imports=imports):
+                self.child_fixture(body, imports=imports)
+                self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {"children::postgres"})
+        self.child_fixture('for target in ["children::postgres"] { struct Command; ' + self.exact_child() + " }")
+        self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {"children::postgres"})
+        for declaration in ("struct Command;", "mod std {}"):
+            with self.subTest(declaration=declaration):
+                self.child_fixture(declaration + body)
+                self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {"children::postgres"})
+        self.child_fixture('use fake as std; for target in ["children::postgres"] { '
+                           + self.exact_child(receiver="std::process::Command", executable="::std::env::current_exe") + " }")
+        self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {"children::postgres"})
+
+    def test_child_binding_is_resolved_at_each_actual_call(self) -> None:
+        call = self.exact_child()
+        for body in (
+            'for target in ["children::postgres"] { ' + call + ' let target = "children::pure"; }',
+            'for target in ["children::postgres"] { { let target = "children::pure"; } ' + call + " }",
+            'for target in ["children::postgres"] { let target = ' + call + " }",
+            'use std::process::Command as Process; for target in ["children::postgres"] { ' + self.exact_child("Process") + " }",
+        ):
+            with self.subTest(body=body):
+                self.child_fixture(body)
+                self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {"children::postgres", "tests::caller"})
+
+    def test_unsupported_child_execution_scope_and_dynamic_binding_fail_closed(self) -> None:
+        call = self.exact_child()
+        for body in (
+            'for target in ["children::postgres"] { let unused = || { ' + call + " }; }",
+            'let unused = || { for target in ["children::postgres"] { ' + call + " } };",
+            'for target in ["children::postgres"] { let target = dynamic_target(); ' + call + " }",
+            'for target in ["children::pure"] { let mut target = "children::pure"; target = "children::postgres"; ' + call + " }",
+            'for target in ["children::pure"] { ' + call + ' { let target = "children::postgres"; ' + call + " } }",
+        ):
+            with self.subTest(body=body):
+                self.child_fixture(body)
+                findings = []
+                membership.discover_pg_inventory(self.root, findings=findings)
+                self.assertEqual(tuple(item.kind for item in membership._unanalyzable(findings)),
+                                 ("isolated-test-target-unresolved",))
+
+    def test_missing_literal_child_target_is_an_unanalyzable_input(self) -> None:
+        self.child_fixture('for target in ["children::missing"] { ' + self.exact_child() + " }")
+        findings = []
+        membership.discover_pg_inventory(self.root, findings=findings)
+        self.assertEqual(tuple(item.kind for item in membership._unanalyzable(findings)),
+                         ("isolated-test-target-unresolved",))
+
     def test_pg_fixture_descendants_and_local_imports_never_enter_replay(self) -> None:
         self.fx.write_source(
             "src/lib.rs",

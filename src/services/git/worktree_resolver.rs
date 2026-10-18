@@ -544,7 +544,12 @@ mod automation_worktree_tests {
         let id = uuid::Uuid::new_v4().to_string();
         let first = ensure_card_workspace_at(repo.to_str().unwrap(), &id, &root).unwrap();
         assert!(first.created);
-        assert!(Path::new(&first.path).starts_with(&root));
+        assert!(
+            Path::new(&first.path)
+                .canonicalize()
+                .unwrap()
+                .starts_with(root.canonicalize().unwrap())
+        );
         let owned = Path::new(&first.path).join("preserved.txt");
         std::fs::write(&owned, "unfinished progress").unwrap();
         let reused = ensure_card_workspace_at(repo.to_str().unwrap(), &id, &root).unwrap();

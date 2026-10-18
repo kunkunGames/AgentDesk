@@ -79,14 +79,16 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
     listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let policy = policy();
-    let started = Instant::now();
-    let deadline = started + policy.blackout_limit;
     let (request_tx, request_rx) = mpsc::channel();
+    let (server_ready_tx, server_ready_rx) = mpsc::channel();
+    let (server_deadline_tx, server_deadline_rx) = mpsc::channel::<Instant>();
+    let (armed_tx, armed_rx) = mpsc::channel();
     let mut threads = Threads::default();
     // Stop an unused listener before joining if a regression skips the probe.
     let server_guard = TcpFixtureGuard::default();
     let stopping = server_guard.0.clone();
     threads.0.push(std::thread::spawn(move || {
+        server_ready_tx.send(()).unwrap();
         let mut stream = loop {
             if stopping.load(Ordering::Relaxed) {
                 return;
@@ -106,6 +108,9 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
         let mut request = [0; 1024];
         assert!(stream.read(&mut request).unwrap() > 0);
         request_tx.send(Instant::now()).unwrap();
+        let deadline = server_deadline_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
         std::thread::sleep(
             (deadline + Duration::from_millis(220)).saturating_duration_since(Instant::now()),
         );
@@ -118,13 +123,23 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
     // Declare the dump release after thread cleanup so unwinding releases it before joining.
     let gate = DumpGate::default();
     let dump_calls = Arc::new(Mutex::new(0));
-    let dump = gate.helper(dump_calls.clone());
+    let capture = gate.helper(dump_calls.clone());
+    let dump = driver::prepare_dump(move || if blocked_dump { capture() } else { Ok(()) })
+        .expect("prepare the dump before arming the blackout clock");
     let (exit_tx, exit_rx) = mpsc::channel();
     let decisions = Arc::new(Mutex::new(Vec::new()));
     let recorded = decisions.clone();
-    let mut state = WatchdogState::new(started);
-    state.last_response_at = Some(started);
+    server_ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
     threads.0.push(std::thread::spawn(move || {
+        // Thread creation is fixture setup, not part of the measured blackout window.
+        let started = Instant::now();
+        let deadline = started + policy.blackout_limit;
+        server_deadline_tx.send(deadline).unwrap();
+        armed_tx.send((started, deadline)).unwrap();
+        let mut state = WatchdogState::new(started);
+        state.last_response_at = Some(started);
         driver::run(
             &policy,
             WatchdogMode::Enforce,
@@ -133,9 +148,7 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
             driver::Hooks {
                 probe: |probe_deadline| driver::tcp_probe(&addr, "127.0.0.1", probe_deadline),
                 snapshot: scheduling,
-                dump: move || {
-                    if blocked_dump { dump() } else { Ok(()) }
-                },
+                dump: Some(dump),
                 log: move |state: &WatchdogState,
                            decision: &Decision,
                            _: Option<&driver::Sample>,
@@ -149,6 +162,7 @@ fn deadline_crossing(late_response: bool, blocked_dump: bool) {
             },
         );
     }));
+    let (started, deadline) = armed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     let requested_at = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(
         requested_at < deadline,
@@ -203,34 +217,46 @@ fn blackout_exit_skips_blocked_dump_helper() {
 
 #[test]
 fn fast_exit_waits_for_dump_only_within_remaining_blackout_budget() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
     let policy = WatchdogPolicy {
         dump_limit: Duration::from_secs(5),
         ..policy()
     };
-    let started = Instant::now();
-    let deadline = started + policy.blackout_limit;
-    let mut state = WatchdogState::new(started);
-    state.fast_failures = 2;
-    state.observed_failures = 2;
     let (exit_tx, exit_rx) = mpsc::channel();
     let (decision_tx, decision_rx) = mpsc::channel();
+    let (armed_tx, armed_rx) = mpsc::channel();
     let mut threads = Threads::default();
     let gate = DumpGate::default();
     let dump_calls = Arc::new(Mutex::new(0));
-    let dump = gate.helper(dump_calls.clone());
+    let dump = driver::prepare_dump(gate.helper(dump_calls.clone()))
+        .expect("prepare the blocked dump before arming the blackout clock");
     threads.0.push(std::thread::spawn(move || {
+        // Arrange two prior failures and an already-consumed blackout budget.
+        // Preparation and a scheduled sleep must not consume the remaining 150ms.
+        let check_at = Instant::now();
+        let started = check_at - (policy.blackout_limit - Duration::from_millis(150));
+        let deadline = started + policy.blackout_limit;
+        let mut state = WatchdogState::new(started);
+        state.fast_failures = 2;
+        state.observed_failures = 2;
+        armed_tx.send((started, deadline)).unwrap();
         driver::run(
             &policy,
             WatchdogMode::Enforce,
             state,
-            deadline - Duration::from_millis(150),
+            check_at,
             driver::Hooks {
-                probe: |deadline| driver::tcp_probe(&addr, "127.0.0.1", deadline),
+                probe: move |probe_deadline| {
+                    assert_eq!(probe_deadline, deadline);
+                    (
+                        HealthProbeOutcome::ConnectFailed {
+                            elapsed_ms: 0,
+                            error: "closed listener".into(),
+                        },
+                        Instant::now(),
+                    )
+                },
                 snapshot: scheduling,
-                dump,
+                dump: Some(dump),
                 log: move |_: &WatchdogState,
                            decision: &Decision,
                            _: Option<&driver::Sample>,
@@ -243,6 +269,7 @@ fn fast_exit_waits_for_dump_only_within_remaining_blackout_budget() {
             },
         );
     }));
+    let (started, deadline) = armed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     let (decision, decided_at) = decision_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(decision, Decision::Exit(Reason::ListenerGone));
     assert!(decided_at < deadline);
@@ -255,8 +282,13 @@ fn fast_exit_waits_for_dump_only_within_remaining_blackout_budget() {
         exited_at.duration_since(started).as_millis()
     );
     assert_eq!(reason, Reason::ListenerGone);
-    assert_eq!(*dump_calls.lock().unwrap(), 1);
     assert!(exited_at <= deadline + OS_ALLOWANCE);
+    // Observe asynchronous capture separately; the exit timestamp is already fixed.
+    let entry_deadline = Instant::now() + Duration::from_secs(2);
+    while *dump_calls.lock().unwrap() == 0 && Instant::now() < entry_deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(*dump_calls.lock().unwrap(), 1);
 }
 
 #[test]
@@ -324,7 +356,7 @@ fn runtime_stall_exits_three_times_before_external_observation_limit() {
             driver::Hooks {
                 probe: |deadline| driver::tcp_probe(&addr, "127.0.0.1", deadline),
                 snapshot: hang_forensics::snapshot,
-                dump: || Ok(()),
+                dump: None,
                 log: move |state: &WatchdogState,
                            decision: &Decision,
                            sample: Option<&driver::Sample>,
@@ -399,7 +431,7 @@ fn scheduling_runtime_and_db_progress_cannot_extend_silence_deadline() {
             driver::Hooks {
                 probe: |deadline| driver::tcp_probe(&addr, "127.0.0.1", deadline),
                 snapshot: hang_forensics::snapshot,
-                dump: || Ok(()),
+                dump: None,
                 log: move |state: &WatchdogState,
                            decision: &Decision,
                            sample: Option<&driver::Sample>,
@@ -447,9 +479,6 @@ fn expired_deadline_reaches_exit_sink_without_probe_snapshot_or_dump() {
         blackout_limit: Duration::from_millis(200),
         ..policy()
     };
-    let called_at = Instant::now();
-    let started = called_at - policy.blackout_limit - Duration::from_millis(20);
-    let deadline = started + policy.blackout_limit;
     let calls = Arc::new((
         AtomicUsize::new(0),
         AtomicUsize::new(0),
@@ -461,6 +490,14 @@ fn expired_deadline_reaches_exit_sink_without_probe_snapshot_or_dump() {
     let (decision_tx, decision_rx) = mpsc::channel();
     let (exit_tx, exit_rx) = mpsc::channel();
     let mut threads = Threads::default();
+    let dump = driver::prepare_dump(move || {
+        dump_calls.2.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    })
+    .expect("prepare an unused dump before measuring expiry");
+    let called_at = Instant::now();
+    let started = called_at - policy.blackout_limit - Duration::from_millis(20);
+    let deadline = started + policy.blackout_limit;
     threads.0.push(std::thread::spawn(move || {
         driver::run(
             &policy,
@@ -482,10 +519,7 @@ fn expired_deadline_reaches_exit_sink_without_probe_snapshot_or_dump() {
                     snapshot_calls.1.fetch_add(1, Ordering::Relaxed);
                     scheduling()
                 },
-                dump: move || {
-                    dump_calls.2.fetch_add(1, Ordering::Relaxed);
-                    Ok(())
-                },
+                dump: Some(dump),
                 log: move |state: &WatchdogState,
                            decision: &Decision,
                            sample: Option<&driver::Sample>,
@@ -577,9 +611,6 @@ fn observe_mode_keeps_actual_probes_without_dump_exit_or_post_deadline_spin() {
         blackout_limit: Duration::from_millis(200),
         ..policy()
     };
-    let called_at = Instant::now();
-    let started = called_at - policy.blackout_limit - Duration::from_millis(20);
-    let deadline = started + policy.blackout_limit;
     let calls = Arc::new((
         AtomicUsize::new(0),
         AtomicUsize::new(0),
@@ -591,6 +622,14 @@ fn observe_mode_keeps_actual_probes_without_dump_exit_or_post_deadline_spin() {
     let probe_starts = Arc::new(Mutex::new(Vec::new()));
     let recorded_starts = probe_starts.clone();
     let (done_tx, done_rx) = mpsc::channel();
+    let dump = driver::prepare_dump(move || {
+        dump_calls.1.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    })
+    .expect("prepare a dump so observe mode can prove it remains unused");
+    let called_at = Instant::now();
+    let started = called_at - policy.blackout_limit - Duration::from_millis(20);
+    let deadline = started + policy.blackout_limit;
     threads.0.push(std::thread::spawn(move || {
         let mut samples = Vec::new();
         // Stop only the test observer; production observe mode has no shutdown side effect.
@@ -609,10 +648,7 @@ fn observe_mode_keeps_actual_probes_without_dump_exit_or_post_deadline_spin() {
                         snapshot_calls.0.fetch_add(1, Ordering::Relaxed);
                         scheduling()
                     },
-                    dump: move || {
-                        dump_calls.1.fetch_add(1, Ordering::Relaxed);
-                        Ok(())
-                    },
+                    dump: Some(dump),
                     log: |_: &WatchdogState,
                           decision: &Decision,
                           sample: Option<&driver::Sample>,

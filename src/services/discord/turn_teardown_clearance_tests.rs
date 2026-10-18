@@ -147,11 +147,15 @@ fn both_ancestors_judge_as_the_last_step_before_spawn() {
         assert!(args.contains("tmux_session_name.as_deref()"), "{file}");
         let spawned = &source[spawn..];
         assert_eq!(
-            source.matches("provider_dispatch::execute(").count(),
+            source.matches("provider_dispatch::execute_scoped(").count(),
             1,
             "{file}"
         );
-        assert!(spawned.contains("provider_dispatch::execute("), "{file}");
+        assert!(
+            spawned.contains("provider_dispatch::execute_scoped("),
+            "{file}"
+        );
+        assert!(!source.contains("provider_dispatch::execute("), "{file}");
         assert!(spawned.contains("tmux_session_name: tmux_session_name.as_deref(),"));
         assert!(
             spawned.contains("teardown: teardown_clearance.as_ref(),"),

@@ -826,7 +826,7 @@ fn source_read_legacy_selector_keeps_latest_mtime_and_resume_boundary() {
     let result = crate::services::codex_tui::rollout_tail::tail_latest_rollout_for_cwd_with_handoff_for_tmux(
         f.root.path(), std::time::UNIX_EPOCH, tx, None, || true, &f.context.tmux_session, None,
     ).unwrap();
-    assert_eq!(result.rollout_path, f.path(B));
+    assert_eq!(result.rollout_path.canonicalize().unwrap(), f.path(B));
     assert!(
         rx.try_iter()
             .any(|message| format!("{message:?}").contains("newest"))

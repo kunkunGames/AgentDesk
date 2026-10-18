@@ -12,7 +12,7 @@ on:
         type: boolean
 
 concurrency:
-  group: ci-nightly-${{ github.workflow }}
+  group: ci-nightly-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:

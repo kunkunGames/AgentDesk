@@ -51,8 +51,14 @@ fn spawn_watchdog_thread(
     std::thread::Builder::new()
         .name("health-watchdog".into())
         .spawn(move || {
-            // Keep the startup grace and initial check interval outside the blackout window.
-            std::thread::sleep(STARTUP_GRACE + CHECK_INTERVAL);
+            let first_check_at = Instant::now() + STARTUP_GRACE + CHECK_INTERVAL;
+            let dump = if mode == WatchdogMode::Enforce {
+                driver::prepare_dump(capture_dump)
+            } else {
+                None
+            };
+            // Prepare within the existing grace, before starting the blackout clock.
+            std::thread::sleep(first_check_at.saturating_duration_since(Instant::now()));
             let loopback = crate::config::loopback();
             let addr = format!("{loopback}:{port}");
             let started = Instant::now();
@@ -64,7 +70,7 @@ fn spawn_watchdog_thread(
                 driver::Hooks {
                     probe: |deadline| driver::tcp_probe(&addr, &loopback, deadline),
                     snapshot: crate::services::hang_forensics::snapshot,
-                    dump: capture_dump,
+                    dump,
                     log: |state: &policy::WatchdogState, decision: &policy::Decision, sample: Option<&driver::Sample>, decided_at| {
                         let reason = decision.reason().label();
                         let action = decision.action();

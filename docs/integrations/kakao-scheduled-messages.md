@@ -2,9 +2,15 @@
 
 AgentDesk can deliver an opted-in scheduled message to Discord, up to five
 Kakao friends, and the connected Kakao account's **My Chatroom**. Kakao support
-is disabled by default and reads secrets only from process environment
-variables; tokens are never accepted through the dashboard or serialized into
-runtime configuration responses.
+is disabled by default. Credentials come from process environment variables
+or the opt-in private token store; tokens are never accepted through the
+dashboard or serialized into runtime configuration responses.
+
+When `AGENTDESK_KAKAO_TOKEN_STORE_DIR` is configured, messages use the same
+owner-only persisted tokens and account lock as calendars. Stored tokens take
+precedence over bootstrap environment tokens. In a cluster, pin
+`AGENTDESK_KAKAO_CREDENTIAL_OWNER_INSTANCE_ID` to the credential node; see
+[managed calendars](kakao-calendar.md) for ownership and restart requirements.
 
 ## Kakao application prerequisites
 
@@ -36,10 +42,17 @@ KAKAO_CLIENT_SECRET=your-client-secret
 KAKAO_REFRESH_TOKEN=the-user-refresh-token
 ```
 
+Use a public HTTPS landing URL whose domain is registered in the Kakao app's
+product link settings. Localhost URLs and the separate `kakao_friend_share`
+YAML configuration do not satisfy this delivery configuration. A scheduling
+503 reports the specific redacted cause (disabled delivery, missing landing URL,
+missing credentials or a credential-store failure).
+
 `KAKAO_CLIENT_SECRET` is optional when the Kakao application does not require
 one. `KAKAO_ACCESS_TOKEN` can be supplied as a short-lived fallback. When a
-refresh token is present, AgentDesk refreshes once before the first send and
-keeps rotated access/refresh tokens only in process memory.
+refresh token is present, AgentDesk refreshes once before the first send.
+Rotated tokens remain in memory by default; with durable storage enabled,
+rotation is persisted before further dispatch.
 
 ## Enable multiple accounts
 

@@ -757,7 +757,13 @@ mod g1b_off {
                 .lines()
                 .any(|line| line.starts_with("G1B_OFF_TRACE="))
         );
-        print!("{stdout}");
+        // Keep the child harness records separate from the parent transcript.
+        for trace in stdout
+            .lines()
+            .filter(|line| line.starts_with("G1B_OFF_TRACE="))
+        {
+            println!("{trace}");
+        }
         false
     }
 

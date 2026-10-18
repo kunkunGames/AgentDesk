@@ -109,7 +109,8 @@ impl Fixture {
         let (env_root, guards) =
             dedupe::binding_context::tests::fixture_after_shared_test_env_lock();
         dedupe::reset_state_for_tests();
-        let root = tempfile::tempdir().unwrap();
+        // Verified source proofs require canonical roots, including macOS's aliased temp directory.
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let channel = 584_502_101;
         let id = "019e660d-4859-7522-9cee-8ba7c4e7c743";
         let tmux = format!("p5a2-{}", uuid::Uuid::new_v4().simple());

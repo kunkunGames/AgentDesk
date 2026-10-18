@@ -13,12 +13,18 @@ mod managed;
 pub(crate) mod recovery;
 mod renewal;
 mod store;
+mod wait;
 pub(crate) use managed::{ExecutionLimits, ManagedAttempt};
 use managed::{LeaseAdmission, LeaseIdentity};
+pub(crate) use wait::AdmissionCheck;
 #[cfg(test)]
 pub(crate) mod managed_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wait_admission_tests;
+#[cfg(test)]
+mod wait_tests;
 
 static LOCAL: OnceLock<(u32, Arc<Semaphore>)> = OnceLock::new();
 const LEASE_SECONDS: i64 = 30;
@@ -141,6 +147,21 @@ impl Drop for ExecutionGuard {
     }
 }
 
+struct LeaseRequest {
+    scope: Option<LeaseAdmission>,
+    timeout: Duration,
+}
+
+#[cfg(test)]
+impl From<Option<LeaseAdmission>> for LeaseRequest {
+    fn from(scope: Option<LeaseAdmission>) -> Self {
+        Self {
+            scope,
+            timeout: LEASE_IO_TIMEOUT,
+        }
+    }
+}
+
 /// Called inside the provider's blocking task, before it starts any process.
 pub(crate) fn acquire(
     pool: Option<&PgPool>,
@@ -149,12 +170,15 @@ pub(crate) fn acquire(
     working_dir: &str,
     remote: bool,
     cancel: Arc<CancelToken>,
+    admission_check: Option<&dyn AdmissionCheck>,
 ) -> Result<Option<ExecutionGuard>, String> {
+    let handle = tokio::runtime::Handle::current();
+    handle.block_on(wait::verify(&cancel, admission_check))?;
     let config = crate::config::load_graceful();
     let instance = super::node_registry::resolve_self_instance_id_without_config();
     let channel = channel.to_string();
     let limits = if let Some(pool) = pool {
-        admission::limits(pool, provider, &channel)?
+        admission::limits_with_timeout(pool, provider, &channel, wait::io_budget(admission_check))?
     } else {
         None
     };
@@ -182,13 +206,14 @@ pub(crate) fn acquire(
         if let Some(pool) = pool {
             tokio::runtime::Handle::current().block_on(async {
                 tokio::time::timeout(
-                    LEASE_IO_TIMEOUT,
+                    wait::io_budget(admission_check),
                     store::check_retained(pool, &instance, &channel, resource_key.as_deref()),
                 )
                 .await
                 .map_err(|_| "retained execution lookup timed out".to_string())?
             })?;
         }
+        handle.block_on(wait::verify(&cancel, admission_check))?;
         return Ok(None);
     }
     let slots = config
@@ -200,26 +225,58 @@ pub(crate) fn acquire(
     if *configured != slots {
         return Err("execution_slots changed; restart the node before new execution".into());
     }
-    let permit = semaphore.clone().try_acquire_owned().map_err(|_| {
-        "node execution capacity exhausted; retry when a turn completes".to_string()
-    })?;
-    let pool = pool
-        .ok_or("execution capacity requires PostgreSQL")?
-        .clone();
-    let provider = provider.to_string();
-    acquire_guard(
-        pool,
-        instance,
-        provider,
-        channel,
-        cancel,
+    let permit = handle.block_on(wait::permit(
+        Arc::clone(semaphore),
+        &cancel,
+        admission_check,
+    ))?;
+    let pool = pool.ok_or("execution capacity requires PostgreSQL")?;
+    let recheck = || -> Result<(), String> {
+        handle.block_on(wait::verify(&cancel, admission_check))?;
+        let current = crate::config::load_graceful();
+        let current_limits = admission::limits_with_timeout(
+            pool,
+            provider,
+            &channel,
+            wait::io_budget(admission_check),
+        )?;
+        if current.cluster.enabled != config.cluster.enabled
+            || current.cluster.execution_slots != config.cluster.execution_slots
+            || current.cluster.instance_id != config.cluster.instance_id
+            || super::node_registry::resolve_self_instance_id_without_config() != instance
+            || current_limits != limits
+            || admission::resource(working_dir, remote, current_limits.is_some())? != resource_key
+        {
+            return Err("execution admission settings changed while awaiting capacity".into());
+        }
+        if current_limits.is_some() {
+            super::node_registry::identity::require_stable(&current.cluster, &instance)?;
+        }
+        handle.block_on(wait::verify(&cancel, admission_check))
+    };
+    // Configuration, managed policy and a canonical workspace can change during
+    // a long queue wait. Do not admit a stale unbounded/managed interpretation.
+    recheck()?;
+    let guard = acquire_guard(
+        pool.clone(),
+        instance.clone(),
+        provider.to_string(),
+        channel.clone(),
+        Arc::clone(&cancel),
         permit,
-        resource_key.map(|resource_key| LeaseAdmission {
-            resource_key,
-            limits,
-        }),
-    )
-    .map(Some)
+        LeaseRequest {
+            scope: resource_key.clone().map(|resource_key| LeaseAdmission {
+                resource_key,
+                limits: limits.clone(),
+            }),
+            timeout: wait::io_budget(admission_check),
+        },
+    )?;
+    // A PG timeout/error is never retried as local congestion. After a known
+    // success, a refused caller drops the existing guard and uses its normal
+    // nonce-scoped lease finalization before the local permit is returned.
+    recheck()?;
+    Ok(Some(guard))
 }
 
 fn acquire_guard(
@@ -229,8 +286,15 @@ fn acquire_guard(
     channel: String,
     cancel: Arc<CancelToken>,
     permit: OwnedSemaphorePermit,
-    admission: Option<LeaseAdmission>,
+    request: LeaseRequest,
 ) -> Result<ExecutionGuard, String> {
+    let LeaseRequest {
+        scope: admission,
+        timeout: io_budget,
+    } = request;
+    if io_budget.is_zero() {
+        return Err("campaign execution admission deadline elapsed before PostgreSQL".into());
+    }
     let managed = admission.as_ref().is_some_and(|a| a.limits.is_some());
     let nonce = if managed {
         uuid::Uuid::parse_str(
@@ -246,7 +310,7 @@ fn acquire_guard(
     let admission_started = std::time::Instant::now();
     let deadline = handle.block_on(async {
         tokio::time::timeout(
-            LEASE_IO_TIMEOUT,
+            io_budget,
             store::acquire_scoped(
                 &pool,
                 &instance,

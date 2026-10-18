@@ -81,6 +81,7 @@ NON_PG_SKIP_ARGS=(
   --skip services::cluster::channel_home_drain::tests
   --skip services::cluster::execution_capacity::managed_tests
   --skip services::cluster::execution_capacity::tests
+  --skip services::cluster::execution_capacity::wait_admission_tests
   --skip services::cluster::intake_preflight::tests
   --skip services::cluster::intake_router_hook::agent_execution_node_tests
   --skip services::cluster::intake_router_hook::attachment_tests
@@ -154,6 +155,7 @@ NON_PG_SKIP_ARGS=(
   --skip services::discord::router::message_handler::intake_turn::native_fresh_prompt_tests
   --skip services::discord::router::message_handler::intake_turn::replay_start_tests
   --skip services::discord::router::message_handler::intake_turn::runtime_transition::native_hold_tests
+  --skip services::discord::router::message_handler::provider_dispatch::campaign_admission::tests
   --skip services::discord::router::message_handler::provider_dispatch::codex_herdr_tests
   --skip services::discord::router::message_handler::provider_dispatch::herdr_tests
   --skip services::discord::router::message_handler::provider_dispatch::tests
@@ -206,6 +208,7 @@ NON_PG_SKIP_ARGS=(
   --skip services::discord::turn_bridge::tmux_runtime::stop_host::tests
   --skip services::discord::turn_bridge::turn_analytics::timestamp_tests
   --skip services::discord::turn_bridge::voice_completion::voice_completion_tests
+  --skip services::discord::turn_presence::activity::tail::switch_tests
   --skip services::discord::turn_presence::activity::unbound::dormancy_tests
   --skip services::discord::turn_presence::activity::unbound::live::review_tests
   --skip services::discord::turn_presence::activity::unbound::tests
@@ -446,7 +449,6 @@ NON_PG_FILTER_REPLAY=(
   services::cluster::intake_worker::home_route_tests::s3_real::harness::route_as_asks_for_the_given_provider
   services::cluster::intake_worker::home_route_tests::s3_real::harness::scripted_reset_holds_each_call_and_never_succeeds_past_its_script
   services::cluster::intake_worker::home_route_tests::s3_real::harness::two_processes_append_whole_steps_to_one_lifecycle
-  services::cluster::intake_worker::home_route_tests::s3_real::s3_node_child
   services::cluster::machine_resources::store::tests::recorder_queue_is_bounded_without_waiting_for_the_database
   services::discord::commands::control::clear_persist_failure_tests::clear_callers_propagate_a_failed_clear_before_their_success_effect
   services::discord::commands::control::clear_persist_failure_tests::failed_clear_holds_the_transition_through_the_stop_and_one_restored_turn_runs
@@ -788,7 +790,9 @@ NON_PG_FILTER_REPLAY=(
   services::discord::turn_bridge::voice_completion::voice_completion_tests::background_completion_target_returns_marker_recorded_voice_channel
   services::discord::turn_bridge::voice_completion::voice_completion_tests::handoff_prompt_classification_requires_typed_marker
   services::discord::turn_bridge::voice_completion::voice_completion_tests::recognizes_voice_background_handoff_via_typed_marker
-  services::discord::turn_presence::activity::tail::switch_tests::s1_tail_off_preserves_real_unbound_absence_and_live_holds_pg
+  services::discord::turn_presence::activity::tail::switch_tests::s1_tail_handoff_budget_and_hash_counters_cross_the_worker
+  services::discord::turn_presence::activity::tail::switch_tests::s1_tail_setting_is_exact_and_frozen_on_first_read
+  services::discord::turn_presence::activity::tail::switch_tests::s1e_tail_io_ranges_are_bounded_at_each_handoff
   services::discord::turn_presence::activity::unbound::dormancy_tests::activation_candidates_counter_crosses_the_blocking_worker
   services::discord::turn_presence::activity::unbound::live::review_tests::s1e_runtime_marker_restore_preserves_legacy_and_canonical_priority
   services::discord::turn_presence::activity::unbound::tests::s1_hosted_absence_cannot_hide_related_inventory
@@ -862,21 +866,9 @@ NON_PG_FILTER_REPLAY=(
   services::session_host::herdr_gate::tests::m0_terminate_admission_off_still_judges
   services::session_host::herdr_gate::tests::m0_terminate_off_has_zero_effect
   services::session_host::herdr_gate::tests::m0_terminate_request_pair_is_exact
-  services::session_host::herdr_gate::tests::m1_afterwrite_never_auto_retries_pg
-  services::session_host::herdr_gate::tests::m1_confirmation_required_stops_pg
   services::session_host::herdr_gate::tests::m1_input_pin_races_terminate_across_fresh_targets
-  services::session_host::herdr_gate::tests::m1_last_pane_is_allowed_pg
   services::session_host::herdr_gate::tests::m1_production_e7_accepts_audited_version
   services::session_host::herdr_gate::tests::m1_production_e7_rejects_unaudited_version_before_provenance
-  services::session_host::herdr_gate::tests::m1_provider_survived_close_keeps_bound_pg
-  services::session_host::herdr_gate::tests::m1_replaced_root_refuses_before_send_pg
-  services::session_host::herdr_gate::tests::m1_retire_cas_failure_keeps_hold_pg
-  services::session_host::herdr_gate::tests::m1_service_missing_pane_absent_provider_retires_pg
-  services::session_host::herdr_gate::tests::m1_stale_a_never_releases_b_pg
-  services::session_host::herdr_gate::tests::m1_unreadable_process_never_means_absent_pg
-  services::session_host::herdr_gate::tests::m2_already_finalized_with_active_a_is_indeterminate_pg
-  services::session_host::herdr_gate::tests::m2_settlement_mailbox_unreadable_is_indeterminate_pg
-  services::session_host::herdr_gate::tests::m2_turn_changed_before_close_has_zero_effect_pg
   services::session_host::herdr_gate::tests::only_a_registered_local_endpoint_makes_a_herdr_target
   services::session_host::herdr_gate::tests::stopped_admission_refuses_input_but_lets_a_cancel_key_through
   services::session_host::herdr_gate::tests::the_boot_registry_holds_only_this_nodes_endpoints

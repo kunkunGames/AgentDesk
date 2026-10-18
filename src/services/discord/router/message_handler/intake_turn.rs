@@ -2460,6 +2460,7 @@ async fn handle_text_message_admitted(
     let provider_for_blocking = provider.clone();
     let execution_pool = shared.pg_pool.clone();
     let producer_registration = original_registration.clone();
+    let campaign_dispatch_id = dispatch_id.clone();
     let teardown_clearance = super::super::super::turn_teardown_clearance::for_turn(
         shared.pg_pool.as_ref(),
         &provider,
@@ -2473,41 +2474,36 @@ async fn handle_text_message_admitted(
         let _input_scope = crate::services::discord::input_runtime::fence::effect::worker_scope(provider_permit);
         let _original_registration = producer_registration;
         let _upload_lifetime = materialized_uploads;
-        let result = crate::services::platform::with_provider_execution_context(
+        let result = super::provider_dispatch::execute_scoped(
             provider_execution_context,
-            || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    super::provider_dispatch::execute(
-                        super::provider_dispatch::StreamingTurn {
-                            pool: execution_pool.as_ref(),
-                            provider: &provider_for_blocking,
-                            prompt: &context_prompt,
-                            session_id: session_id_clone.as_deref(),
-                            working_dir: &current_path_clone,
-                            system_prompt: Some(&system_prompt_owned),
-                            allowed_tools: &allowed_tools,
-                            cancel: cancel_token_clone,
-                            remote_profile: remote_profile.as_ref(),
-                            tmux_session_name: tmux_session_name.as_deref(),
-                            teardown: teardown_clearance.as_ref(),
-                            host: &turn_host,
-                            channel_id: channel_id.get(),
-                            model: model_for_turn.as_deref(),
-                            native_fast_mode: native_fast_mode_override,
-                            codex_goals: codex_goals_override,
-                            compact_percent: compact_percent_for_claude,
-                            compact_lower_bound_tokens,
-                            compact_token_limit: compact_token_limit_for_codex,
-                            cache_ttl_minutes,
-                            dispatch_type: dispatch_type_for_mcp.as_deref(),
-                            force_fresh: force_fresh_provider_session,
-                            submission: submission.as_ref(),
-                        },
-                        replay_start,
-                        tx.clone(),
-                    )
-                }))
+            super::provider_dispatch::StreamingTurn {
+                pool: execution_pool.as_ref(),
+                campaign_dispatch_id: campaign_dispatch_id.as_deref(),
+                provider: &provider_for_blocking,
+                prompt: &context_prompt,
+                session_id: session_id_clone.as_deref(),
+                working_dir: &current_path_clone,
+                system_prompt: Some(&system_prompt_owned),
+                allowed_tools: &allowed_tools,
+                cancel: cancel_token_clone,
+                remote_profile: remote_profile.as_ref(),
+                tmux_session_name: tmux_session_name.as_deref(),
+                teardown: teardown_clearance.as_ref(),
+                host: &turn_host,
+                channel_id: channel_id.get(),
+                model: model_for_turn.as_deref(),
+                native_fast_mode: native_fast_mode_override,
+                codex_goals: codex_goals_override,
+                compact_percent: compact_percent_for_claude,
+                compact_lower_bound_tokens,
+                compact_token_limit: compact_token_limit_for_codex,
+                cache_ttl_minutes,
+                dispatch_type: dispatch_type_for_mcp.as_deref(),
+                force_fresh: force_fresh_provider_session,
+                submission: submission.as_ref(),
             },
+            replay_start,
+            tx.clone(),
         );
 
         match result {
