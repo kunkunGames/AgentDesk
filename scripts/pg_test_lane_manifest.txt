@@ -2049,9 +2049,14 @@ services::discord::router::message_handler::intake_turn::replay_start_tests::wor
 services::discord::router::message_handler::intake_turn::replay_start_tests::worker_entry_tests::b_worker_malformed_sql_sources_hold_claimed_custody_without_failure_or_child_pg
 services::discord::router::message_handler::intake_turn::runtime_transition::native_hold_tests::held_native_boundary_accepts_clear_through_the_text_command_router_pg
 services::discord::router::message_handler::intake_turn::runtime_transition::native_hold_tests::native_hold_requeues_the_real_router_input_and_uploads_durably_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_binds_posted_target_and_exact_retry_sources_pg
 services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_does_not_downgrade_missing_campaign_authority_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_does_not_inherit_thread_or_marker_authority_pg
 services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_keeps_original_deadline_and_soft_pause_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_rechecks_changed_or_removed_posted_target_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_rejects_malformed_posted_targets_pg
 services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_rejects_stale_prompt_provider_terminal_and_deadline_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_requires_persisted_target_before_admission_pg
 services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_review_uses_frozen_policy_and_requires_control_authority_pg
 services::discord::router::message_handler::provider_dispatch::codex_herdr_tests::a_cancel_after_the_first_write_still_binds_its_own_start_and_ends_the_hold_pg
 services::discord::router::message_handler::provider_dispatch::codex_herdr_tests::a_cancel_before_the_first_write_leaves_the_pending_pane_for_the_next_prompt_pg
