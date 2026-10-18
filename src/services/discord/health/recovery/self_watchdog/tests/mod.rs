@@ -446,12 +446,14 @@ fn scheduling_runtime_and_db_progress_cannot_extend_silence_deadline() {
         probe_limit: Duration::from_millis(45),
         ..policy()
     };
-    let started = Instant::now();
     let mut threads = Threads::default();
     let (exit_tx, exit_rx) = mpsc::channel();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorded = seen.clone();
     threads.0.push(std::thread::spawn(move || {
+        // Production starts its blackout clock inside the watchdog thread, after setup.
+        // Thread scheduling before the driver starts is not a health blackout interval.
+        let started = Instant::now();
         driver::run(
             &policy,
             WatchdogMode::Enforce,
@@ -471,16 +473,22 @@ fn scheduling_runtime_and_db_progress_cannot_extend_silence_deadline() {
                         sample.map(|sample| sample.current),
                     ))
                 },
-                exit: move |reason, _| exit_tx.send((reason, Instant::now())).unwrap(),
+                exit: move |reason, _| exit_tx.send((reason, started, Instant::now())).unwrap(),
             },
         );
     }));
-    let (reason, exited_at) = exit_rx
+    let (reason, started, exited_at) = exit_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("live beacon cannot pardon silent health");
     db.abort();
     assert_eq!(reason, Reason::HealthResponseBlackoutLimit);
-    assert!(exited_at <= started + policy.blackout_limit + OS_ALLOWANCE);
+    assert!(
+        exited_at <= started + policy.blackout_limit + OS_ALLOWANCE,
+        "actual watchdog interval {:?} exceeded {:?} plus {:?} OS allowance",
+        exited_at.duration_since(started),
+        policy.blackout_limit,
+        OS_ALLOWANCE,
+    );
     let seen = seen.lock().unwrap();
     assert!(seen.iter().all(|(_, fast, _)| *fast == 0));
     let probes: Vec<_> = seen.iter().filter_map(|(_, _, crumbs)| *crumbs).collect();

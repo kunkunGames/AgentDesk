@@ -9,6 +9,8 @@ const RESPONSE2: &str = "DIRECT_5704_SECOND";
 const PROMPT3: &str = "codex direct prompt 5704 third";
 const RESPONSE3: &str = "DIRECT_5704_THIRD";
 
+mod answer_edits;
+
 fn user_line_for(text: &str) -> String {
     rollout_line(serde_json::json!({"type": "response_item", "payload": {
         "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}}))
@@ -312,21 +314,26 @@ impl Fixture {
         turns
     }
 
-    /// The answer only edits `anchor` (streaming edits included) and its last edit's JSON
-    /// content is exactly `text`.
+    /// Progress stays on `anchor`, followed by exactly one terminal edit containing `text`.
     fn assert_answer(&self, text: &str, anchor: u64) {
         let sent = self.sent(text);
         let anchor = format!("/channels/{}/messages/{anchor}", self.codex.channel.get());
-        assert!(
-            !sent.is_empty()
-                && sent
-                    .iter()
-                    .all(|(method, path, _)| method == "PATCH" && path.ends_with(&anchor)),
-            "{sent:?}"
-        );
-        let body = &sent.last().unwrap().2;
-        let content = serde_json::from_str::<serde_json::Value>(body).unwrap()["content"].clone();
-        assert_eq!(content, text);
+        let bodies: Vec<serde_json::Value> = sent
+            .iter()
+            .map(|(_, _, body)| serde_json::from_str(body).expect("recorded Discord JSON"))
+            .collect();
+        let edits: Vec<_> = sent
+            .iter()
+            .zip(&bodies)
+            .map(|((method, path, _), body)| {
+                (
+                    method.as_str(),
+                    path.as_str(),
+                    body["content"].as_str().expect("answer content"),
+                )
+            })
+            .collect();
+        answer_edits::assert_terminal_answer(&edits, &anchor, text);
     }
 
     /// The turn ended cleanly: row, mailbox and prompt anchor released, no sink frame.
@@ -1277,7 +1284,6 @@ fn codex_6903_discovery_keeps_live_input_out_of_bootstrap_history() {
                 .user_msg_id;
             assert!(fx.delivered("LIVE_DISCOVERY_6903_ANSWER").await);
             fx.polls(3).await;
-            assert_eq!(fx.sent("LIVE_DISCOVERY_6903_ANSWER").len(), 1);
             fx.assert_answer("LIVE_DISCOVERY_6903_ANSWER", anchor);
             assert_eq!(fx.completed_turns(), 1);
             assert_eq!(tail_starts(fx.codex.channel), 1);
