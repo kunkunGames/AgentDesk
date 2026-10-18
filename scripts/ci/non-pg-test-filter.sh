@@ -897,8 +897,6 @@ NON_PG_FILTER_REPLAY=(
   services::settings::tests::settings_response_dtos_serialize_existing_contract_fields
   services::settings::tests::settings_write_response_serializes_ok_contract
   services::stale_turn_reconciler::tests::tmux_identity_rejects_provider_mismatch_and_spinner_is_busy
-  services::tui_o::exact_pg::tests::exact_duplicate_pg_full_fields_and_legacy_same_key_other_attempt
-  services::tui_o::exact_pg::tests::exact_namespace_pg_old_reader_and_legacy_binding_bytes_unchanged
   services::tui_o::exact_pg::tests::exact_snapshot_sibling_construction_is_compile_rejected
   services::tui_o::exact_submission::tests::exact_submission_none_preserves_result_without_runtime
   services::tui_o::repost::admission_tests::a_torn_sidecar_tail_is_cut_and_any_other_damage_refuses_the_sidecar

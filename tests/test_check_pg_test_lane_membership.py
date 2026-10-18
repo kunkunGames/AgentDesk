@@ -394,6 +394,119 @@ class NonPgFilterContract(unittest.TestCase):
 
 
 class DetectionMutation(FixtureCase):
+    def test_relative_qualified_calls_keep_module_namespace_and_local_module_shadowing(self) -> None:
+        self.fx.write_source(
+            "src/lib.rs",
+            "#[cfg(test)] mod plain { pub fn connect() {} }\n"
+            "#[cfg(test)] mod support {\n"
+            "pub mod policy { pub fn policy() {} pub fn connect() { TestPostgresDb::create(); } }\n"
+            "pub use self::policy::policy;\n"
+            "pub fn helper() { policy::connect(); }\n"
+            "#[test] fn caller() { helper(); }\n"
+            "#[test] fn local_module_shadow() { use crate::plain as policy; policy::connect(); }\n"
+            "#[test] fn local_value_alias() { use self::policy::policy; policy::connect(); }\n"
+            "}\n",
+        )
+        findings = []
+        self.assertEqual(set(membership.discover_pg_inventory(self.root, findings).tests), {
+            "support::caller", "support::local_value_alias",
+        })
+        self.assertFalse(membership._unanalyzable(findings))
+
+    def test_an_undeclared_physical_file_cannot_shadow_an_exported_module(self) -> None:
+        self.fx.write_source(
+            "src/lib.rs",
+            "#[cfg(test)] mod storage { pub fn connect() { TestPostgresDb::create(); } }\n"
+            "#[cfg(test)] mod tests { pub use crate::storage as policy;\n"
+            "#[test] fn caller() { crate::tests::policy::connect(); }\n"
+            "}\n",
+        )
+        self.fx.write_source("src/tests/policy.rs", "pub fn unrelated_physical_file() {}\n")
+        findings = []
+        self.assertEqual(set(membership.discover_pg_inventory(self.root, findings).tests), {"tests::caller"})
+        self.assertFalse(membership._unanalyzable(findings))
+
+    def test_an_unknown_local_import_colliding_with_a_module_fails_closed(self) -> None:
+        self.fx.write_source(
+            "src/lib.rs",
+            "#[cfg(test)] mod tests { mod policy { pub fn connect() { TestPostgresDb::create(); } }\n"
+            "#[test] fn caller() { use external::unknown as policy; policy::connect(); }\n"
+            "}\n",
+        )
+        findings = []
+        membership.discover_pg_inventory(self.root, findings)
+        self.assertTrue(any(finding.kind == "pg-module-alias-namespace-unresolved" for finding in findings))
+        self.assertTrue(membership._unanalyzable(findings))
+
+    def test_a_module_and_reexported_value_with_the_same_name_do_not_form_an_alias_cycle(self) -> None:
+        self.fx.write_source(
+            "src/lib.rs",
+            "mod policy { pub struct Policy; pub fn policy() {} }\n"
+            "pub use policy::policy;\n"
+            "#[cfg(test)] mod tests { use crate::policy::*;\n"
+            "#[test] fn pure() { let _ = Policy; crate::policy(); }\n"
+            "}\n",
+        )
+        findings = []
+        self.assertEqual(membership.discover_pg_inventory(self.root, findings).tests, {})
+        self.assertFalse(membership._unanalyzable(findings))
+
+    def test_pg_helpers_follow_chained_reexports_and_module_aliases(self) -> None:
+        self.fx.write_source(
+            "src/lib.rs",
+            "#[cfg(test)] mod storage { pub mod nested { pub fn connect() { TestPostgresDb::create(); } } "
+            "pub use nested::connect as forwarded; }\n"
+            "#[cfg(test)] mod facade { pub use crate::storage::forwarded as connect; "
+            "pub use crate::storage::nested as module; }\n"
+            "#[cfg(test)] mod tests { use crate::facade::connect as open; use crate::facade::*;\n"
+            "#[test] fn qualified() { crate::facade::connect(); }\n"
+            "#[test] fn imported() { open(); }\n"
+            "#[test] fn wildcard() { connect(); }\n"
+            "#[test] fn module_alias() { crate::facade::module::connect(); }\n"
+            "#[test] fn local_import() { use crate::facade::connect as local; local(); }\n"
+            "}\n",
+        )
+        self.assertEqual(set(membership.discover_pg_inventory(self.root).tests), {
+            "tests::qualified", "tests::imported", "tests::wildcard",
+            "tests::module_alias", "tests::local_import",
+        })
+
+    def test_reexport_resolution_preserves_shadowing_and_terminates_cycles(self) -> None:
+        self.fx.write_source(
+            "src/lib.rs",
+            "#[cfg(test)] mod storage { pub fn connect() { TestPostgresDb::create(); } }\n"
+            "#[cfg(test)] mod facade { pub use crate::storage::connect; }\n"
+            "#[cfg(test)] mod cycle { pub use self::other as connect; pub use self::connect as other; }\n"
+            "#[cfg(test)] mod tests { use crate::facade::connect;\n"
+            "mod plain { pub fn connect() {} }\n"
+            "#[test] fn local_shadow() { use self::plain::connect; connect(); }\n"
+            "#[test] fn qualified_plain() { self::plain::connect(); }\n"
+            "#[test] fn unresolved_cycle() { crate::cycle::connect(); }\n"
+            "#[test] fn root_pg() { crate::facade::connect(); }\n"
+            "}\n",
+        )
+        findings = []
+        self.assertEqual(set(membership.discover_pg_inventory(self.root, findings).tests), {"tests::root_pg"})
+        self.assertTrue(any(finding.kind == "pg-reexport-cycle" for finding in findings))
+        self.assertTrue(membership._unanalyzable(findings))
+
+    def test_reexport_chain_past_the_limit_is_an_unanalyzable_input(self) -> None:
+        count = membership.PG_REACH_MAX_DEPTH + 1
+        chain = "".join(
+            f"#[cfg(test)] mod alias{i} {{ pub use crate::alias{i + 1}::connect; }}\n"
+            for i in range(count)
+        )
+        self.fx.write_source(
+            "src/lib.rs",
+            chain + f"#[cfg(test)] mod alias{count} {{ pub fn connect() {{ TestPostgresDb::create(); }} }}\n"
+            "#[cfg(test)] mod tests { #[test] fn caller() { crate::alias0::connect(); } }\n",
+        )
+        analysis = self.fx.analysis()
+        exhausted = [finding for finding in analysis.findings if finding.kind == "pg-reexport-depth-exhausted"]
+        self.assertTrue(exhausted)
+        self.assertTrue(membership._unanalyzable(analysis.findings))
+        self.assertNotIn("tests::caller", analysis.inventory.tests)
+
     def test_relative_imports_respect_local_modules_and_root_fallback(self) -> None:
         self.fx.write_source(
             "src/lib.rs",
