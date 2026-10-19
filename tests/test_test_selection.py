@@ -98,7 +98,7 @@ AUTHORITIES = (
     ".github/actions/ensure-swap/action.yml", "tests/test_x.py", "tests/run_x.sh",
     "tests/fixtures/pg_lane/x.json", "scripts/ci/non-pg-test-filter.sh",
     "scripts/ci-script-checks.sh", "scripts/ci-timeout.py", "scripts/rust_lex.py",
-    "scripts/pg_test_dependencies.py",
+    "scripts/pg_test_dependencies.py", "scripts/timing_test_isolation_contract.py",
     "scripts/lib_test_inventory_manifest.txt", "scripts/pg_test_lane_manifest.txt",
     "scripts/known_test_failures.txt", "scripts/run_test_lane.py",
     "scripts/check_pg_test_lane_membership.py", "scripts/check_test_target_integrity.py",
@@ -489,6 +489,20 @@ class ReplayTests(unittest.TestCase):
         self.assertTrue(child in coverage.load_pg_manifest_tests(REPO_ROOT), "PG child must remain in the PG lane")
         self.assertFalse(child in coverage.load_non_pg_filter_replay(REPO_ROOT), "PG child cannot be a pure replay test")
         self.assertIn(child, ts.declared_ignored(REPO_ROOT))
+
+    def test_selected_timing_ids_run_once_after_the_ordinary_and_replay_sets(self) -> None:
+        timing = ts._module("timing_test_isolation", ts.SCRIPTS / "ci/timing_test_isolation.py")
+        ids = self.repo.selected(self.plan, "sweep")
+        isolated = timing.ISOLATED_FILTERS[1]
+        with mock.patch.object(timing, "run_isolated", return_value=7) as run:
+            code, judged, replayed = self.run_sweep([*ids, isolated])
+        self.assertEqual(code, 7, "a timing failure must fail the selected PR lane")
+        run.assert_called_once_with(self.repo.root, frozenset({isolated}))
+        actual = [name for names, _ in judged for name in names] + [name for batch in replayed for name in batch]
+        self.assertEqual(sorted(actual), sorted(ids))
+        with mock.patch.object(timing, "run_isolated") as run:
+            self.assertEqual(self.run_sweep([*ids, isolated], replay_rc=101)[0], 101)
+        run.assert_not_called()
 
     def test_full_mode_runs_mains_commands_and_plan_writes_its_outputs(self) -> None:
         full = json.loads(json.dumps(self.plan))

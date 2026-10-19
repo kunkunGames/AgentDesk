@@ -44,6 +44,11 @@ from collections.abc import Callable
 from functools import cache, partial
 from pathlib import Path
 
+try:
+    from timing_test_isolation_contract import SERIAL_PREFIX, serial_argv_allowed
+except ModuleNotFoundError:
+    from scripts.timing_test_isolation_contract import SERIAL_PREFIX, serial_argv_allowed
+
 MOD_DECL = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*([;{])"
 )
@@ -992,6 +997,11 @@ def _direct_cargo_test(words: list[str], syntax: list[str]) -> list[str] | None:
                 index += 1
             continue
         if words[index:index + 4] == ["python3", "scripts/ci/lib-test-artifact.py", "run", "--"]:
+            index += 4
+            continue
+        if words[index:index + 4] == SERIAL_PREFIX:
+            if not serial_argv_allowed(words[index + 4:]):
+                return None
             index += 4
             continue
         if words[index:index + 2] in (

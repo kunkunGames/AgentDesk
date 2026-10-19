@@ -96,9 +96,12 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: |
+          set -eo pipefail
           source scripts/ci/non-pg-test-filter.sh
-          python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 4 "${NON_PG_SKIP_ARGS[@]}" -- env -u AGENTDESK_ROOT_DIR cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}"
+          python3 scripts/ci/timing_test_isolation.py check
+          python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 4 "${NON_PG_SKIP_ARGS[@]}" --skip services::discord::health::recovery::self_watchdog:: --skip services::codex_tui::rollout_tail::tests::always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done -- env -u AGENTDESK_ROOT_DIR cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}" --skip services::discord::health::recovery::self_watchdog:: --skip services::codex_tui::rollout_tail::tests::always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done
           run_non_pg_filter_replay
+          python3 scripts/ci/timing_test_isolation.py serial -- env -u AGENTDESK_ROOT_DIR cargo test --lib -- services::discord::health::recovery::self_watchdog:: services::codex_tui::rollout_tail::tests::always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done --test-threads=1
 
       - name: Stop PostgreSQL service
         if: always()

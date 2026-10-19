@@ -3397,6 +3397,8 @@ services::codex_tui::rollout_tail::tests::find_rollout_by_session_id_matches_uui
 services::codex_tui::rollout_tail::tests::find_rollout_by_session_id_rejects_empty_input
 services::codex_tui::rollout_tail::tests::find_rollout_by_session_id_returns_none_for_unknown
 services::codex_tui::rollout_tail::tests::fresh_pane_busy_signal_vetoes_pending_tool_deadline_done
+services::codex_tui::rollout_tail::tests::fresh_pane_veto_keeps_first_deadline_across_repeated_probes
+services::codex_tui::rollout_tail::tests::fresh_pane_veto_starts_at_the_first_fresh_observation
 services::codex_tui::rollout_tail::tests::idle_deadline_fires_after_output_goes_silent
 services::codex_tui::rollout_tail::tests::idle_deadline_survives_continuous_nonassistant_activity
 services::codex_tui::rollout_tail::tests::idle_pane_signal_allows_pending_tool_deadline_done
@@ -3446,6 +3448,7 @@ services::codex_tui::rollout_tail::tests::tool_result_with_empty_content_yields_
 services::codex_tui::rollout_tail::tests::tool_search_pause_does_not_emit_premature_done
 services::codex_tui::rollout_tail::tests::trailing_newline_message_does_not_double_at_boundary
 services::codex_tui::rollout_tail::tests::two_segments_with_long_pause_emits_full_response
+services::codex_tui::rollout_tail::tests::zero_pane_veto_cap_never_grants_a_fresh_extension
 services::codex_tui::session::source_observation::source_observation_tests::additive_launch_context_round_trips_with_the_schema_one_old_parser
 services::codex_tui::session::source_observation::source_observation_tests::captured_cli_advertising_the_bypass_has_hooks_only_through_it
 services::codex_tui::session::source_observation::source_observation_tests::captured_exec_tui_and_clear_hooks_verify_by_payload_path

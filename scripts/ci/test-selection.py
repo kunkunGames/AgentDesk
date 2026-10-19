@@ -52,7 +52,7 @@ FULL_TRIGGERS = (
     "migrations/*", "build.rs", "Cargo.toml", "Cargo.lock", ".cargo/*", "rust-toolchain*",
     "justfile", ".github/workflows/*", ".github/actions/*", "tests/*", "scripts/ci/*",
     "scripts/ci-script-checks.sh", "scripts/ci-timeout.py", "scripts/rust_lex.py",
-    "scripts/pg_test_dependencies.py",
+    "scripts/pg_test_dependencies.py", "scripts/timing_test_isolation_contract.py",
     "scripts/lib_test_inventory_manifest.txt", "scripts/pg_test_lane_*",
     "scripts/known_test_failures.txt", "scripts/run_test_lane.py",
     "scripts/check_pg_test_lane_membership.py", "scripts/check_test_target_integrity.py",
@@ -71,10 +71,11 @@ FULL_PG = ("just", "test-postgres-shard")
 CONTINUITY = ("just", "test-postgres-continuity")
 PREPARED = "source scripts/ci/non-pg-test-filter.sh && run_prepared_lib_test cargo test --lib --"
 GENERIC_NAMES = frozenset({"lib.rs", "main.rs", "mod.rs", "tests.rs"})
-FULL_SWEEP = """source scripts/ci/non-pg-test-filter.sh
-python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 4 "${NON_PG_SKIP_ARGS[@]}" -- env -u AGENTDESK_ROOT_DIR python3 scripts/ci/lib-test-artifact.py run -- cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}"
-run_non_pg_filter_replay
-"""
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+from timing_test_isolation_contract import sweep_script
+
+FULL_SWEEP = sweep_script(prepared=True)
 SELECTED = (f"directory selection; full via ADK_CI_SELECT=off now, or label {KILL_LABEL} "
             "from the next push or reopen")
 
@@ -357,15 +358,17 @@ def run_sweep(root: Path, ids: list[str]) -> int:
     outside the failure ledger, so they run that way here; each must still report a verdict
     and may report `ignored` only if the ledger declares that id ignored."""
     runner, coverage = tools()[:2]
+    timing = _module("timing_test_isolation", SCRIPTS / "ci/timing_test_isolation.py")
+    ordinary, isolated = timing.partition(ids)
     replay = set(coverage.load_non_pg_filter_replay(root))
-    judged = [test_id for test_id in ids if test_id not in replay]
-    replayed = [test_id for test_id in ids if test_id in replay]
+    judged = sorted(test_id for test_id in ordinary if test_id not in replay)
+    replayed = sorted(test_id for test_id in ordinary if test_id in replay)
     if judged and (rc := run_lane(root, "non-pg-sweep", judged, [
             "env", "-u", "AGENTDESK_ROOT_DIR", "python3", "scripts/ci/lib-test-artifact.py", "run",
             "--", "cargo", "test", "--lib", "--", "--exact", *judged])):
         return rc
     if not replayed:
-        return 0
+        return timing.run_isolated(root, isolated)
     rc, outcome = runner.run_and_capture(
         ["bash", "-c", f'cd {shlex.quote(str(root))} && {PREPARED} --exact "$@"', "bash",
          *replayed], None)
@@ -376,7 +379,7 @@ def run_sweep(root: Path, ids: list[str]) -> int:
         if bad:
             print(f"ERROR test-selection sweep: replayed ids {what}: {' '.join(bad)}",
                   file=sys.stderr)
-    return rc or int(bool(missing or undeclared))
+    return rc or int(bool(missing or undeclared)) or timing.run_isolated(root, isolated)
 
 
 def declared_ignored(root: Path) -> set[str]:

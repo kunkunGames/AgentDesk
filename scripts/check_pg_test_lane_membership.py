@@ -30,8 +30,14 @@ from typing import Iterable, NamedTuple
 
 try:
     from pg_test_dependencies import isolated_test_targets
+    from timing_test_isolation_contract import (
+        SERIAL_PREFIX, serial_argv_allowed, verified_timing_skip_lines,
+    )
 except ModuleNotFoundError:
     from scripts.pg_test_dependencies import isolated_test_targets
+    from scripts.timing_test_isolation_contract import (
+        SERIAL_PREFIX, serial_argv_allowed, verified_timing_skip_lines,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASELINE_REL = Path("scripts/pg_test_lane_baseline.txt")
@@ -1204,6 +1210,8 @@ _RUN_TEST_LANE_OPTIONS = {"--lane": r"[^-].*", "--max-summaries": r"[1-9][0-9]*"
 
 def _prefix_template(words: list[str]) -> bool:
     """Whether the raw words before `cargo` are one of the CI prefix templates."""
+    if words[:4] == SERIAL_PREFIX:
+        return words[4:] in ([], _ROOT_UNSET, _ROOT_UNSET + _ARTIFACT_RUN)
     if words[:2] == ["python3", "scripts/ci-timeout.py"]:
         return re.fullmatch(r"[1-9][0-9]*", "".join(words[2:3])) is not None \
             and words[3:] == _ROOT_UNSET
@@ -1244,7 +1252,8 @@ def _proven_cargo_argv(command: str) -> list[str] | None:
             or argv != [token.value for token in tokens[at:]] \
             or len(prefix) != at or not _prefix_template(prefix) or (sourced and prefix not in ([], ["run_prepared_lib_test"])) \
             or any(token.kind != "WORD" or token.depth for token in tokens) \
-            or any(token.dynamic and token.value not in arrays for token in tokens):
+            or any(token.dynamic and token.value not in arrays for token in tokens) \
+            or (prefix[:4] == SERIAL_PREFIX and not serial_argv_allowed([*prefix[4:], *argv])):
         raise ValueError(
             f"cargo-command-unparsed: {command!r} crosses a shell boundary or "
             "run-time value this gate cannot prove, so the lane filter it selects is unknown")
@@ -1790,7 +1799,9 @@ def non_pg_filter_contract_errors(
     for workflow in NON_PG_FILTER_WORKFLOWS:
         path = repo_root / workflow
         code = _strip_comments(path.read_text("utf-8"))
-        if re.search(r"(?:^|\s)--skip(?:=|\s)", code):
+        timing_lines = verified_timing_skip_lines(code)
+        if any(re.search(r"(?:^|\s)--skip(?:=|\s)", line) and index not in timing_lines
+               for index, line in enumerate(code.splitlines())):
             errors.append(
                 f"{workflow}: literal --skip arguments duplicate the canonical "
                 f"definition in {NON_PG_FILTER_REL}"

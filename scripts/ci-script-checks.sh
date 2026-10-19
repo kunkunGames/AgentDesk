@@ -503,7 +503,7 @@ fi
 fi
 
 if run_check contracts "PR test selection plan (main runs every lane in full)"; then
-"$PYTHON" -m unittest tests.test_test_selection
+"$PYTHON" -m unittest tests.test_test_selection tests.test_timing_test_isolation
 fi
 
 if run_check cargo "Test-target integrity gate (#5003/#5008)"; then
