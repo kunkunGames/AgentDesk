@@ -95,6 +95,7 @@ export default function DepartmentFormModal({
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const overlayRef = useRef<HTMLDivElement>(null);
+  const formRef = useRef<HTMLFormElement>(null);
   const colorButtonRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
   // sort_order 기반 다음 순번 계산
@@ -110,6 +111,14 @@ export default function DepartmentFormModal({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [onClose]);
+
+  useEffect(() => {
+    const previousFocus = document.activeElement as HTMLElement | null;
+    formRef.current?.focus();
+    return () => {
+      previousFocus?.focus();
+    };
+  }, []);
 
   const handleSave = handleSubmit(async (values) => {
     setSaving(true);
@@ -275,7 +284,9 @@ export default function DepartmentFormModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="dept-modal-title"
-        className="w-full max-w-2xl max-h-full overflow-y-auto rounded-t-3xl p-5 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:max-h-[85vh] sm:rounded-[28px] sm:p-6"
+        ref={formRef}
+        tabIndex={-1}
+        className="w-full max-w-2xl max-h-full overflow-y-auto rounded-t-3xl p-5 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:max-h-[85vh] sm:rounded-[28px] sm:p-6 focus:outline-none"
         style={{
           background:
             "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",

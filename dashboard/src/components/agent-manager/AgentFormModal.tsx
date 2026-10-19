@@ -56,6 +56,7 @@ export default function AgentFormModal({
 }) {
   const { t } = useI18n();
   const overlayRef = useRef<HTMLDivElement>(null);
+  const formRef = useRef<HTMLFormElement>(null);
   const {
     register,
     handleSubmit,
@@ -80,6 +81,14 @@ export default function AgentFormModal({
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [onClose]);
+
+  useEffect(() => {
+    const previousFocus = document.activeElement as HTMLElement | null;
+    formRef.current?.focus();
+    return () => {
+      previousFocus?.focus();
+    };
+  }, []);
 
   useEffect(() => {
     reset(form);
@@ -117,7 +126,9 @@ export default function AgentFormModal({
         aria-modal="true"
         aria-labelledby="agent-modal-title"
         onSubmit={handleSave}
-        className="w-full self-start max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-1.5rem)] max-w-[calc(100vw-1.5rem)] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[28px] border p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:my-auto sm:max-h-[90vh] sm:max-w-5xl sm:p-6"
+        ref={formRef}
+        tabIndex={-1}
+        className="w-full self-start max-h-[calc(100dvh-env(safe-area-inset-top)-env(safe-area-inset-bottom)-1.5rem)] max-w-[calc(100vw-1.5rem)] overflow-x-hidden overflow-y-auto overscroll-contain rounded-[28px] border p-4 shadow-2xl animate-in fade-in zoom-in-95 duration-200 sm:my-auto sm:max-h-[90vh] sm:max-w-5xl sm:p-6 focus:outline-none"
         style={{
           background:
             "linear-gradient(180deg, color-mix(in srgb, var(--th-card-bg) 96%, transparent) 0%, color-mix(in srgb, var(--th-bg-surface) 98%, transparent) 100%)",
@@ -156,6 +167,7 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   aria-label={tr("다음 스프라이트", "Next Sprite")}
+                  aria-controls="sprite-spinbutton"
                   tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-1 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{
@@ -171,10 +183,11 @@ export default function AgentFormModal({
                   ▲
                 </button>
                 <div
+                  id="sprite-spinbutton"
                   className="w-14 h-14 rounded-xl overflow-hidden bg-th-bg-surface flex items-center justify-center flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-2 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{ border: "2px solid var(--th-input-border)" }}
                   role="spinbutton"
-                  aria-label={tr("스프라이트", "Sprite")}
+                  aria-label={tr("스프라이트 아이콘", "Sprite Icon")}
                   aria-valuenow={spriteNum || 0}
                   aria-valuemin={0}
                   aria-valuemax={MAX_AGENT_SPRITE_NUMBER}
@@ -190,7 +203,7 @@ export default function AgentFormModal({
                       setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
                     } else if (e.key === "ArrowDown") {
                       e.preventDefault();
-                      const next = Math.max(1, (spriteNum || 1) - 1);
+                      const next = Math.max(0, (spriteNum || 0) - 1);
                       setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
                     }
                   }}
@@ -215,6 +228,7 @@ export default function AgentFormModal({
                 <button
                   type="button"
                   aria-label={tr("이전 스프라이트", "Previous Sprite")}
+                  aria-controls="sprite-spinbutton"
                   tabIndex={-1}
                   className="w-6 h-6 rounded flex items-center justify-center text-xs transition-colors focus:outline-none focus:ring-2 focus:ring-[var(--th-accent-primary)] focus:ring-offset-1 focus:ring-offset-[var(--th-bg-surface)]"
                   style={{
@@ -223,7 +237,7 @@ export default function AgentFormModal({
                     background: "color-mix(in srgb, var(--th-bg-surface) 92%, transparent)",
                   }}
                   onClick={() => {
-                    const next = Math.max(1, (spriteNum || 1) - 1);
+                    const next = Math.max(0, (spriteNum || 0) - 1);
                     setValue("sprite_number", next, { shouldDirty: true, shouldValidate: true });
                   }}
                 >
