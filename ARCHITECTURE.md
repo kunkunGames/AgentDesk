@@ -157,7 +157,8 @@ src/
 │   │   │   │   │   ├── control.rs
 │   │   │   │   │   ├── effect.rs
 │   │   │   │   │   ├── guards.rs
-│   │   │   │   │   ├── initial_plan.rs
+│   │   │   │   │   ├── pregraph_capacity.rs
+│   │   │   │   │   ├── pregraph_plan.rs
 │   │   │   │   │   └── settled_effect.rs
 │   │   │   │   ├── artifact.rs
 │   │   │   │   ├── captured.rs
@@ -194,6 +195,7 @@ src/
 │   │   │   ├── revision.rs
 │   │   │   ├── schedule.rs
 │   │   │   ├── schema.rs
+│   │   │   ├── settled_gate.rs
 │   │   │   ├── store.rs
 │   │   │   └── workflow.rs
 │   │   ├── graph.rs
@@ -445,6 +447,7 @@ src/
 │   │   ├── planning_input_tests.rs
 │   │   ├── planning_ownership_tests.rs
 │   │   ├── planning_recovery_tests.rs
+│   │   ├── pregraph_plan_replan_tests.rs
 │   │   ├── proposal_identity_tests.rs
 │   │   ├── reconcile.rs
 │   │   ├── recovery_tests.rs
