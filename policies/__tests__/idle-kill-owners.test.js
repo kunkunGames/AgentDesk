@@ -28,7 +28,7 @@ function fixture(rows, configured = [], nodes = []) {
         return [...new Set(data.rows.map(s => s.instance_id))].map(instance_id => ({ instance_id }));
       }
       if (sql.includes("FROM sessions s")) {
-        assert.match(sql, /ORDER BY latest.last_seen_at ASC LIMIT 50$/);
+        assert.match(sql, /ORDER BY COALESCE\(s\.last_heartbeat, s\.created_at\) ASC LIMIT 50$/);
         if (params.length) assert.match(sql, /BTRIM\(s.instance_id\) NOT IN \(\?(, \?)*\)/);
         return data.rows.filter(s => !params.includes((s.instance_id || "").trim())).slice(0, 50);
       }
