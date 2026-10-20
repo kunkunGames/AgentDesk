@@ -636,6 +636,9 @@ mkdir -p "$SYNC_REPO/scripts/ci"
 cp "$ROOT_DIR/scripts/main-ci-triage.sh" "$SYNC_REPO/scripts/main-ci-triage.sh"
 cp "$SCRIPT" "$SYNC_REPO/scripts/ci/infra-failure-rerun.sh"
 cp "$ROOT_DIR/scripts/check_pg_test_lane_membership.py" "$SYNC_REPO/scripts/check_pg_test_lane_membership.py"
+cp "$ROOT_DIR/scripts/pg_test_dependencies.py" "$SYNC_REPO/scripts/pg_test_dependencies.py"
+cp "$ROOT_DIR/scripts/timing_test_isolation_contract.py" "$SYNC_REPO/scripts/timing_test_isolation_contract.py"
+cp "$ROOT_DIR/scripts/rust_lex.py" "$SYNC_REPO/scripts/rust_lex.py"
 cp "$ROOT_DIR/scripts/ci/real-failure-predicate.sh" "$SYNC_REPO/scripts/ci/real-failure-predicate.sh"
 
 if bash "$SYNC_REPO/scripts/ci/infra-failure-rerun.sh" --self-test >/dev/null 2>&1; then

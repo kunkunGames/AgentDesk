@@ -856,6 +856,7 @@ fn dispatch(switch: Option<bool>) -> Result<(), String> {
     let provider = ProviderKind::Claude;
     let turn = StreamingTurn {
         pool: None,
+        campaign_dispatch_id: None,
         provider: &provider,
         prompt: "question",
         session_id: None,

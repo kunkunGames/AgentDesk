@@ -140,6 +140,7 @@ src/services/cluster/channel_home_drain_tests.rs
 src/services/cluster/channel_home_tests.rs
 src/services/cluster/execution_capacity/managed_tests.rs
 src/services/cluster/execution_capacity/tests.rs
+src/services/cluster/execution_capacity/wait_admission_tests.rs
 src/services/cluster/intake_preflight.rs
 src/services/cluster/intake_router_hook.rs
 src/services/cluster/intake_router_hook/agent_execution_node_tests.rs
@@ -160,6 +161,7 @@ src/services/cluster/intake_worker/replay_hold_tests.rs
 src/services/cluster/intake_worker/s3_real_tests/drain_pg_tests.rs
 src/services/cluster/intake_worker/s3_real_tests/force_pg_tests.rs
 src/services/cluster/intake_worker/s3_real_tests/holder_pg_tests.rs
+src/services/cluster/intake_worker/s3_real_tests/mod.rs
 src/services/cluster/intake_worker/s3_real_tests/route_pg_tests.rs
 src/services/cluster/machine_resources/store.rs
 src/services/discord/admin_host_guard_tests.rs
@@ -226,6 +228,7 @@ src/services/discord/router/message_handler/intake_turn/native_fresh_prompt_test
 src/services/discord/router/message_handler/intake_turn/replay_start_tests.rs
 src/services/discord/router/message_handler/intake_turn/runtime_transition/native_hold_tests.rs
 src/services/discord/router/message_handler/provider_dispatch.rs
+src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs
 src/services/discord/router/message_handler/provider_dispatch_codex_herdr_followup_tests.rs
 src/services/discord/router/message_handler/provider_dispatch_codex_herdr_tests.rs
 src/services/discord/router/message_handler/provider_dispatch_herdr_reconnect_tests.rs
@@ -292,6 +295,7 @@ src/services/discord/turn_bridge/tmux_runtime/process_force_kill_tests.rs
 src/services/discord/turn_bridge/tmux_runtime/stop_host_tests.rs
 src/services/discord/turn_bridge/turn_analytics.rs
 src/services/discord/turn_bridge/voice_completion_tests.rs
+src/services/discord/turn_presence/activity/tail_switch_tests.rs
 src/services/discord/turn_presence/activity/unbound/dormancy_tests.rs
 src/services/discord/turn_presence/activity/unbound/live_review_tests.rs
 src/services/discord/turn_presence/activity/unbound/unit_tests.rs
@@ -506,6 +510,7 @@ services::cluster::channel_home_boot::tests::writer_return
 services::cluster::channel_home_drain::tests
 services::cluster::execution_capacity::managed_tests
 services::cluster::execution_capacity::tests
+services::cluster::execution_capacity::wait_admission_tests
 services::cluster::intake_preflight::tests
 services::cluster::intake_router_hook::agent_execution_node_tests
 services::cluster::intake_router_hook::attachment_tests
@@ -519,6 +524,7 @@ services::cluster::intake_router_hook::pg_tests
 services::cluster::intake_worker::dispatch_stamp_tests
 services::cluster::intake_worker::home_accept_tests
 services::cluster::intake_worker::home_route_tests
+services::cluster::intake_worker::home_route_tests::s3_real
 services::cluster::intake_worker::home_route_tests::s3_real::drain_pg
 services::cluster::intake_worker::home_route_tests::s3_real::force_pg
 services::cluster::intake_worker::home_route_tests::s3_real::holder_pg
@@ -596,6 +602,7 @@ services::discord::router::message_handler::intake_turn::replay_start_tests
 services::discord::router::message_handler::intake_turn::replay_start_tests::kickoff_tests
 services::discord::router::message_handler::intake_turn::replay_start_tests::worker_entry_tests
 services::discord::router::message_handler::intake_turn::runtime_transition::native_hold_tests
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests
 services::discord::router::message_handler::provider_dispatch::codex_herdr_tests
 services::discord::router::message_handler::provider_dispatch::codex_herdr_tests::followup
 services::discord::router::message_handler::provider_dispatch::herdr_tests
@@ -669,6 +676,7 @@ services::discord::turn_bridge::tmux_runtime::process_backend_cancel::tests
 services::discord::turn_bridge::tmux_runtime::stop_host::tests
 services::discord::turn_bridge::turn_analytics::timestamp_tests
 services::discord::turn_bridge::voice_completion::voice_completion_tests
+services::discord::turn_presence::activity::tail::switch_tests
 services::discord::turn_presence::activity::unbound::dormancy_tests
 services::discord::turn_presence::activity::unbound::live::review_tests
 services::discord::turn_presence::activity::unbound::tests
@@ -1627,6 +1635,7 @@ services::cluster::execution_capacity::managed_tests::unknown_budget_survives_tt
 services::cluster::execution_capacity::managed_tests::unknown_writer_survives_expiry_cleanup_and_reconnect_while_independent_work_progresses_pg
 services::cluster::execution_capacity::tests::execution_capacity_atomic_reservations_execution_and_fenced_expiry_pg
 services::cluster::execution_capacity::tests::execution_lease_survives_pool_timeout_but_cancels_on_lost_ownership_pg
+services::cluster::execution_capacity::wait_admission_tests::campaign_capacity_wait_rechecks_node_policy_and_finalizes_refused_lease_pg
 services::cluster::intake_preflight::tests::evaluation_does_not_mutate_production_handoff_state_pg
 services::cluster::intake_router_hook::agent_execution_node_tests::agent_primary_inherits_into_thread_with_bounded_fallback_without_moving_owner_pg
 services::cluster::intake_router_hook::agent_execution_node_tests::preferred_leader_wins_but_unconfigured_agent_keeps_legacy_placement_pg
@@ -1740,6 +1749,7 @@ services::cluster::intake_worker::home_route_tests::s3_real::route_pg::th8_home_
 services::cluster::intake_worker::home_route_tests::s3_real::route_pg::th8_home_moves_between_select_and_confirm_pg
 services::cluster::intake_worker::home_route_tests::s3_real::route_pg::th8_no_row_matches_legacy_pg
 services::cluster::intake_worker::home_route_tests::s3_real::route_pg::th8_two_routers_one_holder_pg
+services::cluster::intake_worker::home_route_tests::s3_real::s3_node_child
 services::cluster::intake_worker::input_effect_tests::c1_worker_afterclaim_closing_returns_only_own_claim_pg
 services::cluster::intake_worker::input_effect_tests::c1_worker_beforeclaim_excludes_closing_population_pg
 services::cluster::intake_worker::input_effect_tests::c1_worker_final_cas_miss_retains_effect_through_classification_pg
@@ -2039,6 +2049,15 @@ services::discord::router::message_handler::intake_turn::replay_start_tests::wor
 services::discord::router::message_handler::intake_turn::replay_start_tests::worker_entry_tests::b_worker_malformed_sql_sources_hold_claimed_custody_without_failure_or_child_pg
 services::discord::router::message_handler::intake_turn::runtime_transition::native_hold_tests::held_native_boundary_accepts_clear_through_the_text_command_router_pg
 services::discord::router::message_handler::intake_turn::runtime_transition::native_hold_tests::native_hold_requeues_the_real_router_input_and_uploads_durably_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_binds_posted_target_and_exact_retry_sources_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_does_not_downgrade_missing_campaign_authority_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_does_not_inherit_thread_or_marker_authority_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_keeps_original_deadline_and_soft_pause_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_rechecks_changed_or_removed_posted_target_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_rejects_malformed_posted_targets_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_rejects_stale_prompt_provider_terminal_and_deadline_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_policy_requires_persisted_target_before_admission_pg
+services::discord::router::message_handler::provider_dispatch::campaign_admission::tests::campaign_capacity_review_uses_frozen_policy_and_requires_control_authority_pg
 services::discord::router::message_handler::provider_dispatch::codex_herdr_tests::a_cancel_after_the_first_write_still_binds_its_own_start_and_ends_the_hold_pg
 services::discord::router::message_handler::provider_dispatch::codex_herdr_tests::a_cancel_before_the_first_write_leaves_the_pending_pane_for_the_next_prompt_pg
 services::discord::router::message_handler::provider_dispatch::codex_herdr_tests::a_first_write_refused_before_any_key_releases_the_hold_for_the_next_prompt_pg
@@ -2404,6 +2423,7 @@ services::discord::turn_bridge::voice_completion::voice_completion_tests::backgr
 services::discord::turn_bridge::voice_completion::voice_completion_tests::background_completion_target_prefers_voice_turn_link_by_dispatch_id_pg
 services::discord::turn_bridge::voice_completion::voice_completion_tests::rehydrate_preserves_remaining_ttl_for_aged_rows_pg
 services::discord::turn_bridge::voice_completion::voice_completion_tests::voice_turn_link_playback_lookup_falls_back_to_announce_message_pg
+services::discord::turn_presence::activity::tail::switch_tests::s1_tail_off_preserves_real_unbound_absence_and_live_holds_pg
 services::discord::turn_presence::activity::unbound::dormancy_tests::u_active_entrypoints_collect_real_unbound_evidence_pg
 services::discord::turn_presence::activity::unbound::live::review_tests::s1e_actual_reading_revalidates_absence_and_has_no_busy_identity_pg
 services::discord::turn_presence::activity::unbound::live::review_tests::s1e_herdr_first_create_keeps_legacy_runtime_trace_pg
@@ -2579,6 +2599,18 @@ services::session_host::herdr_clear_adapter::tests::an_input_hold_refuses_the_cl
 services::session_host::herdr_clear_adapter::tests::an_unclear_clear_line_holds_without_a_second_and_its_late_pending_settles_pg
 services::session_host::herdr_clear_adapter::tests::an_unsettled_or_unread_rotation_refuses_the_clear_pg
 services::session_host::herdr_clear_adapter::tests::every_failed_check_refuses_before_any_change_pg
+services::session_host::herdr_gate::tests::m1_afterwrite_never_auto_retries_pg
+services::session_host::herdr_gate::tests::m1_confirmation_required_stops_pg
+services::session_host::herdr_gate::tests::m1_last_pane_is_allowed_pg
+services::session_host::herdr_gate::tests::m1_provider_survived_close_keeps_bound_pg
+services::session_host::herdr_gate::tests::m1_replaced_root_refuses_before_send_pg
+services::session_host::herdr_gate::tests::m1_retire_cas_failure_keeps_hold_pg
+services::session_host::herdr_gate::tests::m1_service_missing_pane_absent_provider_retires_pg
+services::session_host::herdr_gate::tests::m1_stale_a_never_releases_b_pg
+services::session_host::herdr_gate::tests::m1_unreadable_process_never_means_absent_pg
+services::session_host::herdr_gate::tests::m2_already_finalized_with_active_a_is_indeterminate_pg
+services::session_host::herdr_gate::tests::m2_settlement_mailbox_unreadable_is_indeterminate_pg
+services::session_host::herdr_gate::tests::m2_turn_changed_before_close_has_zero_effect_pg
 services::session_host::herdr_gate::tests::m2t_u8_stop_between_close_and_cas_then_rerun_pg
 services::session_host::herdr_terminate_real_tests::a_p11_m2_confirmation_required_has_no_escalation
 services::session_host::session_record::tests::only_a_found_null_record_admits_the_legacy_clear_pg
@@ -2622,7 +2654,9 @@ services::tui_o::alarm::postgres_tests::waiting_incidents_repeat_once_recur_and_
 services::tui_o::alarm::postgres_tests::writer_alarm_retries_after_insert_failure_without_another_raise_pg
 services::tui_o::exact_pg::tests::exact_ack_pg_waits_for_commit_barrier
 services::tui_o::exact_pg::tests::exact_child_ack_precedes_terminal_seal_pg
+services::tui_o::exact_pg::tests::exact_duplicate_pg_full_fields_and_legacy_same_key_other_attempt
 services::tui_o::exact_pg::tests::exact_metadata_pg_restore_and_terminal_port_stub
+services::tui_o::exact_pg::tests::exact_namespace_pg_old_reader_and_legacy_binding_bytes_unchanged
 services::tui_o::exact_pg::tests::exact_off_pg_statement_trace_and_files_zero
 services::tui_o::exact_pg::tests::exact_pg_process_reader_uses_only_metadata
 services::tui_o::exact_pg::tests::exact_settled_ack_names_normalized_pg_payload

@@ -553,7 +553,7 @@ async fn restored_historical_answer(root: PathBuf, writer_first: bool, race: Opt
         fx.append(&answer_for(&turn(3), "NEXT_6903_ANSWER"));
         assert!(fx.delivered("NEXT_6903_ANSWER").await);
         fx.polls(3).await;
-        assert_eq!(fx.sent("NEXT_6903_ANSWER").len(), 1);
+        fx.assert_answer("NEXT_6903_ANSWER", fx.anchor_of("NEXT_6903_ANSWER"));
         assert_eq!(
             fx.sent(STEER_ANSWER).len(),
             prior,
@@ -627,12 +627,11 @@ async fn restored_historical_answer(root: PathBuf, writer_first: bool, race: Opt
         super::super::super::super::relay_observed_prompt(&fx.shared, event).await;
         assert!(fx.delivered("AFTER_ROTATION_6903_ANSWER").await);
         fx.polls(3).await;
-        assert_eq!(fx.sent("AFTER_ROTATION_6903_ANSWER").len(), 1);
         fx.assert_answer(
             "AFTER_ROTATION_6903_ANSWER",
             fx.anchor_of("AFTER_ROTATION_6903_ANSWER"),
         );
-        assert_eq!(fx.sent(STEER_ANSWER).len(), 1);
+        fx.assert_answer(STEER_ANSWER, anchor);
         assert_eq!(
             native_receipts(fx.codex.channel.get()).len(),
             (prior_receipts + 1).min(32)
@@ -2316,7 +2315,6 @@ async fn deliver_direct_terminal(fx: &mut Fixture, n: u32, last: bool) {
             assert_direct_admission_unique(fx, &event.expect("observation channel open"));
         }
     }
-    assert_eq!(fx.sent(&answer).len(), 1);
     fx.assert_answer(&answer, fx.anchor_of(&answer));
 }
 
@@ -2414,7 +2412,6 @@ async fn direct_pending_rotation(root: &Path, fx: &mut Fixture) {
     fx.codex.rollout = next;
     deliver_direct_terminal(fx, 81, true).await;
     fx.polls(3).await;
-    assert_eq!(fx.sent(answer).len(), 1);
     fx.assert_answer(answer, fx.anchor_of(answer));
 }
 
@@ -2568,7 +2565,7 @@ async fn generation_switch_settles_parked(
         .and_then(|record| record.delivered_frontier)
         .unwrap();
     assert_eq!(frontier.generation_mtime_ns, g2);
-    assert_eq!(fx.sent(STEER_ANSWER).len(), 1, "P is never republished");
+    fx.assert_answer(STEER_ANSWER, fx.anchor_of(STEER_ANSWER));
 }
 
 #[test]

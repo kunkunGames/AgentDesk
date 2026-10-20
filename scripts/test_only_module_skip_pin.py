@@ -283,6 +283,9 @@ PINNED_BASENAME_TEST_FILES = frozenset({
         "src/services/cluster/attachment_transfer/storage_tests.rs",
         "src/services/cluster/intake_router_hook/attachment_tests.rs",
         "src/services/cluster/execution_capacity/tests.rs",
+        "src/services/cluster/execution_capacity/wait_tests.rs",
+        "src/services/cluster/execution_capacity/wait_admission_tests.rs",
+        "src/services/discord/router/message_handler/provider_dispatch/campaign_admission/tests.rs",
         "src/services/cluster/machine_resources/tests.rs",
         "src/db/auto_queue/tests.rs",
         "src/engine/ops/exec_ops/exec_allowlist_tests.rs",
@@ -815,6 +818,7 @@ PINNED_BASENAME_TEST_FILES = frozenset({
 
 # Production-looking basenames classified as test-only by the shared resolver.
 PINNED_RESOLVER_TEST_ONLY_FILES = frozenset({
+        "src/services/discord/tui_prompt_relay/tests/codex_direct_owner_tests/boundary_tests/answer_edits.rs",
         "src/services/discord/tui_prompt_relay/synthetic_start/non_bridge_claim.rs",
         "src/services/discord/tui_prompt_relay/synthetic_start/bridge_handoff/reown.rs",
         "src/services/discord/turn_bridge/replay_policy.rs",

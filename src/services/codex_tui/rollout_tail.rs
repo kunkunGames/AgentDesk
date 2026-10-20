@@ -3132,6 +3132,58 @@ mod tests {
     }
 
     #[test]
+    fn fresh_pane_veto_keeps_first_deadline_across_repeated_probes() {
+        let first = Instant::now();
+        let mut started = None;
+        let cap = Duration::from_millis(250);
+        for elapsed in [0, 100, 200, 249, 250, 251, 1000] {
+            let (origin, may_veto) = following_source::pane_busy_veto_at(
+                &mut started,
+                first + Duration::from_millis(elapsed),
+                cap,
+            );
+            assert_eq!(origin, first);
+            assert_eq!(started, Some(first));
+            assert_eq!(may_veto, elapsed < 250, "probe at {elapsed}ms");
+        }
+    }
+
+    #[test]
+    fn fresh_pane_veto_starts_at_the_first_fresh_observation() {
+        let turn_started = Instant::now();
+        let first_fresh = turn_started + Duration::from_secs(10);
+        let mut started = None;
+        let cap = Duration::from_millis(250);
+        assert!(following_source::pane_busy_veto_at(&mut started, first_fresh, cap).1);
+        assert_eq!(started, Some(first_fresh));
+        assert!(
+            following_source::pane_busy_veto_at(
+                &mut started,
+                first_fresh + Duration::from_millis(249),
+                cap,
+            )
+            .1
+        );
+        assert!(!following_source::pane_busy_veto_at(&mut started, first_fresh + cap, cap,).1);
+    }
+
+    #[test]
+    fn zero_pane_veto_cap_never_grants_a_fresh_extension() {
+        let first = Instant::now();
+        let mut started = None;
+        assert!(!following_source::pane_busy_veto_at(&mut started, first, Duration::ZERO).1);
+        assert!(
+            !following_source::pane_busy_veto_at(
+                &mut started,
+                first + Duration::from_secs(1),
+                Duration::ZERO,
+            )
+            .1
+        );
+        assert_eq!(started, Some(first));
+    }
+
+    #[test]
     fn always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done() {
         let (_dir, rollout) = pending_tool_rollout();
         let (tx, rx) = mpsc::channel();
@@ -3163,8 +3215,8 @@ mod tests {
 
         assert!(matches!(result, ReadOutputResult::Completed { .. }));
         assert!(
-            probes.load(std::sync::atomic::Ordering::SeqCst) >= 3,
-            "the hard cap must allow multiple fresh veto probes"
+            probes.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the initial fresh veto must be rechecked when the hard cap expires"
         );
         assert!(
             started_at.elapsed() >= Duration::from_millis(250),

@@ -16,9 +16,12 @@ use crate::services::stream_json_cli::{
 };
 use crate::services::turn_host::{HerdrRefusal, HerdrTurnPlan, TurnHost};
 use crate::services::{claude, claude_tui, codex, gemini, opencode, qwen};
+mod campaign_admission;
 
 pub(super) struct StreamingTurn<'a> {
     pub pool: Option<&'a sqlx::PgPool>,
+    /// Exact intake dispatch identity; only a DB-authenticated campaign may wait for capacity.
+    pub campaign_dispatch_id: Option<&'a str>,
     pub provider: &'a ProviderKind,
     pub prompt: &'a str,
     pub session_id: Option<&'a str>,
@@ -178,6 +181,20 @@ pub(super) fn producer_error(
     })
 }
 
+/// Run both intake and headless drivers under the same provider context and panic boundary.
+pub(super) fn execute_scoped(
+    context: crate::services::provider_cli::ProviderExecutionContext,
+    turn: StreamingTurn<'_>,
+    start: ReplayStart,
+    sender: Sender<StreamMessage>,
+) -> std::thread::Result<Result<(), String>> {
+    crate::services::platform::with_provider_execution_context(context, || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute(turn, start, sender)
+        }))
+    })
+}
+
 pub(super) fn execute(
     turn: StreamingTurn<'_>,
     start: ReplayStart,
@@ -220,14 +237,7 @@ pub(super) fn execute(
     if let Some(result) = input_effect_probe(&turn, &sender) {
         return result;
     }
-    let _execution_guard = crate::services::cluster::execution_capacity::acquire(
-        turn.pool,
-        turn.provider.as_str(),
-        turn.channel_id,
-        turn.working_dir,
-        turn.remote_profile.is_some(),
-        Arc::clone(&turn.cancel),
-    )?;
+    let _execution_guard = capacity_guard(&turn)?;
     let turn = StreamingTurn {
         system_prompt: turn.system_prompt.and_then(|prompt| {
             crate::services::provider::system_prompt_for_provider_turn(
@@ -361,6 +371,22 @@ pub(super) fn execute(
     }
 }
 
+fn capacity_guard(
+    turn: &StreamingTurn<'_>,
+) -> Result<Option<crate::services::cluster::execution_capacity::ExecutionGuard>, String> {
+    use crate::services::cluster::execution_capacity::{self, AdmissionCheck};
+    let admission = campaign_admission::CampaignAdmission::capture(turn)?;
+    execution_capacity::acquire(
+        turn.pool,
+        turn.provider.as_str(),
+        turn.channel_id,
+        turn.working_dir,
+        turn.remote_profile.is_some(),
+        Arc::clone(&turn.cancel),
+        admission.as_ref().map(|value| value as &dyn AdmissionCheck),
+    )
+}
+
 /// The switch is read first; off, the turn is refused before any I/O.
 #[cfg_attr(not(unix), allow(unused_variables))]
 fn herdr_turn(
@@ -411,14 +437,7 @@ mod herdr {
         sender: Sender<StreamMessage>,
     ) -> Result<(), String> {
         let pool = turn.pool.ok_or("herdr turn: no database")?;
-        let _execution_guard = crate::services::cluster::execution_capacity::acquire(
-            turn.pool,
-            turn.provider.as_str(),
-            turn.channel_id,
-            turn.working_dir,
-            turn.remote_profile.is_some(),
-            Arc::clone(&turn.cancel),
-        )?;
+        let _execution_guard = super::capacity_guard(turn)?;
         let ports = BootPorts {
             pool,
             channel_id: turn.channel_id,
@@ -679,6 +698,7 @@ mod tests {
         let session = "18b99824-ef4a-4363-8094-1b5dbf878dfc";
         let mut turn = StreamingTurn {
             pool: None,
+            campaign_dispatch_id: None,
             provider: &provider,
             prompt: "inspect the candidate",
             session_id: Some(session),
@@ -744,6 +764,7 @@ mod tests {
         let tools = vec!["Read".to_string()];
         let mut turn = StreamingTurn {
             pool: None,
+            campaign_dispatch_id: None,
             provider: &provider,
             prompt: "question",
             session_id: Some("conversation"),
@@ -838,6 +859,7 @@ mod tests {
             let (sender, _receiver) = std::sync::mpsc::channel();
             let turn = StreamingTurn {
                 pool: Some(&pool),
+                campaign_dispatch_id: None,
                 provider: &provider,
                 prompt: "question",
                 session_id: None,

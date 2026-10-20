@@ -54,7 +54,8 @@ fn child(name: &str) -> bool {
         stdout.contains("1 passed; 0 failed; 0 ignored;"),
         "{stdout}"
     );
-    eprintln!("{stdout}\n{stderr}");
+    // Preserve the captured child output within a single diagnostic line.
+    eprintln!("isolated cold incident child: stdout={stdout:?}; stderr={stderr:?}");
     false
 }
 

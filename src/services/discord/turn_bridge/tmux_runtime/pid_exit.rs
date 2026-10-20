@@ -83,8 +83,8 @@ fn wait_for_pid_exit_blocking(pid: u32, deadline: Duration) -> bool {
             udata: std::ptr::null_mut(),
         };
         // Register the watch. A zero timeout means "register only, don't
-        // block". If the PID already exited or doesn't exist, `kevent` sets
-        // EV_ERROR with ESRCH and we treat that as "exited".
+        // block". A process reaped since the initial existence check makes
+        // registration fail with ESRCH rather than delivering an exit event.
         let zero = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
@@ -98,8 +98,9 @@ fn wait_for_pid_exit_blocking(pid: u32, deadline: Duration) -> bool {
             &zero as *const _,
         );
         if reg < 0 {
+            let error = std::io::Error::last_os_error();
             libc::close(kq);
-            return wait_for_pid_exit_kill_fallback(pid, deadline);
+            return wait_for_pid_exit_registration_error(pid, deadline, error);
         }
 
         let mut event: libc::kevent = std::mem::zeroed();
@@ -123,10 +124,16 @@ fn wait_for_pid_exit_blocking(pid: u32, deadline: Duration) -> bool {
             // Timeout — deadline elapsed without NOTE_EXIT.
             return false;
         }
-        // One event delivered. NOTE_EXIT fired or EV_ERROR/ESRCH (already
-        // gone). Both mean "PID is no longer running".
-        true
+        kevent_reports_pid_exit(&event)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn kevent_reports_pid_exit(event: &libc::kevent) -> bool {
+    if event.flags & libc::EV_ERROR != 0 {
+        return event.data == libc::ESRCH as libc::intptr_t;
+    }
+    event.filter == libc::EVFILT_PROC && event.fflags & libc::NOTE_EXIT != 0
 }
 
 #[cfg(all(unix, target_os = "linux"))]
@@ -139,7 +146,11 @@ fn wait_for_pid_exit_blocking(pid: u32, deadline: Duration) -> bool {
     unsafe {
         let fd = libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0_u32) as libc::c_int;
         if fd < 0 {
-            return wait_for_pid_exit_kill_fallback(pid, deadline);
+            return wait_for_pid_exit_registration_error(
+                pid,
+                deadline,
+                std::io::Error::last_os_error(),
+            );
         }
         let mut pfd = libc::pollfd {
             fd,
@@ -154,6 +165,20 @@ fn wait_for_pid_exit_blocking(pid: u32, deadline: Duration) -> bool {
         }
         n > 0
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_for_pid_exit_registration_error(
+    pid: u32,
+    deadline: Duration,
+    error: std::io::Error,
+) -> bool {
+    // The child reaper can finish between kill(pid, 0) and notifier setup.
+    // Only ESRCH proves exit; permissions and unsupported notifiers do not.
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return true;
+    }
+    wait_for_pid_exit_kill_fallback(pid, deadline)
 }
 
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
@@ -177,6 +202,8 @@ fn wait_for_pid_exit_kill_fallback(_pid: u32, deadline: Duration) -> bool {
 #[cfg(all(test, unix))]
 mod pid_exit_tests {
     use super::wait_for_pid_exit;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::{wait_for_pid_exit_blocking, wait_for_pid_exit_registration_error};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -197,6 +224,37 @@ mod pid_exit_tests {
             elapsed < Duration::from_millis(500),
             "nonexistent PID short-circuit must not honour the full deadline (took {elapsed:?})"
         );
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        for error in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
+            assert!(!wait_for_pid_exit_registration_error(
+                4_000_000,
+                Duration::ZERO,
+                std::io::Error::from_raw_os_error(error),
+            ));
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let mut event = libc::kevent {
+                ident: 4_000_000,
+                filter: libc::EVFILT_PROC,
+                flags: 0,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            assert!(!super::kevent_reports_pid_exit(&event));
+            event.fflags = libc::NOTE_EXIT;
+            assert!(super::kevent_reports_pid_exit(&event));
+            event.flags = libc::EV_ERROR;
+            for error in [libc::EPERM, libc::ENOSYS, libc::EMFILE] {
+                event.data = error as libc::intptr_t;
+                assert!(!super::kevent_reports_pid_exit(&event));
+            }
+            event.data = libc::ESRCH as libc::intptr_t;
+            assert!(super::kevent_reports_pid_exit(&event));
+        }
     }
 
     /// Spawn a real child, kill it, then call `wait_for_pid_exit`. The
@@ -240,6 +298,44 @@ mod pid_exit_tests {
             elapsed < Duration::from_millis(1500),
             "OS-level exit notification must beat the upper bound by a comfortable margin (took {elapsed:?})"
         );
+
+        // Hold notifier registration until a child observed alive has been
+        // killed and reaped. This fixes the exact registration race without
+        // relying on scheduler timing or bypassing the real OS notifier.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut child = Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn registration-race child");
+            let pid = child.id();
+            let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+            let (register_tx, register_rx) = std::sync::mpsc::channel();
+            let observer = std::thread::spawn(move || {
+                #[allow(unsafe_code)]
+                let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+                observed_tx.send(alive).unwrap();
+                register_rx.recv().unwrap();
+                wait_for_pid_exit_blocking(pid, Duration::from_secs(2))
+            });
+            let observed = observed_rx.recv_timeout(Duration::from_secs(2));
+            let killed = child.kill();
+            let reaped = child.wait();
+            register_tx.send(()).unwrap();
+            let exited_after_reap = observer.join().unwrap();
+            assert!(observed.unwrap(), "child was alive before registration");
+            assert!(
+                killed.is_ok() && reaped.is_ok(),
+                "owned child was killed and reaped"
+            );
+            assert!(
+                exited_after_reap,
+                "ESRCH at notifier registration proves exit"
+            );
+        }
     }
 
     /// A still-running child must drive `wait_for_pid_exit` to the upper

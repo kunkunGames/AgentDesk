@@ -216,6 +216,8 @@ class WriterNamespaceWindowsTargetsTests(unittest.TestCase):
             scratch.mkdir()
             shutil.copy2(ENGINE, root / "scripts/exact_rust_test_proof.py")
             shutil.copy2(INVENTORY, root / "scripts/check_test_target_integrity.py")
+            shutil.copy2(ROOT / "scripts/timing_test_isolation_contract.py",
+                         root / "scripts/timing_test_isolation_contract.py")
             shutil.copy2(RUNNER, root / "scripts/ci/run-writer-namespace-windows-targets.sh")
             self.assertEqual(RUNNER.read_bytes(), (root / "scripts/ci/run-writer-namespace-windows-targets.sh").read_bytes())
             self.write_graph(root, active=active, optional_active=optional_active, mutation=mutation)

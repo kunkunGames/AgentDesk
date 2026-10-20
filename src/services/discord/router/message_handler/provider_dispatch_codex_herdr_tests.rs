@@ -1060,6 +1060,7 @@ async fn each_provider_follows_only_its_own_herdr_switch_at_intake_and_dispatch_
             let (sender, _receiver) = std::sync::mpsc::channel();
             let turn = StreamingTurn {
                 pool: None,
+                campaign_dispatch_id: None,
                 provider: &provider,
                 prompt: "question",
                 session_id: None,

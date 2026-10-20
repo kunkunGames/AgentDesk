@@ -10,6 +10,8 @@ from pathlib import Path
 
 import yaml
 
+from scripts.timing_test_isolation_contract import sweep_script
+
 ROOT = Path(__file__).resolve().parents[1]
 NIGHTLY = ROOT / ".github/workflows/ci-nightly.yml"
 DEBUG_JOBS = ("full_macos", "full_windows", "postgres_full",
@@ -21,7 +23,6 @@ WINDOWS_STEP = "Discord thread-create cross-process lock"
 WINDOWS_COMMAND = "cargo test --lib discord_thread_create -- --test-threads=1"
 PG_CARGO = ('cargo test --lib -- "${PG_INCLUDE_ARGS[@]}" '
             "--nocapture --test-threads=1")
-NON_PG_CARGO = 'cargo test --all-targets -- "${NON_PG_SKIP_ARGS[@]}"'
 FILTER_SOURCE = "source scripts/ci/non-pg-test-filter.sh"
 
 
@@ -95,10 +96,10 @@ def nightly_contract_problems(text: str) -> list[str]:
 
     for name in ("full_macos", "full_windows"):
         run = (step_of(jobs, name, "cargo test (non-PG)") or {}).get("run", "")
-        need(FILTER_SOURCE in run and NON_PG_CARGO in run,
-             f"{name} changed its canonical non-PG sweep")
-        need("run_non_pg_filter_replay" in run,
-             f"{name} stopped replaying the tests the non-PG skips take with them")
+        need(run == sweep_script(all_targets=True),
+             f"{name} changed the complete broad/replay/strict-serial timing contract")
+        need(not (step_of(jobs, name, "cargo test (non-PG)") or {}).get("continue-on-error"),
+             f"{name} made the non-PG sweep advisory")
 
     pg = step_of(jobs, "postgres_full", PG_STEP) or {}
     lines = [line.strip() for line in pg.get("run", "").splitlines()]

@@ -12,7 +12,7 @@ on:
         type: boolean
 
 concurrency:
-  group: ci-nightly-${{ github.workflow }}
+  group: ci-nightly-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -150,9 +150,12 @@ jobs:
       - name: cargo test (non-PG)
         shell: bash
         run: |
+          set -eo pipefail
           source scripts/ci/non-pg-test-filter.sh
-          cargo test --all-targets -- "${NON_PG_SKIP_ARGS[@]}"
+          python3 scripts/ci/timing_test_isolation.py check
+          cargo test --all-targets -- "${NON_PG_SKIP_ARGS[@]}" --skip services::discord::health::recovery::self_watchdog:: --skip services::codex_tui::rollout_tail::tests::always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done
           run_non_pg_filter_replay
+          python3 scripts/ci/timing_test_isolation.py serial -- cargo test --lib -- services::discord::health::recovery::self_watchdog:: services::codex_tui::rollout_tail::tests::always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done --test-threads=1
         env:
           RUST_BACKTRACE: 1
 
@@ -212,9 +215,12 @@ jobs:
       - name: cargo test (non-PG)
         shell: bash
         run: |
+          set -eo pipefail
           source scripts/ci/non-pg-test-filter.sh
-          cargo test --all-targets -- "${NON_PG_SKIP_ARGS[@]}"
+          python3 scripts/ci/timing_test_isolation.py check
+          cargo test --all-targets -- "${NON_PG_SKIP_ARGS[@]}" --skip services::discord::health::recovery::self_watchdog:: --skip services::codex_tui::rollout_tail::tests::always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done
           run_non_pg_filter_replay
+          python3 scripts/ci/timing_test_isolation.py serial -- cargo test --lib -- services::discord::health::recovery::self_watchdog:: services::codex_tui::rollout_tail::tests::always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done --test-threads=1
         env:
           RUST_BACKTRACE: 1
 

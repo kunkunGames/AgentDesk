@@ -1,10 +1,20 @@
 //! Bind managed policy and resource identity to the existing execution context.
 use super::*;
 
+#[cfg(test)]
 pub(super) fn limits(
     pool: &PgPool,
     provider: &str,
     channel: &str,
+) -> Result<Option<ExecutionLimits>, String> {
+    limits_with_timeout(pool, provider, channel, LEASE_IO_TIMEOUT)
+}
+
+pub(super) fn limits_with_timeout(
+    pool: &PgPool,
+    provider: &str,
+    channel: &str,
+    timeout: Duration,
 ) -> Result<Option<ExecutionLimits>, String> {
     // Capture the blocking thread's context before entering the async lookup.
     // Discord threads and headless/Routine turns already resolve their agent;
@@ -12,7 +22,7 @@ pub(super) fn limits(
     let agent = crate::services::platform::active_provider_context(provider)
         .and_then(|context| context.agent_id);
     tokio::runtime::Handle::current().block_on(async {
-        tokio::time::timeout(LEASE_IO_TIMEOUT, async {
+        tokio::time::timeout(timeout, async {
             let policy = if let Some(agent) = agent.as_deref()
                 && let Some(value) = super::super::execution_requirements::get(pool, agent)
                     .await

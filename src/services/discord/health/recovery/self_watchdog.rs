@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 mod driver;
+mod logging;
 mod policy;
 #[cfg(test)]
 mod tests;
@@ -51,8 +52,19 @@ fn spawn_watchdog_thread(
     std::thread::Builder::new()
         .name("health-watchdog".into())
         .spawn(move || {
-            // Keep the startup grace and initial check interval outside the blackout window.
-            std::thread::sleep(STARTUP_GRACE + CHECK_INTERVAL);
+            let first_check_at = Instant::now() + STARTUP_GRACE + CHECK_INTERVAL;
+            let dump = if mode == WatchdogMode::Enforce {
+                driver::prepare_dump(capture_dump)
+            } else {
+                None
+            };
+            let logger = logging::PreparedLog::spawn(mode)
+                .map_err(|error| {
+                    tracing::warn!("watchdog: diagnostic helper could not start ({error})");
+                })
+                .ok();
+            // Prepare within the existing grace, before starting the blackout clock.
+            std::thread::sleep(first_check_at.saturating_duration_since(Instant::now()));
             let loopback = crate::config::loopback();
             let addr = format!("{loopback}:{port}");
             let started = Instant::now();
@@ -64,26 +76,13 @@ fn spawn_watchdog_thread(
                 driver::Hooks {
                     probe: |deadline| driver::tcp_probe(&addr, &loopback, deadline),
                     snapshot: crate::services::hang_forensics::snapshot,
-                    dump: capture_dump,
-                    log: |state: &policy::WatchdogState, decision: &policy::Decision, sample: Option<&driver::Sample>, decided_at| {
-                        let reason = decision.reason().label();
-                        let action = decision.action();
-                        let response_blackout_ms = state.blackout_at(decided_at).as_millis();
-                        if let Some(sample) = sample {
-                            let outcome = &sample.observation.0;
-                            let verdict = crate::services::hang_forensics::verdict(outcome, &sample.current);
-                            let db_progress = sample.db_progress;
-                            let probe = outcome.render();
-                            let crumbs = sample.current.render();
-                            if outcome.is_ok() && matches!(decision, policy::Decision::Continue(_)) {
-                                if sample.previous_failures > 0 {
-                                    tracing::info!("watchdog: health recovered after {} failure(s) action={action} reason={reason} mode={mode:?} {probe} {crumbs}", sample.previous_failures);
-                                }
-                            } else {
-                                tracing::warn!("watchdog: verdict={verdict} action={action} reason={reason} mode={mode:?} failure_streak={} exit_streak={}/{MAX_FAILURES} response_blackout_ms={response_blackout_ms} db_progress={db_progress} {probe} {crumbs}", state.observed_failures, state.fast_failures);
-                            }
-                        } else {
-                            tracing::warn!("watchdog: action={action} reason={reason} mode={mode:?} failure_streak={} exit_streak={}/{MAX_FAILURES} response_blackout_ms={response_blackout_ms}", state.observed_failures, state.fast_failures);
+                    dump,
+                    log: |state: &policy::WatchdogState,
+                          decision: &policy::Decision,
+                          sample: Option<&driver::Sample>,
+                          decided_at| {
+                        if let Some(logger) = &logger {
+                            logger.record(*state, *decision, sample.cloned(), decided_at);
                         }
                     },
                     exit: |_, _| std::process::exit(1),

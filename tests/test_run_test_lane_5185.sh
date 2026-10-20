@@ -991,24 +991,29 @@ if [ "$rc" -ne 0 ]; then
 else pass_test
 fi
 
-# A substring match is not a pin. `--skip postgres --` is a prefix of
-# `--skip postgres --skip turn_bridge`, so the `grep -q` that used to stand
-# here accepted a lane narrowed by an extra skip -- the exact evasion the
-# assertion claimed to block. Compare the whole command line instead, as a
-# fixed string, with the YAML block indentation normalised away.
-LANE_COMMAND='python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 4 "${NON_PG_SKIP_ARGS[@]}" -- env -u AGENTDESK_ROOT_DIR python3 scripts/ci/lib-test-artifact.py run -- cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}"'
-# `grep -q` exits the moment it matches, which closes the pipe while `sed`
-# still has the rest of the file to write. GNU sed reports that as
-# "couldn't flush stdout: Broken pipe" and exits non-zero; under the
-# `set -o pipefail` above, that non-zero becomes the pipeline's status and
-# this assertion fails *because the pin was found*. BSD sed on the
-# development machines finished writing first, so the suite was green
-# locally and red on ubuntu-latest. Dropping `-q` makes grep read to EOF,
-# so sed always completes and the status reflects the match alone.
-# The PR runs the selector, whose full mode is this exact line (main keeps its own copy).
-if ! grep -xF "$LANE_COMMAND" "$REPO_ROOT/scripts/ci/test-selection.py" >/dev/null \
+# Pin the complete rendered command independently of its shared renderer.
+# The broad lane deliberately excludes the two timing filters, so both replay
+# and the strict serial phase must remain unconditional and exactly selected.
+# A substring, a matching comment, or an extra skip cannot satisfy this pin.
+rc=0
+"$PYTHON" - "$REPO_ROOT/scripts/ci/test-selection.py" >"$OUT" 2>&1 <<'PY' || rc=$?
+import runpy
+import sys
+
+expected = """set -eo pipefail
+source scripts/ci/non-pg-test-filter.sh
+python3 scripts/ci/timing_test_isolation.py check
+python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 4 "@NON_PG_SKIPS@" --skip services::discord::health::recovery::self_watchdog:: --skip services::codex_tui::rollout_tail::tests::always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done -- env -u AGENTDESK_ROOT_DIR python3 scripts/ci/lib-test-artifact.py run -- cargo test --lib -- "@NON_PG_SKIPS@" --skip services::discord::health::recovery::self_watchdog:: --skip services::codex_tui::rollout_tail::tests::always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done
+run_non_pg_filter_replay
+python3 scripts/ci/timing_test_isolation.py serial -- env -u AGENTDESK_ROOT_DIR python3 scripts/ci/lib-test-artifact.py run -- cargo test --lib -- services::discord::health::recovery::self_watchdog:: services::codex_tui::rollout_tail::tests::always_fresh_pane_signal_reaches_hard_veto_cap_and_emits_done --test-threads=1
+""".replace("@NON_PG_SKIPS@", "$" + "{NON_PG_SKIP_ARGS[@]}")
+actual = runpy.run_path(sys.argv[1], run_name="ci_selection_gate_pin_5185")["FULL_SWEEP"]
+if actual != expected:
+    raise SystemExit("selector full sweep differs from the complete pinned gate/replay/serial command")
+PY
+if [ "$rc" -ne 0 ] \
     || ! sed 's/^[[:space:]]*//' "$WORKFLOW" | grep -xF "run: python3 scripts/ci/test-selection.py run --lane sweep" >/dev/null; then
-    fail_test "ci-pr.yml must run the non-pg-sweep lane through the gate with exactly the pinned command"
+    fail_test "ci-pr.yml must run the complete pinned non-pg-sweep, replay and strict serial commands (rc=$rc): $(cat "$OUT")"
 else pass_test
 fi
 

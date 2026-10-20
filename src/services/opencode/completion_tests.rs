@@ -27,6 +27,9 @@ pub(super) fn fixture(
                     Err(error) => panic!("fixture accept: {error}"),
                 }
             };
+            // Darwin inherits the listener's nonblocking mode on accepted
+            // sockets. Request parsing below uses blocking reads with a timeout.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();

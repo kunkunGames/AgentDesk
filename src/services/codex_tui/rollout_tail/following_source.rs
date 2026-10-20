@@ -2,6 +2,16 @@
 
 use super::*;
 
+/// A continuous fresh signal keeps its original grace window; it cannot renew it.
+pub(super) fn pane_busy_veto_at(
+    started_at: &mut Option<Instant>,
+    now: Instant,
+    cap: Duration,
+) -> (Instant, bool) {
+    let started = *started_at.get_or_insert(now);
+    (started, now.saturating_duration_since(started) < cap)
+}
+
 pub(super) fn tail_rollout_file_until_assistant_response_with_pane_busy_probe<
     L: Into<PaneLiveness>,
 >(
@@ -273,9 +283,12 @@ pub(super) fn tail_rollout_file_until_assistant_response_with_pane_busy_probe<
                         |probe| probe(),
                     );
                     if busy_signal == super::super::input::CodexPaneBusySignal::Fresh {
-                        let veto_started_at =
-                            *pane_busy_veto_started_at.get_or_insert_with(Instant::now);
-                        if veto_started_at.elapsed() < pane_busy_veto_cap {
+                        let (veto_started_at, may_veto) = pane_busy_veto_at(
+                            &mut pane_busy_veto_started_at,
+                            Instant::now(),
+                            pane_busy_veto_cap,
+                        );
+                        if may_veto {
                             tracing::debug!(
                                 rollout_path = %rollout_path.display(),
                                 pending_keyed = state.pending_tool_calls.len(),

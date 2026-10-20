@@ -28,6 +28,17 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
+try:
+    from pg_test_dependencies import isolated_test_targets
+    from timing_test_isolation_contract import (
+        SERIAL_PREFIX, serial_argv_allowed, verified_timing_skip_lines,
+    )
+except ModuleNotFoundError:
+    from scripts.pg_test_dependencies import isolated_test_targets
+    from scripts.timing_test_isolation_contract import (
+        SERIAL_PREFIX, serial_argv_allowed, verified_timing_skip_lines,
+    )
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASELINE_REL = Path("scripts/pg_test_lane_baseline.txt")
 MANIFEST_REL = Path("scripts/pg_test_lane_manifest.txt")
@@ -128,6 +139,10 @@ UNANALYZABLE_FINDINGS = frozenset({
     "pr-job-delegates-to-reusable-workflow",
     "unresolved-external-test-module",
     "pg-reach-depth-exhausted",
+    "pg-reexport-depth-exhausted",
+    "pg-reexport-cycle",
+    "pg-module-alias-namespace-unresolved",
+    "isolated-test-target-unresolved",
 })
 # Helper-call hops followed from a test body. `seen` already bounds the walk;
 # the limit only turns an unexpectedly deep chain into an explicit failure.
@@ -430,7 +445,7 @@ def _edge_boundary(clean: str, opening: int, counter: list[int] | None = None) -
 
 
 def _mask_nested_items(
-    body: str, counter: list[int] | None = None
+    body: str, counter: list[int] | None = None, *, raw_body: str | None = None
 ) -> str:
     """Blank block-local functions/impls so their seeds do not taint a test."""
     spans: list[tuple[int, int]] = []
@@ -440,7 +455,7 @@ def _mask_nested_items(
             if opening is None:
                 continue
             spans.append((match.start(), _matching_brace(body, opening, counter) + 1))
-    masked = list(body)
+    masked = list(body if raw_body is None else raw_body)
     for start, end in spans:
         masked[start:end] = ("\n" if char == "\n" else " " for char in masked[start:end])
     return "".join(masked)
@@ -501,7 +516,7 @@ def _inside_test_region(offset: int, ranges: Iterable[ModuleRange], external: bo
     return external or any(item.is_test and item.start < offset < item.end for item in ranges)
 
 
-def _external_test_files(repo_root: Path, coverage, counter: list[int] | None = None, findings: list[Finding] | None = None) -> set[Path]:
+def _external_test_files(repo_root: Path, coverage, counter: list[int] | None = None, findings: list[Finding] | None = None, library_files: set[Path] | None = None) -> set[Path]:
     src_root = (repo_root / "src").resolve()
     declarations: dict[Path, list[tuple[Path | None, bool, Finding]]] = {}
     targets: set[Path] = set()
@@ -541,6 +556,14 @@ def _external_test_files(repo_root: Path, coverage, counter: list[int] | None = 
                     targets.add(target)
                 elif findings is not None:
                     findings.append(finding)
+    if library_files is not None:
+        pending_library = [(src_root / 'lib.rs').resolve()]
+        while pending_library:
+            path = pending_library.pop()
+            if path in library_files:
+                continue
+            library_files.add(path)
+            pending_library.extend(target for target, _, _ in declarations.get(path, []) if target)
     pending = list(targets)
     while pending:
         for target, is_test, finding in declarations.get(pending.pop(), []):
@@ -586,8 +609,11 @@ def discover_pg_inventory(
 
     Supported indirect references are bare/free-function calls, fully-qualified
     free functions, single- and multi-segment associated calls, and UFCS calls of
-    the form ``<Type as Trait>::method()``. Test and helper bodies use the same
-    reference extractor and both mask block-local functions and impls.
+    the form ``<Type as Trait>::method()``. Relative imports use the current
+    module before the crate root. Literal-array loops executing the current
+    libtest binary with one exact target also contribute test-body edges.
+    Test and helper bodies use the same reference extractor and both mask
+    block-local functions and impls.
 
     Out of scope are block-local call graphs, method-level dispatch within an
     impl (an impl is conservatively treated as one type-level item), and UFCS
@@ -603,17 +629,23 @@ def discover_pg_inventory(
     src_root = (repo_root / "src").resolve()
     aliases = _aliases(repo_root, coverage)
     brace_counter = [0]
-    external_tests = _external_test_files(repo_root, coverage, brace_counter, findings)
+    library_files: set[Path] = set()
+    external_tests = _external_test_files(repo_root, coverage, brace_counter, findings, library_files)
+    declared_modules: set[tuple[str, ...]] = {()}
+    function_paths: set[tuple[str, ...]] = set()
     declared_tests = {
         test
         for test_names in coverage.discover_test_inventory(repo_root).values()
         for test in test_names
     }
     item_bodies: dict[tuple[tuple[str, ...], str, str], str] = {}
+    raw_bodies: dict[tuple[tuple[str, ...], str, str], str] = {}
     seeded: set[tuple[tuple[str, ...], str, str]] = set()
     records: list[tuple[str, str, tuple[str, ...], str]] = []
     use_aliases: dict[tuple[str, ...], dict[str, tuple[str, ...]]] = {}
     wildcard_uses: dict[tuple[str, ...], list[tuple[str, ...]]] = {}
+    pending_imports: list[tuple[tuple[str, ...], str]] = []
+    declared_paths: set[tuple[str, ...]] = set()
 
     def absolute_path(module: tuple[str, ...], raw: str) -> tuple[str, ...]:
         parts = tuple(part for part in raw.strip().split("::") if part)
@@ -628,6 +660,8 @@ def discover_pg_inventory(
             while drop < len(parts) and parts[drop] == "super":
                 drop += 1
             return (*module[: max(0, len(module) - drop)], *parts[drop:])
+        if not raw.strip().startswith("::") and (*module, parts[0]) in declared_paths:
+            return (*module, *parts)
         return parts
 
     def import_bindings(module: tuple[str, ...], raw: str):
@@ -679,6 +713,13 @@ def discover_pg_inventory(
             if _TEST_ATTR.search(match.group("attrs"))
         }
 
+        logical_base = coverage._normalize_alias_path(physical_base, aliases)
+        declared_paths.update(logical_base[:index] for index in range(len(logical_base) + 1))
+        for scope in ranges:
+            if not nested(scope.start, ((start, end) for start, end, _, _ in fn_ranges)):
+                logical = coverage._normalize_alias_path((*physical_base, *_scope_at(scope.start + 1, ranges)), aliases)
+                declared_paths.update(logical[:index] for index in range(len(logical) + 1))
+
         for use in _USE.finditer(clean):
             if nested(use.start(), ((start, end) for start, end, _, _ in fn_ranges)) or nested(
                 use.start(), impl_ranges
@@ -686,26 +727,28 @@ def discover_pg_inventory(
                 continue
             physical_module = (*physical_base, *_scope_at(use.start(), ranges))
             module = coverage._normalize_alias_path(physical_module, aliases)
-            for binding, target in import_bindings(module, use.group("path")):
-                if binding == "*":
-                    wildcard_uses.setdefault(module, []).append(target[:-1])
-                else:
-                    use_aliases.setdefault(module, {})[binding] = target
+            pending_imports.append((module, use.group("path")))
 
         all_fn_ranges = [(start, end) for start, end, _, _ in fn_ranges]
+        if path.resolve() in library_files:
+            for declaration in _MOD.finditer(clean):
+                if not nested(declaration.start(), all_fn_ranges) and not nested(declaration.start(), impl_ranges):
+                    physical = (*physical_base, *_scope_at(declaration.start(), ranges), declaration.group('name'))
+                    declared_modules.add(coverage._normalize_alias_path(physical, aliases))
         for start, end, match, opening in fn_ranges:
-            if match.start("name") in test_name_offsets:
-                continue
             other_fns = ((outer_start, outer_end) for outer_start, outer_end in all_fn_ranges if outer_start != start)
             if nested(start, other_fns) or nested(start, impl_ranges):
                 continue
-            if not _inside_test_region(start, ranges, external):
-                continue
             physical_module = (*physical_base, *_scope_at(start, ranges))
             module = coverage._normalize_alias_path(physical_module, aliases)
+            if path.resolve() in library_files:
+                function_paths.add((*module, match.group('name')))
+            if match.start("name") in test_name_offsets or not _inside_test_region(start, ranges, external):
+                continue
             key = (module, match.group("name"), "fn")
             body = _edge_boundary(clean, opening, brace_counter)
             item_bodies[key] = body
+            raw_bodies[key] = source[opening:end + 1]
             if seed_match(body):
                 seeded.add(key)
 
@@ -754,28 +797,109 @@ def discover_pg_inventory(
             # proves that its direct tests are part of the library test target.
             if name in declared_tests or external:
                 records.append((name, path.relative_to(repo_root).as_posix(), logical[:-1], body))
+                key = (logical[:-1], logical[-1], "test")
+                item_bodies[key] = body
+                raw_bodies[key] = source[opening:opening + len(body)]
+                if any(pattern.search(body) for pattern in SEED_PATTERNS):
+                    seeded.add(key)
 
     by_path: dict[tuple[tuple[str, ...], str], set[tuple[tuple[str, ...], str, str]]] = {}
     for key in item_bodies:
         module, name, _ = key
-        by_path.setdefault((module, name), set()).add(key)
+        if key[2] != "test":
+            by_path.setdefault((module, name), set()).add(key)
+        declared_paths.add((*module, name))
+
+    for module, raw_import in pending_imports:
+        for binding, target in import_bindings(module, raw_import):
+            if binding == "*":
+                wildcard_uses.setdefault(module, []).append(target[:-1])
+            else:
+                use_aliases.setdefault(module, {})[binding] = target
+
+    test_nodes = {name: (module, name.rsplit("::", 1)[-1], "test") for name, _, module, _ in records}
+
+    def import_namespace(target: tuple[str, ...]) -> str:
+        seen = set()
+        for _ in range(PG_REACH_MAX_DEPTH):
+            if not target or target in seen:
+                return 'unknown'
+            seen.add(target)
+            if target in declared_modules or any(key[2] in {'struct', 'impl'} for key in by_path.get((target[:-1], target[-1]), ())):
+                return 'type'
+            if target in function_paths:
+                return 'value'
+            for index in range(len(target) - 1, -1, -1):
+                if index < len(target) - 1 and target[:index + 1] in declared_modules:
+                    continue
+                alias = use_aliases.get(target[:index], {}).get(target[index])
+                if alias is not None:
+                    target = (*alias, *target[index + 1:])
+                    break
+            else:
+                return 'unknown'
+        return 'unknown'
+
+    def resolve_target(target: tuple[str, ...]) -> set[tuple[tuple[str, ...], str, str]]:
+        """Follow explicit reexports, including aliases in a qualified module path."""
+        seen = set()
+        for _ in range(PG_REACH_MAX_DEPTH):
+            if not target:
+                return set()
+            if target in seen:
+                if findings is not None:
+                    findings.append(Finding(
+                        "pg-reexport-cycle", "::".join(target),
+                        "import aliases form a cycle; PG dependency is undecided",
+                    ))
+                return set()
+            seen.add(target)
+            direct = by_path.get((target[:-1], target[-1]), set())
+            if direct:
+                return set(direct)
+            for index in range(len(target) - 1, -1, -1):
+                # A module and a reexported function may share a Rust name.
+                # Qualified traversal uses the real module at a prefix; the
+                # function alias applies only when resolving the terminal item.
+                if index < len(target) - 1 and target[:index + 1] in declared_modules:
+                    continue
+                alias = use_aliases.get(target[:index], {}).get(target[index])
+                if alias is not None:
+                    target = (*alias, *target[index + 1:])
+                    break
+            else:
+                return set()
+        if findings is not None:
+            findings.append(Finding(
+                "pg-reexport-depth-exhausted", "::".join(target),
+                "import aliases continue past the resolution limit; PG dependency is undecided",
+            ))
+        return set()
 
     def resolve(module: tuple[str, ...], raw: str, local_aliases=None, local_wildcards=()) -> set[tuple[tuple[str, ...], str, str]]:
         bindings = {**use_aliases.get(module, {}), **(local_aliases or {})}
         if "::" in raw:
             parts = tuple(part for part in raw.split("::") if part)
             alias = bindings.get(parts[0]) if parts else None
+            if alias and (*module, parts[0]) in declared_modules:
+                if parts[0] not in (local_aliases or {}) or import_namespace(alias) == 'value':
+                    alias = None
+                elif import_namespace(alias) == 'unknown':
+                    if findings is not None:
+                        findings.append(Finding('pg-module-alias-namespace-unresolved', raw,
+                            'a local import collides with a declared module; its namespace is undecided'))
+                    return set()
             target = (*alias, *parts[1:]) if alias else absolute_path(module, raw)
-            return by_path.get((target[:-1], target[-1]), set()) if target else set()
+            return resolve_target(target)
         if raw in (local_aliases or {}):
             alias = local_aliases[raw]
-            return set(by_path.get((alias[:-1], alias[-1]), set()))
+            return resolve_target(alias)
         targets = set(by_path.get((module, raw), set()))
         alias = bindings.get(raw)
         if alias:
-            targets.update(by_path.get((alias[:-1], alias[-1]), set()))
+            targets.update(resolve_target(alias))
         for base in (*wildcard_uses.get(module, []), *local_wildcards):
-            targets.update(by_path.get((base, raw), set()))
+            targets.update(resolve_target((*base, raw)))
         return targets
 
     def resolve_call(
@@ -795,7 +919,7 @@ def discover_pg_inventory(
         return targets
 
     def body_references(
-        module: tuple[str, ...], body: str
+        module: tuple[str, ...], body: str, raw_body: str
     ) -> set[tuple[tuple[str, ...], str, str]]:
         """Resolve body-local imports without leaking aliases into sibling tests."""
         local_aliases = {}
@@ -828,21 +952,35 @@ def discover_pg_inventory(
             if not any(start <= mention.start() < end for start, end in occupied)
             for target in resolve(module, mention.group("name"), local_aliases, local_wildcards)
         )
+        bindings = use_aliases.get(module, {})
+        receivers = {name for name, target in bindings.items() if target == ("std", "process", "Command")}
+        standard_library_visible = (absolute_path(module, "std::env::current_exe") == ("std", "env", "current_exe")
+                                    and bindings.get("std", ("std",)) == ("std",))
+        try:
+            children = isolated_test_targets(raw_body, set(test_nodes), command_receivers=receivers,
+                                             standard_library_visible=standard_library_visible,
+                                             resolve_import=lambda raw: import_bindings(module, raw))
+        except ValueError as error:
+            if findings is not None:
+                findings.append(Finding("isolated-test-target-unresolved", "::".join(module), str(error)))
+            children = set()
+        targets.update(test_nodes[name] for name in children)
         return targets
 
     edges: dict[tuple[tuple[str, ...], str, str], set[tuple[tuple[str, ...], str, str]]] = {}
     for key, body in item_bodies.items():
-        if key[2] != "fn":
+        if key[2] not in {"fn", "test"}:
             continue
         edges[key] = body_references(
-            key[0], _mask_nested_items(body, brace_counter)
+            key[0], _mask_nested_items(body, brace_counter),
+            _mask_nested_items(body, brace_counter, raw_body=raw_bodies[key])
         )
 
     tests: dict[str, str] = {}
     for name, path, module, body in records:
         visible_body = _mask_nested_items(body, brace_counter)
         direct = any(pattern.search(visible_body) for pattern in SEED_PATTERNS)
-        referenced = body_references(module, visible_body)
+        referenced = edges[(module, name.rsplit("::", 1)[-1], "test")]
         indirect = _transitive_closure(referenced, seeded, edges)
         if direct or indirect:
             tests[name] = path
@@ -1072,6 +1210,8 @@ _RUN_TEST_LANE_OPTIONS = {"--lane": r"[^-].*", "--max-summaries": r"[1-9][0-9]*"
 
 def _prefix_template(words: list[str]) -> bool:
     """Whether the raw words before `cargo` are one of the CI prefix templates."""
+    if words[:4] == SERIAL_PREFIX:
+        return words[4:] in ([], _ROOT_UNSET, _ROOT_UNSET + _ARTIFACT_RUN)
     if words[:2] == ["python3", "scripts/ci-timeout.py"]:
         return re.fullmatch(r"[1-9][0-9]*", "".join(words[2:3])) is not None \
             and words[3:] == _ROOT_UNSET
@@ -1112,7 +1252,8 @@ def _proven_cargo_argv(command: str) -> list[str] | None:
             or argv != [token.value for token in tokens[at:]] \
             or len(prefix) != at or not _prefix_template(prefix) or (sourced and prefix not in ([], ["run_prepared_lib_test"])) \
             or any(token.kind != "WORD" or token.depth for token in tokens) \
-            or any(token.dynamic and token.value not in arrays for token in tokens):
+            or any(token.dynamic and token.value not in arrays for token in tokens) \
+            or (prefix[:4] == SERIAL_PREFIX and not serial_argv_allowed([*prefix[4:], *argv])):
         raise ValueError(
             f"cargo-command-unparsed: {command!r} crosses a shell boundary or "
             "run-time value this gate cannot prove, so the lane filter it selects is unknown")
@@ -1658,7 +1799,9 @@ def non_pg_filter_contract_errors(
     for workflow in NON_PG_FILTER_WORKFLOWS:
         path = repo_root / workflow
         code = _strip_comments(path.read_text("utf-8"))
-        if re.search(r"(?:^|\s)--skip(?:=|\s)", code):
+        timing_lines = verified_timing_skip_lines(code)
+        if any(re.search(r"(?:^|\s)--skip(?:=|\s)", line) and index not in timing_lines
+               for index, line in enumerate(code.splitlines())):
             errors.append(
                 f"{workflow}: literal --skip arguments duplicate the canonical "
                 f"definition in {NON_PG_FILTER_REL}"

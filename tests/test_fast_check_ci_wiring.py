@@ -20,7 +20,7 @@ REQUIRED_CHECK_MIRROR_SHA256 = (
     "57c78a2ea1d5587ff1c74d5d25e2e32d25814198c5ee966e2297845c6230a30d"
 )
 CI_RUNNER_HARDENING_SHA256 = (
-    "32ee00809a935c60a15d3e48240fbfd1b3a48d3236b82c433b93399f0aa3cca3"
+    "b53b592c9235efd9d3a0031d2563d2d185b8bff51c144c1028c6393b2bf4677b"
 )
 PR_WORKFLOW = REPO_ROOT / ".github/workflows/ci-pr.yml"
 
@@ -893,12 +893,15 @@ class FastCheckCiWiringTests(unittest.TestCase):
         shared = shared_sweep[0]
         self.assertEqual(shared["env"]["ADK_LIB_TEST_ARTIFACT"], "${{ runner.temp }}/lib-test-artifact")
         self.assertEqual(shared["run"], "python3 scripts/ci/test-selection.py run --lane sweep")
-        # The PR's full mode runs the selector's copy of main's sweep, behind the shared-lib wrapper.
+        # PR full mode uses the shared artifact for both broad and strict serial runs.
         wrapper = "python3 scripts/ci/lib-test-artifact.py run -- "
         full_sweep = load_selector().FULL_SWEEP
-        self.assertEqual(full_sweep.count(wrapper), 1)
+        self.assertEqual(full_sweep.count(wrapper), 2)
+        wrapped = [line for line in full_sweep.splitlines() if wrapper in line]
+        self.assertIn("scripts/run_test_lane.py --lane non-pg-sweep", wrapped[0])
+        self.assertIn("scripts/ci/timing_test_isolation.py serial --", wrapped[1])
         added = ("ADK_LIB_TEST_ARTIFACT", "ADK_TEST_SELECTION_PLAN")
-        normalized = {**shared, "env": {key: value for key, value in shared["env"].items() if key not in added}, "run": full_sweep.replace(wrapper, "", 1)}
+        normalized = {**shared, "env": {key: value for key, value in shared["env"].items() if key not in added}, "run": full_sweep.replace(wrapper, "")}
         self.assertEqual(named(main_jobs["full_non_pg"], sweep_step), [normalized])
         self.assertEqual(len(named(main_jobs["full_non_pg"], sweep_step)), 1)
         recipe = just_recipe_commands(justfile, "test-non-pg")
