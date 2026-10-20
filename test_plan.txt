@@ -1,0 +1,14 @@
+I need to make a performance improvement in policies/timeouts/idle-kill.js.
+
+The `idle-kill` routine currently uses a `CROSS JOIN LATERAL` block:
+```js
+var effectiveLastSeenJoin =
+  "CROSS JOIN LATERAL (SELECT COALESCE(s.last_heartbeat, s.created_at) AS last_seen_at) latest ";
+```
+This requires evaluating the `COALESCE` per row and wrapping it in a lateral join. But PostgreSQL evaluates `COALESCE` identically if placed directly in the `WHERE` and `SELECT` clauses. Avoiding the `CROSS JOIN LATERAL` subquery entirely removes overhead and improves query plan readability, without altering the logic.
+
+I will:
+1. Remove `effectiveLastSeenJoin`.
+2. Replace `latest.last_seen_at` in the `SELECT` and `ORDER BY` with `COALESCE(s.last_heartbeat, s.created_at) AS last_seen_at` and `COALESCE(s.last_heartbeat, s.created_at)` respectively.
+3. Replace `latest.last_seen_at` in the `WHERE` clause with `COALESCE(s.last_heartbeat, s.created_at)`.
+4. Run `npm run test:policies` to ensure the change is sound.

@@ -1,0 +1,1012 @@
+
+> test:policies
+> node --test policies/__tests__/*.test.js
+
+TAP version 13
+# Subtest: auto-queue continues its group after an agent busy probe
+ok 1 - auto-queue continues its group after an agent busy probe
+  ---
+  duration_ms: 8.695904
+  type: 'test'
+  ...
+# Subtest: auto-queue defers its group after an agent busy probe
+ok 2 - auto-queue defers its group after an agent busy probe
+  ---
+  duration_ms: 2.376195
+  type: 'test'
+  ...
+# Subtest: auto-queue loadPhaseGateCardLabel uses typed facade agentdesk.cards.get
+ok 3 - auto-queue loadPhaseGateCardLabel uses typed facade agentdesk.cards.get
+  ---
+  duration_ms: 2.861977
+  type: 'test'
+  ...
+# Subtest: auto-queue infers phase_gate_passed when every registry check passes
+ok 4 - auto-queue infers phase_gate_passed when every registry check passes
+  ---
+  duration_ms: 10.891801
+  type: 'test'
+  ...
+# Subtest: auto-queue does not infer a phase gate verdict when result carries explicit failure
+ok 5 - auto-queue does not infer a phase gate verdict when result carries explicit failure
+  ---
+  duration_ms: 2.859646
+  type: 'test'
+  ...
+# Subtest: auto-queue treats phase_gate_verdict as explicit phase gate verdict
+ok 6 - auto-queue treats phase_gate_verdict as explicit phase gate verdict
+  ---
+  duration_ms: 4.479384
+  type: 'test'
+  ...
+# Subtest: auto-queue accepts pass alias only when registry checks pass
+ok 7 - auto-queue accepts pass alias only when registry checks pass
+  ---
+  duration_ms: 2.314343
+  type: 'test'
+  ...
+# Subtest: auto-queue explicit phase_gate_passed cannot bypass registry checks
+ok 8 - auto-queue explicit phase_gate_passed cannot bypass registry checks
+  ---
+  duration_ms: 2.758169
+  type: 'test'
+  ...
+# Subtest: auto-queue agent-supplied deploy_verified cannot satisfy authoritative evidence
+ok 9 - auto-queue agent-supplied deploy_verified cannot satisfy authoritative evidence
+  ---
+  duration_ms: 2.546525
+  type: 'test'
+  ...
+# Subtest: auto-queue malformed and stale declaration snapshots fail closed
+ok 10 - auto-queue malformed and stale declaration snapshots fail closed
+  ---
+  duration_ms: 2.848235
+  type: 'test'
+  ...
+# Subtest: auto-queue production completion persists only closed non-string verdict labels
+ok 11 - auto-queue production completion persists only closed non-string verdict labels
+  ---
+  duration_ms: 4.584261
+  type: 'test'
+  ...
+# Subtest: auto-queue completes pre-snapshot legacy gate only from persisted NULL/blank provenance
+ok 12 - auto-queue completes pre-snapshot legacy gate only from persisted NULL/blank provenance
+  ---
+  duration_ms: 6.25647
+  type: 'test'
+  ...
+# Subtest: auto-queue legacy context remains fail-closed for nonblank persisted kind
+ok 13 - auto-queue legacy context remains fail-closed for nonblank persisted kind
+  ---
+  duration_ms: 3.474836
+  type: 'test'
+  ...
+# Subtest: auto-queue legacy context remains fail-closed for mixed NULL and nonblank persisted kinds
+ok 14 - auto-queue legacy context remains fail-closed for mixed NULL and nonblank persisted kinds
+  ---
+  duration_ms: 2.523509
+  type: 'test'
+  ...
+# Subtest: auto-queue group keys split distinct kind and declaration snapshots
+ok 15 - auto-queue group keys split distinct kind and declaration snapshots
+  ---
+  duration_ms: 2.104133
+  type: 'test'
+  ...
+# Subtest: auto-queue groups persisted legacy defaults and explicit kinds by canonical declaration
+ok 16 - auto-queue groups persisted legacy defaults and explicit kinds by canonical declaration
+  ---
+  duration_ms: 4.055281
+  type: 'test'
+  ...
+# Subtest: auto-queue pipeline checks cannot override canonical declaration
+ok 17 - auto-queue pipeline checks cannot override canonical declaration
+  ---
+  duration_ms: 2.095309
+  type: 'test'
+  ...
+# Subtest: auto-queue unknown persisted phase-gate kind fails closed
+ok 18 - auto-queue unknown persisted phase-gate kind fails closed
+  ---
+  duration_ms: 1.962263
+  type: 'test'
+  ...
+# Subtest: auto-queue unavailable deploy gate creates no runnable dispatch
+ok 19 - auto-queue unavailable deploy gate creates no runnable dispatch
+  ---
+  duration_ms: 2.724086
+  type: 'test'
+  ...
+# Subtest: auto-queue dispatchable targets prioritize requested and keep unique dispatch anchors
+ok 20 - auto-queue dispatchable targets prioritize requested and keep unique dispatch anchors
+  ---
+  duration_ms: 2.982212
+  type: 'test'
+  ...
+# Subtest: auto-queue finds a free path from backlog to the nearest dispatchable state
+ok 21 - auto-queue finds a free path from backlog to the nearest dispatchable state
+  ---
+  duration_ms: 2.016714
+  type: 'test'
+  ...
+# Subtest: auto-queue stale terminal statuses accept normalized strings and arrays
+ok 22 - auto-queue stale terminal statuses accept normalized strings and arrays
+  ---
+  duration_ms: 2.303237
+  type: 'test'
+  ...
+# Subtest: auto-queue stale recovery switches accept only explicit booleans
+ok 23 - auto-queue stale recovery switches accept only explicit booleans
+  ---
+  duration_ms: 6.78163
+  type: 'test'
+  ...
+# Subtest: auto-queue stale recovery switches fail safely on malformed values
+ok 24 - auto-queue stale recovery switches fail safely on malformed values
+  ---
+  duration_ms: 17.820066
+  type: 'test'
+  ...
+# Subtest: auto-queue onTick1min honors stale dispatched runtime config
+ok 25 - auto-queue onTick1min honors stale dispatched runtime config
+  ---
+  duration_ms: 3.405407
+  type: 'test'
+  ...
+# Subtest: auto-queue terminal cleanup uses pipeline terminal states
+ok 26 - auto-queue terminal cleanup uses pipeline terminal states
+  ---
+  duration_ms: 2.617164
+  type: 'test'
+  ...
+# Subtest: auto-queue finalization sweep filters blocked runs before LIMIT
+ok 27 - auto-queue finalization sweep filters blocked runs before LIMIT
+  ---
+  duration_ms: 4.336001
+  type: 'test'
+  ...
+# Subtest: auto-queue phase-gate completion logs refusal instead of claiming completion
+ok 28 - auto-queue phase-gate completion logs refusal instead of claiming completion
+  ---
+  duration_ms: 2.063044
+  type: 'test'
+  ...
+# Subtest: auto-queue rotates saturated active runs in bounded tick sweep
+ok 29 - auto-queue rotates saturated active runs in bounded tick sweep
+  ---
+  duration_ms: 2.743114
+  type: 'test'
+  ...
+# Subtest: auto-queue does not rotate deferred active run activations
+ok 30 - auto-queue does not rotate deferred active run activations
+  ---
+  duration_ms: 2.175506
+  type: 'test'
+  ...
+# Subtest: auto-queue marks pending entries skipped when a card progresses externally into a dispatchable state
+ok 31 - auto-queue marks pending entries skipped when a card progresses externally into a dispatchable state
+  ---
+  duration_ms: 3.060229
+  type: 'test'
+  ...
+# Subtest: ci-recovery marks failed checks on done fallback PRs as pending handoff
+ok 32 - ci-recovery marks failed checks on done fallback PRs as pending handoff
+  ---
+  duration_ms: 9.030023
+  type: 'test'
+  ...
+# Subtest: ci-recovery leaves non-terminal fallback PR failures on the existing rework path
+ok 33 - ci-recovery leaves non-terminal fallback PR failures on the existing rework path
+  ---
+  duration_ms: 2.34895
+  type: 'test'
+  ...
+# Subtest: ci-recovery marks pipeline-terminal fallback PRs without completed_at as pending handoff
+ok 34 - ci-recovery marks pipeline-terminal fallback PRs without completed_at as pending handoff
+  ---
+  duration_ms: 1.80542
+  type: 'test'
+  ...
+# Subtest: ci-recovery marks transient failures on done fallback PRs as pending handoff
+ok 35 - ci-recovery marks transient failures on done fallback PRs as pending handoff
+  ---
+  duration_ms: 1.631969
+  type: 'test'
+  ...
+# Subtest: 00-escalation loadCardMetadata handles pre-parsed object metadata
+ok 36 - 00-escalation loadCardMetadata handles pre-parsed object metadata
+  ---
+  duration_ms: 3.091021
+  type: 'test'
+  ...
+# Subtest: 00-escalation loadManualInterventionState handles missing cards and parses states
+ok 37 - 00-escalation loadManualInterventionState handles missing cards and parses states
+  ---
+  duration_ms: 1.179623
+  type: 'test'
+  ...
+# Subtest: 00-escalation escalationCardTitle uses github issue number
+ok 38 - 00-escalation escalationCardTitle uses github issue number
+  ---
+  duration_ms: 1.889044
+  type: 'test'
+  ...
+# Subtest: 00-escalation enqueueEscalation uses typed kv facade instead of raw db
+ok 39 - 00-escalation enqueueEscalation uses typed kv facade instead of raw db
+  ---
+  duration_ms: 1.076163
+  type: 'test'
+  ...
+# Subtest: 00-escalation flushEscalations uses typed kv facade for writes/deletes
+ok 40 - 00-escalation flushEscalations uses typed kv facade for writes/deletes
+  ---
+  duration_ms: 1.389066
+  type: 'test'
+  ...
+# Subtest: missing trusted origin warns once per owner, never trusts registry, and recovers
+ok 41 - missing trusted origin warns once per owner, never trusts registry, and recovers
+  ---
+  duration_ms: 21.997526
+  type: 'test'
+  ...
+# Subtest: offline, expired and missing heartbeat owners warn once then resume when heartbeat returns
+ok 42 - offline, expired and missing heartbeat owners warn once then resume when heartbeat returns
+  ---
+  duration_ms: 16.844336
+  type: 'test'
+  ...
+# Subtest: heartbeat TTL boundary is inclusive, one millisecond older is excluded
+ok 43 - heartbeat TTL boundary is inclusive, one millisecond older is excluded
+  ---
+  duration_ms: 8.479616
+  type: 'test'
+  ...
+# Subtest: excluded owners do not fill the 50-row window or spend the three-kill budget
+ok 44 - excluded owners do not fill the 50-row window or spend the three-kill budget
+  ---
+  duration_ms: 3.130771
+  type: 'test'
+  ...
+# Subtest: local, ownerless and non-cluster sessions retain their existing cleanup behavior
+ok 45 - local, ownerless and non-cluster sessions retain their existing cleanup behavior
+  ---
+  duration_ms: 2.620118
+  type: 'test'
+  ...
+# Subtest: owner IDs are bound as SQL data, including quotes and SQL-looking text
+ok 46 - owner IDs are bound as SQL data, including quotes and SQL-looking text
+  ---
+  duration_ms: 2.247412
+  type: 'test'
+  ...
+# Subtest: preflight failure suppresses calls, warns once and retries without caching failure
+ok 47 - preflight failure suppresses calls, warns once and retries without caching failure
+  ---
+  duration_ms: 3.586984
+  type: 'test'
+  ...
+# Subtest: warning state follows current owners and resets after absent-owner recovery
+ok 48 - warning state follows current owners and resets after absent-owner recovery
+  ---
+  duration_ms: 2.2579
+  type: 'test'
+  ...
+# Subtest: an old binary missing http.get repeats unavailable WARN hourly and resets after recovery
+ok 49 - an old binary missing http.get repeats unavailable WARN hourly and resets after recovery
+  ---
+  duration_ms: 3.037125
+  type: 'test'
+  ...
+# Subtest: kanban-rules preflight uses typed facade agentdesk.cards.get
+ok 50 - kanban-rules preflight uses typed facade agentdesk.cards.get
+  ---
+  duration_ms: 8.751592
+  type: 'test'
+  ...
+# Subtest: kanban-rules preflight missing facade card returns invalid without fallback side effects
+ok 51 - kanban-rules preflight missing facade card returns invalid without fallback side effects
+  ---
+  duration_ms: 3.506691
+  type: 'test'
+  ...
+# Subtest: kanban-rules preflight returns already_applied when the linked GitHub issue is closed
+ok 52 - kanban-rules preflight returns already_applied when the linked GitHub issue is closed
+  ---
+  duration_ms: 4.427748
+  type: 'test'
+  ...
+# Subtest: kanban-rules skips preflight once for api_reopen cards and preserves other metadata
+ok 53 - kanban-rules skips preflight once for api_reopen cards and preserves other metadata
+  ---
+  duration_ms: 3.75031
+  type: 'test'
+  ...
+# Subtest: kanban-rules writes consultation-clear metadata as a JSON object param
+ok 54 - kanban-rules writes consultation-clear metadata as a JSON object param
+  ---
+  duration_ms: 3.231817
+  type: 'test'
+  ...
+# Subtest: kanban-rules writes consultation-escalated metadata as a JSON object param
+ok 55 - kanban-rules writes consultation-escalated metadata as a JSON object param
+  ---
+  duration_ms: 2.252012
+  type: 'test'
+  ...
+# Subtest: kanban-rules writes noop work-resolution metadata as a JSON object param
+ok 56 - kanban-rules writes noop work-resolution metadata as a JSON object param
+  ---
+  duration_ms: 2.675529
+  type: 'test'
+  ...
+# Subtest: kanban-rules preflight already_applied transitions the card to done and skips pending queue entries
+ok 57 - kanban-rules preflight already_applied transitions the card to done and skips pending queue entries
+  ---
+  duration_ms: 2.832864
+  type: 'test'
+  ...
+# Subtest: kanban-rules sends completed rework dispatches directly back to review
+ok 58 - kanban-rules sends completed rework dispatches directly back to review
+  ---
+  duration_ms: 2.586971
+  type: 'test'
+  ...
+# Subtest: kanban-rules marks DoD-only gate failures as awaiting_dod instead of escalating immediately
+ok 59 - kanban-rules marks DoD-only gate failures as awaiting_dod instead of escalating immediately
+  ---
+  duration_ms: 3.711226
+  type: 'test'
+  ...
+# Subtest: kanban-rules ignores malformed DoD verified shape from facade card
+ok 60 - kanban-rules ignores malformed DoD verified shape from facade card
+  ---
+  duration_ms: 2.068679
+  type: 'test'
+  ...
+# Subtest: kanban-rules _loadCardAlertContext uses typed facade agentdesk.cards.get
+ok 61 - kanban-rules _loadCardAlertContext uses typed facade agentdesk.cards.get
+  ---
+  duration_ms: 2.124012
+  type: 'test'
+  ...
+# Subtest: kanban-rules dispatches scope-assessment once when a card enters requested and preflight clears
+ok 62 - kanban-rules dispatches scope-assessment once when a card enters requested and preflight clears
+  ---
+  duration_ms: 2.592162
+  type: 'test'
+  ...
+# Subtest: kanban-rules does not dispatch scope-assessment twice when status already set
+ok 63 - kanban-rules does not dispatch scope-assessment twice when status already set
+  ---
+  duration_ms: 2.146385
+  type: 'test'
+  ...
+# Subtest: kanban-rules skips scope-assessment when the card has no assigned agent (\#3605)
+ok 64 - kanban-rules skips scope-assessment when the card has no assigned agent (\#3605)
+  ---
+  duration_ms: 3.394505
+  type: 'test'
+  ...
+# Subtest: kanban-rules does not dispatch scope-assessment when preflight is already_applied
+ok 65 - kanban-rules does not dispatch scope-assessment when preflight is already_applied
+  ---
+  duration_ms: 1.757097
+  type: 'test'
+  ...
+# Subtest: kanban-rules does not dispatch scope-assessment when preflight is consult_required (codex R2 \#3605)
+ok 66 - kanban-rules does not dispatch scope-assessment when preflight is consult_required (codex R2 \#3605)
+  ---
+  duration_ms: 1.939803
+  type: 'test'
+  ...
+# Subtest: kanban-rules records scope-assessment result on the card metadata and stays inert
+ok 67 - kanban-rules records scope-assessment result on the card metadata and stays inert
+  ---
+  duration_ms: 2.353027
+  type: 'test'
+  ...
+# Subtest: kanban-rules falls back to full when scope-assessment result is unusable
+ok 68 - kanban-rules falls back to full when scope-assessment result is unusable
+  ---
+  duration_ms: 6.549957
+  type: 'test'
+  ...
+# Subtest: kanban-rules normalizes scope_depth case and dashes
+ok 69 - kanban-rules normalizes scope_depth case and dashes
+  ---
+  duration_ms: 1.929254
+  type: 'test'
+  ...
+# Subtest: T3: scope-assessment depth=direct creates an implementation dispatch directly
+ok 70 - T3: scope-assessment depth=direct creates an implementation dispatch directly
+  ---
+  duration_ms: 2.140075
+  type: 'test'
+  ...
+# Subtest: T3: scope-assessment depth=plan_only creates a plan dispatch carrying depth
+ok 71 - T3: scope-assessment depth=plan_only creates a plan dispatch carrying depth
+  ---
+  duration_ms: 1.89932
+  type: 'test'
+  ...
+# Subtest: T3: scope-assessment depth=full creates a plan dispatch carrying full
+ok 72 - T3: scope-assessment depth=full creates a plan dispatch carrying full
+  ---
+  duration_ms: 1.860199
+  type: 'test'
+  ...
+# Subtest: T3: fail-safe — unknown/missing scope_depth metadata is treated as full (plan)
+ok 73 - T3: fail-safe — unknown/missing scope_depth metadata is treated as full (plan)
+  ---
+  duration_ms: 3.861325
+  type: 'test'
+  ...
+# Subtest: T3: plan completion (depth=plan_only in context) creates the implementation dispatch
+ok 74 - T3: plan completion (depth=plan_only in context) creates the implementation dispatch
+  ---
+  duration_ms: 1.966311
+  type: 'test'
+  ...
+# Subtest: T3: plan completion (depth=full in context) publishes a plan-review dispatch
+ok 75 - T3: plan completion (depth=full in context) publishes a plan-review dispatch
+  ---
+  duration_ms: 2.465384
+  type: 'test'
+  ...
+# Subtest: T3: plan-review pass → implementation dispatch
+ok 76 - T3: plan-review pass → implementation dispatch
+  ---
+  duration_ms: 1.898593
+  type: 'test'
+  ...
+# Subtest: T3: plan-review rework → re-plan dispatch
+ok 77 - T3: plan-review rework → re-plan dispatch
+  ---
+  duration_ms: 2.000077
+  type: 'test'
+  ...
+# Subtest: T3: plan-review with missing/ambiguous verdict re-plans (cautious default)
+ok 78 - T3: plan-review with missing/ambiguous verdict re-plans (cautious default)
+  ---
+  duration_ms: 1.970071
+  type: 'test'
+  ...
+# Subtest: T3: scope/plan dispatches never enter the PM-gate / review lifecycle
+ok 79 - T3: scope/plan dispatches never enter the PM-gate / review lifecycle
+  ---
+  duration_ms: 3.085855
+  type: 'test'
+  ...
+# Subtest: T3 ★ full chain: scope→plan→plan-review→impl keeps one entry alive, only impl is terminal work, plan body flows through
+ok 80 - T3 ★ full chain: scope→plan→plan-review→impl keeps one entry alive, only impl is terminal work, plan body flows through
+  ---
+  duration_ms: 2.705314
+  type: 'test'
+  ...
+# Subtest: T3 ★ plan_only chain: scope→plan→impl (no plan-review)
+ok 81 - T3 ★ plan_only chain: scope→plan→impl (no plan-review)
+  ---
+  duration_ms: 2.071742
+  type: 'test'
+  ...
+# Subtest: T3 ★ direct chain: scope→impl (no plan)
+ok 82 - T3 ★ direct chain: scope→impl (no plan)
+  ---
+  duration_ms: 1.987949
+  type: 'test'
+  ...
+# Subtest: pipeline onCardTransition uses typed facade agentdesk.cards.get
+ok 83 - pipeline onCardTransition uses typed facade agentdesk.cards.get
+  ---
+  duration_ms: 2.8521
+  type: 'test'
+  ...
+# Subtest: pipeline picks the stage itself on a binary without enterStage
+ok 84 - pipeline picks the stage itself on a binary without enterStage
+  ---
+  duration_ms: 0.851347
+  type: 'test'
+  ...
+# Subtest: review-automation preserves managed await_checks with review disabled
+ok 85 - review-automation preserves managed await_checks with review disabled
+  ---
+  duration_ms: 8.086863
+  type: 'test'
+  ...
+# Subtest: review-automation preserves managed await_human with review disabled
+ok 86 - review-automation preserves managed await_human with review disabled
+  ---
+  duration_ms: 1.981611
+  type: 'test'
+  ...
+# Subtest: managed local review never auto-approves without a counter channel
+ok 87 - managed local review never auto-approves without a counter channel
+  ---
+  duration_ms: 1.816518
+  type: 'test'
+  ...
+# Subtest: review-automation immediately terminals cards when review_enabled is false
+ok 88 - review-automation immediately terminals cards when review_enabled is false
+  ---
+  duration_ms: 2.244193
+  type: 'test'
+  ...
+# Subtest: review-automation auto-approves review entry when the assigned agent has no counter-model channel
+ok 89 - review-automation auto-approves review entry when the assigned agent has no counter-model channel
+  ---
+  duration_ms: 3.720762
+  type: 'test'
+  ...
+# Subtest: review-automation keeps canonical review state but defers dispatch creation while active work still exists
+ok 90 - review-automation keeps canonical review state but defers dispatch creation while active work still exists
+  ---
+  duration_ms: 2.493503
+  type: 'test'
+  ...
+# Subtest: review-automation carries the completed work slot into review dispatch context
+ok 91 - review-automation carries the completed work slot into review dispatch context
+  ---
+  duration_ms: 2.688866
+  type: 'test'
+  ...
+# Subtest: review-automation creates a review-decision dispatch when an auto-completed review has no verdict
+ok 92 - review-automation creates a review-decision dispatch when an auto-completed review has no verdict
+  ---
+  duration_ms: 2.269352
+  type: 'test'
+  ...
+# Subtest: review-automation noop verification passes go terminal without creating a PR dispatch
+ok 93 - review-automation noop verification passes go terminal without creating a PR dispatch
+  ---
+  duration_ms: 3.460179
+  type: 'test'
+  ...
+# Subtest: review-automation clears a completed pipeline stage after cards.get migration
+ok 94 - review-automation clears a completed pipeline stage after cards.get migration
+  ---
+  duration_ms: 2.523839
+  type: 'test'
+  ...
+# Subtest: review-automation holds a card whose pipeline stage row is gone
+ok 95 - review-automation holds a card whose pipeline stage row is gone
+  ---
+  duration_ms: 3.150887
+  type: 'test'
+  ...
+# Subtest: review-automation walks stages itself on a binary without advanceStage
+ok 96 - review-automation walks stages itself on a binary without advanceStage
+  ---
+  duration_ms: 1.905931
+  type: 'test'
+  ...
+# Subtest: review-automation skips create-pr when reviewed work is already on origin mainline
+ok 97 - review-automation skips create-pr when reviewed work is already on origin mainline
+  ---
+  duration_ms: 2.263062
+  type: 'test'
+  ...
+# Subtest: loadLatestReviewDispatchContext returns the context matching card.review_round, not the newest
+ok 98 - loadLatestReviewDispatchContext returns the context matching card.review_round, not the newest
+  ---
+  duration_ms: 1.696126
+  type: 'test'
+  ...
+# Subtest: loadLatestReviewDispatchContext falls back to newest and warns when no round matches
+ok 99 - loadLatestReviewDispatchContext falls back to newest and warns when no round matches
+  ---
+  duration_ms: 1.722884
+  type: 'test'
+  ...
+# Subtest: review-automation dedupes review-decision dispatches when one is already pending
+ok 100 - review-automation dedupes review-decision dispatches when one is already pending
+  ---
+  duration_ms: 1.629415
+  type: 'test'
+  ...
+# Subtest: review-automation skips recordEntry when shouldAdvanceRound would exceed max_review_rounds
+ok 101 - review-automation skips recordEntry when shouldAdvanceRound would exceed max_review_rounds
+  ---
+  duration_ms: 1.734165
+  type: 'test'
+  ...
+# Subtest: review-automation hands the first create-pr failure to an agent/operator
+ok 102 - review-automation hands the first create-pr failure to an agent/operator
+  ---
+  duration_ms: 2.088837
+  type: 'test'
+  ...
+# Subtest: review-automation sweeps stranded create-pr rows once and then drops them from the candidate set
+ok 103 - review-automation sweeps stranded create-pr rows once and then drops them from the candidate set
+  ---
+  duration_ms: 2.48215
+  type: 'test'
+  ...
+# Subtest: review-automation keeps a create-pr failure retryable when the handoff alert is not delivered
+ok 104 - review-automation keeps a create-pr failure retryable when the handoff alert is not delivered
+  ---
+  duration_ms: 1.673672
+  type: 'test'
+  ...
+# Subtest: review-automation settles a create-pr handoff surfaced as a human-alert WARN when no deadlock channel is set
+ok 105 - review-automation settles a create-pr handoff surfaced as a human-alert WARN when no deadlock channel is set
+  ---
+  duration_ms: 2.633593
+  type: 'test'
+  ...
+# Subtest: review-automation keeps a create-pr handoff retryable when the real deadlock-channel enqueue fails
+ok 106 - review-automation keeps a create-pr handoff retryable when the real deadlock-channel enqueue fails
+  ---
+  duration_ms: 3.190773
+  type: 'test'
+  ...
+# Subtest: review-automation alerts again for a new create-pr failure generation
+ok 107 - review-automation alerts again for a new create-pr failure generation
+  ---
+  duration_ms: 1.82823
+  type: 'test'
+  ...
+# Subtest: review-automation commits a create-pr completion failure in one op with no pre-count upsert
+ok 108 - review-automation commits a create-pr completion failure in one op with no pre-count upsert
+  ---
+  duration_ms: 1.958307
+  type: 'test'
+  ...
+# Subtest: review-automation hands off a create-pr failure the record op did not record
+ok 109 - review-automation hands off a create-pr failure the record op did not record
+  ---
+  duration_ms: 1.828874
+  type: 'test'
+  ...
+# Subtest: review-automation stays silent when a create-pr failure record is a stale-generation noop
+ok 110 - review-automation stays silent when a create-pr failure record is a stale-generation noop
+  ---
+  duration_ms: 1.725774
+  type: 'test'
+  ...
+# Subtest: review-automation alerts separately for each stamped generation whose failure record threw
+ok 111 - review-automation alerts separately for each stamped generation whose failure record threw
+  ---
+  duration_ms: 1.599178
+  type: 'test'
+  ...
+# Subtest: review-automation still hands off a create-pr failure when the terminal mutations throw
+ok 112 - review-automation still hands off a create-pr failure when the terminal mutations throw
+  ---
+  duration_ms: 3.457547
+  type: 'test'
+  ...
+# Subtest: review-automation terminalizes a card whose create-pr handoff throws and logs delivery honestly
+ok 113 - review-automation terminalizes a card whose create-pr handoff throws and logs delivery honestly
+  ---
+  duration_ms: 3.401057
+  type: 'test'
+  ...
+# Subtest: 00-escalation notifyDeadlockManager reports enqueue failures as undelivered
+ok 114 - 00-escalation notifyDeadlockManager reports enqueue failures as undelivered
+  ---
+  duration_ms: 0.920298
+  type: 'test'
+  ...
+# (node:38486) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: timeouts helper module parses session channel names
+ok 115 - timeouts helper module parses session channel names
+  ---
+  duration_ms: 9.404075
+  type: 'test'
+  ...
+# Subtest: timeouts helper module identifies synthetic missing-inflight reattach placeholders
+ok 116 - timeouts helper module identifies synthetic missing-inflight reattach placeholders
+  ---
+  duration_ms: 2.498065
+  type: 'test'
+  ...
+# Subtest: S7T1 helper recognizes external-input TUI-direct synthetic owners
+ok 117 - S7T1 helper recognizes external-input TUI-direct synthetic owners
+  ---
+  duration_ms: 3.623484
+  type: 'test'
+  ...
+# Subtest: S7T2 helper rejects rebind, ordinary, other-owner and missing inflights
+ok 118 - S7T2 helper rejects rebind, ordinary, other-owner and missing inflights
+  ---
+  duration_ms: 2.152543
+  type: 'test'
+  ...
+# Subtest: timeouts helper module ignores synthetic reattach placeholders for inflight progress
+ok 119 - timeouts helper module ignores synthetic reattach placeholders for inflight progress
+  ---
+  duration_ms: 3.051601
+  type: 'test'
+  ...
+# Subtest: timeouts card timeout module marks requested dispatches failed before retry
+ok 120 - timeouts card timeout module marks requested dispatches failed before retry
+  ---
+  duration_ms: 3.716849
+  type: 'test'
+  ...
+# Subtest: timeouts requested sweep skips consultation side-path dispatches (\#256)
+ok 121 - timeouts requested sweep skips consultation side-path dispatches (\#256)
+  ---
+  duration_ms: 3.195874
+  type: 'test'
+  ...
+# Subtest: timeouts requested sweep skips scope-assessment side-path even when overdue (\#3605)
+ok 122 - timeouts requested sweep skips scope-assessment side-path even when overdue (\#3605)
+  ---
+  duration_ms: 2.04437
+  type: 'test'
+  ...
+# Subtest: timeouts dispatch maintenance retries failed dispatches with an incremented retry count
+ok 123 - timeouts dispatch maintenance retries failed dispatches with an incremented retry count
+  ---
+  duration_ms: 3.055679
+  type: 'test'
+  ...
+# Subtest: generic timeout retries exclude native Campaign ownership across held and active cards
+ok 124 - generic timeout retries exclude native Campaign ownership across held and active cards
+  ---
+  duration_ms: 4.161456
+  type: 'test'
+  ...
+# Subtest: timeouts requested sweep retries below the dispatch budget and escalates at it
+ok 125 - timeouts requested sweep retries below the dispatch budget and escalates at it
+  ---
+  duration_ms: 2.619562
+  type: 'test'
+  ...
+# Subtest: timeouts requested sweep leaves already-terminal dispatches alone
+ok 126 - timeouts requested sweep leaves already-terminal dispatches alone
+  ---
+  duration_ms: 2.852146
+  type: 'test'
+  ...
+# Subtest: timeouts failed-dispatch retry keeps the budget filter and retries the last attempt
+ok 127 - timeouts failed-dispatch retry keeps the budget filter and retries the last attempt
+  ---
+  duration_ms: 2.163713
+  type: 'test'
+  ...
+# Subtest: timeouts failed-dispatch retry tolerates a dispatch create failure
+ok 128 - timeouts failed-dispatch retry tolerates a dispatch create failure
+  ---
+  duration_ms: 2.333519
+  type: 'test'
+  ...
+# Subtest: timeouts review timeout module escalates overdue DoD waits
+ok 129 - timeouts review timeout module escalates overdue DoD waits
+  ---
+  duration_ms: 2.018163
+  type: 'test'
+  ...
+# Subtest: timeouts review auto-accept module creates rework dispatches before transitioning
+ok 130 - timeouts review auto-accept module creates rework dispatches before transitioning
+  ---
+  duration_ms: 3.391554
+  type: 'test'
+  ...
+# Subtest: timeouts review auto-accept triggers tuning aggregate once after batch inserts
+ok 131 - timeouts review auto-accept triggers tuning aggregate once after batch inserts
+  ---
+  duration_ms: 2.243835
+  type: 'test'
+  ...
+# Subtest: timeouts review auto-accept retries pending tuning aggregate on later tick
+ok 132 - timeouts review auto-accept retries pending tuning aggregate on later tick
+  ---
+  duration_ms: 2.22775
+  type: 'test'
+  ...
+# Subtest: timeouts review auto-accept keeps aggregate retry when POST returns error payload
+ok 133 - timeouts review auto-accept keeps aggregate retry when POST returns error payload
+  ---
+  duration_ms: 2.06298
+  type: 'test'
+  ...
+# Subtest: timeouts dispatch maintenance module re-enqueues unnotified pending dispatches
+ok 134 - timeouts dispatch maintenance module re-enqueues unnotified pending dispatches
+  ---
+  duration_ms: 2.412225
+  type: 'test'
+  ...
+# Subtest: timeouts active monitor normalizes the full-key host observation without exec
+ok 135 - timeouts active monitor normalizes the full-key host observation without exec
+  ---
+  duration_ms: 13.059254
+  type: 'test'
+  ...
+# Subtest: native stale owners never use tmux absence as live, exit, or restart-unknown settlement evidence
+ok 136 - native stale owners never use tmux absence as live, exit, or restart-unknown settlement evidence
+  ---
+  duration_ms: 16.088218
+  type: 'test'
+  ...
+# Subtest: native runtime evidence survives a missing inflight after restart
+ok 137 - native runtime evidence survives a missing inflight after restart
+  ---
+  duration_ms: 2.087112
+  type: 'test'
+  ...
+# Subtest: unknown or conflicting runtime evidence preserves stale ownership
+ok 138 - unknown or conflicting runtime evidence preserves stale ownership
+  ---
+  duration_ms: 8.6428
+  type: 'test'
+  ...
+# Subtest: live TUI owners retain the existing accepted-turn behavior
+ok 139 - live TUI owners retain the existing accepted-turn behavior
+  ---
+  duration_ms: 2.651969
+  type: 'test'
+  ...
+# Subtest: dead TUI recovery uses one identity snapshot and canonical guarded facade for both scans
+ok 140 - dead TUI recovery uses one identity snapshot and canonical guarded facade for both scans
+  ---
+  duration_ms: 2.693539
+  type: 'test'
+  ...
+# Subtest: changed, unapplied, or failed recovery never performs a second idle write or success log
+ok 141 - changed, unapplied, or failed recovery never performs a second idle write or success log
+  ---
+  duration_ms: 6.91159
+  type: 'test'
+  ...
+# Subtest: timeouts active monitor deadlock section uses typed timeout facade
+ok 142 - timeouts active monitor deadlock section uses typed timeout facade
+  ---
+  duration_ms: 2.186642
+  type: 'test'
+  ...
+# Subtest: timeouts active monitor preserves a live owner with only a synthetic reattach placeholder
+ok 143 - timeouts active monitor preserves a live owner with only a synthetic reattach placeholder
+  ---
+  duration_ms: 2.188466
+  type: 'test'
+  ...
+# Subtest: S7 active monitor exempts synthetic turns without force-kill or repeated logs
+ok 144 - S7 active monitor exempts synthetic turns without force-kill or repeated logs
+  ---
+  duration_ms: 21.451878
+  type: 'test'
+  ...
+# Subtest: timeouts active monitor preserves quiet accepted review turns
+ok 145 - timeouts active monitor preserves quiet accepted review turns
+  ---
+  duration_ms: 2.109052
+  type: 'test'
+  ...
+# Subtest: timeouts active monitor review fast path leaves non-review sessions on the normal threshold
+ok 146 - timeouts active monitor review fast path leaves non-review sessions on the normal threshold
+  ---
+  duration_ms: 2.190927
+  type: 'test'
+  ...
+# Subtest: timeouts orphan dispatch module emits orphan recovery signals
+ok 147 - timeouts orphan dispatch module emits orphan recovery signals
+  ---
+  duration_ms: 2.220695
+  type: 'test'
+  ...
+# Subtest: long turns do not register monitoring or page the deadlock manager
+ok 148 - long turns do not register monitoring or page the deadlock manager
+  ---
+  duration_ms: 2.162443
+  type: 'test'
+  ...
+# Subtest: timeouts workspace branch guard module recovers wt branches
+ok 149 - timeouts workspace branch guard module recovers wt branches
+  ---
+  duration_ms: 4.143045
+  type: 'test'
+  ...
+# Subtest: timeouts idle-kill module calls kill-tmux API for expired idle sessions
+ok 150 - timeouts idle-kill module calls kill-tmux API for expired idle sessions
+  ---
+  duration_ms: 4.007388
+  type: 'test'
+  ...
+# Subtest: timeouts idle-kill module leaves active-dispatch sessions to dispatch cleanup
+ok 151 - timeouts idle-kill module leaves active-dispatch sessions to dispatch cleanup
+  ---
+  duration_ms: 4.203153
+  type: 'test'
+  ...
+# Subtest: timeouts idle-kill module does not let zombie (already-gone tmux) rows starve live idle sessions (\#2861)
+ok 152 - timeouts idle-kill module does not let zombie (already-gone tmux) rows starve live idle sessions (\#2861)
+  ---
+  duration_ms: 2.393902
+  type: 'test'
+  ...
+# Subtest: timeouts idle-kill module does not count live-activity guard skips toward budget
+ok 153 - timeouts idle-kill module does not count live-activity guard skips toward budget
+  ---
+  duration_ms: 2.353981
+  type: 'test'
+  ...
+# Subtest: timeouts idle-kill module does not count provider busy, unknown or host-refused skips toward budget
+ok 154 - timeouts idle-kill module does not count provider busy, unknown or host-refused skips toward budget
+  ---
+  duration_ms: 2.279992
+  type: 'test'
+  ...
+# Subtest: timeouts idle-kill module counts genuine kill failures (tmux alive but kill failed) toward budget
+ok 155 - timeouts idle-kill module counts genuine kill failures (tmux alive but kill failed) toward budget
+  ---
+  duration_ms: 2.078373
+  type: 'test'
+  ...
+# Subtest: timeouts idle-kill module excludes thread idle rows from the main batch
+ok 156 - timeouts idle-kill module excludes thread idle rows from the main batch
+  ---
+  duration_ms: 2.232329
+  type: 'test'
+  ...
+# Subtest: S7 ordinary successor clears a legacy synthetic marker without a silence counter
+ok 157 - S7 ordinary successor clears a legacy synthetic marker without a silence counter
+  ---
+  duration_ms: 1.993944
+  type: 'test'
+  ...
+# Subtest: active monitor preserves productive turns beyond four and six hours
+ok 158 - active monitor preserves productive turns beyond four and six hours
+  ---
+  duration_ms: 16.14365
+  type: 'test'
+  ...
+# Subtest: active monitor defers every unresolved host in both loops and refreshes its tick cache
+ok 159 - active monitor defers every unresolved host in both loops and refreshes its tick cache
+  ---
+  duration_ms: 39.830503
+  type: 'test'
+  ...
+# Subtest: active monitor reports a repair the facade refused without an idle log
+ok 160 - active monitor reports a repair the facade refused without an idle log
+  ---
+  duration_ms: 1.942105
+  type: 'test'
+  ...
+# Subtest: agent:<id> label assigns the card to the resolved agent
+ok 161 - agent:<id> label assigns the card to the resolved agent
+  ---
+  duration_ms: 4.434707
+  type: 'test'
+  ...
+# Subtest: agent label resolves via ch- prefix fallback when exact match misses
+ok 162 - agent label resolves via ch- prefix fallback when exact match misses
+  ---
+  duration_ms: 2.803488
+  type: 'test'
+  ...
+# Subtest: unlabeled card is a no-op (no assign, no priority, no PMD ping)
+ok 163 - unlabeled card is a no-op (no assign, no priority, no PMD ping)
+  ---
+  duration_ms: 1.301218
+  type: 'test'
+  ...
+# Subtest: priority-only label sets priority without assigning (card stays unassigned)
+ok 164 - priority-only label sets priority without assigning (card stays unassigned)
+  ---
+  duration_ms: 1.342765
+  type: 'test'
+  ...
+# Subtest: agent label that resolves to no agent does not assign
+ok 165 - agent label that resolves to no agent does not assign
+  ---
+  duration_ms: 1.202179
+  type: 'test'
+  ...
+# Subtest: regression: PMD classification ping is never emitted across mixed cards
+ok 166 - regression: PMD classification ping is never emitted across mixed cards
+  ---
+  duration_ms: 1.23203
+  type: 'test'
+  ...
+1..166
+# tests 166
+# suites 0
+# pass 166
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 657.772052

@@ -52,16 +52,13 @@ module.exports = function attachIdleKill(timeouts, helpers) {
       var mainChannelSqlGuard =
         "AND thread_channel_id IS NULL " +
         "AND session_key !~ '-t[0-9]{15,}(-dev)?$' ";
-      var effectiveLastSeenJoin =
-        "CROSS JOIN LATERAL (SELECT COALESCE(s.last_heartbeat, s.created_at) AS last_seen_at) latest ";
       var idleFromWhere =
         "FROM sessions s " +
-        effectiveLastSeenJoin +
         "WHERE status = 'idle' " +
         "AND provider IN ('claude', 'codex', 'qwen') " +
         "AND active_dispatch_id IS NULL " +
         mainChannelSqlGuard +
-        "AND latest.last_seen_at < NOW() - INTERVAL '6 hours' ";
+        "AND COALESCE(s.last_heartbeat, s.created_at) < NOW() - INTERVAL '6 hours' ";
       // Exclude unavailable owners before LIMIT so an offline node's backlog
       // cannot occupy all 50 slots and starve healthy/local owners (#5714).
       var owners = agentdesk.db.query("SELECT DISTINCT s.instance_id " + idleFromWhere);
@@ -73,8 +70,8 @@ module.exports = function attachIdleKill(timeouts, helpers) {
           excludedOwners.map(function() { return "?"; }).join(", ") + ")) "
         : "";
       var idleSessions = agentdesk.db.query(
-        "SELECT s.session_key, s.agent_id, s.provider, s.instance_id, s.active_dispatch_id, s.thread_channel_id, latest.last_seen_at " +
-        idleFromWhere + ownerSqlGuard + "ORDER BY latest.last_seen_at ASC LIMIT 50",
+        "SELECT s.session_key, s.agent_id, s.provider, s.instance_id, s.active_dispatch_id, s.thread_channel_id, COALESCE(s.last_heartbeat, s.created_at) AS last_seen_at " +
+        idleFromWhere + ownerSqlGuard + "ORDER BY COALESCE(s.last_heartbeat, s.created_at) ASC LIMIT 50",
         excludedOwners
       );
 
