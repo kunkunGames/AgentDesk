@@ -18,9 +18,14 @@ Those unused tables remain available for retention and recovery.
 Campaign 146 also includes upstream 141's nullable returned-hosted-execution archive column.
 
 Every subsequent migration belongs in `migrations/postgres_shared`, starting at
-147. Do not append to either historical catalog. The shared catalog must behave
-correctly with either retained legacy Office tables or no Office tables.
-The immutable checksum guard covers all three directories.
+147. Upstream migrations added in `migrations/postgres` after 0141 (including the
+version-0146 collision with `0146_campaign_upstream_convergence.sql`) are
+mirrored into `migrations/postgres_shared` starting at 0147 while keeping the
+upstream source files intact for immutable checksum verification. The `Upstream`
+lineage selects `migrations/postgres` through 0141 plus
+`0146_campaign_upstream_convergence.sql` and then appends `migrations/postgres_shared`.
+The shared catalog must behave correctly with either retained legacy Office tables
+or no Office tables. The immutable checksum guard covers all three directories.
 
 An empty database defaults to upstream only when no application relation,
 routine, or user type exists in the effective search path. Extension-owned

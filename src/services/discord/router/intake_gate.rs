@@ -8,16 +8,14 @@ use super::intake_queue_transaction::{
 
 mod busy_duplicate_notice;
 pub(super) mod busy_inject;
+mod busy_queue;
 mod component_events;
 mod gate;
-pub(in crate::services::discord) mod ledger;
-use crate::services::discord::input_runtime::intake::admit::SourceKind;
+#[cfg(all(test, unix))]
+mod live_entry_tests;
 mod queue_effects;
 mod reply_context;
-use reply_context::build_reply_context;
-#[cfg(test)]
-use reply_context::{AttachmentReplyItem, format_attachment_reply_context};
-mod stale_turn;
+pub(super) mod stale_turn;
 
 pub(in crate::services::discord) use gate::should_process_turn_message;
 
@@ -30,9 +28,9 @@ use gate::{
 };
 pub(in crate::services::discord::router) use queue_effects::should_schedule_post_enqueue_idle_drain;
 use queue_effects::{IntakeGateQueueEffects, render_visible_queued_ack};
+use reply_context::build_reply_context;
 use stale_turn::{
-    mailbox_has_live_active_turn_or_cleanup_stale_proof, thread_guard_force_clean_stale_thread,
-    thread_guard_should_force_clean_stale_thread,
+    mailbox_has_live_active_turn_or_cleanup_stale_proof, thread_guard_release_stale_thread,
 };
 
 async fn append_pending_uploads(
@@ -191,20 +189,8 @@ pub(in crate::services::discord) async fn handle_event(
     match event {
         serenity::FullEvent::InteractionCreate { interaction } => {
             if let Some(component) = interaction.as_message_component() {
-                if component_events::handle_model_picker_component_if_applicable(
-                    ctx, component, data,
-                )
-                .await?
-                {
+                if component_events::handle_component_if_applicable(ctx, component, data).await? {
                     return Ok(());
-                }
-                if super::super::idle_recap_interaction::is_idle_recap_custom_id(
-                    &component.data.custom_id,
-                ) {
-                    return super::super::idle_recap_interaction::handle_idle_recap_interaction(
-                        ctx, component, data,
-                    )
-                    .await;
                 }
                 if super::super::commands::is_node_picker_custom_id(&component.data.custom_id) {
                     let settings_snapshot = { data.shared.settings.read().await.clone() };
@@ -631,19 +617,6 @@ pub(in crate::services::discord) async fn handle_event(
             if !is_allowed_bot && !check_auth(user_id, user_name, &data.shared, &data.token).await {
                 return Ok(());
             }
-            if !is_dm
-                && Box::pin(ledger::hold_live(
-                    &data.shared,
-                    &ctx.http,
-                    &data.provider,
-                    new_message,
-                    SourceKind::LiveMessage,
-                    None,
-                ))
-                .await?
-            {
-                return Ok(());
-            }
             let author_excluded_from_cancel_preservation =
                 live_sender_excluded_from_human_preservation(
                     &settings_snapshot.allowed_bot_ids,
@@ -683,18 +656,6 @@ pub(in crate::services::discord) async fn handle_event(
                 .await;
                 return Ok(());
             }
-            // #3148: the idle-recap card clear (and the per-channel
-            // turn-generation bump) was RELOCATED from here to
-            // `intake_turn::handle_text_message`, immediately AFTER the mailbox
-            // claim succeeds (`started == true`), mirroring the TUI path
-            // (`tui_prompt_relay` claim → bump → clear). Clearing at intake
-            // time — BEFORE the later mailbox claim — was not truly
-            // capture-at-claim: a recap POST could recheck-idle while intake had
-            // captured old/none but the claim had not happened, persist a fresh
-            // card, and the old-id-keyed clear could not remove it (Window 2).
-            // Performing the clear after the claim (and after the claim's
-            // generation bump) closes that window with the same capture-at-claim
-            // semantics the TUI path already has.
 
             // #189: Generic DM reply tracking — consume pending entry if present.
             // Keep this after auth so unauthorized DM senders cannot inject
@@ -763,8 +724,8 @@ pub(in crate::services::discord) async fn handle_event(
                         admitted_attachment_submission = Some(submission);
                     }
                     Err(nonlocal) => {
-                        super::finish_text_intake_admission(&deps, nonlocal, submission).await?;
-                        return Ok(());
+                        let finish = super::finish_nonlocal_attachment_admission;
+                        return finish(&deps, nonlocal, submission).await;
                     }
                 }
 
@@ -837,13 +798,10 @@ pub(in crate::services::discord) async fn handle_event(
                 return Ok(());
             }
 
-            // ── Text commands (!start, !meeting, !stop, !clear) ──
-            // Strip leading bot mention to get the actual command text.
-            //
-            // #2044 F11: the helper uses a constant regex compiled once via
-            // `LazyLock`, avoiding a per-message compile cost in the hot path.
+            // Agent text commands and removed-name answers, read after the leading bot mention;
+            // the strip's regex is compiled once, keeping this hot path cheap.
             let cmd_text = strip_leading_bot_mention(text);
-            if cmd_text.starts_with('!') {
+            if super::super::catch_up::handled_command::is_text_command(&cmd_text) {
                 // Recorded before the handler, so even a silent or failing command is
                 // settled by catch-up instead of replaying as a provider prompt.
                 super::super::catch_up::consumed_commands::record(
@@ -852,42 +810,20 @@ pub(in crate::services::discord) async fn handle_event(
                     new_message.id,
                 )
                 .await;
-                // Skill prompts enter central admission with their upload paths
-                // still in the submission. Do not inject them into this
-                // gateway's local session before owner routing has admitted
-                // local execution.
-                let mut command_parts = cmd_text.split_whitespace();
-                let command = command_parts.next().unwrap_or_default();
-                let skill_name = command_parts.next().unwrap_or_default();
-                let is_skill_command = matches!(command, "!skill" | "!cc")
-                    && !skill_name.is_empty()
-                    && !matches!(
-                        skill_name,
-                        "clear" | "stop" | "pwd" | "health" | "status" | "inflight" | "help"
-                    );
-                if !is_skill_command {
-                    upload_records_appended_to_session =
-                        append_pending_uploads(&data.shared, channel_id, &upload_records).await;
-                }
+                upload_records_appended_to_session =
+                    append_pending_uploads(&data.shared, channel_id, &upload_records).await;
                 let handled = super::message_handler::handle_text_command(
                     ctx,
                     new_message,
                     &data,
                     channel_id,
                     &cmd_text,
-                    &upload_records,
-                    &mut attachment_local_permit,
                 )
                 .await?;
+                // An unhandled command, such as a consent retry Herdr does not serve here, is chat.
                 if handled {
-                    if (!is_skill_command || attachment_local_permit.is_some())
-                        && !upload_records_appended_to_session
-                    {
-                        let _ =
-                            append_pending_uploads(&data.shared, channel_id, &upload_records).await;
-                    }
+                    return Ok(());
                 }
-                return Ok(());
             }
 
             // Auto-restore session (for threads, fall back to parent channel's session)
@@ -1029,21 +965,14 @@ pub(in crate::services::discord) async fn handle_event(
                         // mirroring the stall-watchdog's conjunction so a
                         // quiet-but-live long turn (e.g. mid-Bash) is never
                         // mistaken for a dead dispatch.
-                        let stale_inflight = thread_guard_should_force_clean_stale_thread(
+                        let released = thread_guard_release_stale_thread(
                             &data.shared,
                             &data.provider,
                             thread_id,
                             chrono::Utc::now().timestamp(),
                         )
                         .await;
-                        if stale_inflight {
-                            thread_guard_force_clean_stale_thread(
-                                &data.shared,
-                                &data.provider,
-                                channel_id,
-                                thread_id,
-                            )
-                            .await;
+                        if released {
                             // Fall through to normal processing below.
                         } else {
                             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1151,16 +1080,14 @@ pub(in crate::services::discord) async fn handle_event(
             let live = busy_inject::LiveText {
                 channel_id,
                 parent,
-                message_id: new_message.id,
-                author_id: user_id,
-                author_is_bot: new_message.author.bot,
+                message: new_message,
                 author_is_allowed_automation: author_excluded_from_cancel_preservation,
                 text,
                 reply_context: reply_context.as_deref(),
                 has_reply_boundary,
-                carries_more_than_text: !upload_records.is_empty()
-                    || !new_message.attachments.is_empty()
-                    || resolved_voice_announcement.is_some(),
+                uploads: &upload_records,
+                voice_announcement: resolved_voice_announcement.as_ref(),
+                merge_consecutive,
             };
             if busy_inject::offered(ctx, data, &live).await {
                 return Ok(());
@@ -1189,24 +1116,7 @@ pub(in crate::services::discord) async fn handle_event(
                                 new_message.author.bot,
                                 is_allowed_bot,
                             ),
-                            intervention: SoftInterventionSpec {
-                                channel_id,
-                                author_id: user_id,
-                                author_is_bot: new_message.author.bot,
-                                author_is_allowed_automation:
-                                    author_excluded_from_cancel_preservation,
-                                message_id: new_message.id,
-                                text: text.to_string(),
-                                reply_context: reply_context.clone(),
-                                has_reply_boundary,
-                                merge_consecutive,
-                                pending_uploads: upload_records.clone(),
-                                // #2266: main busy-active-turn queue path — voice transcripts that
-                                // arrive while a previous turn is running flow through here. Embed the
-                                // announcement so the queued dispatch reinserts it into the store even
-                                // if the >30s in-memory TTL expires first.
-                                voice_announcement: resolved_voice_announcement.clone(),
-                            },
+                            intervention: busy_queue::spec(&live),
                             options: IntakeQueueCommitOptions::default(),
                         },
                     )
@@ -1491,21 +1401,6 @@ pub(in crate::services::discord) async fn handle_event(
                 }
             }
 
-            // Legacy command boundary: deny only; never reinterpret text as execution.
-            if text.starts_with('!') {
-                if !upload_records_appended_to_session {
-                    let _ = append_pending_uploads(&data.shared, channel_id, &upload_records).await;
-                }
-                super::message_handler::handle_shell_command_raw(
-                    ctx,
-                    channel_id,
-                    text,
-                    &data.shared,
-                )
-                .await?;
-                return Ok(());
-            }
-
             // Regular text → Claude AI
             let ts = chrono::Local::now().format("%H:%M:%S");
             let preview = truncate_str(text, 60);
@@ -1523,7 +1418,7 @@ pub(in crate::services::discord) async fn handle_event(
             };
             // A replay-deferred direct dispatch checkpoints only once its custody is settled.
             let settle_checkpoint = attachment_local_permit.is_none()
-                && super::checkpoint_waits_for_admission(channel_id);
+                && super::live_checkpoint_waits(&data.provider, channel_id);
             if !settle_checkpoint {
                 checkpoint();
             }
@@ -1619,26 +1514,6 @@ pub(super) use queue_effects::queue_pending_reaction_for;
 #[cfg(test)]
 mod reply_context_tests {
     use super::gate::{should_start_attachment_only_turn, strip_leading_bot_mention};
-    use super::{AttachmentReplyItem, format_attachment_reply_context};
-
-    #[test]
-    fn attachment_reply_context_keeps_canonical_message_id_and_all_files() {
-        let attachments = (1..=5)
-            .map(|index| AttachmentReplyItem {
-                filename: format!("photo-{index}.png"),
-                size: 1024 * index,
-                description: (index == 3).then_some("middle attachment".to_string()),
-            })
-            .collect::<Vec<_>>();
-
-        let context = format_attachment_reply_context("사용자", 1500, &attachments);
-
-        assert!(context.contains("Canonical Discord message id: 1500"));
-        assert!(context.contains("photo-1.png"));
-        assert!(context.contains("photo-3.png"));
-        assert!(context.contains("middle attachment"));
-        assert!(context.contains("photo-5.png"));
-    }
 
     #[test]
     fn attachment_only_empty_check_ignores_leading_bot_mention() {
@@ -1662,126 +1537,16 @@ mod reply_context_tests {
 /// pass that same value into both request and submission envelopes.
 #[cfg(test)]
 mod live_intake_preserve_wiring_tests {
+    pub(super) mod source_guard_tests;
+    use source_guard_tests::{INTAKE_GATE, admission_guard_gaps, preservation_gaps};
+
     #[test]
     fn live_human_preservation_precedes_stale_dispatch_suppression() {
-        let module_src = include_str!("intake_gate.rs");
-        let computation = "let preserve_on_cancel =\n                !new_message.author.bot && !author_excluded_from_cancel_preservation;";
-        let computation_pos = module_src
-            .find(computation)
-            .expect("live preservation is computed once from author identity");
-        let guard_pos = module_src[computation_pos..]
-            .find("if !preserve_on_cancel")
-            .map(|offset| computation_pos + offset)
-            .expect("stale dispatch suppression is gated by preservation");
-        let stale_lookup_pos = module_src[guard_pos..]
-            .find("stale_dispatch_turn_for_text(")
-            .map(|offset| guard_pos + offset)
-            .expect("stale dispatch lookup remains present for automation");
-        let raw_submission_pos = module_src[stale_lookup_pos..]
-            .find("origin: super::IntakeOrigin::RawAttachment,")
-            .map(|offset| stale_lookup_pos + offset)
-            .expect("raw-attachment IntakeSubmission construction exists");
-        let live_submission_pos = module_src[raw_submission_pos..]
-            .find("origin: super::IntakeOrigin::LiveMessage,")
-            .map(|offset| raw_submission_pos + offset)
-            .expect("live-message IntakeSubmission construction exists");
-        let raw_request_window = &module_src[stale_lookup_pos..raw_submission_pos];
-        let raw_submission_window = &module_src[raw_submission_pos..live_submission_pos];
-        let live_request_window = &module_src[raw_submission_pos..live_submission_pos];
-        let production_end = module_src[live_submission_pos..]
-            .find("#[cfg(test)]\nmod reply_context_tests")
-            .map(|offset| live_submission_pos + offset)
-            .expect("production intake gate ends before reply-context tests");
-        let live_submission_window = &module_src[live_submission_pos..production_end];
-
-        assert!(computation_pos < guard_pos && guard_pos < stale_lookup_pos);
-        assert!(
-            raw_request_window.contains("turn_kind,\n                        preserve_on_cancel,"),
-            "raw attachment IntakeRequest must reuse the precomputed preservation value"
-        );
-        assert!(
-            raw_submission_window.contains(
-                "origin: super::IntakeOrigin::RawAttachment,\n                    preserve_on_cancel,"
-            ),
-            "raw attachment IntakeSubmission must reuse the precomputed preservation value"
-        );
-        assert!(
-            live_request_window.contains("turn_kind,\n                        preserve_on_cancel,"),
-            "live IntakeRequest must reuse the precomputed preservation value"
-        );
-        assert!(
-            live_submission_window.contains(
-                "origin: super::IntakeOrigin::LiveMessage,\n                    preserve_on_cancel,"
-            ),
-            "live IntakeSubmission must reuse the precomputed preservation value"
-        );
+        assert_eq!(preservation_gaps(INTAKE_GATE), Vec::<String>::new());
     }
 
     #[test]
     fn one_admission_guard_precedes_all_soft_intervention_entrypoints() {
-        let module_src = include_str!("intake_gate.rs");
-        let production_end = module_src
-            .find("#[cfg(test)]\nmod reply_context_tests")
-            .expect("production intake gate ends before unit tests");
-        let production = &module_src[..production_end];
-        let guard = "if is_allowed_bot_sender\n                && !should_admit_turn_message(";
-        let guard_pos = production
-            .find(guard)
-            .expect("all intake queue branches share the outer admission guard");
-        let first_queue_entry = production
-            .find("SoftInterventionSpec {")
-            .expect("intake gate has a soft intervention queue entrypoint");
-
-        assert!(guard_pos < first_queue_entry);
-        assert_eq!(
-            production.matches("is_allowed_turn_sender(").count(),
-            0,
-            "queue branches must not make sender decisions independently"
-        );
-    }
-}
-
-#[cfg(test)]
-mod command_recognition_tests {
-    #[test]
-    fn command_outcomes_end_before_restore_and_preserve_upload_conditions() {
-        let production = include_str!("intake_gate.rs")
-            .split_once("#[cfg(test)]\nmod reply_context_tests")
-            .unwrap()
-            .0;
-        let command = production
-            .split_once("let cmd_text = strip_leading_bot_mention(text);")
-            .unwrap()
-            .1
-            .split_once("// Auto-restore session")
-            .unwrap()
-            .0;
-        let anchors = [
-            "if cmd_text.starts_with('!')",
-            "let handled = super::message_handler::handle_text_command(",
-            "&mut attachment_local_permit,",
-            ".await?;",
-            "if handled {",
-            "if (!is_skill_command || attachment_local_permit.is_some())",
-            "&& !upload_records_appended_to_session",
-        ];
-        let mut remaining = command;
-        for anchor in anchors {
-            remaining = remaining.split_once(anchor).expect(anchor).1;
-        }
-        assert!(
-            remaining
-                .trim_end()
-                .ends_with("}\n                return Ok(());\n            }")
-        );
-        let legacy = production
-            .split_once("// Legacy command boundary:")
-            .unwrap()
-            .1
-            .split_once("// Regular text")
-            .unwrap()
-            .0;
-        assert!(legacy.contains("super::message_handler::handle_shell_command_raw("));
-        assert!(legacy.trim_end().ends_with("return Ok(());\n            }"));
+        assert_eq!(admission_guard_gaps(INTAKE_GATE), Vec::<String>::new());
     }
 }

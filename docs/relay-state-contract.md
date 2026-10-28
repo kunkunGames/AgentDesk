@@ -170,22 +170,21 @@ Repair, in priority order:
    section's own thesis forbids shape rules: a reviewer applying the count
    literally and one running the judgment diverge, exactly as they did on the
    static form above. The manifest cost is real and small:
-   `docs/pr-cap-check.md` sets the cap at 30 production files and net +800 code
+   `docs/pr-cap-check.md` sets the cap at 30 production files and net +1500 code
    lines; test and manifest paths follow its exclusion policy. Spend an id when the name buys a
    claim; do not spend it to restate one an existing test's name already makes.
    `intake_delivery_sweep::tests` has the pattern to copy in
    `spawn_wiring_claims_process_latch_before_observed_task`. Copy the half that
    bears the load: it reads **the module that holds the production call site**,
    here through `include_str!("../framework_setup.rs")`, and asserts that call
-   site appears exactly once. Identify that file by what it CONTAINS, never by
-   how it is related to the test — the relation is an accident of the example.
-   Here `framework_setup` is a sibling of the module under test; elsewhere the
-   wiring may sit in a parent or further away. "Read the parent module" is
-   specifically the wrong generalization, because the parent of
-   `intake_delivery_sweep::tests` is `intake_delivery_sweep` itself, which is
-   the source read by this test's OTHER half — an ordering guard that pins no
-   production entrypoint. A guard copied from that half alone leaves exactly
-   the nominal coverage this gate rejects.
+   site appears exactly once. Identify its source by content, not test relation.
+   Use distinctive executable syntax—a qualified call with arguments or a
+   predicate such as `&& !preserve_on_cancel`—never a bare identifier prose can
+   repeat. Count after excluding comments and strings. A raw-source guard must
+   find exactly one intended executable match; `find()` can accept earlier prose.
+   `framework_setup` is a sibling here, but wiring may live elsewhere. The test
+   parent can mislead: `intake_delivery_sweep::tests` is under
+   `intake_delivery_sweep`, whose other half only pins ordering, not production.
 
 A lexical guard is the fallback, not the goal: it pins that the call site
 *exists*, not that the call is *meaningfully wired*. The exemplar says so in its
@@ -219,7 +218,7 @@ halves, each by the tool that can actually prove its half:
   attribute inside it are checked against byte-exact whitelists (no cfg parser):
   the gate must be `#[cfg(test)]` or `#[cfg(all(test, unix))]`, and the only
   attribute allowed inside the block is `#[test]`. `unix` is allowed because the
-  only required PR Rust compile is `check_fast` (matrix `os: [ubuntu-latest]`,
+  only required PR Rust compile is the `lint` job's clippy (`ubuntu-latest`,
   where `cfg(unix)` is true), so that required job compiles the block; the
   windows lane is advisory/non-required and skipped for relay-only changes, so a
   windows/non-ubuntu gate would run in no required job. The `pause_epoch`
@@ -241,7 +240,7 @@ compiler-checked reference together.
 
 **How the two halves stay on together in CI.** The set-comparison half is an
 explicit `ci-pr.yml` step. The compile-existence half is the required
-`check_fast` job; a `relay_contract` path filter (the anchor files it lists, this
+`lint` job's clippy compile; a `relay_contract` path filter (the anchor files it lists, this
 doc, and the gate script) force-runs it for doc-only binding changes as well as
 Rust changes. No branch-name escape hatch may skip either half.
 
@@ -998,16 +997,16 @@ past. I19 governs the resume point itself.
   2026-09-16T14:13:37Z..14:21:32Z five consecutive redrives ran with
   `last_relay_offset=0` and `unread_bytes=24_553_403` — the entire transcript —
   after a dcserver restart dropped the in-memory coordinate.
-- Witness: `DurableFrontierObservation::durable_delivery_witness`, carried onto
-  the snapshot as `WatcherStateSnapshot::durable_frontier`: the one term the
-  restart does not take with it (both I12 readings live in the emptied
-  `SharedData::tmux_relay_coords`). `RowPresent` alone is not the predicate —
-  `live_generation_mtime_ns` is read off the coordinate ENTRY, so after that
-  restart `observe` can only answer `GenerationUnresolved`; both count. Three
-  shapes give NO witness: `GenerationMismatch` (a different incarnation, whose
-  re-created wrapper legitimately zeroes), a `relayed_start` of zero (the very
-  value the guard distrusts), and a row with no relayed offset (`RowUnrelayed`,
-  `RowAbsent`).
+- Witness: `DurableFrontierObservation::durable_delivery_witness`, exposed as
+  `WatcherStateSnapshot::durable_frontier`, survives restart; the I12 readings in
+  `SharedData::tmux_relay_coords` do not. `RowPresent` and `GenerationUnresolved`
+  count: after restart the coordinate entry's `live_generation_mtime_ns` is gone.
+  `GenerationMismatch` (a different incarnation that legitimately zeroes), zero
+  `relayed_start`, `RowUnrelayed`, and `RowAbsent` give NO witness. Wire: each
+  `GET /api/health/detail` mailbox entry exposes the tagged union at
+  `frontier_provenance.durable_observation`; a row with no relayed offset is
+  `{"kind":"row_unrelayed","turn_start_offset":N}`, distinct from
+  `{"kind":"row_absent"}`. Consumers must tolerate additional `kind` values.
 - Floor (r3): an unwitnessed zero is NOT approved as zero. The row's
   `last_watcher_relayed_offset` is `None` from the turn's birth until its first
   relay, so every fresh turn arrives unwitnessed and zero would re-read every
@@ -1025,7 +1024,7 @@ past. I19 governs the resume point itself.
   confirm lag over an already-persisted batch — precisely what recovery is for),
   and an unset `watcher_owner_channel_id` (the rest of the codebase already reads
   that as "the polled channel": `nudge_existing_watcher_for_backlog`,
-  `RelayHealthSnapshot::channel_binding`, `idle_recap`).
+  `RelayHealthSnapshot::channel_binding`).
 - On refusal the redrive is counted as a no-progress attempt (r3): the same
   backoff as a nudge, then `redrive_no_progress_capped` after
   `REDRIVE_MAX_NO_PROGRESS_ATTEMPTS`, instead of re-running every poll. It never
@@ -1405,11 +1404,9 @@ reachability obligations, I16 and I19 are #5943's, I17 #5941's, I18 #5948's.
   nothing. `SessionEnrichment` holds those operands but publishes no
   such grade, which is why the derivation belongs at the source rather than at either
   struct's boundary.
-  Publishing the attribution grade is L2's FIRST task, ahead of any gate it wires that
-  reads this term. A lane that publishes that grade owns correcting this bullet in the
-  same change, or the contract starts lying about its own surface — an obligation this
-  document cannot enforce on itself, which is why #6025 tracks the pattern instead of
-  this sentence predicting its own repair.
+  Publishing the attribution grade alone does not close this gap: both consumers must
+  read the grade before this contract's claim can change. Until then, no lane may cite
+  the grade as a repair.
   Duplicate relays after a retirement stay I18's and I19's.
 - It also puts nothing in conflict with the pinned "normal", and no lane may weaken
   that to land a repair. `relay_recovery::tests::unpaired_active_token_is_observe_only`
@@ -1471,21 +1468,37 @@ reachability obligations, I16 and I19 are #5943's, I17 #5941's, I18 #5948's.
 
 ## Appendix: TUI O unseen resume boundary
 
-This is the current O writer contract, checked against main `538af4dbd`. R5-2 (`47901f438`)
+The unseen-resume baseline was checked against main `538af4dbd`. R5-2 (`47901f438`)
 allows an in-session resume into a first-seen session to be adopted at its SessionStart; it
 does not establish a resume byte boundary (`src/services/claude_tui/source_verify.rs:361–390`).
-The [operator procedure](tui-o-writer-canary-runbook.md#9-resolve-an-unseen-resume-boundary)
-records a boundary in the existing O ledger; it adds no relay owner or delivery authority.
+The boundary-resolution CLI was retired (#7266). Existing durable boundary records remain
+readable; unresolved sources stay Pending. Use ordinary `/clear` to start a fresh session,
+following the [current recovery notes](tui-o-writer-canary-runbook.md#9-resolve-an-unseen-resume-boundary).
 
 | Contract | Current code evidence |
 |---|---|
 | First-seen source: no stored cursor or rotation link; a Resume without a verified parent starts Pending and raises `BoundaryPending`. An earlier unread binding also forces Pending. | `src/services/tui_o/writer/rotation.rs:592–604`; `src/services/tui_o/writer/past_bind.rs:29–39` |
 | Pending spools history and new rows but derives no delivery work. It is not a completed delivery or a discarded source. | `src/services/tui_o/store/rotation.rs:23–29`; `src/services/tui_o/writer/rotation/owe.rs:37–42` |
-| An operator selects the first owed position by byte offset or unique UUID, naming one Pending source by spool key or path. A numeric offset is checked only as a line start (newline-aligned EOF and an incomplete trailing line pass); a UUID must match exactly one complete JSON line. Neither proves the resume boundary. Validation and the durable append share the existing ledger lock, also held by recovery. | `src/cli/o.rs:48–83`; `src/services/tui_o/store/rotation.rs:211–285`; `src/services/tui_o/store/ledger.rs:564–568` |
-| `BoundaryResolved` records `from` and `excluded_range: 0..from`; only the next writer start applies Pending → `Owed { from }` and replays retained records. | `src/services/tui_o/store/rotation.rs:142–157`, `:185–199`, `:242–249`; `src/services/tui_o/writer/rotation/readers.rs:31–34`, `:63–69` |
+| This build has no operator boundary-resolution command. Pending history stays retained; ordinary `/clear` starts a fresh session. | `docs/tui-o-writer-canary-runbook.md` §9; `src/services/discord/commands/control/clear_teardown.rs` |
+| Existing `BoundaryResolved` records retain `from` and `excluded_range: 0..from`; writer startup applies Pending → `Owed { from }` and replays retained records. | `ChannelStore::apply_resolved_boundaries`; `Sources::resume_selected` |
 | The historical prefix `[0, from)` is excluded; records starting at or after `from` remain owed, subject to the existing parent mask. | `src/services/tui_o/store/ledger.rs:75–82`; `src/services/tui_o/writer/rotation/owe.rs:37–42` |
 | Pending is not collectible; both the writer collector and the direct store GC path refuse it. | `src/services/tui_o/writer/rotation.rs:880–889`; `src/services/tui_o/store/rotation.rs:135–140`; `src/services/tui_o/store/spool.rs:588–596` |
-| `tui_o:boundary_pending:<channel>` makes health at least degraded: the boundary is unresolved and output withheld, without proving loss or duplication. Unresolved Pending is alarmed again on writer start. | `src/services/tui_o/alarm.rs:215`, `:260–277`; `src/services/discord/health/snapshot.rs:1080–1086`; `src/services/tui_o/writer/rotation/readers.rs:55–61` |
+| `tui_o:boundary_pending:<channel>` makes health at least degraded: the boundary is unresolved and output withheld, without proving loss or duplication. After successful resume or capture, health is reconciled from all selected Pending links: suspended sources are excluded, but retired selected sources still count. The reason clears only when that count is zero. | `Sources::{resume,capture,reconcile_boundary_pending}`; `Sources::resume_selected`; `AlarmRouter::reconcile_boundary_pending` |
+
+New Codex rehydration can record `CauseSource::Launch` only when (1) the current spawn nonce
+matches a schema-1 Codex context, tmux session, channel and runtime owner; (2) that context is
+`fresh`, uses `shadow` policy and names no expected native session; (3) the native verifier
+confirms a regular rollout under the provider root, matching UUID/path, CLI non-child metadata
+and stable file identity; and (4) its native creation timestamp is present and no earlier than
+the context. This uses `pane_registration::codex_launch_cause::cause` and
+`verify_codex_hook_source`; the existing earlier-unread-binding guard still overrides Startup.
+
+Condition (5), when `first_prompt_digest` is present, requires its SHA-256 to match the first
+real user input's original UTF-8 text. The shared extractor selects that input, excluding
+synthetic records; its trimmed return value is not hashed. Raw text parts are joined with
+newlines without trimming. An incomplete header or prompt, or an unavailable/replaced file,
+defers registration until a later tick; definitive mismatches remain observed. This first-bind
+classification does not reclassify old Pending links, including the investigated sequence 122.
 
 Unseen-resume byte boundaries and existing resume Pending states have no automatic resolution
 policy. Hook publication time, elapsed time and EOF are not exact resume-position evidence.
@@ -1499,11 +1512,11 @@ Acceptance evidence below is the existing test source, not a new test execution:
   (`src/services/tui_o/writer/reclaim_tests.rs:373`, assertions `:393–416`) drives the adopted
   resume into Pending, checks one alarm, no posts and a retained spool, then selects the end of
   history and starts another writer; only the new `b out` is posted.
-- `successful_operator_append_survives_recovery_tail_truncation`
-  (`src/services/tui_o/store/ledger_lock_tests.rs:44`, assertions `:74–91`) overlaps recovery
-  with the operator append and verifies that a successful resolution survives the next recovery.
 
-[U] BoundaryPending has no alarm-clear hook; same-process health reconciliation remains an operational follow-up (`src/services/tui_o/alarm.rs:129–164`, `:317–333`; `src/services/tui_o/writer/mod.rs:179–188`).
+
+An operator resolution only appends `BoundaryResolved`. Verify the actual managed writer reopen,
+retained-output delivery and reconciled health; a successful CLI command alone does not apply
+the boundary or establish recovery.
 
 ## How to add a new invariant
 

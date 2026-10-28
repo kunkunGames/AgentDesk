@@ -379,10 +379,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, dispatch_id) = seed_run_holding_slot(&pool, "crash").await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
         assert_eq!(cancelled.dispatch_ids, vec![dispatch_id.clone()]);
 
         // --- the crash window itself ---------------------------------------
@@ -430,6 +433,8 @@ mod pg_tests {
             0,
             "a converged cleanup task must not be replayed again"
         );
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// Acceptance criterion: a failing `clear_sessions_for_dispatches_pg` must
@@ -443,10 +448,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, _dispatch_id) = seed_run_holding_slot(&pool, "retry").await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         sqlx::query("ALTER TABLE sessions RENAME TO sessions_hidden")
             .execute(&pool)
@@ -541,6 +549,8 @@ mod pg_tests {
                 .expect("count cleanup tasks"), // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
             0
         );
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// P2 fixture gap: run the slot-thread clearing branch with a health
@@ -553,10 +563,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, _dispatch_id) = seed_run_holding_slot(&pool, "registry").await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         let registry = std::sync::Arc::new(crate::services::discord::health::HealthRegistry::new());
         let outcome =
@@ -573,6 +586,8 @@ mod pg_tests {
         );
         assert_eq!(slot_assignment(&pool).await, None);
         assert_eq!(provider_session_ids(&pool).await, vec![None]);
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// A replay that arrives after the slot was handed to a different run must
@@ -583,9 +598,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, _dispatch_id) = seed_run_holding_slot(&pool, "aba").await;
 
-        cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-            .await
-            .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         // Another run takes the slot while the cleanup is still owed, and brings
         // its own live session on the same thread.
@@ -652,6 +671,8 @@ mod pg_tests {
             Some("claude-session-successor".to_string()),
             "the replay must not clear the successor run's slot-thread session"
         );
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     // ---------------------------------------------------------------------
@@ -687,8 +708,12 @@ mod pg_tests {
         .await
         .expect("hide cleanup task table"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
 
-        let failed =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel").await;
+        let failed = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await;
         assert!(
             failed.is_err(),
             "a cancel that cannot record its cleanup debt must fail loudly, got {failed:?}"
@@ -725,10 +750,13 @@ mod pg_tests {
             0,
             "a rolled-back cancel must not leave a cleanup row behind"
         );
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel after the cleanup table came back"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel after the cleanup table came back"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
         assert_eq!(cancelled.dispatch_ids, vec![dispatch_id.clone()]);
         assert_eq!(dispatch_status(&pool, &dispatch_id).await, "cancelled");
         assert!(
@@ -738,6 +766,8 @@ mod pg_tests {
         );
         assert_eq!(slot_assignment(&pool).await, None);
         assert_eq!(provider_session_ids(&pool).await, vec![None]);
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// **#5142 D-1 regression.** The slot release and the durable record of
@@ -761,10 +791,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, _dispatch_id) = seed_run_holding_slot(&pool, "atomicslots").await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         arm_released_slots_persist_failure(&pool).await;
         let outcome = drain_run_cleanup_task_by_id_pg(None, &pool, cancelled.cleanup_task_id).await;
@@ -823,6 +856,8 @@ mod pg_tests {
                 .expect("count cleanup tasks"), // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
             0
         );
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// **#5142 D-3.** Step 2 of the drain is a structural no-op, and this pins
@@ -840,10 +875,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, dispatch_id) = seed_run_holding_slot(&pool, "noop").await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
         assert_eq!(cancelled.dispatch_ids, vec![dispatch_id.clone()]);
 
         // The committed cancel already unbound the session from the dispatch...
@@ -881,6 +919,8 @@ mod pg_tests {
                 .completed
         );
         assert_eq!(provider_session_ids(&pool).await, vec![None]);
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// **#5142 D-4.** The health registry is not decoration: the slot-thread
@@ -912,10 +952,13 @@ mod pg_tests {
         let (run_id, _dispatch_id) =
             seed_run_holding_slot_on_thread(&pool, "runtime", RUNTIME_THREAD_ID).await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         let registry = std::sync::Arc::new(crate::services::discord::health::HealthRegistry::new());
         registry
@@ -946,6 +989,8 @@ mod pg_tests {
              cleared slot thread — passing None here silently drops the runtime \
              half of the cleanup"
         );
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// **#5142 D-2.** A task that can never succeed must stop occupying the head
@@ -969,9 +1014,13 @@ mod pg_tests {
         .expect("seed undecodable cleanup task"); // agentdesk-audit: allow-unwrap — test-only PostgreSQL fixture
 
         let (run_id, _dispatch_id) = seed_run_holding_slot(&pool, "poison").await;
-        cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-            .await
-            .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         let stats = replay_pending_run_cleanup_tasks_pg(None, &pool)
             .await
@@ -996,6 +1045,8 @@ mod pg_tests {
             .await
             .expect("replay after dead-lettering"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
         assert_eq!(after, RunCleanupReplayStats::default());
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// **#5142 D-2.** A task that keeps failing must be dead-lettered once it
@@ -1014,10 +1065,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, _dispatch_id) = seed_run_holding_slot(&pool, "cap").await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         // Fast-forward to the last attempt this task is entitled to.
         sqlx::query("UPDATE auto_queue_run_cleanup_tasks SET attempts = $1 WHERE id = $2")
@@ -1069,6 +1123,8 @@ mod pg_tests {
             1,
             "the dead-lettered row is retained for the operator"
         );
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// **#5142 D-6.** The inline post-commit drain and the tick replay sweep both
@@ -1080,10 +1136,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, _dispatch_id) = seed_run_holding_slot(&pool, "claim").await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         // Model the competing drainer: it holds a fresh claim on the row.
         sqlx::query(
@@ -1136,6 +1195,8 @@ mod pg_tests {
         assert_eq!(recovered.completed, 1);
         assert_eq!(slot_assignment(&pool).await, None);
         assert_eq!(provider_session_ids(&pool).await, vec![None]);
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     // ---------------------------------------------------------------------
@@ -1189,10 +1250,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, _dispatch_id) = seed_run_holding_slot(&pool, "deadletter").await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         // Nothing is parked yet, so the gauge must read zero — otherwise a
         // non-zero reading below would prove nothing.
@@ -1293,6 +1357,8 @@ mod pg_tests {
             "the gauge is a standing backlog, so it must survive the sweep that \
              found nothing to do"
         );
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// **The `!task.emitted` guard is what makes "never double-counting" true.**
@@ -1318,10 +1384,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, dispatch_id) = seed_run_holding_slot(&pool, "reemit").await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         // Without a pending emit the guard is vacuous and this test would pass
         // for the wrong reason.
@@ -1385,6 +1454,8 @@ mod pg_tests {
                 .expect("count cleanup tasks"), // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
             0
         );
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// **Round 3, P2-2 companion — and the test that pins step 1's ordering.**
@@ -1419,10 +1490,13 @@ mod pg_tests {
         let (run_id, dispatch_id) = seed_run_holding_slot(&pool, "markfail").await;
         let emits_before = emit_probe::emit_count(&dispatch_id);
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         // Reject the mark itself: any UPDATE that flips `emitted` to TRUE.
         sqlx::query(
@@ -1514,6 +1588,8 @@ mod pg_tests {
         );
         assert_eq!(slot_assignment(&pool).await, None);
         assert_eq!(provider_session_ids(&pool).await, vec![None]);
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     // ---------------------------------------------------------------------
@@ -1540,10 +1616,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, _dispatch_id) = seed_run_holding_slot(&pool, "delfail").await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         arm_cleanup_task_delete_failure(&pool).await;
         let outcome = drain_run_cleanup_task_by_id_pg(None, &pool, cancelled.cleanup_task_id).await;
@@ -1594,6 +1673,8 @@ mod pg_tests {
                 .expect("count cleanup tasks"), // agentdesk-audit: allow-unwrap — test-only PostgreSQL assertion
             0
         );
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// **The second bookkeeping write.** `dead_letter_task_pg` used to swallow
@@ -1654,6 +1735,8 @@ mod pg_tests {
         assert_eq!(stats.dead_lettered, 1);
         assert_eq!(stats.unrecorded_failures, 0);
         assert!(task_retry_state(&pool, poison_id).await.2);
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// **The third bookkeeping write.** `record_task_failure_pg` used to return a
@@ -1667,10 +1750,13 @@ mod pg_tests {
         let pool = pg_db.connect_and_migrate().await;
         let (run_id, _dispatch_id) = seed_run_holding_slot(&pool, "noattempt").await;
 
-        let cancelled =
-            cancel_live_dispatches_for_runs_pg(&pool, &[run_id.clone()], "auto_queue_cancel")
-                .await
-                .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
+        let cancelled = cancel_live_dispatches_for_runs_pg(
+            &pool,
+            std::slice::from_ref(&run_id),
+            "auto_queue_cancel",
+        )
+        .await
+        .expect("cancel run-owned dispatches"); // agentdesk-audit: allow-unwrap — production entrypoint assertion
 
         // Break a drain step, then break the bookkeeping that would record it.
         sqlx::query("ALTER TABLE sessions RENAME TO sessions_hidden")
@@ -1734,6 +1820,8 @@ mod pg_tests {
         assert_eq!(stats.unrecorded_failures, 0);
         assert_eq!(slot_assignment(&pool).await, None);
         assert_eq!(provider_session_ids(&pool).await, vec![None]);
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// #5357: NULL generations never enter replay. The card rollback and the
@@ -1809,6 +1897,8 @@ mod pg_tests {
                 "cancelled".to_string()
             )
         );
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// #5357: generation enrollment and row locking must be one operation.
@@ -2015,6 +2105,8 @@ mod pg_tests {
                 .await
                 .expect("load first NULL ABA cancellation card");
         assert_eq!(first_card, ("ready".to_string(), None));
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// The trigger fails specifically when the shared in-transaction rollback
@@ -2091,6 +2183,8 @@ mod pg_tests {
                 .await
                 .expect("count outbox rows after aborted cancel");
         assert_eq!(task_count, 0);
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     #[tokio::test]
@@ -2308,6 +2402,8 @@ mod pg_tests {
                 .await
                 .expect("count mixed-generation cleanup row after drain");
         assert_eq!(remaining, 0, "completed mixed row must be deleted");
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     #[tokio::test]

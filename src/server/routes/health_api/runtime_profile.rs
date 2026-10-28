@@ -1,49 +1,67 @@
 //! Runtime-profile health projection and gateway standby semantics.
 use super::*;
 
+mod managed_herdr;
+
 pub(super) fn attach_runtime_profile(json: &mut serde_json::Value, config: &crate::config::Config) {
     json["runtime_profile"] = serde_json::json!(config.cluster.runtime_profile);
     json["modules"] = serde_json::json!(config.cluster.runtime_profile.modules());
     json["dashboard_required"] =
         serde_json::json!(config.cluster.runtime_profile.modules().dashboard);
     json["herdr"] = herdr_health(config);
-    if let Some(homes) = crate::services::cluster::channel_home::health() {
-        json["channel_homes"] = homes;
-    }
 }
 
 /// The boot `session_hosts` view and the admission switch. No E7 runs here; `last_e7` is `never`
-/// until a launch records one. Admission is read only once a channel is configured.
-fn herdr_health(config: &crate::config::Config) -> serde_json::Value {
-    use crate::config::session_hosts::{BootSessionHosts, with_boot};
-    let view = |boot: &BootSessionHosts| {
-        let channels: Vec<String> = boot.channels().keys().map(u64::to_string).collect();
-        let admission = match channels.is_empty() {
-            true => "not_evaluated".to_string(),
-            false => match crate::services::herdr_admission::check() {
-                Ok(()) => "open".to_string(),
-                Err(cause) => format!("stopped({})", cause.as_str()),
-            },
+/// until the managed config upkeep reads one. Admission is read only once a channel is configured.
+pub(crate) fn herdr_health(config: &crate::config::Config) -> serde_json::Value {
+    use crate::config::session_hosts::{BootSessionHosts, with_boot, with_boot_migration};
+    with_boot_migration(|metadata| {
+        let view = |boot: &BootSessionHosts| {
+            let channels: Vec<String> = boot.channels().keys().map(u64::to_string).collect();
+            let admission = match channels.is_empty() {
+                true => "not_evaluated".to_string(),
+                false => match crate::services::herdr_admission::check() {
+                    Ok(()) => "open".to_string(),
+                    Err(cause) => format!("stopped({})", cause.as_str()),
+                },
+            };
+            let mut endpoints = serde_json::Map::new();
+            for (key, endpoint) in &boot.config().herdr.endpoints {
+                let node = endpoint.execution_node.trim();
+                let local = boot.local_node() == Some(node);
+                let mut entry =
+                    serde_json::json!({"node": node, "local": local, "last_e7": "never"});
+                managed_herdr::endpoint(key, &mut entry);
+                if endpoint.mode == crate::config::session_hosts::EndpointMode::UserDefault {
+                    entry["mode"] = "user_default".into();
+                    entry["socket"] = endpoint.socket_path.to_string_lossy().into_owned().into();
+                    entry["policy"] = crate::services::session_host::policy::diagnostics::snapshot(
+                        &endpoint.socket_path,
+                    );
+                }
+                endpoints.insert(key.clone(), entry);
+            }
+            let mut view = serde_json::json!({
+                "configured_channels": channels,
+                "admission": admission,
+                "endpoints": endpoints,
+                "restart_required": metadata.map_or(boot.config() != &config.session_hosts, |m| m.restart_required(config)),
+            });
+            if let Some(migration) = metadata.and_then(|m| m.migration()) {
+                view["migration_refused"] =
+                    (migration.reason == "session_hosts_migration_refused").into();
+                view["migration"] = serde_json::json!(migration);
+                view["candidate"] = serde_json::json!(metadata.map(|m| m.candidate()));
+                view["applied"] = serde_json::json!(boot.config());
+            }
+            managed_herdr::summarize(&mut view);
+            attach_local_herdr(&mut view);
+            view
         };
-        let mut endpoints = serde_json::Map::new();
-        for (key, endpoint) in &boot.config().herdr.endpoints {
-            let node = endpoint.execution_node.trim();
-            let local = boot.local_node() == Some(node);
-            let entry = serde_json::json!({"node": node, "local": local, "last_e7": "never"});
-            endpoints.insert(key.clone(), entry);
-        }
-        let mut view = serde_json::json!({
-            "configured_channels": channels,
-            "admission": admission,
-            "endpoints": endpoints,
-            "restart_required": *boot.config() != config.session_hosts,
-        });
-        attach_local_herdr(&mut view);
-        view
-    };
-    with_boot(|boot| match boot {
-        Some(boot) => view(boot),
-        None => view(&BootSessionHosts::default()),
+        with_boot(|boot| match boot {
+            Some(boot) => view(boot),
+            None => view(&BootSessionHosts::default()),
+        })
     })
 }
 
@@ -111,6 +129,34 @@ mod tests {
         health["herdr"].take()
     }
 
+    #[test]
+    fn health_exposes_user_default_proof_refusal_without_server_or_file_io() {
+        use crate::services::session_host::policy::{ProofCache, Unverified, diagnostics};
+        let _hosts = force_for_test(Some("worker"), &[(41, "worker")])
+            .with_mode(crate::config::session_hosts::EndpointMode::UserDefault);
+        diagnostics::record(
+            std::path::Path::new("/adk/herdr/agentdesk.sock"),
+            &ProofCache::default(),
+            &Err(Unverified::Identity),
+        );
+        let mut live = crate::config::Config::default();
+        live.session_hosts = with_boot(|b| b.unwrap().config().clone());
+        let view = herdr(&live);
+        let endpoint = &view["endpoints"]["worker-endpoint"];
+        assert_eq!(endpoint["mode"], "user_default");
+        assert_eq!(
+            endpoint["policy"]["next_restart_ready"], false,
+            "health_user_default_refusal_is_not_readiness_contract"
+        );
+        assert_eq!(endpoint["policy"]["startup_proof"], "unknown");
+        assert!(
+            endpoint["policy"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("Identity")
+        );
+    }
+
     // The health body shows the boot section as booted: nothing configured reads no admission,
     // a configured node shows its stopped switch and endpoints, and a live edit needs a restart.
     #[test]
@@ -140,36 +186,18 @@ mod tests {
         );
     }
 
-    // With no delegated home registered the body has no channel home key at all; a registered
-    // one shows its state and what its drain waits on, read from memory.
     #[test]
-    fn health_shows_channel_homes_only_once_one_is_registered() {
-        use crate::db::o_channel_homes::{HeldHome, HomeState};
-        use crate::services::cluster::channel_home::{self, HomeGate};
+    fn health_omits_retired_channel_home_status() {
         let config = crate::config::Config::default();
-        let mut quiet = json!({});
-        super::attach_runtime_profile(&mut quiet, &config);
-        assert_eq!(quiet.get("channel_homes"), None);
-
-        let home = std::sync::Arc::new(HomeGate::new("77", "mini"));
-        channel_home::register(std::sync::Arc::clone(&home));
         let mut health = json!({});
         super::attach_runtime_profile(&mut health, &config);
-        let lost = json!({"homes": [{"channel": "77", "holder": "mini", "home": "lost",
-            "epoch": null}], "home_draining": []});
-        assert_eq!(health["channel_homes"], lost);
-
-        let renewal = HeldHome::for_test("77", "mini", 5, HomeState::Reclaiming);
-        home.confirm(&renewal, tokio::time::Instant::now()).unwrap();
-        home.note_drain(Some("owed"));
-        super::attach_runtime_profile(&mut health, &config);
-        let draining = json!({"homes": [{"channel": "77", "holder": "mini", "home": "draining",
-            "epoch": 5}], "home_draining": [{"channel": "77", "blocker": "owed"}]});
-        assert_eq!(health["channel_homes"], draining);
-        channel_home::unregister("77");
-        let mut after = json!({});
-        super::attach_runtime_profile(&mut after, &config);
-        assert_eq!(after, quiet);
+        assert!(
+            health.get("channel_homes").is_none(),
+            "retired home diagnostics must stay absent"
+        );
+        assert!(health.get("runtime_profile").is_some());
+        assert!(health.get("modules").is_some());
+        assert!(health.get("herdr").is_some());
     }
 
     // A local endpoint adds the latest restart reconnect counts and the held inputs that pass

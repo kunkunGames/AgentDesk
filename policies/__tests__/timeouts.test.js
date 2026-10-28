@@ -402,27 +402,6 @@ test("timeouts failed-dispatch retry tolerates a dispatch create failure", () =>
   assert.match(state.logs.error[0], /Failed to create retry dispatch for card card-retry-2/);
 });
 
-test("timeouts review timeout module escalates overdue DoD waits", () => {
-  const { policy, state } = loadPolicy("policies/timeouts.js", {
-    dbQuery: createSqlRouter([
-      {
-        match: "WHERE status = ? AND review_status = 'awaiting_dod'",
-        result: [{ id: "card-dod-1" }]
-      }
-    ])
-  });
-
-  policy._section_D();
-
-  assert.deepEqual(state.manualInterventions, [
-    {
-      cardId: "card-dod-1",
-      reason: "DoD 대기 15분 초과",
-      options: { review: true }
-    }
-  ]);
-});
-
 test("timeouts review auto-accept module creates rework dispatches before transitioning", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
     dbQuery: createSqlRouter([
@@ -964,31 +943,16 @@ test("long turns do not register monitoring or page the deadlock manager", () =>
   assert.equal(state.executions.length, 0);
 });
 
-test("timeouts workspace branch guard module recovers wt branches", () => {
-  const workspace = "/tmp/agentdesk-main";
+test("workspace branch guard stays out of the 5min tick (startup guard owns it)", () => {
   const { policy, state } = loadPolicy("policies/timeouts.js", {
-    dbQuery: createSqlRouter([
-      {
-        match: "SELECT DISTINCT json_extract(metadata, '$.workspace') as ws FROM sessions",
-        result: [{ ws: workspace }]
-      },
-      { match: "SELECT DISTINCT workspace FROM agents WHERE workspace IS NOT NULL AND workspace != ''", result: [] }
-    ]),
-    exec(cmd, args) {
-      assert.equal(cmd, "git");
-      const parsed = JSON.parse(args);
-      if (parsed.includes("branch")) return "wt/feature-1\n";
-      return "";
+    exec(cmd) {
+      assert.fail("5min tick must not shell out to " + cmd);
     }
   });
-
-  policy._section_M();
-
-  assert.deepEqual(
-    state.execCalls.map((call) => JSON.parse(call.args)[2]),
-    ["branch", "stash", "checkout", "pull", "worktree"]
-  );
-  assert.equal(state.deadlockAlerts.length, 1);
+  assert.equal(policy._section_M, undefined);
+  for (const section of ["B", "G", "O"]) policy["_section_" + section] = () => {};
+  policy.onTick5min({});
+  assert.equal(state.execCalls.length, 0);
 });
 
 test("timeouts idle-kill module calls kill-tmux API for expired idle sessions", () => {

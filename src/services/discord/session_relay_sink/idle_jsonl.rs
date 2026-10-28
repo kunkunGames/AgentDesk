@@ -40,6 +40,7 @@ pub(super) enum IdleJsonlInflightGateDecision {
     DeferUntilCommitted,
 }
 
+#[cfg(test)]
 pub(super) fn idle_jsonl_should_retry_without_dedup_shared<T>(
     shared_for_dedup: Option<&T>,
 ) -> bool {
@@ -238,6 +239,8 @@ pub(super) struct IdleCursor {
     pub offset: u64,
     pub source: (ProviderKind, u64, String, SourceFileIdentity),
     pub first_restore: bool,
+    /// `relay_output_replacements` for the path when this cursor was created.
+    pub replacements: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -636,7 +639,7 @@ mod tests {
         .as_bytes();
         let start = 0u64;
         let end = payload.len() as u64;
-        let mut offset = start;
+        let offset = start;
         let mut duplicate_actor_offset = start;
         let mut session_init_seen = HashSet::new();
         let mut send_attempts = 0;

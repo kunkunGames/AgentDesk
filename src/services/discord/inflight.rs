@@ -16,18 +16,14 @@ pub(in crate::services::discord) use host_recovery_guard::keyed_tests::{
     seed_session_row, seed_session_row_hashed, seed_session_row_keyed,
 };
 pub(in crate::services::discord) use host_recovery_guard::{
-    KeyedTeardown, clear_channel_session, keyed_teardown, teardown_for_lookup, tmux_marker_is_known,
+    KeyedTeardown, clear_channel_session, keyed_teardown, teardown_for_lookup,
 };
 #[cfg(unix)]
 pub(in crate::services::discord) use host_recovery_guard::{marker_witness, with_inflight_row};
 #[cfg(test)]
 mod invariant_test_capture;
 mod model;
-#[cfg(test)]
 pub(crate) mod read_only_owner_snapshot;
-#[cfg(test)]
-#[path = "inflight/restart_mark_fence_tests.rs"]
-mod restart_mark_fence_tests;
 pub(in crate::services::discord) mod terminal_delivery_evidence_loss;
 // Re-export the domain model at its existing visibility for root and sibling callers.
 #[cfg(test)]
@@ -64,12 +60,11 @@ use circuit_removal::handoff_before_discard_locked;
 // is named nowhere outside `store` (it only flows as a return type), so it keeps
 // its module-tree visibility there without a parent re-export.
 pub(in crate::services::discord) use destructive_commit::{
-    CommitError, CommitEvidence, DestructiveCancelCommitOutcome, DestructiveCancelPinField,
-    commit_destructive_cancel_locked,
+    CommitEvidence, DestructiveCancelCommitOutcome, commit_destructive_cancel_locked,
 };
 pub(in crate::services::discord) use episode_guard::{
-    InflightEpisodeLockError, InflightEpisodePin, LockedInflightEpisode,
-    adopt_and_lock_inflight_episode, lock_inflight_episode,
+    InflightEpisodePin, LockedInflightEpisode, adopt_and_lock_inflight_episode,
+    lock_inflight_episode,
 };
 pub(in crate::services::discord) use managed_submission::{
     ManagedSubmission, SubmissionFailure, install_managed_submission_boundary,
@@ -77,6 +72,8 @@ pub(in crate::services::discord) use managed_submission::{
 #[cfg(test)]
 pub(in crate::services::discord) use managed_submission::{SubmissionPhase, fault};
 pub(in crate::services::discord) use store::InflightDeliveryRewindReason;
+#[cfg(test)]
+pub(in crate::services::discord) use store::boot_observation::Probe as SidecarAttemptProbe;
 use store::inflight_provider_dir;
 pub(in crate::services::discord) use store::inflight_state_path;
 pub(crate) use store::lock_inflight_state_path;
@@ -109,8 +106,7 @@ use self::rebind_reap::{reap_abandoned_rebind_origin_locked_in_root, rebind_orig
 use self::rebind_reap::{
     REBIND_ORIGIN_DEADLINE_SECS_DEFAULT, WatcherLiveness,
     ownerless_external_input_inflight_is_stale_at, proven_dead_from_signals,
-    reap_dead_watcher_rebind_origin_locked, reap_dead_watcher_rebind_origin_locked_in_root,
-    should_reap_dead_watcher_rebind_origin,
+    reap_dead_watcher_rebind_origin_locked_in_root, should_reap_dead_watcher_rebind_origin,
 };
 mod removal;
 #[cfg(test)]
@@ -129,10 +125,7 @@ use self::removal::{
 pub(in crate::services::discord) use self::removal::{
     load_channel_inflight_for_probe, load_inflight_states_for_probe_from_root,
 };
-use self::removal::{
-    load_inflight_probe_from_root_excluding, load_inflight_states_from_root,
-    load_inflight_states_from_root_excluding,
-};
+use self::removal::{load_inflight_probe_from_root_excluding, load_inflight_states_from_root};
 pub(super) use self::removal::{log_inflight_remove, log_inflight_remove_for_path};
 #[cfg(test)]
 pub(in crate::services::discord) use self::restart_mark::short_pass_event_for_test;
@@ -142,14 +135,14 @@ pub(in crate::services::discord) use self::restart_mark::{
 
 mod watcher_state;
 pub(in crate::services::discord) use self::watcher_state::{
-    WatcherProgressOutcome, WatcherRelayWatermarkOutcome, WatcherRelayWatermarkPatch,
-    WatcherStreamProgressPatch, WatcherTerminalCommitOutcome, WatcherTerminalCommitPatch,
+    WatcherProgressOutcome, WatcherRelayWatermarkPatch, WatcherStreamProgressPatch,
+    WatcherTerminalCommitOutcome, WatcherTerminalCommitPatch,
     commit_watcher_terminal_delivery_locked, persist_watcher_relay_watermark_locked,
     persist_watcher_stream_progress_locked,
 };
 #[cfg(test)]
 use self::watcher_state::{
-    commit_watcher_terminal_delivery_locked_in_root,
+    WatcherRelayWatermarkOutcome, commit_watcher_terminal_delivery_locked_in_root,
     persist_watcher_relay_watermark_locked_in_root, persist_watcher_stream_progress_locked_in_root,
 };
 
@@ -205,7 +198,8 @@ use self::store::{
 pub(super) use self::save_store::save_inflight_state;
 pub(super) use self::save_store::{
     CreateNewInflightError, save_inflight_delivery_rewind_if_matches_identity,
-    save_inflight_state_create_new, save_inflight_state_if_absent,
+    save_inflight_state_create_new, save_inflight_state_create_new_fenced,
+    save_inflight_state_if_absent,
 };
 pub(in crate::services::discord) use self::save_store::{
     GuardedSaveOutcome, StreamRelayAuthority, bind_recovery_anchor_for_snapshot,
@@ -270,7 +264,6 @@ use self::clear_store::normalize_response_sent_offset;
 use self::clear_store::{
     clear_inflight_state_if_matches_identity_after_delivery_in_root,
     clear_inflight_state_if_matches_identity_in_root,
-    clear_inflight_state_if_matches_identity_turn_nonce_in_root,
     clear_inflight_state_if_matches_tmux_response_in_root,
     clear_rebind_origin_inflight_state_if_matches_identity_in_root,
     refresh_inflight_last_offset_if_matches_identity_in_root,
@@ -289,7 +282,7 @@ use chrono::TimeZone;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::InflightRestartMode;
-use super::runtime_store::{atomic_write, discord_inflight_root};
+use super::runtime_store::{discord_inflight_root, sync_removed};
 use crate::dispatch::Source;
 use crate::services::agent_protocol::RuntimeHandoffKind;
 // #3552: short alias for the invariant-severity hint forwarded to observability.
@@ -536,7 +529,7 @@ pub(crate) fn remove_inflight_row_for_policy_op(path: &Path) -> PolicyOpRemoveOu
     if !path.exists() {
         return Outcome::Missing;
     }
-    let _lock = match store::try_lock_unfenced_inflight_state_path(path) {
+    let _lock = match store::try_lock_inflight_state_path_typed(path) {
         Ok(lock) => lock,
         Err(store::TryLockRefusal::Failed(error)) => return Outcome::Io(error),
         Err(_) => return Outcome::Busy,
@@ -554,7 +547,7 @@ pub(crate) fn remove_inflight_row_for_policy_op(path: &Path) -> PolicyOpRemoveOu
     }
     #[cfg(test)]
     policy_op_unlink_hook::before(path);
-    match fs::remove_file(path) {
+    match fs::remove_file(path).map(|()| sync_removed(path)) {
         Ok(()) => Outcome::Removed,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Outcome::Missing,
         Err(error) => Outcome::Io(error.to_string()),
@@ -789,7 +782,7 @@ fn set_inflight_restart_mode_under_lock(
         return Failed;
     }
     match serde_json::to_string_pretty(&state) {
-        Ok(json) if atomic_write(path, &json).is_ok() => Marked,
+        Ok(json) if store::publish_row(path, &json).is_ok() => Marked,
         _ => Failed,
     }
 }
@@ -857,39 +850,6 @@ pub(super) fn load_inflight_states(provider: &ProviderKind) -> Vec<InflightTurnS
         return Vec::new();
     };
     load_inflight_states_from_root(&root, provider)
-}
-
-pub(super) fn load_inflight_states_excluding(
-    provider: &ProviderKind,
-    exclude_channel: impl Fn(u64) -> bool,
-) -> Vec<InflightTurnState> {
-    let Some(root) = inflight_runtime_root() else {
-        return Vec::new();
-    };
-    load_inflight_states_from_root_excluding(&root, provider, exclude_channel)
-}
-
-#[cfg(test)]
-thread_local! {
-    pub(in crate::services::discord) static AFTER_EXCLUDING_SCAN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
-}
-
-pub(crate) fn latest_request_owner_user_id_for_channel(channel_id: u64) -> Option<u64> {
-    let providers = [
-        ProviderKind::Claude,
-        ProviderKind::Codex,
-        ProviderKind::Gemini,
-        ProviderKind::Qwen,
-        ProviderKind::Grok,
-        ProviderKind::Antigravity,
-    ];
-
-    providers
-        .iter()
-        .flat_map(load_inflight_states)
-        .filter(|state| state.channel_id == channel_id)
-        .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
-        .map(|state| state.request_owner_user_id)
 }
 
 /// #2448: explicit completion signal published from the turn_bridge
@@ -1283,7 +1243,7 @@ mod stall_recovery_tests {
             std::fs::create_dir_all(parent).expect("create provider dir");
         }
         let json = serde_json::to_string_pretty(state).expect("serialize state");
-        super::atomic_write(&path, &json).expect("force write state");
+        super::super::runtime_store::atomic_write(&path, &json).expect("force write state");
     }
 
     // ---- #3859: failure-path abandon-request (durable handoff, row deleted) ----

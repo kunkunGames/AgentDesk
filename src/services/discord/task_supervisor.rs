@@ -7,10 +7,10 @@ use std::sync::atomic::AtomicBool;
 use futures::FutureExt;
 
 use super::SharedData;
-#[cfg(all(test, unix))]
-#[path = "task_supervisor/n4d_spawn_observation_tests.rs"]
-pub(in crate::services::discord) mod n4d_spawn_observation;
 pub(in crate::services::discord) mod watcher_completion;
+#[cfg(all(test, unix))]
+#[path = "task_supervisor/watcher_spawn_observation_tests.rs"]
+pub(in crate::services::discord) mod watcher_spawn_observation;
 
 pub(in crate::services::discord) fn spawn_observed<F>(
     task_name: &'static str,
@@ -45,8 +45,9 @@ pub(in crate::services::discord) fn spawn_observed_tmux_watcher<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let future = Box::pin(future);
     #[cfg(all(test, unix))]
-    let observed = n4d_spawn_observation::submitted(&shared, &cancel);
+    let observed = watcher_spawn_observation::submitted(&shared, &cancel);
     #[cfg(all(test, unix))]
     let observed_task = observed.clone();
     let completion = watcher_completion::Registration::new(cancel.clone());
@@ -56,7 +57,21 @@ where
             tmux_session_name,
             cancel,
         };
-        let outcome = AssertUnwindSafe(future).catch_unwind().await;
+        let outcome = AssertUnwindSafe(async {
+            #[cfg(unix)]
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                super::recovery_engine::producer_resume::ensure(
+                    cleanup_guard.shared.clone(),
+                    cleanup_guard.tmux_session_name.clone(),
+                    cleanup_guard.cancel.clone(),
+                ),
+            )
+            .await;
+            future.await;
+        })
+        .catch_unwind()
+        .await;
         drop(cleanup_guard);
         let result = match outcome {
             Ok(()) => watcher_completion::Outcome::Returned,
@@ -66,11 +81,11 @@ where
             }
         };
         #[cfg(all(test, unix))]
-        n4d_spawn_observation::finished(&observed_task, result);
+        watcher_spawn_observation::finished(&observed_task, result);
         completion.finish(result);
     });
     #[cfg(all(test, unix))]
-    n4d_spawn_observation::attach(&observed, task.abort_handle());
+    watcher_spawn_observation::attach(&observed, task.abort_handle());
     task
 }
 
@@ -128,23 +143,44 @@ mod tests {
         }
     }
 
+    const TASK_SUPERVISOR: &str = include_str!("task_supervisor.rs");
+    const WRAPPER: &str = "pub(in crate::services::discord) fn spawn_observed_tmux_watcher<F>(";
+    const CLEANUP: &str = "\n        drop(cleanup_guard);";
+    const COMPLETION: &str = "\n        completion.finish(";
+
+    /// Classification 2: inside the wrapper item, comments excluded, the statement-level
+    /// cleanup drop precedes completion. A lexical tripwire, not an execution-order proof.
+    fn cleanup_order_gaps(source: &str) -> Vec<String> {
+        use crate::services::discord::router::source_guard_support::Lexed;
+        let Some(wrapper) = Lexed::new(source).block(WRAPPER) else {
+            return vec![format!("missing {WRAPPER}")];
+        };
+        match (wrapper.find(CLEANUP), wrapper.find(COMPLETION)) {
+            (Some(drop_at), Some(finish_at)) if drop_at < finish_at => Vec::new(),
+            found => vec![format!("cleanup drop → completion broken: {found:?}")],
+        }
+    }
+
     #[test]
     fn watcher_wrapper_textually_drops_cleanup_before_completion() {
-        // Lexical tripwire only: bounded to the wrapper, not an execution-order
-        // proof or a Rust parser. Comments/strings are not stripped.
-        let source = include_str!("task_supervisor.rs");
-        let (_, wrapper) = source
-            .split_once("pub(in crate::services::discord) fn spawn_observed_tmux_watcher<F>(")
-            .expect("watcher wrapper exists");
-        let (wrapper, _) = wrapper
-            .split_once("\nstruct TmuxWatcherTaskGuard {")
-            .expect("watcher wrapper has its next symbol boundary");
-        let cleanup = wrapper.find("\n        drop(cleanup_guard);");
-        let completion = wrapper.find("\n        completion.finish(");
-        assert!(
-            matches!((cleanup, completion), (Some(drop_at), Some(finish_at)) if drop_at < finish_at),
-            "wrapper must explicitly drop cleanup_guard before completion.finish"
-        );
+        assert_eq!(cleanup_order_gaps(TASK_SUPERVISOR), Vec::<String>::new());
+    }
+
+    #[test]
+    fn cleanup_order_guard_rejects_commented_and_reordered_steps() {
+        use crate::services::discord::router::source_guard_support::{forge, swap};
+        use crate::test_support::CommentForgery;
+        for needle in [WRAPPER, CLEANUP.trim_start(), COMPLETION.trim_start()] {
+            for forgery in CommentForgery::ALL {
+                let forged = forge(TASK_SUPERVISOR, needle, forgery);
+                assert!(
+                    !cleanup_order_gaps(&forged).is_empty(),
+                    "{forgery:?} commented `{needle}` still passes"
+                );
+            }
+        }
+        let finish_first = swap(TASK_SUPERVISOR, CLEANUP, COMPLETION);
+        assert!(!cleanup_order_gaps(&finish_first).is_empty());
     }
 
     // This runtime check observes cleanup after ACK, but on current_thread it

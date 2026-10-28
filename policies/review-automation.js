@@ -151,13 +151,6 @@ var reviewAutomation = {
       return;
     }
 
-    // #128: If card entered review with awaiting_dod (DoD incomplete),
-    // skip review dispatch — timeouts.js [D] will escalate to dilemma_pending after 15 min
-    if (card.review_status === "awaiting_dod") {
-      agentdesk.log.info("[review] Card " + card.id + " is awaiting_dod — skipping review dispatch");
-      return;
-    }
-
     // Check if review is enabled — if not, complete immediately
     var reviewEnabled = agentdesk.config.get("review_enabled");
     if (disposition === "unmanaged" && (reviewEnabled === "false" || reviewEnabled === false)) {
@@ -736,7 +729,7 @@ function loadLatestCompletedWorkDispatch(cardId) {
     "WHERE kanban_card_id = ? " +
     "AND dispatch_type IN ('implementation', 'rework') " +
     "AND status = 'completed' " +
-    "ORDER BY COALESCE(completed_at, updated_at) DESC, rowid DESC LIMIT 1",
+    "ORDER BY COALESCE(completed_at, updated_at) DESC, created_at DESC, id DESC LIMIT 1",
     [cardId]
   );
   if (rows.length === 0) return null;
@@ -1359,7 +1352,7 @@ function loadLatestReviewDispatchContext(cardId, dispatchId) {
     "SELECT context, status FROM task_dispatches " +
     "WHERE kanban_card_id = ? AND dispatch_type = 'review' " +
     "ORDER BY CASE WHEN status IN ('pending', 'dispatched') THEN 0 ELSE 1 END ASC, " +
-    "COALESCE(completed_at, updated_at, created_at) DESC, rowid DESC LIMIT 10",
+    "COALESCE(completed_at, updated_at, created_at) DESC, created_at DESC, id DESC LIMIT 10",
     [cardId]
   );
   if (rows.length === 0) return {};
@@ -1395,8 +1388,8 @@ function advanceReviewStage(cardId, cardInfo) {
   var stages;
   if (cardInfo.pipeline_stage_id) {
     var current = agentdesk.db.query(
-      "SELECT stage_order FROM pipeline_stages WHERE id = ?",
-      [cardInfo.pipeline_stage_id]
+      "SELECT stage_order FROM pipeline_stages WHERE id::text = ?",
+      [String(cardInfo.pipeline_stage_id)]
     );
     if (current.length === 0) return { status: "missing", stage: null };
     stages = agentdesk.db.query(
@@ -1463,7 +1456,7 @@ function processVerdict(cardId, verdict, result, options) {
     // #2051 Finding 12 (P2): the two state-syncs below execute in separate
     // bridge calls (each commits its own SQL transaction). A throw from one
     // used to leave the card with `review_status = NULL` but
-    // `card_review_state = reviewing`, which confused timeouts.js [D] /
+    // `card_review_state = reviewing`, which confused the timeouts.js
     // review auto-accept paths. Wrap each call so we (1) emit a structured
     // warning when only one half succeeds, and (2) attempt a best-effort
     // re-sync so subsequent ticks see a consistent state. A true 2-table
@@ -1735,17 +1728,20 @@ function processVerdict(cardId, verdict, result, options) {
       repeatedFindings = findingsSimilar(prevNotes, newNotes);
     }
 
-    // Guard: empty notes on non-pass verdict — similarity check is blind.
-    // If consecutive rounds have no notes, escalate — the review loop cannot
-    // self-correct without feedback data.
-    // #118: Check actual prior-round notes from review_tuning_outcomes to detect
-    // truly consecutive empty notes (review_notes field persists old values).
+    // Empty notes blind the similarity check: escalate when the previous review dispatch's
+    // result also had no notes/feedback (review_notes keeps stale values).
     if (!newNotes && currentRound >= 2 && (verdict === "improve" || verdict === "reject")) {
-      var priorRoundNotes = agentdesk.db.query(
-        "SELECT notes FROM kanban_reviews WHERE card_id = ? AND round = ? ORDER BY created_at DESC LIMIT 1",
-        [cardId, currentRound - 1]
+      var priorReviewRows = agentdesk.db.query(
+        "SELECT result FROM task_dispatches " +
+        "WHERE kanban_card_id = ? AND dispatch_type = 'review' AND status = 'completed' AND id <> ? " +
+        "ORDER BY COALESCE(completed_at, updated_at, created_at) DESC, created_at DESC, id DESC LIMIT 1",
+        [cardId, opts.review_dispatch_id || ""]
       );
-      var priorEmpty = priorRoundNotes.length === 0 || !priorRoundNotes[0].notes;
+      var priorResult = priorReviewRows.length > 0 ? parseJsonObject(priorReviewRows[0].result) : null;
+      var priorVerdict = priorResult ? (priorResult.verdict || priorResult.decision || null) : null;
+      var priorEmpty = !priorResult ||
+        (priorVerdict !== "pass" && priorVerdict !== "approved" &&
+          !(priorResult.notes || priorResult.feedback));
       if (priorEmpty) {
         agentdesk.log.warn("[review] #118 Empty notes for 2+ consecutive improve/reject rounds on " + cardId + " — escalating to PM");
         escalateToManualIntervention(cardId, "리뷰 피드백 없이 2회 이상 연속 " + verdict + " — 유사성 검사 불가, PM 판단 필요", {

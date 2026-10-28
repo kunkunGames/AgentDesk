@@ -5,10 +5,6 @@
 //! delivery lease commits, terminal-controller cutover, voice completion,
 //! TUI completion gate, dispatch completion/fail, watcher-delivered mark,
 //! `tv_done`, and terminal status readiness.
-
-use std::sync::Arc;
-
-use super::intake_settlement;
 use super::output_lifecycle::BridgeOutputOwner;
 use super::stream_tick::{
     LongRunningPlaceholderActive, PendingLongRunningOpenAfterStateSave,
@@ -32,15 +28,19 @@ use delivery_epilogue::{
 use empty_response_recovery::{
     EmptyResponseRecoveryContext, EmptyResponseRecoveryMessage, EmptyResponseRecoveryState,
 };
+#[cfg(test)]
+pub(in crate::services::discord) use foreign_terminal_handoff::custody_test_adapter;
 use recovery_retry::{
     RecoveryRetryContext, RecoveryRetryMessage, RecoveryRetryOutcome, RecoveryRetryState,
     handle_recovery_retry,
 };
+use std::sync::Arc;
 #[cfg(unix)]
 pub(super) use stream_loop::types::PinnedTerminalTransport;
 
 mod busy_followup_retry;
 mod cancel_prompt_replace;
+mod completion_proof;
 mod contracts;
 mod delivery_epilogue;
 #[cfg(test)]
@@ -58,16 +58,44 @@ use terminal_controller_cutover::{bridge_body_claim, bridge_o_body_peek_decision
 
 const TERMINAL_DELIVERY_LOG_TARGET: &str = module_path!();
 
+fn record_delivered_input(provider: &ProviderKind, channel: ChannelId, input: &InflightTurnState) {
+    if input.user_msg_id == 0
+        || super::super::is_synthetic_headless_message_id_raw(input.user_msg_id)
+    {
+        return;
+    }
+    super::super::outbound::completed_turn_ledger::append_completed_episode(
+        provider,
+        channel.get(),
+        input.user_msg_id,
+        input
+            .turn_nonce
+            .as_deref()
+            .filter(|nonce| !nonce.is_empty()),
+    );
+}
+
 pub(super) async fn run_terminal_outcome_delivery(
     ctx: TerminalOutcomeDeliveryContext,
     mut state: TerminalOutcomeDeliveryState,
 ) -> TerminalOutcomeDeliveryOutput {
+    #[cfg(unix)]
+    if !ctx.cancelled && !ctx.transport_error && !ctx.is_prompt_too_long && !ctx.recovery_retry {
+        let mut captured = state.inflight_state.clone();
+        captured.full_response = state.full_response.clone();
+        #[cfg(unix)]
+        super::super::outbound::completed_turn_ledger::o_pending::capture(
+            &state.provider,
+            &captured,
+        )
+        .await;
+    }
     let claude_tui_followup_busy_readiness_timeout =
         bridge_claude_tui_followup_busy_readiness_timeout(
             &state.provider,
             state.inflight_state.runtime_kind,
             ctx.tui_error_classification,
-        );
+        ) || completion_proof::waiting(&state.inflight_state).is_some();
     let (receipt_disposition, mut preserve_inflight_for_cleanup_retry, mut terminal_outcome) =
         foreign_terminal_handoff::prepare_receipt_disposition(
             &ctx,
@@ -150,6 +178,7 @@ pub(super) async fn run_terminal_outcome_delivery(
     let (mut claude_tui_busy_requeue_pending, mut auto_retry) = (false, AutoRetry::default());
     let mut busy_requeue_outcome = None;
     let (mut terminal_delivery_committed, mut terminal_body_visible) = (false, false);
+    let mut provider_failure = false;
     let mut status_panel_terminal_committed = false;
     let mut completion_footer_terminal_text: Option<String> = None;
     // #2161 (Codex round-2 H1): hoisted into the outer scope so the
@@ -370,11 +399,30 @@ pub(super) async fn run_terminal_outcome_delivery(
         // Ownership is only read here; each Legacy arm below claims at its own transport.
         let direct = can_deliver_directly;
         let o_body_cut = bridge_o_body_peek_decision(channel_id, &inflight_state, direct);
+        provider_failure = status_panel::provider_failure::is_provider_failure_turn(
+            transport_error,
+            resume_failure_detected,
+            busy_requeue_outcome.is_some() || claude_tui_followup_pre_submit_requeue_candidate,
+            inflight_state.silent_turn,
+            &full_response,
+        );
+        // O posts native answers; the bridge still shows its failure and empty-response notices.
+        // These notices are chrome and send without an answer claim.
+        let o_notice = (provider_failure || terminal_empty_response_notice.is_some())
+            && direct
+            && o_body_cut == Ok(true);
+        if o_notice && provider_failure {
+            delivery_response = full_response.clone();
+        }
         // An empty-response notice or TUI chrome is no answer, so it sends without a claim.
-        let answerless = no_answer(&full_response, response_sent_offset, &delivery_response);
-        let body_claim =
-            (!answerless).then(|| bridge_body_claim(channel_id, &inflight_state, direct));
-        if o_body_cut.is_err() || silent_turn_handled {
+        let answerless =
+            o_notice || no_answer(&full_response, response_sent_offset, &delivery_response);
+        let preparation_wait = completion_proof::waiting(&inflight_state).is_some();
+        let body_claim = (!answerless && !preparation_wait)
+            .then(|| bridge_body_claim(channel_id, &inflight_state, direct));
+        if preparation_wait {
+            // The non-turn outbox owns the waiting notice; it commits no answer or footer.
+        } else if o_body_cut.is_err() || silent_turn_handled {
             preserve_inflight_for_cleanup_retry |= o_body_cut.is_err();
         } else if delivery_response.trim().is_empty() {
             if empty_sink_commits_fully_consumed_response(&full_response, response_sent_offset) {
@@ -411,7 +459,7 @@ pub(super) async fn run_terminal_outcome_delivery(
                 inflight_state.turn_start_offset,
             )
             .format_and_prefix(response_sent_offset == 0, &delivery_response);
-            if o_body_cut == Ok(true) {
+            if o_body_cut == Ok(true) && !o_notice {
                 let _ = gateway.delete_message(channel_id, current_msg_id).await;
                 (terminal_delivery_committed, terminal_body_visible) = (true, true);
             } else if can_deliver_directly {
@@ -696,6 +744,13 @@ pub(super) async fn run_terminal_outcome_delivery(
                                     replace_committed
                                 } else {
                                     // NoRange: no new bytes, so no lease and no advance.
+                                    if replace_committed || fallback_delivered {
+                                        record_delivered_input(
+                                            &provider,
+                                            channel_id,
+                                            &inflight_state,
+                                        );
+                                    }
                                     replace_committed
                                 };
                                 if outcome {
@@ -734,6 +789,12 @@ pub(super) async fn run_terminal_outcome_delivery(
                     );
                 let delivery_outcome =
                     enqueue_claimed_headless_delivery(body_claim, delivery_arguments).await;
+                if matches!(
+                    delivery_outcome,
+                    super::headless_delivery::HeadlessDeliveryOutcome::Delivered
+                ) {
+                    record_delivered_input(&provider, channel_id, &inflight_state);
+                }
                 match super::headless_delivery::headless_delivery_disposition(&delivery_outcome) {
                     super::headless_delivery::HeadlessDeliveryDisposition::Commit => {
                         cleanup_headless_streaming_placeholder_after_delivery(
@@ -794,6 +855,7 @@ pub(super) async fn run_terminal_outcome_delivery(
                 cancelled,
                 is_prompt_too_long,
                 transport_error,
+                provider_failure,
                 recovery_retry,
                 resume_failure_detected,
                 busy_attempt_cost,
@@ -825,29 +887,8 @@ pub(super) async fn run_terminal_outcome_delivery(
     }
     // A terminal answer without a busy requeue unties the card so no later turn edits it; any
     // spent retries stay with the input.
-    if busy_requeue_outcome.is_none() {
+    if busy_requeue_outcome.is_none() && completion_proof::waiting(&inflight_state).is_none() {
         super::busy_followup_retry_store::release_notice(&provider, channel_id, &inflight_state);
-    }
-    // Consume, rather than re-sample, the stamp snapshot under the
-    // `SettlementCapabilities` contract.
-    // A failure of both delivery sinks is not a no-body success settlement.
-    if !matches!(
-        terminal_outcome,
-        TerminalOutcomeDeliveryOutcome::Unresolved { .. }
-    ) {
-        intake_settlement::settle_intake_row_at_bridge_exit(
-            &shared_owned,
-            &inflight_state,
-            intake_settlement::classify(
-                terminal_delivery_committed,
-                status_panel_terminal_committed,
-                preserve_inflight_for_cleanup_retry,
-                bridge_skip_holder_owns_inflight,
-                bridge_output_owner.is_some(),
-            ),
-            inflight_state.intake_delivery_capabilities(),
-        )
-        .await;
     }
     TerminalOutcomeDeliveryOutput {
         outcome: terminal_outcome,
@@ -863,6 +904,7 @@ pub(super) async fn run_terminal_outcome_delivery(
         new_session_id,
         new_raw_provider_session_id,
         full_response,
+        provider_failure,
         active_background_child_session_ids,
         pending_long_running_open_after_state_save,
         pending_long_running_retarget_after_state_save,

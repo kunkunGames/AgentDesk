@@ -12,7 +12,6 @@ mod stale_busy_identity;
 
 use super::host_teardown_gate::shared_teardown;
 use super::inflight::KeyedTeardown;
-use super::input_runtime::fence::{BootTarget, boot_skip};
 use crate::services::platform::tmux::PaneLiveness;
 use crate::services::provider::{ProviderKind, parse_provider_and_channel_from_tmux_name};
 use crate::services::session_host::HostLiveness;
@@ -31,21 +30,6 @@ use stale_busy_identity::{
     stale_busy_turn_is_still_reapable,
 };
 
-macro_rules! input_boundary {
-    ($stage:literal, $name:expr) => {
-        #[cfg(all(test, unix))]
-        host_guard_tests::boundary($stage, $name).await;
-    };
-}
-macro_rules! input_guard {
-    ($target:expr, $exit:expr, $stage:literal, $name:expr) => {
-        input_boundary!($stage, $name);
-        if boot_skip($target) {
-            $exit
-        }
-    };
-}
-
 /// Self-heal one busy mailbox whose managed tmux session may have been killed
 /// before emitting a terminal result. Returns true only when the observed turn
 /// no longer owns the mailbox after the identity-guarded finalizer submission,
@@ -59,16 +43,6 @@ async fn heal_stale_busy_mailbox_with_probe(
     probe: &(dyn Fn(String) -> BoxFuture<'static, bool> + Send + Sync),
     host_gate: &HostGate,
 ) -> bool {
-    // Both the intake heal and the periodic reaper enter here before any probe or finalize.
-    let site = if respect_watcher_authority {
-        "periodic_stale_busy_reaper"
-    } else {
-        "intake_stale_busy_heal"
-    };
-    if super::health::legacy_supervision::legacy_retired(provider.as_str(), channel_id.get(), site)
-    {
-        return false;
-    }
     let Ok(_recovery) = super::live_bridge::try_recovery(provider, channel_id.get()) else {
         return false;
     };
@@ -149,12 +123,6 @@ async fn heal_stale_busy_mailbox_with_probe(
             .is_none_or(|actor| !Arc::ptr_eq(actor, observed_actor))
         || !stale_busy_mailbox_start_is_expired(shared, channel_id, &current)
         || (respect_watcher_authority && shared.tmux_watchers.contains_key(&channel_id))
-    {
-        return false;
-    }
-
-    // Retirement can land during the mailbox, host or final tmux probe await.
-    if super::health::legacy_supervision::legacy_retired(provider.as_str(), channel_id.get(), site)
     {
         return false;
     }
@@ -251,10 +219,6 @@ async fn reap_stale_busy_mailboxes(shared: &Arc<SharedData>) {
 /// Kill orphan tmux sessions (AgentDesk-*) that don't map to any known channel.
 /// Called after restore_tmux_watchers to clean up sessions from renamed/deleted channels.
 pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
-    // Bound Legacy orphans also wait until the last input protection releases.
-    if boot_skip(BootTarget::Unknown) {
-        return;
-    }
     let output = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::task::spawn_blocking(crate::services::platform::tmux::list_session_names),
@@ -270,10 +234,6 @@ pub(super) async fn cleanup_orphan_tmux_sessions(shared: &Arc<SharedData>) {
 /// Cleans the unowned sessions among `output`. An orphan has no channel, so no inflight
 /// row names it; its sessions row and `.host_kind` marker still go to the host guard.
 async fn clean_orphan_sessions(shared: &Arc<SharedData>, output: &[String]) {
-    if boot_skip(BootTarget::Unknown) {
-        return;
-    }
-    input_boundary!("orphan_scan_start", "");
     let provider = shared.settings.read().await.provider.clone();
     let current_owner_marker = current_tmux_owner_marker();
     let mut protected_dispatch_orphans = Vec::new();
@@ -306,28 +266,6 @@ async fn clean_orphan_sessions(shared: &Arc<SharedData>, output: &[String]) {
             let has_owner = owned_sessions.contains(session_name);
 
             if !has_owner {
-                if crate::services::tmux_common::read_tmux_channel_binding(session_name)
-                    .is_some_and(|channel| {
-                        super::health::legacy_supervision::is_retired(provider.as_str(), channel)
-                            && crate::services::tmux_common::resolve_tmux_runtime_kind_marker(
-                                session_name,
-                            )
-                            .is_some_and(|kind| match provider {
-                                ProviderKind::Claude => kind
-                                    == crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
-                                ProviderKind::Codex => kind
-                                    == crate::services::agent_protocol::RuntimeHandoffKind::CodexTui,
-                                _ => false,
-                            })
-                    })
-                {
-                    continue;
-                }
-                input_boundary!("orphan_scan", session_name);
-                // A binding alone cannot settle an unowned session's channel identity.
-                if boot_skip(BootTarget::Unknown) {
-                    continue;
-                }
                 let parsed_channel_name = parse_provider_and_channel_from_tmux_name(session_name)
                     .as_ref()
                     .map(|(_, ch_name)| ch_name.clone());
@@ -341,9 +279,7 @@ async fn clean_orphan_sessions(shared: &Arc<SharedData>, output: &[String]) {
 
                 let caller = "orphan_cleanup";
                 let teardown = shared_teardown(shared, &provider, 0, session_name, None, caller);
-                input_boundary!("orphan_host_start", session_name);
                 let teardown = teardown.await;
-                input_guard!(BootTarget::Unknown, continue, "orphan_host", session_name);
                 if matches!(teardown, KeyedTeardown::Kept) {
                     continue;
                 }
@@ -353,9 +289,7 @@ async fn clean_orphan_sessions(shared: &Arc<SharedData>, output: &[String]) {
                 // data.sessions (recover_orphan_pending_dispatches runs AFTER this).
                 // A tmux pane with a running process is proof the session is in use;
                 // a failed probe is not proof of death either.
-                input_boundary!("orphan_pane_start", session_name);
                 let pane = probe_tmux_session_pane_liveness(session_name).await;
-                input_guard!(BootTarget::Unknown, continue, "orphan_pane", session_name);
                 if pane != PaneLiveness::DeadOrAbsent {
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     tracing::info!("  [{ts}]   skipped orphan (live pane): {}", session_name);
@@ -371,7 +305,6 @@ async fn clean_orphan_sessions(shared: &Arc<SharedData>, output: &[String]) {
                     continue;
                 }
 
-                input_boundary!("orphan_dispatch", session_name);
                 if let Some(protection) = super::tmux_lifecycle::resolve_dispatch_tmux_protection(
                     shared.pg_pool.as_ref(),
                     &shared.token_hash,
@@ -406,8 +339,6 @@ async fn clean_orphan_sessions(shared: &Arc<SharedData>, output: &[String]) {
     };
 
     for (session_name, protection) in &protected_dispatch_orphans {
-        input_guard!(BootTarget::Unknown, continue, "orphan_fail", session_name);
-        input_boundary!("orphan_fail_start", session_name);
         if super::tmux_lifecycle::fail_active_dispatch_for_dead_tmux_session(
             shared.api_port,
             protection,
@@ -436,7 +367,6 @@ async fn clean_orphan_sessions(shared: &Arc<SharedData>, output: &[String]) {
     );
 
     for (name, teardown) in &orphans {
-        input_guard!(BootTarget::Unknown, continue, "orphan_before_kill", name);
         let name_clone = name.clone();
         let killed = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -452,7 +382,6 @@ async fn clean_orphan_sessions(shared: &Arc<SharedData>, output: &[String]) {
         .unwrap_or(Ok(false))
         .unwrap_or(false);
 
-        input_guard!(BootTarget::Unknown, continue, "orphan_kill", name);
         if killed {
             tracing::info!("  [{ts}]   killed orphan: {}", name);
             // Clean both persistent and legacy temp files.
@@ -554,10 +483,6 @@ async fn reap_listed_dead_sessions(shared: &Arc<SharedData>, output: &[String]) 
             }
             continue;
         };
-        let input_target = || BootTarget::Channel(&provider, channel_id.get());
-        if boot_skip(input_target()) {
-            continue;
-        }
 
         // If a watcher is attached, tmux liveness is the termination authority:
         // the watcher observes pane death, clears the registry, and applies the
@@ -578,8 +503,6 @@ async fn reap_listed_dead_sessions(shared: &Arc<SharedData>, output: &[String]) 
             continue;
         }
 
-        input_guard!(input_target(), continue, "mapped_host", session_name);
-        input_boundary!("mapped_dispatch", session_name);
         if let Some(protection) = super::tmux_lifecycle::resolve_dispatch_tmux_protection(
             shared.pg_pool.as_ref(),
             &shared.token_hash,
@@ -611,9 +534,6 @@ async fn reap_listed_dead_sessions(shared: &Arc<SharedData>, output: &[String]) 
             }
         }
 
-        if boot_skip(input_target()) {
-            continue;
-        }
         // Dead session with no watcher — report idle to DB and kill
         let tmux_name =
             provider.build_tmux_session_name(channel_name.as_deref().unwrap_or("unknown"));
@@ -663,7 +583,6 @@ async fn reap_listed_dead_sessions(shared: &Arc<SharedData>, output: &[String]) 
             .await;
         }
 
-        input_guard!(input_target(), continue, "mapped_row", session_name);
         if is_unified_active {
             // Don't kill unified-thread sessions — they'll be reused
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -750,10 +669,6 @@ async fn reap_fresh_routine_orphan(
     session_name: &str,
     routine_id: &str,
 ) -> bool {
-    if boot_skip(BootTarget::Unknown) {
-        return false;
-    }
-    input_boundary!("fresh_reread_start", session_name);
     let Some(pool) = shared.pg_pool.as_ref() else {
         return false;
     };
@@ -772,34 +687,14 @@ async fn reap_fresh_routine_orphan(
         }
     };
 
-    input_guard!(
-        BootTarget::Unknown,
-        return false,
-        "fresh_reread",
-        session_name
-    );
-    input_boundary!("fresh_host_start", session_name);
     let teardown = routine_teardown(shared, pool, provider, routine_id, session_name).await;
-    input_guard!(
-        BootTarget::Unknown,
-        return false,
-        "fresh_host",
-        session_name
-    );
     if matches!(teardown, KeyedTeardown::Kept) {
         return false;
     }
 
     // Re-probe pane liveness as a three-state answer: a transient probe failure
     // must NOT be mistaken for death (treated as "unknown ⇒ preserve").
-    input_boundary!("fresh_pane_start", session_name);
     let pane = probe_tmux_session_pane_liveness(session_name).await;
-    input_guard!(
-        BootTarget::Unknown,
-        return false,
-        "fresh_pane",
-        session_name
-    );
 
     if let Err(reason) =
         crate::services::routines::fresh_session_reaper::revalidate_fresh_orphan_before_kill(
@@ -814,7 +709,6 @@ async fn reap_fresh_routine_orphan(
         return false;
     }
 
-    input_boundary!("fresh_before_kill", session_name);
     let name = session_name.to_string();
     let killed = tokio::time::timeout(
         std::time::Duration::from_secs(10),
@@ -833,12 +727,6 @@ async fn reap_fresh_routine_orphan(
     .unwrap_or(Ok(false))
     .unwrap_or(false);
 
-    input_guard!(
-        BootTarget::Unknown,
-        return killed,
-        "fresh_kill",
-        session_name
-    );
     if killed {
         match &teardown {
             KeyedTeardown::Cleared(session) => {
@@ -1078,9 +966,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_busy_finalize_uses_identity_gate_and_returns_global_slot() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -1132,9 +1018,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_busy_finalize_cannot_release_newer_mailbox_identity() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -1188,9 +1072,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn periodic_reaper_preserves_live_turn_for_role_override_provider() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
         let config_dir = root.path().join("config");
@@ -1923,9 +1805,7 @@ agents:
     /// probing the reconstructed name instead finds it dead → false-finalize.
     #[tokio::test(flavor = "current_thread")]
     async fn periodic_reaper_probes_recorded_routine_session_not_reconstructed_name() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
 
@@ -2035,9 +1915,7 @@ agents:
     /// falling back to the reconstructed dead name here would finalize the turn.
     #[tokio::test(flavor = "current_thread")]
     async fn periodic_reaper_skips_when_recorded_session_name_is_absent() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
 
@@ -2275,53 +2153,6 @@ agents:
             .await
             .active_user_message_id
             .is_some()
-    }
-
-    /// Both stale-busy entries (intake heal and periodic reaper) leave a retired channel's
-    /// busy turn alone while finalizing Legacy channels whose session is dead.
-    #[tokio::test(flavor = "current_thread")]
-    async fn stale_busy_heal_and_reaper_skip_retired_channel() {
-        use crate::services::discord::health::legacy_supervision::RetiredForTest;
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let root = tempfile::tempdir().expect("runtime root");
-        let _root = RuntimeRootGuard::set(root.path());
-        let shared = crate::services::discord::make_shared_data_for_tests();
-        shared.settings.write().await.provider = ProviderKind::Claude;
-        let (retired, intake, periodic) = (6_325_402_001u64, 6_325_402_002u64, 6_325_402_003u64);
-        let retired_token = seed_busy_channel(&shared, retired).await;
-        seed_busy_channel(&shared, intake).await;
-        seed_busy_channel(&shared, periodic).await;
-        shared.restart.global_active.store(3, Ordering::Relaxed);
-        let _retired = RetiredForTest::new("claude", retired);
-        let probe = |_: String| -> BoxFuture<'static, bool> { Box::pin(async { false }) };
-        let heal = |channel: u64| {
-            super::heal_stale_busy_mailbox_with_probe(
-                &shared,
-                &ProviderKind::Claude,
-                ChannelId::new(channel),
-                "intake",
-                false,
-                &probe,
-                &admit_any_host,
-            )
-        };
-
-        assert!(
-            !heal(retired).await,
-            "intake heal skips the retired channel"
-        );
-        assert!(heal(intake).await, "intake heal finalizes a Legacy channel");
-        reap_stale_busy_mailboxes_with_probe(&shared, &probe, &admit_any_host).await;
-
-        assert!(still_busy(&shared, retired).await);
-        assert!(!retired_token.cancelled.load(Ordering::Relaxed));
-        assert!(
-            !still_busy(&shared, periodic).await,
-            "periodic reaper finalizes Legacy"
-        );
-        assert_eq!(shared.restart.global_active.load(Ordering::Relaxed), 1);
     }
 }
 

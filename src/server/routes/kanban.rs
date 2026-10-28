@@ -5,6 +5,9 @@ use axum::{
 };
 use serde_json::json;
 
+mod card_delete;
+pub use card_delete::delete_card;
+
 use super::AppState;
 use crate::api_caller_observability::{
     RequestPrincipal, log_identity_consumption, manager_channel_check_relied_on_claimed_header,
@@ -260,6 +263,33 @@ fn execute_transition_intent_pg(
     intent: &crate::engine::transition::TransitionIntent,
 ) -> anyhow::Result<()> {
     execute_transition_intents_pg(state, std::slice::from_ref(intent))
+}
+
+/// PM decisions still answer after a secondary review-state write fails; leave a trace.
+fn warn_side_write<'a>(card_id: &'a str, write: &'a str) -> impl FnOnce(&anyhow::Error) + 'a {
+    move |error| tracing::warn!(card_id = %card_id, "[pm-decision] {write} failed: {error:#}")
+}
+
+/// Completes the card's pending pm-decision dispatches; a failed completion is logged.
+async fn complete_pending_pm_decisions(
+    pool: &sqlx::PgPool,
+    card_id: &str,
+    result: &serde_json::Value,
+) -> Result<(), String> {
+    for dispatch_id in kanban_db::pending_pm_decision_dispatch_ids_pg(pool, card_id).await? {
+        if let Err(error) = crate::dispatch::set_dispatch_status_with_backends(
+            Some(pool),
+            &dispatch_id,
+            "completed",
+            Some(result),
+            "mark_dispatch_completed",
+            Some(&["pending", "dispatched"]),
+            true,
+        ) {
+            tracing::warn!(card_id, dispatch_id, "[pm-decision] completion: {error:#}");
+        }
+    }
+    Ok(())
 }
 
 fn review_state_sync_pg(state: &AppState, payload: serde_json::Value) -> anyhow::Result<String> {
@@ -518,29 +548,6 @@ pub async fn assign_card(
                 ))
             }
             Ok(None) => Err(database_error("failed to read card after assign")),
-            Err(error) => Err(database_error(error)),
-        };
-    }
-
-    Err(pg_pool_required_error())
-}
-
-/// DELETE /api/kanban-cards/:id
-pub async fn delete_card(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    if let Some(pool) = state.pg_pool_ref() {
-        return match kanban_db::delete_card_pg(pool, &id).await {
-            Ok(false) => Err(AppError::not_found("card not found")),
-            Ok(true) => {
-                crate::server::ws::emit_event(
-                    &state.broadcast_tx,
-                    "kanban_card_deleted",
-                    json!({"id": id}),
-                );
-                Ok((StatusCode::OK, Json(json!({"ok": true}))))
-            }
             Err(error) => Err(database_error(error)),
         };
     }
@@ -853,59 +860,10 @@ pub async fn defer_dod(
     let Some(dod_state) = row else {
         return Err(AppError::not_found("card not found"));
     };
-    let current = dod_state.deferred_dod_json;
-    let card_status = dod_state.status;
-    let review_status = dod_state.review_status;
-
-    let dod = apply_deferred_dod_changes(current, body);
+    let dod = apply_deferred_dod_changes(dod_state.deferred_dod_json, body);
     let dod_str = serde_json::to_string(&dod).unwrap_or_default();
     if let Err(error) = kanban_db::update_deferred_dod_pg(pool, &id, &dod_str).await {
         return Err(database_error(error));
-    }
-
-    let is_review_state = {
-        crate::pipeline::ensure_loaded();
-        crate::pipeline::try_get()
-            .and_then(|p| p.hooks_for_state(&card_status))
-            .is_some_and(|h| h.on_enter.iter().any(|n| n == "OnReviewEnter"))
-    };
-    let all_done = if let (Some(items), Some(verified)) =
-        (dod["items"].as_array(), dod["verified"].as_array())
-    {
-        !items.is_empty() && items.iter().all(|item| verified.contains(item))
-    } else {
-        false
-    };
-    let restart_review_state =
-        is_review_state && review_status.as_deref() == Some("awaiting_dod") && all_done;
-
-    if restart_review_state {
-        use crate::engine::transition::TransitionIntent;
-        for intent in [
-            TransitionIntent::SetReviewStatus {
-                card_id: id.clone(),
-                review_status: Some("reviewing".to_string()),
-            },
-            TransitionIntent::SyncReviewState {
-                card_id: id.clone(),
-                state: "reviewing".to_string(),
-            },
-        ] {
-            if let Err(error) = execute_transition_intent_pg(&state, &intent) {
-                return Err(database_error(format!("{error}")));
-            }
-        }
-        if let Err(error) = kanban_db::update_review_clock_after_dod_pg(pool, &id).await {
-            return Err(database_error(error));
-        }
-    }
-
-    if restart_review_state {
-        crate::kanban::fire_enter_hooks_with_backends(&state.engine, &id, &card_status);
-        tracing::info!(
-            "[dod] Card {} DoD all-complete — restarting review from awaiting_dod",
-            id
-        );
     }
 
     match load_card_json_pg(pool, &id).await {
@@ -1307,27 +1265,9 @@ pub async fn pm_decision(
     // Complete any pending pm-decision dispatches (rework handles its own completion after dispatch success)
     if body.decision != "rework" {
         let completion_result = json!({"decision": body.decision, "comment": body.comment});
-        let pending_dispatch_ids =
-            match kanban_db::pending_pm_decision_dispatch_ids_pg(transition_pool, &body.card_id)
-                .await
-            {
-                Ok(ids) => ids,
-                Err(error) => {
-                    return Err(database_error(error));
-                }
-            };
-        for dispatch_id in pending_dispatch_ids {
-            crate::dispatch::set_dispatch_status_with_backends(
-                Some(transition_pool),
-                &dispatch_id,
-                "completed",
-                Some(&completion_result),
-                "mark_dispatch_completed",
-                Some(&["pending", "dispatched"]),
-                true,
-            )
-            .ok();
-        }
+        complete_pending_pm_decisions(transition_pool, &body.card_id, &completion_result)
+            .await
+            .map_err(database_error)?;
     }
     // Clear manual-intervention markers before applying the selected decision.
     if let Err(error) =
@@ -1343,6 +1283,7 @@ pub async fn pm_decision(
                 review_status: None,
             },
         )
+        .inspect_err(warn_side_write(&body.card_id, "clear review_status"))
         .ok();
         execute_transition_intent_pg(
             &state,
@@ -1351,6 +1292,7 @@ pub async fn pm_decision(
                 state: "idle".to_string(),
             },
         )
+        .inspect_err(warn_side_write(&body.card_id, "sync review state idle"))
         .ok();
     }
 
@@ -1416,29 +1358,13 @@ pub async fn pm_decision(
                 Ok(_) => {
                     // Dispatch succeeded — now complete pm-decision dispatch + transition
                     let completion_result = json!({"decision": "rework", "comment": body.comment});
-                    let pending_dispatch_ids = match kanban_db::pending_pm_decision_dispatch_ids_pg(
+                    complete_pending_pm_decisions(
                         transition_pool,
                         &body.card_id,
+                        &completion_result,
                     )
                     .await
-                    {
-                        Ok(ids) => ids,
-                        Err(error) => {
-                            return Err(database_error(error));
-                        }
-                    };
-                    for dispatch_id in pending_dispatch_ids {
-                        crate::dispatch::set_dispatch_status_with_backends(
-                            Some(transition_pool),
-                            &dispatch_id,
-                            "completed",
-                            Some(&completion_result),
-                            "mark_dispatch_completed",
-                            Some(&["pending", "dispatched"]),
-                            true,
-                        )
-                        .ok();
-                    }
+                    .map_err(database_error)?;
                     // Pipeline-driven: rework target from current state's review_rework gate
                     let rework_status: String =
                         match kanban_db::card_status_pg(transition_pool, &body.card_id).await {
@@ -1483,12 +1409,17 @@ pub async fn pm_decision(
                             review_status: Some("rework_pending".to_string()),
                         },
                     )
+                    .inspect_err(warn_side_write(
+                        &body.card_id,
+                        "set review_status rework_pending",
+                    ))
                     .ok();
                     // #117/#158: sync canonical review state via unified entrypoint.
                     review_state_sync_pg(
                         &state,
                         serde_json::json!({"card_id": body.card_id.clone(), "state": "rework_pending", "last_decision": "pm_rework"}),
                     )
+                    .inspect_err(warn_side_write(&body.card_id, "sync review state rework_pending"))
                     .ok();
                     "Rework dispatch created"
                 }

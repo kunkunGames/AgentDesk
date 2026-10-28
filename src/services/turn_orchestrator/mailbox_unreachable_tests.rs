@@ -11,6 +11,9 @@ use super::{
 use crate::services::provider::ProviderKind;
 use poise::serenity_prelude::ChannelId;
 
+#[cfg(unix)]
+mod health_barrier_tests;
+
 pub(crate) fn closed_handle() -> ChannelMailboxHandle {
     let (sender, receiver) = mpsc::unbounded_channel();
     drop(receiver);
@@ -54,7 +57,7 @@ impl ChannelMailboxRegistry {
         let counter = attempts.clone();
         let (sender, mut receiver) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Some((msg, _input_permit)) = receiver.recv().await {
+            while let Some(msg) = receiver.recv().await {
                 match msg {
                     super::ChannelMailboxMsg::CancelToken { reply } if observed_idle => {
                         let _ = reply.send(None);
@@ -89,6 +92,24 @@ impl ChannelMailboxRegistry {
 
     pub(crate) fn insert_unreachable_for_test(&self, channel_id: ChannelId) {
         let handle = closed_handle();
+        self.handles.insert(channel_id, handle.clone());
+        GLOBAL_CHANNEL_MAILBOXES.insert(channel_id, handle);
+    }
+
+    /// An actor that keeps every request and answers none, so each read waits until it is cut.
+    #[cfg(unix)]
+    pub(crate) fn insert_silent_for_test(&self, channel_id: ChannelId) {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(msg) = receiver.recv().await {
+                held.push(msg);
+            }
+        });
+        let handle = ChannelMailboxHandle {
+            sender,
+            recovery_done: Arc::new(RecoveryDoneSignal::new()),
+        };
         self.handles.insert(channel_id, handle.clone());
         GLOBAL_CHANNEL_MAILBOXES.insert(channel_id, handle);
     }

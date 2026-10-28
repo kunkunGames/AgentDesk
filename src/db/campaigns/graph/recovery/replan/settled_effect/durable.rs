@@ -66,7 +66,7 @@ async fn require_owners_settled(
 ) -> Result<()> {
     // NULL or unfamiliar states are not evidence of quiescence. The common
     // owned-work predicate includes working sessions, slots and cleanup debt.
-    let unsettled = sqlx::query_scalar::<_, bool>(&format!(
+    let unsettled = sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
         "SELECT EXISTS(SELECT 1 FROM campaign_graph_tasks t WHERE t.campaign_id=$1 AND ($2::text IS NULL OR t.task_key=$2) AND (
           ({}) OR EXISTS(SELECT 1 FROM task_dispatches d WHERE d.kanban_card_id=t.card_id
             AND (d.status IS NULL OR d.status NOT IN ('completed','failed','cancelled')))
@@ -90,7 +90,11 @@ async fn require_owners_settled(
               OR EXISTS(SELECT 1 FROM auto_queue_entries e JOIN auto_queue_runs r ON r.id=e.run_id
                 WHERE e.kanban_card_id=t.card_id AND s.thread_channel_id IN (r.unified_thread_id,r.unified_thread_channel_id))))))",
         learning::budget::UNSETTLED_TASK_SQL
-    )).bind(campaign).bind(key).fetch_one(&mut **tx).await?;
+    )))
+    .bind(campaign)
+    .bind(key)
+    .fetch_one(&mut **tx)
+    .await?;
     ensure!(
         !unsettled,
         "settled effect still has unknown state, active ownership or cleanup debt"

@@ -28,7 +28,7 @@ pub(in crate::services::discord::tmux::tmux_watcher) struct TurnStreamCollectorC
     pub(in crate::services::discord::tmux::tmux_watcher) restored_injected_prompt_message_id:
         Option<u64>,
     pub(in crate::services::discord::tmux::tmux_watcher) host: Arc<HostSnapshot>,
-    pub(in crate::services::discord::tmux::tmux_watcher) legacy_mode: WatcherLegacyMode,
+    pub(in crate::services::discord::tmux::tmux_watcher) watcher_instance_id: u64,
 }
 
 pub(in crate::services::discord::tmux::tmux_watcher) struct TurnStreamCollectorIo {
@@ -119,6 +119,7 @@ pub(in crate::services::discord::tmux::tmux_watcher) struct ActiveReadState {
 pub(in crate::services::discord::tmux::tmux_watcher) struct CollectedTurnStream {
     pub(in crate::services::discord::tmux::tmux_watcher) turn_data_start_offset: u64,
     pub(in crate::services::discord::tmux::tmux_watcher) source_authority: WatcherSourceAuthority,
+    pub(in crate::services::discord::tmux::tmux_watcher) mixed_read_provenance: bool,
     pub(in crate::services::discord::tmux::tmux_watcher) split_trailing_turn_follows: bool,
     pub(in crate::services::discord::tmux::tmux_watcher) state: StreamLineState,
     pub(in crate::services::discord::tmux::tmux_watcher) restored_response_seed: String,
@@ -133,6 +134,8 @@ pub(in crate::services::discord::tmux::tmux_watcher) struct CollectedTurnStream 
     pub(in crate::services::discord::tmux::tmux_watcher) startup_inflight_snapshot:
         Option<InflightTurnState>,
     pub(in crate::services::discord::tmux::tmux_watcher) completion_actor:
+        Option<std::sync::Weak<crate::services::provider::CancelToken>>,
+    pub(in crate::services::discord::tmux::tmux_watcher) summary_actor:
         Option<std::sync::Weak<crate::services::provider::CancelToken>>,
     // #3805 P2 (PR-C): this turn's status-panel generation epoch, SEEDED from
     // the on-disk row so a restart re-hydrating an existing panel carries the
@@ -211,7 +214,7 @@ impl TurnStreamCollectorContext {
             turn_result_relayed,
             restored_injected_prompt_message_id,
             host: context.host.clone(),
-            legacy_mode: context.legacy_mode,
+            watcher_instance_id: context.watcher_instance_id,
         }
     }
 }

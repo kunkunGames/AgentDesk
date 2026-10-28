@@ -7,17 +7,9 @@
 //! parent. Items are `pub(super)` and re-imported by the parent via
 //! `use self::injected_prompt_policy::{...}`, so call sites are unchanged.
 
-use super::*;
-
-// #3075: the terminal sanitizer is service-level so prompt observation can use
-// it before Discord relay state exists; `tui_task_card` delegates to that same
-// definition. The ASCII truncator remains task-card owned. The parent's glob
-// (`use super::*`) does not re-export these `use`-imported names, so the child
-// module imports them directly.
 use super::super::response_sanitizer::subagent_notification_card;
-use super::super::tui_task_card::{
-    clamp_discord_message_content, strip_terminal_controls, truncate_chars_ascii as truncate_chars,
-};
+use super::super::tui_task_card::strip_terminal_controls;
+use super::super::{DISCORD_MSG_LIMIT, formatting::discord_message_units};
 
 const LOCAL_COMMAND_STDOUT_OPEN: &str = "<local-command-stdout>";
 const LOCAL_COMMAND_STDOUT_CLOSE: &str = "</local-command-stdout>";
@@ -298,22 +290,55 @@ pub(super) fn strip_leading_injection_wrapper(text: &str) -> &str {
 
 pub(super) fn format_ssh_direct_prompt_notification(
     _provider: &str,
-    tmux_session_name: &str,
+    _tmux_session_name: &str,
     prompt: &str,
 ) -> String {
-    let prompt = strip_terminal_controls(prompt);
-    let preview =
-        truncate_chars(prompt.trim(), SSH_DIRECT_PROMPT_PREVIEW_LIMIT).replace("```", "` ` `");
-    // #4032: clamp at the source — the card branch clamps internally; this
-    // SSH-direct formatter and the slash-control note below are the remaining
-    // producers feeding `say`, each clamped at its own source.
-    clamp_discord_message_content(&format!(
-        "터미널에 직접 주입된 입력 (tmux : `{}`):\n```text\n{}\n```",
-        sanitize_inline_code(tmux_session_name),
-        preview,
-    ))
+    let prompt = strip_terminal_controls(prompt)
+        .replace("\r\n", "\n")
+        .replace(['\r', '\u{2028}', '\u{2029}'], "\n");
+    let mut output = String::from("-# ⌨️ ");
+    let mut units = discord_message_units(&output);
+    // Keep source-scalar boundaries so a clamp cannot split a Markdown escape
+    // or the zero-width mention guard attached to an at-sign.
+    let mut checkpoints = Vec::new();
+    for ch in prompt.chars() {
+        let escaped = match ch {
+            '\n' => "\n-# ".to_string(),
+            '@' => "@\u{200b}".to_string(),
+            '<' => "‹".to_string(),
+            '>' => "›".to_string(),
+            '\\' | '`' | '*' | '_' | '~' | '|' | '[' | ']' | '#' | '-' | '+' | '.' | '(' | ')'
+            | '!' => format!("\\{ch}"),
+            _ => ch.to_string(),
+        };
+        let next_units = units + discord_message_units(&escaped);
+        if next_units > DISCORD_MSG_LIMIT {
+            break;
+        }
+        checkpoints.push((output.len(), units));
+        output.push_str(&escaped);
+        units = next_units;
+    }
+    let mut omitted = prompt.chars().count() - checkpoints.len();
+    if omitted == 0 {
+        return output;
+    }
+    loop {
+        let suffix = format!("… (이하 {omitted}자)");
+        if units + discord_message_units(&suffix) <= DISCORD_MSG_LIMIT {
+            output.push_str(&suffix);
+            return output;
+        }
+        let (end, previous_units) = checkpoints
+            .pop()
+            .expect("the notice header leaves room for the omission marker");
+        output.truncate(end);
+        units = previous_units;
+        omitted += 1;
+    }
 }
 
+#[cfg(test)]
 pub(super) fn format_subagent_notification_card(tmux_session_name: &str, prompt: &str) -> String {
     subagent_notification_card::format_subagent_notification_card(Some(tmux_session_name), prompt)
 }
@@ -365,50 +390,22 @@ pub(super) fn format_slash_command_control_note(
     kind: &str,
     raw_prompt: &str,
 ) -> String {
-    // #4032: clamp at the source like the SSH-direct formatter — this note is
-    // the third producer feeding the active-turn `say()` and the session name
-    // segment is otherwise unbounded.
-    clamp_discord_message_content(&format_slash_command_control_note_unclamped(
-        tmux_session_name,
-        kind,
-        raw_prompt,
-    ))
-}
-
-fn format_slash_command_control_note_unclamped(
-    tmux_session_name: &str,
-    kind: &str,
-    raw_prompt: &str,
-) -> String {
-    let label = match kind {
-        "/loop" => "🔁 자동 점검(/loop)",
-        "/compact" => "🧹 컨텍스트 정리(/compact)",
-        _ => "⚙️ 머신 슬래시 명령",
+    let (icon, label) = match kind {
+        "/loop" => ("🔁", "자동 점검(/loop)"),
+        "/compact" => ("🧹", "컨텍스트 정리(/compact)"),
+        _ => ("⚙️", "머신 슬래시 명령"),
     };
-    let header = format!(
-        "{} (tmux : `{}`) — 시스템 주입 (활성 턴 아님)",
-        label,
-        sanitize_inline_code(tmux_session_name),
-    );
-    if kind == "/loop" {
-        if let Some(body) = extract_loop_body(raw_prompt) {
-            let preview = truncate_chars(body.trim(), SSH_DIRECT_PROMPT_PREVIEW_LIMIT)
-                .replace("```", "` ` `");
-            if !preview.is_empty() {
-                return format!("{header}:\n```text\n{preview}\n```");
-            }
-        }
-    }
-    if kind == "local-command-stdout" {
-        if let Some(body) = extract_local_command_stdout_body(raw_prompt) {
-            let preview = truncate_chars(body.trim(), SSH_DIRECT_PROMPT_PREVIEW_LIMIT)
-                .replace("```", "` ` `");
-            if !preview.is_empty() {
-                return format!("{header}:\n```text\n{preview}\n```");
-            }
-        }
-    }
-    header
+    let header = format!("{label} (tmux: {tmux_session_name}) — 시스템 주입 (활성 턴 아님)");
+    let body = match kind {
+        "/loop" => extract_loop_body(raw_prompt),
+        "local-command-stdout" => extract_local_command_stdout_body(raw_prompt),
+        _ => None,
+    };
+    let content = match body.filter(|body| !body.trim().is_empty()) {
+        Some(body) => format!("{header}: {body}"),
+        None => header,
+    };
+    super::super::session_notice::subtext(icon, &content)
 }
 
 /// Pull the human-facing `/loop` directive body from raw echo or command args.
@@ -455,14 +452,10 @@ fn extract_local_command_stdout_body(prompt: &str) -> Option<String> {
 }
 
 pub(super) fn format_system_continuation_note(tmux_session_name: &str, _prompt: &str) -> String {
-    format!(
-        "🧩 Session continued (compact/resume) · tmux: `{}`",
-        sanitize_inline_code(tmux_session_name),
+    super::super::session_notice::subtext(
+        "🧩",
+        &format!("Session continued (compact/resume) · tmux: {tmux_session_name}"),
     )
-}
-
-pub(super) fn sanitize_inline_code(value: &str) -> String {
-    value.replace('`', "'")
 }
 
 #[cfg(test)]

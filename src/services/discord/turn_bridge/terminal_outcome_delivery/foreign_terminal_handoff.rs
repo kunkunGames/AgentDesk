@@ -319,6 +319,81 @@ pub(super) async fn preserve_or_publish(ctx: Handoff<'_>) -> Outcome {
     }
 }
 
+#[cfg(test)]
+pub(in crate::services::discord) mod custody_test_adapter {
+    use super::*;
+
+    pub(in crate::services::discord) async fn retain(
+        local: &InflightTurnState,
+        admitted: &CodexRange,
+    ) -> Result<String, String> {
+        let provider = local.provider_kind().ok_or("custody provider")?;
+        let notice = admitted
+            .result
+            .trim()
+            .is_empty()
+            .then(|| empty_response_recovery::empty_response_guidance(false));
+        match preserve_or_publish(Handoff {
+            provider: &provider,
+            local,
+            admitted: Some(admitted),
+            content: &admitted.result,
+            delivery_body: None,
+            empty_recovery_notice: notice,
+            response_sent_offset: 0,
+            channel_id: ChannelId::new(local.channel_id),
+            old_anchor: MessageId::new(local.current_msg_id),
+            watcher_owner_channel_id: ChannelId::new(local.delivery_record_owner_channel_id()),
+            tmux_last_offset: Some(admitted.complete_record_end()),
+            cancelled: false,
+            cancel_source: String::new(),
+            children: &[],
+            dispatch_id: None,
+            adk_cwd: None,
+            should_complete: false,
+            should_fail: false,
+            resume_failure: false,
+            recovery_retry: false,
+        })
+        .await
+        {
+            Outcome::Deferred { key } => Ok(key),
+            Outcome::Unresolved { error } => Err(error),
+        }
+    }
+
+    pub(in crate::services::discord) async fn resume(
+        shared: &Arc<SharedData>,
+        http: &Arc<serenity::Http>,
+    ) -> Result<usize, String> {
+        crate::services::discord::terminal_delivery_custody::drain_for_test(
+            |mut payload, checkpoint| {
+                let gateway = crate::services::discord::gateway::DiscordGateway::new(
+                    http.clone(),
+                    shared.clone(),
+                    ProviderKind::Codex,
+                    None,
+                );
+                async move {
+                    let result =
+                        resume_payload_with_gateway(shared, &gateway, &mut payload, &checkpoint)
+                            .await;
+                    (payload, result)
+                }
+            },
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn unreadable_retained_custody_keeps_restored_head_pg() {
+        crate::services::discord::commands::control::codex_clear_relaunch_tests::absent_launch_tests::custody_tests::unreadable_retained_custody_case(
+            concat!(module_path!(), "::unreadable_retained_custody_keeps_restored_head_pg"),
+        ).await;
+    }
+}
+
 pub(in crate::services::discord) async fn resume(
     registry: &crate::services::discord::health::HealthRegistry,
     payload: &mut serde_json::Value,
@@ -450,6 +525,14 @@ pub(super) async fn resume_with_gateway(
     ) else {
         return Ok(false);
     };
+    #[cfg(unix)]
+    if o_owns_body {
+        super::super::super::outbound::completed_turn_ledger::o_pending::capture(
+            &provider,
+            &snapshot.local,
+        )
+        .await;
+    }
     let mut delivered = o_owns_body
         || snapshot.delivery_receipts.len() == chunks.len()
         || decision() == rowless_receipt::TerminalReceiptDisposition::AlreadyDelivered;
@@ -496,10 +579,19 @@ pub(super) async fn resume_with_gateway(
                 }
                 Ok::<(), String>(())
             };
+            #[cfg(all(test, unix))]
+            crate::services::discord::recovery_engine::o_settlement_tests::before_claim();
             match crate::services::tui_o::cutover::claim_then_send(Some(claim), post).await {
                 Ok(crate::services::tui_o::cutover::BodySend::Sent(posted)) => posted?,
                 // O took the channel since the peek: settle the custody as O's.
-                Ok(crate::services::tui_o::cutover::BodySend::OwnedByO) => {}
+                Ok(crate::services::tui_o::cutover::BodySend::OwnedByO) => {
+                    #[cfg(unix)]
+                    super::super::super::outbound::completed_turn_ledger::o_pending::capture(
+                        &provider,
+                        &snapshot.local,
+                    )
+                    .await;
+                }
                 Err(_) => return Ok(false),
             }
         }
@@ -593,10 +685,15 @@ pub(super) fn cancelled_terminal_response(
     } else if remaining_response.trim().is_empty() {
         "[Stopped]".to_string()
     } else {
-        format!(
-            "{}\n\n[Stopped]",
-            banner.format_discord_body(remaining_response)
-        )
+        banner.format_discord_body(remaining_response)
     };
     banner.prefix(response_sent_offset == 0, response)
 }
+
+#[cfg(test)]
+#[path = "cancelled_body_retirement_tests.rs"]
+mod cancelled_body_retirement_tests;
+
+#[cfg(all(test, unix))]
+#[path = "foreign_o_settlement_tests.rs"]
+mod o_settlement_tests;

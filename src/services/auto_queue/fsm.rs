@@ -204,11 +204,13 @@ pub(super) async fn load_restore_entries_pg(
     run_id: &str,
 ) -> Result<Vec<RestoreEntryRecord>, String> {
     let rows = sqlx::query(
-        "SELECT id, kanban_card_id, agent_id, COALESCE(thread_group, 0)::BIGINT AS thread_group
-         FROM auto_queue_entries
-         WHERE run_id = $1
-           AND status = 'skipped'
-         ORDER BY priority_rank ASC, created_at ASC, id ASC",
+        "SELECT e.id, e.kanban_card_id, e.agent_id,
+                COALESCE(e.thread_group, 0)::BIGINT AS thread_group
+         FROM auto_queue_entries e
+         JOIN kanban_cards kc ON kc.id = e.kanban_card_id AND kc.deleted_at IS NULL
+         WHERE e.run_id = $1
+           AND e.status = 'skipped'
+         ORDER BY e.priority_rank ASC, e.created_at ASC, e.id ASC",
     )
     .bind(run_id)
     .fetch_all(&mut **tx)
@@ -284,6 +286,8 @@ pub(super) async fn apply_restore_state_changes_pg(
         .begin()
         .await
         .map_err(|error| format!("open postgres restore transaction failed: {error}"))?;
+    // Reopening skipped entries waits on the run token, so take it before the first row write.
+    crate::db::auto_queue::run_admission::lock_run_token_on_pg_tx(&mut tx, run_id).await?;
     if run_status == Some("cancelled") {
         let restored_run = sqlx::query(
             "UPDATE auto_queue_runs

@@ -23,9 +23,9 @@ EXPECTED_COMMANDS = (
     '"$PYTHON" -m unittest tests.test_durable_frontier_writer_call_sites',
     '"$PYTHON" scripts/check_intake_outbox_done_writer_call_sites.py',
     '"$PYTHON" -m unittest tests.test_intake_outbox_done_writer_call_sites',
-    '"$PYTHON" scripts/check_sql_execution_surface_inventory.py --check',
-    "git diff --exit-code HEAD -- scripts/sql_execution_surface_inventory.json",
-    '"$PYTHON" -m unittest tests.test_sql_execution_surface_inventory',
+    '"$PYTHON" scripts/check_destructive_call_site_ratchet.py --check',
+    "git diff --exit-code HEAD -- scripts/destructive_call_site_baseline.json",
+    '"$PYTHON" -m unittest tests.test_destructive_call_site_ratchet',
     "./scripts/check-ci-runner-hardening.sh",
     '"$PYTHON" -m unittest tests.test_fast_check_ci_wiring',
 )
@@ -119,6 +119,26 @@ class WriterGateCiWiringTests(unittest.TestCase):
                 self.assertIn(command, result.stderr)
                 self.assertIn("found 0", result.stderr)
 
+    def test_process_rejects_destructive_ratchet_block_deletion(self) -> None:
+        text = (REPO_ROOT / guard.CI_SCRIPT).read_text(encoding="utf-8")
+        header = 'if run_check guards "Destructive call-site per-file ratchet (#5071 T3-A4)"; then\n'
+        before, separator, after = text.partition(header)
+        self.assertTrue(separator)
+        block, separator, after = after.partition("\nfi\n")
+        self.assertTrue(separator)
+        result = self.run_process(before + after)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(EXPECTED_COMMANDS[5], result.stderr)
+        self.assertIn("found 0", result.stderr)
+
+    def test_process_rejects_each_destructive_ratchet_invocation_deletion(self) -> None:
+        for command in EXPECTED_COMMANDS[5:8]:
+            with self.subTest(command=command):
+                result = self.run_process(self.fixture_text().replace(f"{command}\n", "", 1))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(command, result.stderr)
+                self.assertIn("found 0", result.stderr)
+
     def test_comment_echo_and_indentation_do_not_count(self) -> None:
         command = EXPECTED_COMMANDS[0]
         decoys = (
@@ -133,7 +153,7 @@ class WriterGateCiWiringTests(unittest.TestCase):
                 self.assertTrue(any("found 0" in error for error in errors), errors)
 
     def test_duplicate_invocation_fails(self) -> None:
-        for command in (EXPECTED_COMMANDS[1], EXPECTED_COMMANDS[5], EXPECTED_COMMANDS[6], EXPECTED_COMMANDS[7]):
+        for command in (*EXPECTED_COMMANDS[5:8], EXPECTED_COMMANDS[1]):
             errors = guard.check_text(self.fixture_text() + f"{command}\n")
             self.assertTrue(any("found 2" in error for error in errors), errors)
 
@@ -165,13 +185,15 @@ class WriterGateCiWiringTests(unittest.TestCase):
                 self.assertTrue(any("must run before" in error for error in errors), errors)
 
     def test_dirty_worktree_guard_must_immediately_follow_check(self) -> None:
-        mutated = self.fixture_text().replace(
-            EXPECTED_COMMANDS[5] + "\n" + EXPECTED_COMMANDS[6],
-            EXPECTED_COMMANDS[5] + "\necho decoy\n" + EXPECTED_COMMANDS[6],
-            1,
-        )
-        errors = guard.check_text(mutated)
-        self.assertTrue(any("must run immediately after" in error for error in errors), errors)
+        for gate, dirty in ((5, 6),):
+            with self.subTest(gate=EXPECTED_COMMANDS[gate]):
+                mutated = self.fixture_text().replace(
+                    EXPECTED_COMMANDS[gate] + "\n" + EXPECTED_COMMANDS[dirty],
+                    EXPECTED_COMMANDS[gate] + "\necho decoy\n" + EXPECTED_COMMANDS[dirty],
+                    1,
+                )
+                errors = guard.check_text(mutated)
+                self.assertTrue(any("must run immediately after" in error for error in errors), errors)
 
     def test_process_exit_code_maps_pass_and_failure(self) -> None:
         passing = self.run_process(self.fixture_text())

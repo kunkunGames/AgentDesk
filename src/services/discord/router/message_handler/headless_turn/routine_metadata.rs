@@ -61,6 +61,30 @@ pub(super) fn fresh_routine_turn(metadata: Option<&serde_json::Value>) -> bool {
         .and_then(|value| value.as_str())
         != Some("persistent")
 }
+/// Process mode is explicit and only honored on fresh routine metadata.
+pub(super) fn routine_process_turn(metadata: Option<&serde_json::Value>) -> bool {
+    fresh_routine_turn(metadata)
+        && valid_routine_metadata(metadata)
+            .and_then(|value| value.get("execution_mode"))
+            .and_then(serde_json::Value::as_str)
+            == Some("process")
+}
+
+pub(super) fn routine_tmux_session_name(
+    provider: &ProviderKind,
+    metadata: Option<&serde_json::Value>,
+    label: Option<&str>,
+    channel_name: Option<&str>,
+) -> Option<String> {
+    (provider.uses_managed_tmux_backend() && !routine_process_turn(metadata))
+        .then(|| {
+            label
+                .or(channel_name)
+                .map(|name| provider.build_tmux_session_name(name))
+        })
+        .flatten()
+}
+
 pub(super) fn routine_metadata_role_binding(
     metadata: Option<&serde_json::Value>,
     provider: &ProviderKind,
@@ -83,8 +107,7 @@ pub(super) fn routine_metadata_role_binding(
         model: None,
         reasoning_effort: None,
         peer_agents_enabled: true,
-        quality_feedback_injection_enabled: true,
-        memory: settings::resolve_memory_settings(None, None),
+        memory: settings::memory_settings_for_role(agent_id),
     })
 }
 
@@ -107,4 +130,133 @@ where
         clear().await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod memory_scope_tests {
+    use super::*;
+    use crate::services::discord::prompt_builder::{DispatchProfile, build_system_prompt};
+    use crate::services::discord::settings::MemoryBackendKind;
+
+    fn routine_binding_and_hint(group: Option<&str>) -> (settings::RoleBinding, String) {
+        let root = tempfile::tempdir().unwrap();
+        let _guard = crate::config::set_agentdesk_root_for_test(root.path());
+        let mut config = crate::config::Config::default();
+        let mut agent: crate::config::AgentDef = serde_yaml::from_str(
+            "id: ch-td\nname: Test\nchannels:\n  claude:\n    id: '4242'\n    workspace: /fixture/ch-td\n",
+        )
+        .unwrap();
+        agent.memory_group = group.map(str::to_owned);
+        config.agents.push(agent);
+        let path = crate::runtime_layout::config_file_path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        let metadata = serde_json::json!({"routine_id": "routine-1", "agent_id": " ch-td "});
+        let mut binding =
+            routine_metadata_role_binding(Some(&metadata), &ProviderKind::Claude).unwrap();
+        binding.memory.backend = MemoryBackendKind::Memento;
+        let prompt = build_system_prompt(
+            "ctx",
+            &[],
+            "/fixture/ch-td",
+            ChannelId::new(4242),
+            "tok",
+            Some(&binding),
+            false,
+            DispatchProfile::Full,
+            None,
+            None,
+            None,
+            None,
+            Some(&binding.memory),
+            true,
+            false,
+        );
+        let hint = prompt
+            .lines()
+            .find(|line| line.starts_with("- scope hints:"))
+            .unwrap()
+            .to_owned();
+        (binding, hint)
+    }
+
+    #[test]
+    fn routine_memory_group_reaches_binding_and_three_tier_hint() {
+        let (binding, hint) = routine_binding_and_hint(Some("cookingheart"));
+        assert_eq!(binding.memory.memory_group.as_deref(), Some("cookingheart"));
+        assert_eq!(
+            hint,
+            "- scope hints: read=`workspace=cookingheart, agentId=ch-td`; default write (private)=`workspace=cookingheart, agentId=ch-td`; group shared=`workspace=cookingheart, agentId=default`; global=`agentId=default` (omit workspace)."
+        );
+        assert!(!hint.contains("agent-private="));
+    }
+
+    #[test]
+    fn routine_memory_group_absent_hint_preserves_main_bytes() {
+        let (binding, hint) = routine_binding_and_hint(None);
+        assert_eq!(binding.memory.memory_group, None);
+        assert_eq!(
+            hint,
+            "- scope hints: project=`workspace=ch-td, agentId=default`; agent-private=`workspace=agentdesk-ch-td, agentId=ch-td`."
+        );
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn fresh_process_turn_suppresses_tmux_but_keeps_isolated_session_key() {
+        let metadata =
+            json!({"routine_id":"r-1", "execution_strategy":"fresh", "execution_mode":"process"});
+        for provider in [ProviderKind::Claude, ProviderKind::Codex] {
+            assert_eq!(
+                routine_tmux_session_name(
+                    &provider,
+                    Some(&metadata),
+                    Some("routine unique attempt"),
+                    Some("real channel")
+                ),
+                None
+            );
+            assert_eq!(
+                session_key_basis_override(None, Some(&metadata), Some("routine unique attempt")),
+                Some("routine unique attempt")
+            );
+            let kind =
+                super::super::super::provider_isolation::prelaunch_runtime_kind_for_managed_session(
+                    &provider, true, false, None,
+                );
+            assert_eq!(
+                kind, None,
+                "process mode must not register a managed tmux runtime"
+            );
+            assert_eq!(
+                super::super::super::provider_isolation::prelaunch_inflight_runtime_seed_without_codex_raw(&provider, true, None, kind),
+                (None, None, None, 0),
+                "a process attempt must not seed wrapper files or a tmux watcher target",
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_and_non_routine_metadata_keep_tmux_route() {
+        for metadata in [
+            json!({"routine_id":"r-1", "execution_strategy":"persistent", "execution_mode":"process"}),
+            json!({"execution_strategy":"fresh", "execution_mode":"process"}),
+            json!({"routine_id":"r-1", "execution_strategy":"fresh"}),
+        ] {
+            assert_eq!(
+                routine_tmux_session_name(
+                    &ProviderKind::Claude,
+                    Some(&metadata),
+                    Some("routine label"),
+                    Some("channel")
+                ),
+                Some(ProviderKind::Claude.build_tmux_session_name("routine label"))
+            );
+        }
+    }
 }

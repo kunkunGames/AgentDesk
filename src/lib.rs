@@ -1,4 +1,8 @@
 #![recursion_limit = "256"]
+#![deny(clippy::drop_non_drop)]
+#![deny(clippy::await_holding_lock)]
+#![deny(clippy::mistyped_literal_suffixes)]
+#![deny(clippy::correctness)]
 // Non-dead-code clippy debt predates the bin/lib split. Keep the existing
 // style/complexity debt explicit here so this change can remove the crate-wide
 // dead_code blanket without rewriting unrelated modules.
@@ -7,10 +11,8 @@
 // occurrences carry narrow item/module allows so newly introduced debt remains
 // visible to Clippy.
 //
-// `await_holding_lock` is intentionally NOT suppressed here (#3034): production
-// lock-across-await races must surface in clippy. The only legitimate holders
-// are test-serialization guards (process-global env/metrics/PG-setup Mutexes),
-// each carrying a narrow `#[allow(clippy::await_holding_lock)]` + `// SAFETY:`.
+// Test environment wrappers intentionally hold their lock across await to serialize per-test runtimes.
+// Clippy cannot see the MutexGuard stored inside those wrappers.
 #![allow(
     clippy::absurd_extreme_comparisons,
     clippy::assertions_on_constants,
@@ -276,19 +278,12 @@ pub fn run_from_args() -> Result<()> {
 
 #[cfg(test)]
 mod test_env_panic_probe;
+#[cfg(test)]
+mod test_support;
 
-/// Shared home lifetime contracts; registration and authority admission remain internal.
+/// Managed writer lifetime contracts; hosting and ownership admission remain internal.
 pub mod home_runtime {
-    pub use crate::services::cluster::home_supervisor::{
-        Generation, HomeBundle, HomeLifecycle, NoHomes, Phase, Refused, Settled, StopReason,
-        Supervisor, stop_all_and_join,
-    };
     pub use crate::services::tui_o::writer::host::{ManagedWriterHandle, WriterStopped};
-}
-
-/// Read-only delegation boot status, distinct from home authority and restore readiness.
-pub mod delegation_availability {
-    pub use crate::services::cluster::home_availability::{Availability, Unavailable, state};
 }
 
 /// Dormant iMessage reply contracts for admission and claim/ACK integration.

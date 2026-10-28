@@ -1,5 +1,7 @@
 # T5 → T6 철거 인벤토리 — #5464 (#5071 T5)
 
+<!-- doc-path-refs: removed src/services/discord/relay_recovery/cohort.rs src/services/discord/relay_recovery/authority_observation.rs src/services/discord/relay_recovery/authority_observation/delivery_boundary.rs src/services/discord/relay_recovery/authority_retention.rs scripts/relay_authority_rollout_report.py tests/test_relay_authority_rollout_report.py src/integration_tests.rs scripts/lib_test_inventory_manifest.txt -->
+
 > **이 리포 사본이 정본이다.** §12-2 기록은 이 파일에서만 갱신한다.
 > 워크플로 초안 `/private/tmp/adk-b0814/t6-removal-inventory.md` 는 S1 r1 시점에
 > 동결됐고 더 이상 갱신하지 않는다 — `/private/tmp` 산출물은 T5 배포~T6 삭제
@@ -695,6 +697,9 @@ S9 면제가 아니다 — 그 행도 같이 갱신했다.
   red 였다. r1~r3 의 게이트 실행이 이 4건을 targeted 목록에 넣지 않아 놓쳤다. 핀 1줄로 닫았고
   4건 모두 green 이다. 경로 목록이 16 → 17 로 늘어난 유일한 이유다.
 
+  현재 basename 제외는 `tests.rs`·`*_tests.rs` 이름 규칙으로 판정하므로 위 핀 추가는
+  이력이다. 생산 모듈의 basename 시험 파일 마운트는 거부하고 resolver 경로만 고정한다.
+
   r1의 코드 8 = 설계가 열거한 5(`authority_observation.rs`, `bridge_entry_persist.rs`,
   `post_loop_finalize.rs`, `guarded_persist.rs`, `snapshot.rs`) + `health_api.rs` +
   `relay_recovery.rs`(mod 선언) + `cohort.rs`(S1 위임 건) — 설계의 5는 mod 선언 파일과 S1
@@ -1186,7 +1191,7 @@ mixed-version 금지 문서 계약은 필요 없다. 다만 그 PR이 남긴 회
 `bot_settings_write_back_preserves_unknown_keys_inside_modelled_sections` 하나로 그 모양을
 고정했다. 잔여는 이 항목 밖이며 이미 별도로 기록돼 있다: whole-`Config` `save_to_path` writer
 는 **프로덕션 8곳**이다 — `server/routes/voice_config.rs:151`·`server/routes/agents_crud.rs:1018`·
-`server/routes/agents_setup.rs:530`·`services/discord_config_audit.rs:1169`·
+`server/routes/agents_setup.rs:530`·`services/discord_config_audit.rs` (`write_runtime_config`)·
 `runtime_layout/config_merge.rs:38`·`cli/migrate/apply.rs:638`·
 `services/onboarding/mod.rs:1331`·`services/onboarding/mod.rs:1805`.
 이전 기록의 "4곳"은 뒤 4곳을 누락한 과소 계수였다(`onboarding/mod.rs` 의 두 곳은 같은 파일의

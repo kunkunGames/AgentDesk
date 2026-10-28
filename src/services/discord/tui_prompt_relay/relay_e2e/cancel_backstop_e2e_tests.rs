@@ -13,6 +13,7 @@ use std::time::Duration;
 use super::discord_mock::USER_ID;
 use super::stop_command_catch_up_e2e::{hold_a_turn, queued_ids, recent_snowflake_base};
 use super::{AbortOnDrop, RelayE2eHarness, wait_until};
+use crate::config::test_env_lock::{SharedTestEnvLockGuard, acquire_shared_test_env_lock};
 use crate::services::discord::{self as discord, inflight, mailbox_snapshot, queue_io};
 use crate::services::provider::{CancelToken, ProviderKind};
 
@@ -22,14 +23,12 @@ const HEAD: &str = "i6016 previous turn head already visible";
 const TAIL: &str = "i6016 previous turn undelivered tail";
 const CLAUDE: ProviderKind = ProviderKind::Claude;
 
-fn fixture_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    crate::config::shared_test_env_lock()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+fn fixture_env_lock() -> SharedTestEnvLockGuard {
+    acquire_shared_test_env_lock()
 }
 
 fn set_fixture_path(
-    _env_lock: &std::sync::MutexGuard<'static, ()>,
+    _env_lock: &SharedTestEnvLockGuard,
     key: &'static str,
     value: &Path,
 ) -> crate::config::TestEnvVarGuard {
@@ -438,6 +437,7 @@ case "$*" in *"{tmux}"*) read -r state < '{root}/pane' ;; *) state=dead ;; esac
 case "$1" in
  has-session) [ "$state" = dead ] && {{ echo "can't find session" >&2; exit 1; }}; exit 0 ;;
  list-panes) [ "$state" = dead ] && echo 1 || echo 0; exit 0 ;;
+ display-message) for last do :; done; if [ "$last" = '#{{pane_dead}}' ]; then [ "$state" = dead ] && echo 1 || echo 0; fi; exit 0 ;;
  capture-pane) case "$state" in busy) printf '%s\n' '⏺ Running 1 shell command…' '· Actioning… (4m 7s · esc to interrupt)' ;; idle) cat '{root}/idle-pane' ;; esac; exit 0 ;;
  kill-session) echo "$*" >> '{root}/tmux-kills'; exit 0 ;;
  send-keys|load-buffer|paste-buffer) echo "$*" >> '{root}/tmux-writes'; exit 0 ;;
@@ -1027,78 +1027,6 @@ async fn live_foreign_row_survives_sweep_and_backstop() {
         "a live foreign row never loses its anchor"
     );
 
-    let snapshot = h.mailbox().await;
-    h.shared
-        .queue_park_ledger
-        .evaluate(&h.shared, &CLAUDE, h.channel_id, &snapshot);
-    h.shared
-        .queue_park_ledger
-        .age_sources_for_tests(h.channel_id, Duration::from_secs(600));
-    #[derive(Clone)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for Capture {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let bytes = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_writer({
-            let bytes = bytes.clone();
-            move || Capture(bytes.clone())
-        })
-        .finish();
-    crate::logging::test_capture::pin_callsite_interest();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::error!(target: "agentdesk::discord::queue_park", "positive capture control");
-        for _ in 0..2 {
-            h.shared
-                .queue_park_ledger
-                .evaluate(&h.shared, &CLAUDE, h.channel_id, &snapshot);
-        }
-    });
-    let captured = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
-    assert!(captured.contains("positive capture control"));
-    assert_eq!(
-        captured
-            .matches("cancel-preserved source remains parked")
-            .count(),
-        1,
-        "{captured}"
-    );
-    let park = h
-        .shared
-        .queue_park_ledger
-        .project(&h.shared, &CLAUDE, h.channel_id, &snapshot);
-    assert_eq!(park.owner, Some("idle_queue_backstop"));
-    assert_eq!(
-        park.reason.as_deref(),
-        Some("cancelled_anchor_held:hold_inflight_present")
-    );
-    let detail =
-        serde_json::to_value(discord::health::build_health_snapshot(registry).await).unwrap();
-    let health = detail["mailboxes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|mailbox| mailbox["channel_id"].as_u64() == Some(h.channel_id.get()))
-        .expect("real health mailbox projection");
-    assert_eq!(health["queue_park_owner"], "idle_queue_backstop");
-    assert_eq!(
-        health["queue_park_reason"],
-        "cancelled_anchor_held:hold_inflight_present"
-    );
-    assert_eq!(
-        health["queue_park_tracked_source_ids"],
-        serde_json::json!([queued])
-    );
-
     // Positive control supplies native terminal evidence after proving the live owner was held.
     use std::io::Write;
     std::fs::OpenOptions::new()
@@ -1180,11 +1108,13 @@ async fn session_bound_row_keeps_its_anchor_despite_dead_pane() {
     answered_once(&h).await;
 }
 
+/// A person's draft in the composer no longer holds Q after a cancelled anchor: the recovery
+/// types Q once behind the draft, without C-s on an unlisted channel, and Q is answered once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cancelled_anchor_recovery_keeps_a_person_draft_and_q_until_lift_pg() {
+async fn cancelled_anchor_recovery_types_q_once_behind_a_person_draft_pg() {
     if !isolated(concat!(
         module_path!(),
-        "::cancelled_anchor_recovery_keeps_a_person_draft_and_q_until_lift_pg"
+        "::cancelled_anchor_recovery_types_q_once_behind_a_person_draft_pg"
     )) {
         return;
     }
@@ -1269,7 +1199,7 @@ async fn cancelled_anchor_recovery_keeps_a_person_draft_and_q_until_lift_pg() {
     let person = "\x1b[39m❯\u{a0}person typed this without Enter";
     let original = idle_pane(person);
     draft.show(&original);
-    // The regular readiness capture is empty; the attributed final read sees the person's text.
+    std::fs::write(pane.root.join("idle-pane"), &original).unwrap();
     token.bind_unmanaged_session_name(&tmux);
     assert_eq!(
         discord::zombie_foreground_release::tui_structurally_idle(&CLAUDE, &token),
@@ -1279,57 +1209,9 @@ async fn cancelled_anchor_recovery_keeps_a_person_draft_and_q_until_lift_pg() {
     assert!(
         !discord::router::hosted_tui_promote_readiness_blocked(&h.shared, &CLAUDE, h.channel_id)
             .await,
-        "real host evidence and native Idle must permit the final composer read"
+        "real host evidence and native Idle must permit the recovery"
     );
-    wake_existing(&h);
-    assert!(
-        wait_until(WAIT, {
-            let shared = h.shared.clone();
-            let channel = h.channel_id;
-            let tmux = tmux.clone();
-            move || {
-                let shared = shared.clone();
-                let tmux = tmux.clone();
-                Box::pin(async move {
-                    let snapshot = mailbox_snapshot(&shared, channel).await;
-                    composer_lock::draft_guarded(&tmux)
-                        && snapshot.cancel_token.is_none()
-                        && snapshot.intervention_queue.iter().any(|i| i.text == Q)
-                })
-            }
-        })
-        .await,
-        "the final composer read must refuse and restore Q: draft_reads={}; cancel_present={}; queue={:?}; inputs={:?}; messages={:?}; writes={}",
-        draft.draft_reads(),
-        h.mailbox().await.cancel_token.is_some(),
-        queued_ids(&h).await,
-        h.provider_inputs(),
-        h.messages(),
-        pane.writes()
-    );
-    assert!(
-        draft.draft_reads() >= 1,
-        "the person's actual attributed composer was read"
-    );
-    assert_eq!(
-        crate::services::claude_tui::host_input::observe_draft(&tmux),
-        Some(original),
-        "the person's attributed composer bytes remain unchanged"
-    );
-    assert!(
-        pane.writes().is_empty(),
-        "draft protection sends no cleanup, paste or Enter: {}",
-        pane.writes()
-    );
-    assert!(
-        !h.root.path().join(super::PROVIDER_INPUTS_FILE).exists(),
-        "no fallback CLI execution may bypass the draft"
-    );
-    assert_eq!(queued_ids(&h).await, vec![queued]);
-    assert_eq!(h.durable_queue()[0].text, Q);
-    assert!(composer_lock::draft_guarded(&tmux));
-    // Existing main's draft-lift owner performs the retry; only the fixture pane changes.
-    let empty = "\x1b[39m❯\u{a0}\x1b[2mTry \"refactor <filepath>\"\x1b[0m";
+    // Enter makes the fake Claude answer, so the recovered Q completes its turn.
     let script_path = pane.root.join("tmux");
     let mut script = std::fs::read_to_string(&script_path).unwrap();
     let stream = pane.root.join("tui-done.jsonl");
@@ -1341,7 +1223,7 @@ async fn cancelled_anchor_recovery_keeps_a_person_draft_and_q_until_lift_pg() {
     script=script.replace("send-keys|load-buffer|paste-buffer) echo \"$*\" >>", "send-keys|load-buffer|paste-buffer) case \" $* \" in *\" Enter \"*) cat 'STREAM' >> 'TRANSCRIPT' ;; esac; echo \"$*\" >>")
         .replace("STREAM", &stream.display().to_string()).replace("TRANSCRIPT", &transcript.display().to_string());
     std::fs::write(&script_path, script).unwrap();
-    draft.show(&idle_pane(empty));
+    wake_existing(&h);
     assert!(
         wait_until(WAIT, {
             let shared = h.shared.clone();
@@ -1363,23 +1245,28 @@ async fn cancelled_anchor_recovery_keeps_a_person_draft_and_q_until_lift_pg() {
             }
         })
         .await,
-        "main draft-lift retry must actually submit and answer Q: {:?}; writes={}",
+        "the recovery must type and answer Q despite the draft: {:?}; writes={}",
         h.messages(),
         pane.writes()
     );
     let writes = pane.writes();
-    assert_eq!(
-        writes.matches(Q).count(),
-        1,
-        "one actual literal/paste input: {writes}"
-    );
-    assert_eq!(
+    let keyed = |word: &str| {
         writes
             .lines()
-            .filter(|line| line.split_whitespace().any(|word| word == "Enter"))
-            .count(),
-        1,
-        "one actual Enter: {writes}"
+            .filter(|line| line.split_whitespace().any(|w| w == word))
+            .count()
+    };
+    assert_eq!(keyed("paste-buffer"), 1, "one paste: {writes}");
+    assert_eq!(keyed("Enter"), 1, "one actual Enter: {writes}");
+    assert_eq!(
+        keyed("C-s"),
+        0,
+        "an unlisted channel never stashes: {writes}"
+    );
+    assert!(!composer_lock::draft_guarded(&tmux));
+    assert!(
+        !h.root.path().join(super::PROVIDER_INPUTS_FILE).exists(),
+        "no fallback CLI execution runs beside the pane input"
     );
     assert_eq!(
         h.messages().iter().filter(|(_, text)| text == "ok").count(),

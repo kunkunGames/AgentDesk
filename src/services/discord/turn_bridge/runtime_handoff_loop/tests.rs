@@ -103,6 +103,7 @@ async fn dispatch_handoff_from_persisted_baseline(
     });
     let mut last_activity_heartbeat_at = None;
     let mut watcher_adopted_after_done = false;
+    let actor_nonce = state.turn_nonce.clone();
 
     let outcome = handle_runtime_handoff_loop_message(
         message,
@@ -113,6 +114,7 @@ async fn dispatch_handoff_from_persisted_baseline(
             done,
             persisted_inflight_baseline,
             adk_session_name: &None,
+            captured_nonce: actor_nonce.as_deref(),
         },
         RuntimeHandoffLoopState {
             terminal_control_ready_observed: &mut terminal_control_ready_observed,
@@ -240,9 +242,7 @@ async fn late_terminal_session_identity_uses_persisted_baseline_and_fences_compe
 
 #[tokio::test]
 async fn process_runtime_ready_first_population_is_saved() {
-    let _lock = crate::config::shared_test_env_lock()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let root = tempfile::tempdir().expect("runtime root");
     let _env_reset = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
         "AGENTDESK_ROOT_DIR",
@@ -290,9 +290,7 @@ async fn process_runtime_ready_first_population_is_saved() {
 
 #[tokio::test]
 async fn transient_runtime_stamp_io_error_restores_local_and_requeues_exact_handoff() {
-    let _lock = crate::config::shared_test_env_lock()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let temp = tempfile::tempdir().expect("runtime root parent");
     let blocked_root = temp.path().join("blocked-root");
     std::fs::write(&blocked_root, b"not a directory").expect("block runtime root");
@@ -352,9 +350,7 @@ async fn transient_runtime_stamp_io_error_restores_local_and_requeues_exact_hand
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn second_watcher_owner_stamp_io_error_retries_from_exact_partial_checkpoint() {
-    let _lock = crate::config::shared_test_env_lock()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let root = tempfile::tempdir().expect("runtime root");
     let _env_reset = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
         "AGENTDESK_ROOT_DIR",
@@ -488,7 +484,7 @@ async fn second_watcher_owner_stamp_io_error_retries_from_exact_partial_checkpoi
 #[cfg(unix)]
 #[rustfmt::skip]
 async fn assert_claim_eviction_fails_closed(channel_id: u64, message: RuntimeHandoffLoopMessage) {
-    let _lock = crate::config::shared_test_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+    let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let root = tempfile::tempdir().unwrap();
     let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock("AGENTDESK_ROOT_DIR", root.path());
     let provider = ProviderKind::Codex;
@@ -525,9 +521,7 @@ async fn direct_tmux_adoption_rejects_claim_evicted_before_publication() {
 #[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn runtime_adoption_pins_authoritative_incumbent_not_provisional_marker() {
-    let _lock = crate::config::shared_test_env_lock()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let root = tempfile::tempdir().expect("runtime root");
     let _env_reset = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
         "AGENTDESK_ROOT_DIR",
@@ -656,9 +650,7 @@ async fn thread_follow_up_tmux_ready_claim_records_intended_classification_4984(
 
 #[tokio::test]
 async fn process_ready_skips_reowned_row_and_does_not_queue_stale_flush() {
-    let _lock = crate::config::shared_test_env_lock()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let root = tempfile::tempdir().expect("runtime root");
     let _env_reset = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
         "AGENTDESK_ROOT_DIR",
@@ -709,9 +701,7 @@ async fn assert_reowned_watcher_handoff_has_no_side_effects(
     message: RuntimeHandoffLoopMessage,
     channel_id: u64,
 ) {
-    let _lock = crate::config::shared_test_env_lock()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let root = tempfile::tempdir().expect("runtime root");
     let _env_reset = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
         "AGENTDESK_ROOT_DIR",
@@ -825,3 +815,7 @@ fn provisional_cleanup_preserves_replacement_incarnation() {
 #[cfg(unix)]
 #[path = "herdr_owner_tests.rs"]
 mod herdr_owner;
+
+#[cfg(unix)]
+#[path = "codex_replacement_tests.rs"]
+pub(super) mod codex_replacement;

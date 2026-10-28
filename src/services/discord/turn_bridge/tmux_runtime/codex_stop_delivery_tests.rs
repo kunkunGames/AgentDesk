@@ -260,7 +260,6 @@ impl Case {
 impl Drop for Case {
     fn drop(&mut self) {
         dedupe::clear_tmux_runtime_binding(&self.owner.logical_key);
-        crate::services::cluster::channel_home::unregister(&self.channel.to_string());
     }
 }
 
@@ -390,14 +389,6 @@ fn herdr_typed_refusals_have_no_escape_effects() {
             HerdrDelivery::NotSent(HerdrNotSent::SwitchOff)
         );
         HERDR_CANCEL_OVERRIDE.set(Some(true));
-        let home =
-            crate::services::cluster::channel_home::register_for_test(case.channel.get(), None);
-        assert_eq!(
-            runtime.block_on(case.delivery("/stop")),
-            HerdrDelivery::NotSent(HerdrNotSent::Holder)
-        );
-        drop(home);
-        crate::services::cluster::channel_home::unregister(&case.channel.to_string());
         case.screen(false);
         assert_eq!(
             runtime.block_on(case.delivery("/stop")),
@@ -615,7 +606,7 @@ fn herdr_uncertain_escape_spends_claim_and_gate_mismatch_writes_nothing() {
 }
 
 #[test]
-fn herdr_draining_holder_still_cancels_and_generation_adds_no_cleanup_authority_pg() {
+fn herdr_cancel_generation_adds_no_cleanup_authority_pg() {
     let fx = Fixture::new();
     let _dedupe = dedupe::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _switch = Switch::on();
@@ -630,14 +621,6 @@ fn herdr_draining_holder_still_cancels_and_generation_adds_no_cleanup_authority_
         {
             let case = Case::new(&pool, root.path(), provider, 400 + n as u64).await;
             let _registry = case.rig.registry_on_this_thread();
-            let home = crate::services::cluster::channel_home::register_for_test(
-                case.channel.get(),
-                Some(crate::db::o_channel_homes::HomeState::Reclaiming),
-            );
-            assert_eq!(
-                home.refusal(),
-                Some(crate::services::cluster::channel_home::HomeRefusal::Draining)
-            );
             assert_eq!(case.delivery("/cc stop").await, HerdrDelivery::Sent);
             assert_eq!(case.escapes(), 1);
             case.token.cancel_with_tmux_cleanup();
@@ -1142,16 +1125,7 @@ fn act7_slash_stop_effect_keeps_host_owned_and_dormant_matches_base() {
         );
         assert!(fx.take_calls().is_empty());
     });
-    let source = include_str!("../../commands/control.rs");
-    let body = source
-        .split("async fn cmd_stop")
-        .nth(1)
-        .unwrap()
-        .split("pub(super) fn parse_queued_message_id")
-        .next()
-        .unwrap();
-    assert_eq!(body.matches("run_slash_stop(").count(), 1);
-    assert!(!body.contains("begin_command_stop(") && !body.contains("begin_user_stop("));
+    source_guard_tests::act7_slash_stop_enters_through_run_slash_stop();
 }
 
 /// A cold stop alone is no proof and holds; after the executor's no-attempt exit the exit seal
@@ -1182,7 +1156,7 @@ fn cold_unsubmitted_stop_closes_only_after_a_no_attempt_exit() {
             &current_token(case, runtime).unwrap(),
             &case.token
         ));
-        finish_execution(Some(&case.token));
+        finish_execution(Some(&case.token), false);
         assert_eq!(state.closed_probe(), Some(true));
         let ExitDecision::PolicyClose(proof) = seal_exit(&case.token, false, false) else {
             panic!("a no-attempt exit with a cold stop is a before-start proof");
@@ -1324,8 +1298,14 @@ fn act7_each_stop_reason_preserves_delivery_and_settlement_axes() {
     );
 }
 
-#[path = "codex_stop_delivery_home_stop_tests.rs"]
-mod home_stop;
+#[path = "codex_stop_source_guard_tests.rs"]
+mod source_guard_tests;
 
 #[path = "codex_stop_delivery_cut_tests.rs"]
 pub(super) mod cut;
+
+#[path = "herdr_stop_pane_tests.rs"]
+mod herdr_stop_pane;
+
+#[path = "herdr_http_cancel_tests.rs"]
+mod http_cancel;

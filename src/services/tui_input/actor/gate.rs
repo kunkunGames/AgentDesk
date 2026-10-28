@@ -17,7 +17,8 @@ use crate::services::tmux_common::{
 use crate::services::tui_input::submission::SubmitContext;
 use crate::services::tui_o::shadow::ShadowProvider;
 
-pub(crate) mod claude_guarded;
+#[cfg(test)]
+mod own_draft_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaneVerdict {
@@ -29,7 +30,7 @@ pub enum PaneVerdict {
 
 pub fn judge_pane(provider: ShadowProvider, capture: &str) -> PaneVerdict {
     #[cfg(test)]
-    if super::super::transition::mutant("draft_veto") && capture.contains("foreign draft") {
+    if super::super::mutant("draft_veto") && capture.contains("foreign draft") {
         return PaneVerdict::Ready;
     }
     match provider {
@@ -105,7 +106,7 @@ pub(crate) fn own_draft(
     pre_empty: bool,
 ) -> bool {
     #[cfg(test)]
-    if super::super::transition::mutant("pre_empty") {
+    if super::super::mutant("pre_empty") {
         return true;
     }
     if !pre_empty {
@@ -144,7 +145,7 @@ pub(crate) fn own_draft(
         return true;
     }
     #[cfg(test)]
-    if super::super::transition::mutant("folded_unknown") {
+    if super::super::mutant("folded_unknown") {
         return false;
     }
     let Some(rest) = body.strip_prefix("[Pasted text #") else {
@@ -160,18 +161,10 @@ pub(crate) fn own_draft(
         return frame.chars().count() > 800 && suffix == "]";
     }
     #[cfg(test)]
-    if super::super::transition::mutant("folded_k") {
+    if super::super::mutant("folded_k") {
         return true;
     }
     suffix == format!(" +{newlines} lines]")
-}
-
-/// The composer shows exactly `rows`, as Claude wraps a paste; nothing folded or typed besides.
-pub(crate) fn own_wrapped_draft(capture: &str, rows: &[String]) -> bool {
-    let plain = strip_ansi_escape_sequences(capture);
-    claude_composer_not_known_empty(capture)
-        && claude_composer_rows(&plain)
-            .is_some_and(|shown| shown.into_iter().eq(rows.iter().map(String::as_str)))
 }
 
 // Only the existing measured raw layout can identify a native hint as an empty composer.

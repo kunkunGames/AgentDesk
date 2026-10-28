@@ -5,6 +5,7 @@ use std::sync::{Arc, mpsc::Sender};
 use std::time::Duration;
 
 use crate::services::agent_protocol::StreamMessage;
+use crate::services::discord::codex_absence::InflightObs;
 use crate::services::discord::inflight::{ManagedSubmission, SubmissionFailure};
 use crate::services::discord::replay_policy::permit::EffectTarget;
 use crate::services::discord::router::intake_dispatch::replay_admission::ReplayStart;
@@ -17,6 +18,8 @@ use crate::services::stream_json_cli::{
 use crate::services::turn_host::{HerdrRefusal, HerdrTurnPlan, TurnHost};
 use crate::services::{claude, claude_tui, codex, gemini, opencode, qwen};
 
+pub(super) mod replay_scope;
+
 pub(super) struct StreamingTurn<'a> {
     pub pool: Option<&'a sqlx::PgPool>,
     pub provider: &'a ProviderKind,
@@ -26,6 +29,7 @@ pub(super) struct StreamingTurn<'a> {
     pub system_prompt: Option<&'a str>,
     pub allowed_tools: &'a [String],
     pub cancel: Arc<CancelToken>,
+    pub codex_observation: Option<&'a InflightObs>,
     pub remote_profile: Option<&'a RemoteProfile>,
     pub tmux_session_name: Option<&'a str>,
     /// Host-guard verdict for the turn's tmux teardowns, judged before spawn.
@@ -46,26 +50,69 @@ pub(super) struct StreamingTurn<'a> {
     pub submission: Option<&'a ManagedSubmission>,
 }
 
+pub(super) async fn observe_codex_turn(
+    provider: &ProviderKind,
+    channel: u64,
+    tmux: Option<&str>,
+    remote: bool,
+    host: &TurnHost,
+    token: &Arc<CancelToken>,
+) -> Option<InflightObs> {
+    if !matches!(provider, ProviderKind::Codex) || remote || !matches!(host, TurnHost::Tmux) {
+        return None;
+    }
+    crate::services::discord::codex_absence::observe_turn(channel, tmux?, token).await
+}
+
 #[cfg(test)]
-pub(super) struct InputEffectProbe {
+pub(in crate::services::discord) struct InputEffectProbe {
     pub channel: u64,
-    pub entered: tokio::sync::oneshot::Sender<(bool, bool)>,
+    /// Receives the thread the provider ran on, so a caller can tell it left the async task.
+    pub entered: tokio::sync::oneshot::Sender<std::thread::ThreadId>,
     pub release: std::sync::mpsc::Receiver<()>,
     pub terminal_before_release: bool,
 }
 #[cfg(test)]
-pub(super) static INPUT_EFFECT_PROBE: std::sync::Mutex<Option<InputEffectProbe>> =
+pub(in crate::services::discord) static INPUT_EFFECT_PROBE: std::sync::Mutex<
+    Option<InputEffectProbe>,
+> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(super) type InputEffectObserver = Box<dyn FnOnce(String) + Send>;
+#[cfg(test)]
+pub(super) static INPUT_EFFECT_OBSERVER: std::sync::Mutex<Option<(u64, InputEffectObserver)>> =
     std::sync::Mutex::new(None);
 #[cfg(test)]
 pub(super) struct SubmittedPrompt {
     pub prompt: String,
-    pub system_prompt: Option<String>,
     pub session_id: Option<String>,
 }
 #[cfg(test)]
 pub(super) static INPUT_PROMPT_PROBE: std::sync::Mutex<
     Option<(u64, tokio::sync::oneshot::Sender<SubmittedPrompt>)>,
 > = std::sync::Mutex::new(None);
+/// Provider dispatches a test counts on one channel; a counted dispatch with no effect probe left
+/// is refused, so a duplicate start never reaches the real provider.
+#[cfg(test)]
+pub(in crate::services::discord) static COUNTED_DISPATCHES: std::sync::Mutex<Option<(u64, usize)>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+fn count_dispatch(channel: u64) -> Result<(), String> {
+    let mut counted = COUNTED_DISPATCHES.lock().unwrap();
+    let Some((_, count)) = counted.as_mut().filter(|(counted, _)| *counted == channel) else {
+        return Ok(());
+    };
+    *count += 1;
+    let probed = INPUT_EFFECT_PROBE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|probe| probe.channel == channel);
+    if probed {
+        Ok(())
+    } else {
+        Err("counted test dispatch has no provider probe".into())
+    }
+}
 #[cfg(test)]
 fn input_effect_probe(
     turn: &StreamingTurn<'_>,
@@ -82,14 +129,25 @@ fn input_effect_probe(
             None
         }
     }?;
-    use crate::services::discord::input_runtime::fence;
-    let named = fence::effect::current()
-        .is_some_and(|permit| permit.validate(turn.provider, turn.channel_id).is_ok());
-    let _ = probe.entered.send((named, fence::require_worker().is_ok()));
+    let observer = {
+        let mut slot = INPUT_EFFECT_OBSERVER.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|(channel, _)| *channel == turn.channel_id)
+        {
+            slot.take().map(|(_, observer)| observer)
+        } else {
+            None
+        }
+    };
+    if let Some(observer) = observer {
+        observer(turn.provider.as_str().to_owned());
+    }
+    let _ = probe.entered.send(std::thread::current().id());
     let terminal = || {
         sender
             .send(StreamMessage::Done {
-                result: "NO_REPLY".into(),
+                result: tests::take_result(turn.channel_id),
                 session_id: Some("input-effect-provider".into()),
             })
             .map_err(|error| error.to_string())
@@ -105,34 +163,14 @@ fn input_effect_probe(
     }
 }
 
-#[cfg(test)]
-pub(super) static INPUT_EFFECT_COMPLETION_PROBE: std::sync::Mutex<
-    Option<(u64, tokio::sync::oneshot::Sender<()>)>,
-> = std::sync::Mutex::new(None);
-#[cfg(test)]
-pub(super) fn observe_input_effect_completion(channel: u64, task: tokio::task::JoinHandle<()>) {
-    let probe = {
-        let mut slot = INPUT_EFFECT_COMPLETION_PROBE.lock().unwrap();
-        if slot.as_ref().is_some_and(|probe| probe.0 == channel) {
-            slot.take()
-        } else {
-            None
-        }
-    };
-    if let Some((_, completed)) = probe {
-        tokio::spawn(async move {
-            task.await.unwrap();
-            let _ = completed.send(());
-        });
-    }
-}
-
 /// Stands in for the Claude driver inside the submission scope, on the real provider thread.
 #[cfg(test)]
-pub(super) type ClaudeLegacyProbe = Box<dyn FnOnce() -> Result<(), String> + Send>;
+pub(in crate::services::discord) type ClaudeLegacyProbe =
+    Box<dyn FnOnce() -> Result<(), String> + Send>;
 #[cfg(test)]
-pub(super) static CLAUDE_LEGACY_PROBE: std::sync::Mutex<Option<(u64, ClaudeLegacyProbe)>> =
-    std::sync::Mutex::new(None);
+pub(in crate::services::discord) static CLAUDE_LEGACY_PROBE: std::sync::Mutex<
+    Option<(u64, ClaudeLegacyProbe)>,
+> = std::sync::Mutex::new(None);
 #[cfg(test)]
 fn claude_legacy_probe(channel: u64) -> Option<Result<(), String>> {
     let mut slot = CLAUDE_LEGACY_PROBE.lock().unwrap();
@@ -142,6 +180,24 @@ fn claude_legacy_probe(channel: u64) -> Option<Result<(), String>> {
     slot.take().map(|(_, probe)| probe())
 }
 
+/// User and headless workers report panic failures through the same bridge message.
+pub(super) fn producer_panic(scope: &str, info: Box<dyn std::any::Any + Send>) -> StreamMessage {
+    let message = if let Some(value) = info.downcast_ref::<String>() {
+        value.clone()
+    } else if let Some(value) = info.downcast_ref::<&str>() {
+        value.to_string()
+    } else {
+        "unknown panic".to_string()
+    };
+    tracing::error!("  [{}] PANIC: {}", scope, message);
+    StreamMessage::Error {
+        message: format!("Internal error (panic): {}", message),
+        stdout: String::new(),
+        stderr: String::new(),
+        exit_code: None,
+    }
+}
+
 /// The bridge message for a provider `Err`. A prompt held before submit sends none, so the
 /// bridge keeps the Waiting row instead of finishing the turn as a provider failure.
 pub(super) fn producer_error(
@@ -149,6 +205,9 @@ pub(super) fn producer_error(
     channel_id: u64,
     error: String,
 ) -> Option<StreamMessage> {
+    if submission.is_some_and(|attempt| attempt.preparation_hold().is_some()) {
+        return None;
+    }
     match submission.map(ManagedSubmission::classify_failure) {
         Some(SubmissionFailure::GuardedStopped(run)) => {
             tracing::warn!(channel_id, ?run, "guarded Claude submission remains held");
@@ -183,6 +242,19 @@ pub(super) fn execute(
     start: ReplayStart,
     sender: Sender<StreamMessage>,
 ) -> Result<(), String> {
+    let start = if start.receipt_id().is_some() {
+        let scope = replay_scope::selected(
+            turn.provider,
+            turn.channel_id,
+            turn.remote_profile.is_some(),
+            turn.tmux_session_name,
+        );
+        start
+            .in_scope(scope.driver.as_str(), scope.runtime)
+            .map_err(|error| format!("replay driver scope changed: {error:?}"))?
+    } else {
+        start
+    };
     // Spent before any driver, Herdr included, so a protected start's first input needs its permit.
     let target = EffectTarget::ProviderStart {
         provider: turn.provider.as_str().to_string(),
@@ -202,6 +274,8 @@ pub(super) fn execute(
         }
     }
     #[cfg(test)]
+    count_dispatch(turn.channel_id)?;
+    #[cfg(test)]
     {
         let mut probe = INPUT_PROMPT_PROBE.lock().unwrap();
         if probe
@@ -211,7 +285,6 @@ pub(super) fn execute(
             let (_, capture) = probe.take().unwrap();
             let _ = capture.send(SubmittedPrompt {
                 prompt: turn.prompt.to_owned(),
-                system_prompt: turn.system_prompt.map(str::to_owned),
                 session_id: turn.session_id.map(str::to_owned),
             });
         }
@@ -238,6 +311,9 @@ pub(super) fn execute(
         }),
         ..turn
     };
+    #[cfg(test)]
+    let _driver_setup =
+        crate::services::discord::codex_absence::test_setup::enter(turn.channel_id, turn.prompt);
     match turn.provider.legacy_streaming_dispatch_kind() {
         LegacyDispatchKind::Claude => claude_tui::guarded_outcome::with_owner(
             turn.submission.map(ManagedSubmission::observer),
@@ -245,60 +321,61 @@ pub(super) fn execute(
                 claude_tui::submission_fence::with_scope(
                     turn.submission.map(ManagedSubmission::fence),
                     || {
-                        claude_tui::submit_canary::with_channel(turn.channel_id, || {
-                            #[cfg(all(test, unix))]
-                            submission_tests::observe_owner(
-                                turn.channel_id,
-                                turn.submission,
-                                turn.prompt,
-                            );
-                            #[cfg(test)]
-                            if let Some(result) = claude_legacy_probe(turn.channel_id) {
-                                return result;
-                            }
-                            claude::execute_command_streaming(
-                                turn.prompt,
-                                turn.session_id,
-                                turn.working_dir,
-                                sender,
-                                turn.system_prompt,
-                                Some(turn.allowed_tools),
-                                Some(turn.cancel),
-                                turn.remote_profile,
-                                turn.tmux_session_name,
-                                turn.teardown,
-                                Some(turn.channel_id),
-                                Some(turn.provider.clone()),
-                                turn.model,
-                                turn.native_fast_mode,
-                                turn.compact_percent,
-                                turn.compact_lower_bound_tokens,
-                                turn.cache_ttl_minutes,
-                                turn.dispatch_type,
-                            )
-                        })
+                        #[cfg(all(test, unix))]
+                        submission_tests::observe_owner(
+                            turn.channel_id,
+                            turn.submission,
+                            turn.prompt,
+                        );
+                        #[cfg(test)]
+                        if let Some(result) = claude_legacy_probe(turn.channel_id) {
+                            return result;
+                        }
+                        claude::execute_command_streaming(
+                            turn.prompt,
+                            turn.session_id,
+                            turn.working_dir,
+                            sender,
+                            turn.system_prompt,
+                            Some(turn.allowed_tools),
+                            Some(turn.cancel),
+                            turn.remote_profile,
+                            turn.tmux_session_name,
+                            turn.teardown,
+                            Some(turn.channel_id),
+                            Some(turn.provider.clone()),
+                            turn.model,
+                            turn.native_fast_mode,
+                            turn.compact_percent,
+                            turn.compact_lower_bound_tokens,
+                            turn.cache_ttl_minutes,
+                            turn.dispatch_type,
+                        )
                     },
                 )
             },
         ),
-        LegacyDispatchKind::Codex => codex::execute_command_streaming(
-            turn.prompt,
-            turn.session_id,
-            turn.working_dir,
-            sender,
-            turn.system_prompt,
-            Some(turn.allowed_tools),
-            Some(turn.cancel),
-            turn.remote_profile,
-            turn.tmux_session_name,
-            turn.teardown,
-            Some(turn.channel_id),
-            Some(turn.provider.clone()),
-            turn.model,
-            turn.native_fast_mode,
-            turn.codex_goals,
-            turn.compact_token_limit,
-            turn.force_fresh,
+        LegacyDispatchKind::Codex => codex::execute_command_streaming_observed(
+            codex::CommandStreamingRequest {
+                prompt: turn.prompt,
+                session_id: turn.session_id,
+                working_dir: turn.working_dir,
+                sender,
+                system_prompt: turn.system_prompt,
+                allowed_tools: Some(turn.allowed_tools),
+                cancel_token: Some(turn.cancel),
+                remote_profile: turn.remote_profile,
+                tmux_session_name: turn.tmux_session_name,
+                teardown: turn.teardown,
+                report_channel_id: Some(turn.channel_id),
+                report_provider: Some(turn.provider.clone()),
+                model: turn.model,
+                fast_mode_enabled: turn.native_fast_mode,
+                goals_enabled: turn.codex_goals,
+                compact_token_limit: turn.compact_token_limit,
+                force_fresh_provider_session: turn.force_fresh,
+            },
+            turn.codex_observation,
         ),
         LegacyDispatchKind::Gemini => gemini::execute_command_streaming(
             turn.prompt,
@@ -622,7 +699,7 @@ mod herdr {
         }
 
         fn read_pane(&self, pane_id: &str) -> HerdrPaneReading {
-            if pane_id == self.pane && self.target.execution_alive() {
+            if pane_id == self.pane && self.target.execution_confirmed() {
                 return HerdrPaneReading::Present(self.evidence.clone());
             }
             HerdrPaneReading::Unreadable("the pane gate did not confirm the execution".into())
@@ -668,8 +745,50 @@ mod idle_stash_tests;
 pub(super) mod producer_error_test_support;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    static INPUT_RESULT: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
+
+    pub(in crate::services::discord::router::message_handler) struct ResultReset(u64);
+
+    impl Drop for ResultReset {
+        fn drop(&mut self) {
+            let mut result = INPUT_RESULT.lock().unwrap_or_else(|p| p.into_inner());
+            if result
+                .as_ref()
+                .is_some_and(|(channel, _)| *channel == self.0)
+            {
+                result.take();
+            }
+        }
+    }
+
+    pub(in crate::services::discord::router::message_handler) fn set_result(
+        channel: u64,
+        result: String,
+    ) -> ResultReset {
+        assert!(
+            INPUT_RESULT
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .replace((channel, result))
+                .is_none()
+        );
+        ResultReset(channel)
+    }
+
+    pub(super) fn take_result(channel: u64) -> String {
+        let mut result = INPUT_RESULT.lock().unwrap_or_else(|p| p.into_inner());
+        if result
+            .as_ref()
+            .is_some_and(|(probed, _)| *probed == channel)
+        {
+            result.take().unwrap().1
+        } else {
+            "NO_REPLY".into()
+        }
+    }
 
     #[test]
     fn grok_discord_dispatch_uses_native_dialect_and_preserves_model_policy_and_attempt() {
@@ -686,6 +805,7 @@ mod tests {
             system_prompt: Some("reviewer"),
             allowed_tools: &tools,
             cancel: Arc::clone(&cancel),
+            codex_observation: None,
             remote_profile: None,
             tmux_session_name: None,
             teardown: None,
@@ -751,6 +871,7 @@ mod tests {
             system_prompt: Some("role"),
             allowed_tools: &tools,
             cancel: Arc::clone(&cancel),
+            codex_observation: None,
             remote_profile: None,
             tmux_session_name: None,
             teardown: None,
@@ -845,6 +966,7 @@ mod tests {
                 system_prompt: None,
                 allowed_tools: &[],
                 cancel: Arc::new(CancelToken::new()),
+                codex_observation: None,
                 remote_profile: None,
                 tmux_session_name: Some("AgentDesk-claude-dash"),
                 teardown: None,

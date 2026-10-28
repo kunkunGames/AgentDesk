@@ -1,9 +1,9 @@
 //! Read-only Unbound evidence; no result here grants a start capability.
 use std::collections::BTreeMap;
 
-use crate::config::{Config, session_hosts::BootSessionHosts};
+use crate::config::{Config, session_hosts::ChannelEndpoint};
 use crate::db::dispatched_sessions::hosted_execution::{
-    HostedLookup, HostedOwner, HostedRecord, HostedState,
+    HostedLookup, HostedObservation, HostedOwner, HostedRecord, HostedState,
 };
 use crate::services::discord::{
     adk_session,
@@ -28,6 +28,7 @@ enum Origin {
     Core,
     Fallback,
     Binding(u64),
+    Canonical,
     Inflight,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +176,7 @@ struct HostReads<'a> {
     exact_key: &'a str,
     exact: &'a HostedLookup,
     canonical: &'a HostedLookup,
+    legacy_absence: bool,
     evidence: Result<SessionTargetEvidence, String>,
     marker: HostKindMarker,
     inflight: &'a Result<Option<InflightTurnState>, String>,
@@ -219,7 +221,7 @@ fn host_scope_result(reads: HostReads<'_>) -> Scope {
         return hold("probe_failed");
     }
     if evidence.host_marker != marker {
-        return hold("identity_unresolved");
+        return hold("marker_witness_mismatch");
     }
     let key =
         adk_session::build_namespaced_session_key(reads.token_hash, reads.provider, reads.name);
@@ -229,20 +231,24 @@ fn host_scope_result(reads: HostReads<'_>) -> Scope {
             .session_name
             .as_deref()
             .is_some_and(|n| n != reads.name)
-        || reads.exact != reads.canonical
     {
-        return hold("identity_unresolved");
+        return hold("key_witness_mismatch");
+    }
+    if reads.exact != reads.canonical && !reads.legacy_absence {
+        return hold("exact_canonical_mismatch");
     }
     evidence.session_key = Some(key.clone());
     evidence.session_name = Some(reads.name.into());
     if evidence.session_record != observed_row(reads.exact) {
-        return hold("identity_unresolved");
+        return hold("record_witness_mismatch");
     }
     if let Some(row) = row {
         evidence = with_inflight_row(evidence, row);
     }
-    if evidence.name_conflict.is_some()
-        || evidence.runtime_kind_unrecognized
+    if evidence.name_conflict.is_some() {
+        return hold("inflight_name_conflict");
+    }
+    if evidence.runtime_kind_unrecognized
         || [
             &evidence.session_record,
             &evidence.inflight_locator,
@@ -256,7 +262,7 @@ fn host_scope_result(reads: HostReads<'_>) -> Scope {
             )
         })
     {
-        return hold("identity_unresolved");
+        return hold("witness_unrecognized");
     }
     let bindings: Vec<_> = reads
         .config
@@ -280,9 +286,6 @@ fn host_scope_result(reads: HostReads<'_>) -> Scope {
     {
         return hold("host_unsupported");
     }
-    let Ok(boot) = BootSessionHosts::from_config(reads.config) else {
-        return hold("probe_failed");
-    };
     let quiet = row.is_none()
         && evidence.inflight_locator == HostWitness::Absent
         && evidence.durable_runtime_kind.is_none()
@@ -298,39 +301,30 @@ fn host_scope_result(reads: HostReads<'_>) -> Scope {
                 target: None
             }
     );
-    if let Some(endpoint) = boot.herdr_endpoint(reads.channel) {
+    // Hosting is the boot section until restart, like every routing consumer.
+    if let Some(endpoint) = crate::config::session_hosts::herdr_endpoint(reads.channel) {
         let owner = reads.expected_owner;
-        if owner.provider != reads.provider.as_str()
-            || owner.channel_id != reads.channel.to_string()
-            || owner.discord_token_hash != reads.token_hash
-            || owner.logical_key != reads.name
-            || Some(owner.owner_node.as_str()) != boot.local_node()
-            || owner.runtime_root.trim().is_empty()
-        {
-            return hold("identity_unresolved");
+        let (provider, token_hash) = (reads.provider, reads.token_hash);
+        let node = crate::config::session_hosts::local_node();
+        if !local_owner(
+            owner,
+            provider,
+            reads.channel,
+            token_hash,
+            reads.name,
+            node.as_deref(),
+        ) {
+            return hold("herdr_owner_mismatch");
         }
         return match reads.exact {
             HostedLookup::Missing if clean => Scope::HerdrFirstCreate,
-            HostedLookup::Found(found) => match &found.record {
-                HostedRecord::Known(record)
-                    if quiet
-                        && retired_marker
-                        && HostedRecord::decode(serde_json::to_value(record).ok().as_ref())
-                            == found.record
-                        && record.state == HostedState::Retired
-                        && record.owner == *owner
-                        && record.location.as_ref().is_some_and(|at| {
-                            at.host == "herdr"
-                                && at.execution_node == endpoint.execution_node
-                                && at.endpoint_config_key == endpoint.key
-                                && at.socket_addr == endpoint.socket_path.to_string_lossy()
-                                && at.named_session == endpoint.herdr_session
-                        }) =>
-                {
-                    Scope::HerdrRetired
-                }
-                _ => hold("hosted_active_or_unknown"),
-            },
+            HostedLookup::Found(found)
+                if quiet
+                    && retired_marker
+                    && herdr_record_at(found, HostedState::Retired, owner, &endpoint) =>
+            {
+                Scope::HerdrRetired
+            }
             _ => hold("hosted_active_or_unknown"),
         };
     }
@@ -349,6 +343,45 @@ fn host_scope_result(reads: HostReads<'_>) -> Scope {
         } if name == reads.name => Scope::LocalInventory,
         _ => hold("host_unresolved"),
     }
+}
+
+/// Whether `owner` names this channel's session `name` on this node, under a runtime root.
+fn local_owner(
+    owner: &HostedOwner,
+    provider: &ProviderKind,
+    channel: u64,
+    token_hash: &str,
+    name: &str,
+    node: Option<&str>,
+) -> bool {
+    owner.provider == provider.as_str()
+        && owner.channel_id == channel.to_string()
+        && owner.discord_token_hash == token_hash
+        && owner.logical_key == name
+        && Some(owner.owner_node.as_str()) == node
+        && !owner.runtime_root.trim().is_empty()
+}
+
+/// Whether `found` is a self-consistent record in `state`, owned by `owner` at `endpoint`.
+fn herdr_record_at(
+    found: &HostedObservation,
+    state: HostedState,
+    owner: &HostedOwner,
+    endpoint: &ChannelEndpoint,
+) -> bool {
+    let HostedRecord::Known(record) = &found.record else {
+        return false;
+    };
+    HostedRecord::decode(serde_json::to_value(record).ok().as_ref()) == found.record
+        && record.state == state
+        && record.owner == *owner
+        && record.location.as_ref().is_some_and(|at| {
+            at.host == "herdr"
+                && at.execution_node == endpoint.execution_node
+                && at.endpoint_config_key == endpoint.key
+                && at.socket_addr == endpoint.socket_path.to_string_lossy()
+                && at.named_session == endpoint.herdr_session
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -373,8 +406,11 @@ fn decide_unbound(
     };
     #[cfg(test)]
     dormancy_tests::reached(candidates.channel);
-    if candidates.conflict || candidates.inflight {
-        return Verdict::Hold("identity_unresolved");
+    if candidates.conflict {
+        return Verdict::Hold("candidate_conflict");
+    }
+    if candidates.inflight {
+        return Verdict::Hold("candidate_inflight");
     }
     if scope.channel != candidates.channel
         || scope.provider != candidates.provider
@@ -383,7 +419,7 @@ fn decide_unbound(
             .as_ref()
             .is_some_and(|name| name != &scope.name)
     {
-        return Verdict::Hold("identity_unresolved");
+        return Verdict::Hold("scope_mismatch");
     }
     if candidates.current.is_none()
         && !matches!(
@@ -391,10 +427,10 @@ fn decide_unbound(
             Scope::LocalInventory | Scope::LocalNameless | Scope::Hold(_)
         )
     {
-        return Verdict::Hold("candidate_unresolved");
+        return Verdict::Hold("hosted_candidate_unresolved");
     }
     if matches!(scope.result, Scope::LocalNameless) && candidates.current.is_some() {
-        return Verdict::Hold("identity_unresolved");
+        return Verdict::Hold("nameless_with_current");
     }
     let hosted = match scope.result {
         Scope::Hold(reason) => return Verdict::Hold(reason),
@@ -422,10 +458,13 @@ fn decide_unbound(
     }) {
         return Verdict::Hold("watcher_unbound");
     }
-    if names
-        .iter()
-        .any(|name| !matches!(owners.get(name), Some(Some(owner)) if *owner != candidates.channel))
-    {
+    // Only a name in AgentDesk's tmux namespace can be this channel's session under a name its
+    // own evidence lacks; a session it names or owns already held above.
+    let namespace = format!("{}-", crate::services::provider::TMUX_SESSION_PREFIX);
+    if names.iter().any(|name| {
+        name.starts_with(&namespace)
+            && !matches!(owners.get(name), Some(Some(owner)) if *owner != candidates.channel)
+    }) {
         return Verdict::Hold("owner_unresolved");
     }
     if let Some(absence) = hosted {
@@ -483,8 +522,7 @@ fn local_registration(config: &Config, channel: u64, provider: &ProviderKind) ->
                 .to_ascii_lowercase();
             name == provider.as_str() && channel_effective_tui_request(config, binding, &name)
         })
-        && BootSessionHosts::from_config(config)
-            .is_ok_and(|boot| boot.herdr_endpoint(channel).is_none())
+        && crate::config::session_hosts::herdr_endpoint(channel).is_none()
 }
 
 #[cfg(test)]
@@ -493,4 +531,9 @@ mod dormancy_tests;
 #[path = "unbound/unit_tests.rs"]
 mod tests;
 
+mod binding_metadata;
+mod cross_runtime_owners;
+pub(super) mod herdr_bound;
+pub(super) mod hold_leaf;
 pub(super) mod live;
+mod routine_owner;

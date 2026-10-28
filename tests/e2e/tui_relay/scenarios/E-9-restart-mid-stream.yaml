@@ -2,6 +2,7 @@ id: E-9
 title: 스트리밍 중 dev 재기동 — sentinel marker 후 restart, 청크 이어 emit, 중복 0
 agent_mode: real_live
 coverage_class: live
+# Manual execution specification; not run in CI. Conditional post-deploy subset (E-1/E-35/E-50/E-51): see README.md.
 cells: [claude-pipe, claude-tui, codex-pipe, codex-tui]
 isolation: required
 destructive: true
@@ -14,8 +15,8 @@ steps:
       마지막 줄에는 정확히 "[E2E:E9:END]"를 출력해줘.
   - wait_for_discord_text: "[E2E:E9:STREAM_OK]"
     timeout_s: 180
+  # The run picks dev or release from --base-url or --restart-target-override.
   - restart_dcserver:
-      target: dev
       # Same bulk inventory baseline as E-54; any other degraded reason still fails.
       require_status: &bulk_status [healthy, degraded]
       allowed_degraded_reasons: &bulk_baseline_reasons
@@ -65,14 +66,7 @@ assertions:
   # (byte-identical only) does not catch. The sentinel must appear in exactly
   # one relay message across the whole window, pre- and post-restart.
   - no_duplicate_marker: "[E2E:E9:STREAM_OK]"
-  # #4488 PR-F: with the two-message rollout enabled, restart recovery must
-  # leave the live panel below the latest answer chunk instead of reusing a
-  # stranded pre-restart panel above it.
-  # These rollout assertions are opt-in. Set
-  # AGENTDESK_E2E_FEATURES=two_message_panel only when the boot-bound
-  # placeholder.two_message_panel_enabled flag is enabled for the target.
-  - requires_feature: two_message_panel
-    status_panel_after_body:
-      body_marker: "[E2E:E9:END]"
-  - requires_feature: two_message_panel
-    single_status_panel: true
+  - no_status_chrome: true
+  - completion_per_turn:
+      exact: 1
+      marker: "[E2E:E9:END]"

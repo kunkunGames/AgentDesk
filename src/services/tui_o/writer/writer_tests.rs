@@ -20,6 +20,25 @@ use crate::services::tui_o::store::{ChannelStore, InitSource, Initialized, OStor
 const BOT: u64 = 42;
 const CHANNEL: u64 = 7;
 
+thread_local! {
+    static RESTART_POLICY_CALLS: std::cell::Cell<Option<(u64, usize)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+pub(crate) fn restart_policy_call(channel: u64) {
+    if super::replay::mutant("counter_off") {
+        return;
+    }
+    RESTART_POLICY_CALLS.with(|calls| {
+        if let Some((selected, count)) = calls.get()
+            && selected == channel
+        {
+            calls.set(Some((selected, count + 1)));
+        }
+    });
+}
+
 #[derive(Clone, Copy)]
 enum Reply {
     Created,
@@ -34,7 +53,11 @@ enum Reply {
     CreatedByOther,
     /// Created by this bot with an id behind the anchor, which the ledger treats as a violation.
     CreatedBehind,
+    /// Created by this bot with an id just behind its previous post, as Discord can mint one.
+    CreatedReordered,
 }
+
+type PostHook = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
 
 #[derive(Default)]
 struct FakePort {
@@ -50,7 +73,11 @@ struct FakePort {
     started: Arc<Mutex<Vec<&'static str>>>,
     /// A lazy request waits on this before it completes.
     hold: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
-    on_post: Mutex<Option<Box<dyn Fn() + Send>>>,
+    on_post: PostHook,
+    history_reads: AtomicUsize,
+    on_construct: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Each POST answers only after this long.
+    delay: Mutex<Option<std::time::Duration>>,
 }
 
 impl FakePort {
@@ -82,6 +109,9 @@ impl DiscordPort for FakePort {
         _channel: u64,
         content: String,
     ) -> impl Future<Output = PostOutcome> + Send + 'static {
+        if let Some(hook) = self.on_construct.lock().unwrap().as_ref() {
+            hook();
+        }
         let ledger = self
             .ledger
             .lock()
@@ -114,15 +144,28 @@ impl DiscordPort for FakePort {
                 author_id: BOT,
                 content,
             }),
+            Reply::CreatedReordered => {
+                let id = self.say(BOT, &content).id - 2;
+                PostOutcome::Created(SeenMessage {
+                    id,
+                    author_id: BOT,
+                    content,
+                })
+            }
         };
-        if let Some(hook) = self.on_post.lock().unwrap().as_ref() {
-            hook();
-        }
+        let on_post = Arc::clone(&self.on_post);
         let lazy = self.lazy.load(Ordering::SeqCst).then(|| {
             let hold = self.hold.lock().unwrap().take();
             (Arc::clone(&self.started), hold)
         });
+        let delay = *self.delay.lock().unwrap();
         async move {
+            if let Some(hook) = on_post.lock().unwrap().as_ref() {
+                hook();
+            }
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             if let Some((started, hold)) = lazy {
                 started.lock().unwrap().push("http");
                 if let Some(hold) = hold {
@@ -138,6 +181,7 @@ impl DiscordPort for FakePort {
         _channel: u64,
         after: u64,
     ) -> impl Future<Output = Result<Vec<SeenMessage>, String>> + Send {
+        self.history_reads.fetch_add(1, Ordering::SeqCst);
         // Without history permission Discord lists nothing rather than refusing.
         let readable = !self.unreadable.load(Ordering::SeqCst);
         let history = self.history.lock().unwrap();
@@ -206,6 +250,7 @@ impl DeliveryLease for Arc<FakeLease> {
 struct Alarms {
     channel: u64,
     raised: Arc<Mutex<Vec<WriterAlarm>>>,
+    cleared: Arc<AtomicUsize>,
     /// The reader count the writer last reported.
     readers: Arc<Mutex<Option<usize>>>,
 }
@@ -214,6 +259,11 @@ impl AlarmSink for Alarms {
     fn raise(&self, channel: u64, alarm: WriterAlarm) {
         assert_eq!(channel, self.channel);
         self.raised.lock().unwrap().push(alarm);
+    }
+
+    fn waiting_cleared(&self, channel: u64) {
+        assert_eq!(channel, self.channel);
+        self.cleared.fetch_add(1, Ordering::SeqCst);
     }
 
     fn reconcile_reader_count(&self, channel: u64, count: usize) {
@@ -295,6 +345,7 @@ impl Harness {
             alarms: Alarms {
                 channel: channel_id,
                 raised: Arc::default(),
+                cleared: Arc::default(),
                 readers: Arc::default(),
             },
         }
@@ -328,6 +379,41 @@ fn unit(native_key: &str) -> UnitKey {
         native_key: native_key.into(),
         kind,
     }
+}
+
+pub(crate) async fn post_codex_records_for_test(channel: u64, raw: &str) -> (Vec<String>, String) {
+    let harness = Harness::build_channel(channel, |_| Vec::new());
+    harness.gate.acquired();
+    let mut writer = harness.writer();
+    let mut deriver =
+        UnitDeriver::new(channel, ShadowProvider::Codex).with_turn_summary(pieces::SummaryInputs {
+            turn_marks: Default::default(),
+            disposed: Default::default(),
+            context_window: None,
+        });
+    let mut start = 0;
+    for line in raw.lines() {
+        let end = start + line.len() as u64 + 1;
+        let record = CapturedRecord {
+            start,
+            end,
+            line: line.as_bytes().to_vec(),
+        };
+        for item in deriver.derive(&record) {
+            assert_eq!(writer.deliver(&item).await, Step::Done);
+        }
+        start = end;
+    }
+    let ledger = std::fs::read_to_string(
+        harness
+            ._runtime
+            .path()
+            .join("o_store")
+            .join(channel.to_string())
+            .join("ledger.jsonl"),
+    )
+    .unwrap();
+    (harness.port.posts(), ledger)
 }
 
 fn piece(native_key: &str, payload: &str) -> Derived {
@@ -682,6 +768,13 @@ fn derivation_splits_each_unit_once_and_excludes_or_blocks_the_rest() {
         deriver.derive(&row("msg_1", "changed")).as_slice(),
         [Derived::Blocked { .. }]
     ));
+    // Same pieces and UTF-16 lengths: only the piece digest can tell this change apart.
+    assert!(matches!(
+        deriver
+            .derive(&row("msg_1", &long.replacen("word", "ward", 1)))
+            .as_slice(),
+        [Derived::Blocked { .. }]
+    ));
     let result = serde_json::json!({"type": "user", "message": {"content": [
         {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}});
     let line = serde_json::to_vec(&result).unwrap();
@@ -857,6 +950,21 @@ async fn a_violation_recorded_while_running_stops_the_writer_before_the_next_pos
     ));
 }
 
+/// Guards that an id Discord minted just behind the previous post neither stops nor re-sends.
+#[tokio::test(start_paused = true)]
+async fn a_post_whose_id_trails_the_previous_one_keeps_the_writer_running() {
+    let harness = Harness::new();
+    harness.gate.acquired();
+    let replies = [Reply::Created, Reply::CreatedReordered];
+    harness.port.replies.lock().unwrap().extend(replies);
+    let mut writer = harness.writer();
+    for (key, body) in [("m1", "a"), ("m2", "b"), ("m3", "c")] {
+        assert_eq!(writer.deliver(&piece(key, body)).await, Step::Done);
+    }
+    assert_eq!(harness.port.posts(), ["a", "b", "c"]);
+    assert!(harness.alarms.taken().is_empty());
+}
+
 /// The ledger file a channel store appends to.
 fn ledger_path(harness: &Harness) -> PathBuf {
     let dir = harness
@@ -909,19 +1017,26 @@ async fn a_stop_keeps_its_store_error_and_names_a_prepared_only_while_nothing_po
         assert_eq!(harness.port.posts(), ["a"]);
     }
 }
-
 #[path = "local_retry_tests.rs"]
 mod local_retry_tests;
+#[path = "tool_card_replay_tests.rs"]
+mod tool_card_replay;
 
 #[path = "actor_tests.rs"]
-mod actor;
+pub(crate) mod actor;
 #[path = "codex_herdr_drive_tests.rs"]
 pub(crate) mod codex_herdr_drive;
 #[path = "operator_resume_tests.rs"]
 mod operator_resume;
+#[path = "tool_result_tests.rs"]
+mod tool_result_tests;
+#[path = "turn_summary_replay_tests.rs"]
+mod turn_summary_replay;
 
-#[path = "deliver_home_tests.rs"]
-mod deliver_home;
+#[path = "boundary_pending_health_tests.rs"]
+mod boundary_pending_health_tests;
+#[path = "codex_launch_cause_tests.rs"]
+mod codex_launch_cause;
 
 #[tokio::test(start_paused = true)]
 async fn a_gateway_return_ends_the_pause_in_process_health() {
@@ -947,3 +1062,7 @@ async fn a_gateway_return_ends_the_pause_in_process_health() {
     assert_eq!(writer.deliver(&piece("m2", "b")).await, Step::NoGateway);
     assert_eq!(health_reasons(), paused);
 }
+
+pub(crate) use actor::rotation::retire_tests::transition_actor_tests::bo::{
+    with_blocked_codex, with_ready_codex, with_ready_codex_and_claude, with_ready_codex_backlog,
+};

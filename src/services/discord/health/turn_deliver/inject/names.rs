@@ -1,35 +1,17 @@
 //! The names a pane veto or an unconfirmed paste reports under, for each TUI runtime.
 
 use super::{NOT_BUSY, codex_inject};
-use crate::services::claude_tui::busy_inject::{Unconfirmed, Veto};
+use crate::services::claude_tui::busy_inject::Veto;
 
 pub(super) fn veto_name(veto: Veto) -> &'static str {
     match veto {
         Veto::InvalidInput => "invalid_input",
         Veto::LockContended => "lock_contended",
-        Veto::HumanAttached => "human_attached",
-        Veto::AttachUnknown => "attach_unknown",
         Veto::PaneUnavailable => "pane_unavailable",
         Veto::Modal => "modal",
-        Veto::Draft => "draft",
         Veto::NotBusy => "not_busy",
         Veto::TranscriptUnavailable => "transcript_unavailable",
         Veto::LoadFailed => "load_failed",
-        Veto::UnpredictableRender => "unpredictable_render",
-    }
-}
-
-pub(super) fn unconfirmed_name(detail: Unconfirmed) -> &'static str {
-    match detail {
-        Unconfirmed::PasteFailed => "paste_failed",
-        Unconfirmed::AttachedAfterPaste => "attached_after_paste",
-        Unconfirmed::CaptureFailed => "capture_failed",
-        Unconfirmed::ModalAfterPaste => "modal_after_paste",
-        Unconfirmed::DraftNotOwned => "draft_not_owned",
-        Unconfirmed::ContaminatedSubmit => "contaminated_submit",
-        Unconfirmed::CursorChangedBeforeEnter => "cursor_changed_before_enter",
-        Unconfirmed::EnterFailed => "enter_failed",
-        Unconfirmed::NotObserved => "not_observed",
     }
 }
 
@@ -38,11 +20,8 @@ pub(super) fn codex_veto_name(veto: codex_inject::Veto) -> &'static str {
     match veto {
         Veto::InvalidInput => "invalid_input",
         Veto::LockContended => "lock_contended",
-        Veto::HumanAttached => "human_attached",
-        Veto::AttachUnknown => "attach_unknown",
         Veto::PaneUnavailable => "pane_unavailable",
         Veto::Modal => "modal",
-        Veto::NoComposer => "no_composer",
         Veto::Draft => "draft",
         Veto::QueueShown => "queue_shown",
         Veto::NotSteerable => "not_steerable",
@@ -51,7 +30,6 @@ pub(super) fn codex_veto_name(veto: codex_inject::Veto) -> &'static str {
         Veto::TurnChanged => "turn_changed",
         Veto::TranscriptUnavailable => "transcript_unavailable",
         Veto::LoadFailed => "load_failed",
-        Veto::UnpredictableRender => "unpredictable_render",
         Veto::LedgerFull => "ledger_full",
     }
 }
@@ -60,10 +38,6 @@ pub(super) fn codex_unconfirmed_name(detail: codex_inject::Unconfirmed) -> &'sta
     use codex_inject::Unconfirmed;
     match detail {
         Unconfirmed::PasteFailed => "paste_failed",
-        Unconfirmed::AttachedAfterPaste => "attached_after_paste",
-        Unconfirmed::CaptureFailed => "capture_failed",
-        Unconfirmed::DraftNotOwned => "draft_not_owned",
         Unconfirmed::EnterFailed => "enter_failed",
-        Unconfirmed::NotObserved => "not_observed",
     }
 }

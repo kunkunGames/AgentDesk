@@ -29,7 +29,7 @@ fn build_tmux_death_diagnostic(_name: &str, _output_path: Option<&str>) -> Optio
 }
 
 #[cfg(unix)]
-use super::herdr_before_start_restart::herdr_turn_held;
+use super::herdr_row_end::held_at_restore;
 
 #[path = "restore_inflight/kickoff_identity.rs"]
 mod kickoff_identity;
@@ -43,26 +43,28 @@ use output_paths::recovery_output_path_with_tmux_fallback;
 mod diagnostics;
 #[path = "restore_inflight/replay_hold.rs"]
 mod replay_hold;
-use diagnostics::observe_restore_inflight_snapshot;
+#[path = "restore_inflight/replay_decision.rs"]
+mod replay_decision;
+use replay_decision::observe_restore_inflight_snapshot;
 
 pub(in crate::services::discord) async fn restore_inflight_turns(
     http: &Arc<serenity::Http>,
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
 ) {
-    let states = inflight::load_inflight_states_excluding(provider, |channel| {
-        crate::services::discord::input_runtime::fence::lookup(provider, channel).is_some()
-    });
+    let states = inflight::load_inflight_states(provider);
     observe_restore_inflight_snapshot(
         provider,
         &states,
         shared.restart.recovery_started_at.elapsed(),
     );
     if states.is_empty() {
+        replay_decision::spawn_pg_only(shared.pg_pool.as_ref(), provider.as_str());
         return;
     }
 
     Box::pin(restore_inflight_states(http, shared, provider, states)).await;
+    replay_decision::spawn_pg_only(shared.pg_pool.as_ref(), provider.as_str());
 }
 
 pub(in crate::services::discord) async fn restore_inflight_states(
@@ -82,12 +84,6 @@ pub(in crate::services::discord) async fn restore_inflight_states(
     // its bound is the next boot that successfully advances the epoch. An allocation-
     // provenance witness belongs to #5482.
     for mut state in states {
-        // An input-protected channel's row waits for its move or handback.
-        if crate::services::discord::input_runtime::fence::lookup(provider, state.channel_id)
-            .is_some()
-        {
-            continue;
-        }
         #[cfg(unix)]
         if super::herdr_before_start_restart::settle_receipt(http, shared, provider, &state).await {
             continue;
@@ -100,7 +96,13 @@ pub(in crate::services::discord) async fn restore_inflight_states(
             continue;
         }
         // An unverified projected receipt waits for another pass without persisting a read error.
-        if !replay_hold::hydrate_replay_hold(shared.pg_pool.as_ref(), &mut state).await {
+        if !replay_hold::hydrate_replay_hold(
+            shared.pg_pool.as_ref(),
+            &mut state,
+            shared.restart.replay_restart.get(),
+        )
+        .await
+        {
             continue;
         }
         if state.replay_rerun_blocked() {
@@ -151,9 +153,9 @@ pub(in crate::services::discord) async fn restore_inflight_states(
             r.settle(http, shared, &state).await;
             continue;
         }
-        // A held Herdr turn ends only on its admitted terminal, never on a transcript read here.
+        // A held Herdr turn, or a restarted one its end pass reads later, skips the wrapper path.
         #[cfg(unix)]
-        if herdr_turn_held(provider, &state) {
+        if held_at_restore(provider, &state) {
             tracing::info!(
                 channel_id = state.channel_id,
                 "recovery kept a held Herdr turn"

@@ -62,9 +62,9 @@ AgentDesk intentionally keeps a separate `target/` directory per worktree. Shari
 - for bare Cargo commands, opt in manually with `export RUSTC_WRAPPER=sccache` after installing `sccache`. This uses inherited settings or sccache's own defaults; it does not apply AgentDesk's cache size or idle settings.
 - release/deploy scripts and the installer's source-build path call `setup_sccache_env` from `scripts/_defaults.sh` to activate caching when sccache is installed.
 - Linux/Windows CI configures sccache through workflow environment settings and the Mozilla action. macOS CI runs only on GitHub-hosted runners and disables sccache.
-- the shell helper and POSIX campaign wrapper (`scripts/build_token.py`) default to `SCCACHE_CACHE_SIZE=40G` and `SCCACHE_IDLE_TIMEOUT=0` (no idle exit). Unset or empty values use these defaults; nonempty overrides remain intact. The campaign wrapper skips activation entirely when `RUSTC_WRAPPER` or `CARGO_BUILD_RUSTC_WRAPPER` is already present, even empty, so a manually configured wrapper does not receive these defaults.
+- the shell helper and POSIX campaign wrapper (`scripts/build_token.py`) default to `SCCACHE_CACHE_SIZE=15G` and `SCCACHE_IDLE_TIMEOUT=0` (no idle exit). Unset or empty values use these defaults; nonempty overrides remain intact. The campaign wrapper skips activation entirely when `RUSTC_WRAPPER` or `CARGO_BUILD_RUSTC_WRAPPER` is already present, even empty, so a manually configured wrapper does not receive these defaults.
 
-The 40G limit allows up to 30G more local disk use than the previous limit; it does not preallocate that space. New environment settings do not reconfigure an already running daemon. See the [sccache setup guide](docs/ci/sccache-setup.md) for activation and daemon-restart boundaries.
+The 15G limit bounds the shared cache on hosts that also carry several lane build targets; it does not preallocate that space. New environment settings do not reconfigure an already running daemon. See the [sccache setup guide](docs/ci/sccache-setup.md) for activation and daemon-restart boundaries.
 
 Install `sccache` to actually engage caching:
 
@@ -133,7 +133,7 @@ Create Discord bots in the [Discord Developer Portal](https://discord.com/develo
 
 | Bot key | Role | Required Permissions |
 |---------|------|---------------------|
-| **`announce`** | Authoritative trigger source: posts dispatch envelopes (`DISPATCH:<uuid>`), PM/escalation cards, and agent-to-agent routing via `/api/discord/send`. Other agent bots treat its messages as turn triggers. | Administrator (simplest) or Send Messages + Manage Messages + Manage Channels + Manage Roles |
+| **`announce`** | Authoritative trigger source: posts dispatch envelopes (`DISPATCH:<uuid>`), PM cards, and agent-to-agent routing via `/api/discord/send`. Other agent bots treat its messages as turn triggers. | Administrator (simplest) or Send Messages + Manage Messages + Manage Channels + Manage Roles |
 | **`notify`** | Informational notifications only — issue announcement cards (`📋 새 이슈 #N`, `✅ #N 완료`), system alerts. Its user id is intentionally NOT in `allowed_bot_ids`, so its messages do not trigger agent turns (#1448 follow-up). | Send Messages, Read Message History |
 | **Per-provider** (`claude`, `codex`, …) | User-facing bots humans @-mention in agent channels. When a user posts in a channel mapped to one of these bots, AgentDesk runs a turn for that provider. Add one bot per provider you plan to use. | Send Messages, Read Message History, Manage Messages, Create Public Threads, Send Messages in Threads (the wizard's generated invite includes all of these — required for dispatch threads) |
 
@@ -182,7 +182,7 @@ backlog → ready → requested → in_progress → review → done
 - **Counter-model review** — Claude reviews Codex's work and vice versa, with configurable max rounds
 - **Auto-queue with batch phases** — Automatic card progression with priority scoring, dependency-aware phased execution, and phase gate verification
 - **GitHub sync** — Bidirectional issue synchronization with DoD checklist mirroring
-- **Escalation routing** — PM/user/time-based escalation mode switching
+- **Escalation alerts** — Cards that need a person are sent as a Discord DM to `discord.owner_id`
 - **Audit logging** — Every state transition and dispatch event is recorded
 
 ### Policy Engine
@@ -190,9 +190,9 @@ Business logic lives in JavaScript files under `policies/`, hot-reloaded without
 
 | Policy | Purpose |
 |--------|---------|
-| `00-escalation.js` | Manual-intervention routing, PM cooldown management, escalation flush loop |
+| `00-escalation.js` | Manual-intervention alerts: dedupe, re-alert cooldown, escalation flush loop |
 | `00-pr-tracking.js` | Card→PR linkage cache and PR sync helpers |
-| `kanban-rules.js` | Core lifecycle: dispatch completion, PM decision gates |
+| `kanban-rules.js` | Core lifecycle: dispatch completion → review entry |
 | `review-automation.js` | Counter-model review dispatch, verdict processing, review state sync |
 | `auto-queue.js` | Batch-phased card queuing, phase gate dispatch, slot management |
 | `ci-recovery.js` | CI failure detection, auto-rerun, and recovery card creation |
@@ -203,6 +203,14 @@ Business logic lives in JavaScript files under `policies/`, hot-reloaded without
 No policy merges pull requests. Every merge goes through a PR that an agent babysits: it confirms CI and review, then merges, and repairs the PR on failure.
 
 Repository policy files under `policies/` are canonical for shipped behavior. Release copies under `~/.adk/release/policies/` are deployment replicas, and operator-local policy directories are extensions selected by `policies.dir`. For the complete policy/config source map, see [`docs/source-of-truth.md`](docs/source-of-truth.md).
+
+**Upgrade note (PM Decision Gate removal).** Completed work now enters review directly, and nothing advances a card still parked in the old `awaiting_dod` review sub-state. Before and after upgrading, check for leftovers:
+
+```sql
+SELECT id, title FROM kanban_cards WHERE status = 'review' AND review_status = 'awaiting_dod';
+```
+
+Recover each one with `POST /api/kanban-cards/{id}/rereview` (body `{"reason": "awaiting_dod cleanup"}`, plus the `Authorization: Bearer` / `X-Channel-Id` headers when `server.auth_token` / `kanban.manager_channel_id` are set). It clears the sub-state and starts a fresh counter-model review; `/resume` rejects this sub-state.
 
 ### Policy Tests
 Local policy development now has a dedicated Node runner for the repository copies under `policies/`.
@@ -244,7 +252,7 @@ Policies hook into a 3-tier periodic tick system running on a dedicated OS threa
 ### Multi-Bot Architecture
 Each bot identity has a distinct role so message intent stays unambiguous:
 
-- **`announce`** is the authoritative trigger source. It posts dispatch envelopes (`── implementation dispatch ──\nDISPATCH:<uuid>…`), PM/escalation cards, and agent-to-agent messages routed through `/api/discord/send`. Other agent bots accept its messages as turn triggers when its user id is listed under `auth.allowed_bot_ids`.
+- **`announce`** is the authoritative trigger source. It posts dispatch envelopes (`── implementation dispatch ──\nDISPATCH:<uuid>…`), PM cards, and agent-to-agent messages routed through `/api/discord/send`. Other agent bots accept its messages as turn triggers when its user id is listed under `auth.allowed_bot_ids`.
 - **`notify`** delivers informational notifications — issue announcement cards (`📋 새 이슈 #N`, `✅ #N 완료`) and system alerts. Its user id is intentionally omitted from `allowed_bot_ids`, so its posts never trigger an agent turn (the routing change landed in #1448 follow-up).
 - **Per-provider bots** (`claude`, `codex`, optionally `gemini` / `opencode` / `qwen`) are the user-facing identities humans @-mention in agent channels. A user message in a channel mapped to one of these bots starts a turn for that provider. Each agent can be wired to multiple provider bots — see `agents[].channels` in `agentdesk.yaml` — letting Claude and Codex (or any combination) work side-by-side on the same agent role.
 
@@ -255,7 +263,7 @@ A React-based dashboard served from the same binary:
 - **Agent Manager** — Agent configuration, skills, timeline, sessions, kanban tab
 - **Analytics** — Streaks, achievements, activity heatmaps, audit logs
 - **Meeting Minutes** — Round-table meeting transcripts with issue extraction
-- **Settings** — Runtime configuration, onboarding re-run, policy management, escalation routing
+- **Settings** — Runtime configuration, onboarding re-run, policy management
 
 ### Round-Table Meetings
 Coordinate multi-agent discussions with structured rounds, automatic transcript recording, and post-meeting issue extraction to GitHub.
@@ -422,7 +430,6 @@ policies:
 # `RuntimeSettingsConfig`) and can be hot-edited from the dashboard runtime panel.
 kanban:
   manager_channel_id: "channel-id"  # optional: PM/manager Discord channel
-  pm_decision_gate_enabled: true
 
 review:
   enabled: true
@@ -442,20 +449,11 @@ AgentDesk keeps settings in multiple surfaces on purpose. The contract is per-su
 | Company settings | General settings UI / callers that own the merged JSON | `kv_meta['settings']` only. No YAML baseline. | Persists until replaced. `PUT /api/settings` is full replace, so callers must merge hidden keys before saving. Retired legacy keys are stripped server-side. | `GET/PUT /api/settings` |
 | Runtime config | Dashboard live-runtime controls | Hardcoded defaults < `agentdesk.yaml` `runtime:` < `kv_meta['runtime-config']` override JSON | Applies immediately. On reboot, YAML-backed keys are re-applied; saved keys without YAML baselines persist unless `runtime.reset_overrides_on_restart=true`, in which case the whole surface resets to baseline. | `GET/PUT /api/settings/runtime-config` |
 | Policy/config keys | Dashboard policy controls and automation helpers | Hardcoded defaults < YAML sections (`review:`, `runtime:`, `kanban:`) < individual `kv_meta` rows | `PATCH` writes live overrides. YAML-backed keys are re-seeded on restart, while hardcoded-only keys keep their DB override unless the reset flag is on. `server_port` is surfaced as read-only config metadata. | `GET/PATCH /api/settings/config` |
-| Escalation routing | Dashboard escalation panel and Discord `!escalation` command | `escalation:` config baseline plus fallback owner/channel defaults, overridden by `kv_meta['escalation-settings-override']` | Override persists until changed back to defaults. When `runtime.reset_overrides_on_restart=true`, the stored escalation override is cleared on boot. | `GET/PUT /api/settings/escalation` |
 | Onboarding/secrets | Dedicated onboarding wizard | Dedicated onboarding keys and flows | Tokens and setup secrets stay outside the general settings form. | `/api/onboarding/*` |
 | Channel provider rules | `onboarding.provider_suffix_map` / `default_provider` | Registry defaults, then YAML entries: add a key, replace its provider, or set its value to `null` to remove that suffix. An empty section preserves registry behavior. | Applied from the server config snapshot (including successful hot reload); offline `show session-name` reads the same YAML. Explicit provider selections win. | Channel dispatch and onboarding |
 
-Claude native `/clear` on O-owned tmux channels is controlled by the live YAML keys
-`runtime.native_clear_enabled` and `runtime.native_clear_channels`. Both clear commands
-and prompt admission read the current configuration. With `native_clear_enabled: true`,
-an optional list of numeric Discord channel IDs limits native clear and its unresolved
-boundary recovery to those channels. Omitting the list keeps all O-owned channels
-eligible; `native_clear_channels: []` selects none. An unset or false enabled switch
-keeps managed restart behavior regardless of the list. These keys have no environment
-variable override and require no process restart. Channels outside the list keep the
-existing managed-host refusal rules and do not read or write native clear boundaries.
-Shrinking the list does not complete an unresolved clear for a removed channel. Complete any unresolved clear with `!clear` before removing that channel from the list.
+The native clear switches were retired (#7266); old YAML keys are ignored.
+Discord `/clear` and `!clear` use the same general session-reset path.
 
 For example, `onboarding.provider_suffix_map: {"-gem": gemini, "-cc": codex, "-gm": null}` adds `-gem`, changes `-cc` to Codex, and removes `-gm`; other registry suffixes remain available. Keys are normalized to lowercase with a leading `-`; channel names still match exactly, and the longest matching suffix wins. Unknown providers and overlapping suffixes produce warnings; invalid provider entries are ignored, preserving any registry entry at that key. Unknown keys under `onboarding` are rejected. `onboarding.default_provider` sets the provider fallback when there is no explicit provider or matching suffix; an invalid value warns and uses the registry default. The offline session-name command still requires a suffix or explicit `--provider`.
 
@@ -545,7 +543,7 @@ agentdesk.kanban.setStatus(cardId, "in_progress")
 agentdesk.kanban.setStatus(cardId, "done", true)        // force
 agentdesk.kanban.getCard(cardId)
 agentdesk.kanban.reopen(cardId, "ready")
-agentdesk.kanban.setReviewStatus(cardId, "awaiting_dod", { awaiting_dod_at: "now" })
+agentdesk.kanban.setReviewStatus(cardId, "rework_pending", { suggestion_pending_at: null })
 
 // Review state
 agentdesk.reviewState.sync(cardId, "idle")
@@ -582,7 +580,7 @@ agentdesk.agents.get(agentId)
 agentdesk.config.get("review_max_rounds")
 
 // Messaging — third arg picks the bot:
-//   "announce" → trigger-bearing card (DISPATCH, PM, escalation routing)
+//   "announce" → trigger-bearing card (DISPATCH, PM)
 //   "notify"   → informational only (does NOT trigger an agent turn, post-#1448)
 agentdesk.message.queue("channel:123456", "Hello", "announce", "system")
 agentdesk.message.queue("channel:123456", "📋 새 이슈 #42", "notify", "issue-sync")
@@ -666,7 +664,7 @@ agentdesk deploy                                 # Build workspace + promote to 
 ```
 
 `migrate postgres-cutover` was retired after the production cutover landed
-(2026-04-19); restore `src/cli/migrate/postgres_cutover.rs` from history only
+(2026-04-19); restore `src/cli/migrate/postgres_cutover.rs` (removed) from history only
 for an explicitly approved emergency re-cutover.
 
 ## API Overview
@@ -683,7 +681,7 @@ AgentDesk exposes 270 REST API endpoints. Key groups:
 | `/api/round-table-meetings` | Start, transcript, issues | Multi-agent meetings |
 | `/api/departments` | CRUD + ordering | Department management |
 | `/api/pipeline` | Stages, config, graphs, card history | Pipeline configuration |
-| `/api/settings` | Company + config/runtime/escalation subroutes | Platform configuration surfaces |
+| `/api/settings` | Company + config/runtime subroutes | Platform configuration surfaces |
 | `/api/github` | Repo sync, dashboard views, issue actions | GitHub integration |
 | `/api/discord` | `/send`, `/send-to-agent`, `/send-dm`, channel messages, bindings, DM reply hooks. Legacy top-level `/api/send*` aliases were removed. | Discord access layer |
 | `/api/cluster` | Nodes, routing diagnostics, resource locks, task-dispatch claims, issue specs, phase evidence | Multinode coordination |
@@ -753,24 +751,24 @@ AgentDesk/
 ├── src/                        # Rust source
 │   ├── main.rs                 # Entry point + CLI dispatch
 │   ├── config.rs               # YAML configuration
-│   ├── kanban.rs               # Kanban state machine + transition hooks
+│   ├── kanban/                 # Kanban state machine + transition hooks
 │   ├── pipeline.rs             # Pipeline config resolution
 │   ├── cli/                    # CLI commands (dcserver, init, client)
 │   ├── db/                     # PostgreSQL schema helpers, migrations, typed queries
 │   ├── dispatch/               # Dispatch creation, outbox, delivery
 │   ├── engine/                 # QuickJS policy engine + bridge ops
-│   │   └── ops/                # ~21 bridge namespaces (cards, kanban, dispatch, kv, http, runtime, quality, ...)
-│   ├── github/                 # Issue sync, auto-triage, DoD mirroring
+│   │   └── ops/                # Bridge namespaces (cards, kanban, dispatch, kv, http, runtime, quality, ...)
+│   ├── github/                 # Issue sync, auto-triage
 │   ├── server/                 # Axum HTTP server + WebSocket
-│   │   └── routes/             # 270 API route handlers
+│   │   └── routes/             # HTTP route handlers (list: docs/generated/route-inventory.md)
 │   └── services/               # Provider integrations + platform abstractions
 │       ├── discord/            # Serenity/Poise gateway, router, recovery
 │       │   └── watchers/lifecycle.rs   # Tmux watcher lifecycle (extracted from tmux.rs in #1435)
-│       ├── dispatches.rs       # Dispatch service layer
+│       ├── dispatches/         # Dispatch service layer
 │       ├── turn_orchestrator.rs # Turn lifecycle management
 │       ├── issue_announcements.rs # Notify-bot routing for issue cards (#1448 follow-up)
 │       ├── retrospectives.rs   # Terminal card retrospectives
-│       └── api_friction.rs     # API friction reporting
+│       └── api_friction/       # API friction reporting
 ├── policies/                   # JavaScript policy files (repo canonical; release mirror hot-reload)
 ├── dashboard/                  # React 19 + TypeScript + Vite + Tailwind
 ├── docs/                       # ADRs and design documents

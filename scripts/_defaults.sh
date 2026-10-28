@@ -42,7 +42,7 @@ setup_sccache_env() {
   fi
 
   export SCCACHE_DIR="${SCCACHE_DIR:-$HOME/.cache/sccache}"
-  export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-40G}"
+  export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-15G}"
   export SCCACHE_IDLE_TIMEOUT="${SCCACHE_IDLE_TIMEOUT:-0}"
   export RUSTC_WRAPPER="$sccache_bin"
   mkdir -p "$SCCACHE_DIR"
@@ -725,32 +725,37 @@ _health_json_degraded_reasons_all_match() {
   done
   return 0
 }
-
 _health_json_deploy_nonblocking_ere() {
   # $1 allow_reconcile_degraded, $2 deploy verdict, $3 cluster_standby proven,
   # $4 providers whose TUI gateway restriction the body verifies (alternation).
   # A relay verdict label cycles with placeholder state, so it cannot judge a
-  # deploy (2026-09-07 measurement). A queue depth is backlog, so it only stops
-  # counting for a deploy verdict. Standby tokens join the set only once the
-  # body proves the node is a standby, and a TUI gateway reason only for a
-  # provider whose role the body verifies. A TUI O channel released to Legacy
-  # before any store write keeps its output there, so it never blocks. Everything
-  # else, including an unrecognised reason, blocks. No comma: the fallback splits on one.
+  # deploy (2026-09-07 measurement). Queue and deferred-hook depths are backlog,
+  # so they only stop counting for a deploy verdict. Standby tokens join the set
+  # only once the body proves the node is a standby. A TUI gateway reason is
+  # accepted only for a provider whose role the body verifies. A TUI O channel
+  # released to Legacy before any store write keeps its output there, so it never
+  # blocks. Everything else, including an unrecognised reason, blocks. No comma:
+  # the fallback splits on one.
   # $5 joins smoke E2E and pre-existing reader alarm channel ids; only their
   # reader-count reason is accepted, and only for a deploy verdict.
-  local ere='^(relay_verdict_[^,]+|tui_o:released:[0-9]+' ids_re='^[0-9]+([|][0-9]+)*$'
+  # $6 is the smoke E2E channel ids alone: a held source start there is the
+  # smoke's own known failure, so it does not block a deploy verdict either.
+  local ere='^(relay_verdict_[^,]+|tui_o:released:[0-9]+|turn_presence_unknown:(claude|codex):(~|([A-Za-z0-9_.-]|%[0-9A-F]{2})+):[a-z][a-z0-9_]*:[a-z][a-z0-9_]*:[1-9][0-9]*:[0-9]+' ids_re='^[0-9]+([|][0-9]+)*$'
   [ "${1:-0}" = "1" ] && ere="$ere|provider:[^:,]+:reconcile_in_progress"
   [ "${2:-0}" = "1" ] && ere="$ere|provider:[^:,]+:pending_queue_depth:[0-9]+"
+  [ "${2:-0}" = "1" ] && ere="$ere|provider:[^:,]+:deferred_hooks_backlog:[1-9][0-9]*"
   [ "${2:-0}" = "1" ] && [[ "${5:-}" =~ $ids_re ]] && ere="$ere|tui_o:too_many_readers:(${5})"
+  [ "${2:-0}" = "1" ] && [[ "${6:-}" =~ $ids_re ]] && ere="$ere|tui_o:boundary_pending:(${6})"
   [ "${3:-0}" = "1" ] && ere="$ere|gateway_standby|provider:[^:,]+:gateway_standby"
   [ -n "${4:-}" ] && ere="$ere|provider:(${4}):tui_output_requires_gateway"
-  printf '%s)$' "$ere"
+  [ "${2:-0}:${AGENTDESK_DEPLOY_ALLOW_DEGRADED+x}" = '1:x' ] || { printf '%s)$' "$ere"; return; }
+  . "$(dirname "${BASH_SOURCE[0]}")/lib/deploy_allow_degraded.sh" || return 2
+  _deploy_allow_degraded_ere "${2:-0}" "$ere)$" "${7:-}"
 }
-
 _health_json_deploy_nonblocking_ere_for_body() {
   # Structural proof comes from this body; deploy-release supplies the smoke
   # channels and the local reader alarms observed before restart.
-  local health_json="$1" standby=0 tui reader_ids="" ids ids_re='^[0-9]+([|][0-9]+)*$'
+  local health_json="$1" standby=0 tui reader_ids="" smoke_ids="" ids ids_re='^[0-9]+([|][0-9]+)*$'
   _health_json_field_is_true "$health_json" "cluster_standby" && standby=1
   tui=$(_health_json_tui_gateway_verified_providers "$health_json")
   for ids in "${DEPLOY_E2E_SMOKE_CHANNEL_IDS:-}" "${DEPLOY_PREEXISTING_READER_CHANNEL_IDS:-}"; do
@@ -758,8 +763,9 @@ _health_json_deploy_nonblocking_ere_for_body() {
       reader_ids="${reader_ids:+$reader_ids|}$ids"
     fi
   done
+  [[ "${DEPLOY_E2E_SMOKE_CHANNEL_IDS:-}" =~ $ids_re ]] && smoke_ids="$DEPLOY_E2E_SMOKE_CHANNEL_IDS"
   _health_json_deploy_nonblocking_ere "${2:-0}" "${3:-0}" "$standby" "$tui" \
-    "$reader_ids"
+    "$reader_ids" "$smoke_ids" "$health_json"
 }
 
 _deploy_e2e_smoke_channel_ids() {
@@ -941,7 +947,10 @@ health_json_is_ready() {
   [ -n "$health_json" ] || return 1
   _health_json_field_is_true "$health_json" "db" || return 1
 
-  if [ "$require_dashboard" = "1" ]; then
+  # A profile that never runs the dashboard (runner) reports dashboard_required
+  # false; only that explicit false waives it, anything else still requires it.
+  if [ "$require_dashboard" = "1" ] \
+    && ! _health_json_field_is_false "$health_json" "dashboard_required"; then
     _health_json_field_is_true "$health_json" "dashboard" || return 1
   fi
 
@@ -965,7 +974,7 @@ health_json_is_ready() {
     # Membership decides: every reason must be one a deploy cannot clear. An
     # unrecognised reason is not in that set, so a newly added one fails closed.
     nonblocking_ere=$(_health_json_deploy_nonblocking_ere_for_body \
-      "$health_json" "$allow_reconcile_degraded" "$allow_deploy_nonblocking")
+      "$health_json" "$allow_reconcile_degraded" "$allow_deploy_nonblocking") || return 1
     if _health_json_degraded_reasons_all_match "$health_json" "$nonblocking_ere"; then
       echo "  ▸ degraded only for causes a deploy cannot clear ($(_health_json_reasons "$health_json")) — deploy proceeds; health still reports degraded"
       return 0
@@ -986,7 +995,7 @@ health_json_is_ready() {
   fi
 
   nonblocking_ere=$(_health_json_deploy_nonblocking_ere_for_body \
-    "$health_json" "$allow_reconcile_degraded" "$allow_deploy_nonblocking")
+    "$health_json" "$allow_reconcile_degraded" "$allow_deploy_nonblocking") || return 1
   _health_json_degraded_reasons_all_match "$health_json" "$nonblocking_ere"
 }
 
@@ -1575,6 +1584,10 @@ _restart_persistence_proof_class() {
     printf 'legacy-index'
     return 0
   fi
+  # Snapshot only a failed check; diagnostics cannot change proof authority.
+  # shellcheck source=/dev/null
+  ( . "$(dirname "${BASH_SOURCE[0]}")/lib/restart_persistence_diag.sh" \
+    && _restart_persistence_failure_snapshot "$root" "$expected_nonce" ) 2>/dev/null || true
   return 1
 }
 
@@ -1707,6 +1720,8 @@ wait_for_restart_persistence_or_fail() {
   clear_restart_drain_mode "$runtime_root" "$expected_nonce" || true
   echo "✗ [gate] ${scope} restart persistence was not acknowledged within ${max_wait}s" >&2
   echo "  Cleared restart_pending and refused bootout: the in-flight delivery frontier is not durable." >&2
+  printf '  restart persistence marker_root=%q nonce=%s\n%s\n' "$root" "$expected_nonce" \
+    "${proof_class:-  last proof observation: unavailable (no completed check or diagnostic helper failed)}" >&2 || true
   return 1
 }
 
@@ -1769,11 +1784,11 @@ guard_no_foreign_active_turns_or_warn() {
   return 1
 }
 
-# AGENTDESK_RESTART_REQUEST_NONCE, AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED,
-# and AGENTDESK_RESTART_DRAIN_VERDICT are intentional out-parameters: the
-# sourcing deploy script reads them after this function returns. shellcheck
-# analyses this library in isolation and cannot see that cross-file consumption,
-# so it reports SC2034 (appears unused). Silence it for this function.
+# AGENTDESK_RESTART_REQUEST_NONCE, AGENTDESK_RESTART_DRAIN_PERSISTENCE_NOT_REQUIRED
+# and AGENTDESK_RESTART_DRAIN_VERDICT are out-parameters read by deploy-release.sh
+# (shellcheck cannot see that, hence SC2034). The operator input
+# AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED=1 is never written here; deploy-release
+# skips its durability gate when either that input or this function's result is 1.
 # shellcheck disable=SC2034
 request_restart_drain_mode_or_fail() {
   local scope="$1"
@@ -1793,7 +1808,7 @@ request_restart_drain_mode_or_fail() {
   local nonce entropy marker_rc terminal_path
 
   AGENTDESK_RESTART_REQUEST_NONCE=""
-  AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED=0
+  AGENTDESK_RESTART_DRAIN_PERSISTENCE_NOT_REQUIRED=0
   # Honest sentinel for exits before a terminal drain observation. Protocol
   # verdicts are assigned only at the sites that prove them.
   AGENTDESK_RESTART_DRAIN_VERDICT="not evaluated: no terminal drain verdict reached"
@@ -1937,7 +1952,7 @@ request_restart_drain_mode_or_fail() {
     # through the nonce CAS so a newer actor's canonical lease survives.
     _restart_dispose_marker_by_own_nonce "$root" "$nonce" || true
     AGENTDESK_RESTART_REQUEST_NONCE="$nonce"
-    AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED=1
+    AGENTDESK_RESTART_DRAIN_PERSISTENCE_NOT_REQUIRED=1
     AGENTDESK_RESTART_DRAIN_VERDICT="not evaluated: launchd job is not running"
     echo "▸ [gate] ${scope} launchd job is not running; cleared restart drain marker (no in-flight turns to drain)"
     return 0
@@ -1962,9 +1977,9 @@ request_restart_drain_mode_or_fail() {
   # this phase-1 timeout disable its own downstream authority. The restart skill
   # has no phase 2, so its established permissive timeout remains unchanged.
   if [ "$source" = "deploy-release" ]; then
-    AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED=0
+    AGENTDESK_RESTART_DRAIN_PERSISTENCE_NOT_REQUIRED=0
   else
-    AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED=1
+    AGENTDESK_RESTART_DRAIN_PERSISTENCE_NOT_REQUIRED=1
   fi
   AGENTDESK_RESTART_DRAIN_VERDICT="not evaluated: restart drain acknowledgement timed out"
   return 0

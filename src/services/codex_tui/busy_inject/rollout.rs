@@ -168,24 +168,87 @@ fn ends(review: &Review, turn_id: Option<&str>) -> bool {
 /// The turn a complete user record after `offset` carrying the nonce names, the first one found.
 /// The outer Some is the sighting; the inner value is the turn id when the record names one.
 pub(crate) fn submitted(path: &Path, offset: u64, nonce: &str) -> Option<Option<String>> {
+    #[cfg(test)]
+    if let Some(source) = crate::services::tui_input::human_frame::history::v2::scoped_source() {
+        let source = source.ok()?;
+        if source.provider != "codex"
+            || crate::services::codex_tui::rollout_index::read_rollout_session_meta(path)?
+                .id
+                .as_deref()
+                != Some(&source.session_id)
+        {
+            return None;
+        }
+    }
+
     let mut file = std::fs::File::open(path).ok()?;
     if file.metadata().ok()?.len() < offset {
         return None;
     }
     file.seek(SeekFrom::Start(offset)).ok()?;
     let marker = format!(" · {nonce}]");
+    let allows_legacy =
+        crate::services::tui_input::human_frame::history::allows_legacy(nonce, path);
     let mut reader = std::io::BufReader::new(file);
     let mut line = Vec::new();
+    let mut position = offset;
     while reader
         .read_until(b'\n', &mut line)
         .is_ok_and(|read| read > 0)
     {
+        let start = position;
+        position += line.len() as u64;
         if line.ends_with(b"\n")
             && let Ok(record) = serde_json::from_slice::<Value>(&line)
             && let Some((input, turn)) = user_input(&record)
-            && input.contains(&marker)
         {
-            return Some(turn);
+            let legacy = !input.starts_with("[User: ")
+                || input
+                    .split(']')
+                    .next()
+                    .is_some_and(|header| header.contains(" · 📱 v1 mode="));
+            if allows_legacy && legacy && input.contains(&marker) {
+                return Some(turn);
+            }
+            // The UserMessage completion owns a native item id; its paired response item does not.
+            if text(&record, "type") != Some("event_msg") {
+                line.clear();
+                continue;
+            }
+            let exact_text = record
+                .pointer("/payload/item/content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks.iter().all(|block| {
+                        matches!(text(block, "type"), Some("input_text" | "text"))
+                            && text(block, "text").is_some()
+                    })
+                });
+            if !exact_text {
+                line.clear();
+                continue;
+            }
+            let Some(row) = record
+                .pointer("/payload/item/id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+            else {
+                line.clear();
+                continue;
+            };
+            let ledger = crate::services::tui_input::human_frame::history::registered;
+            if ledger(nonce, path, &input)
+                && crate::services::tui_input::human_frame::history::receipt(
+                    nonce,
+                    path,
+                    start,
+                    "codex",
+                    Some(row),
+                    &input,
+                ) == Some(true)
+            {
+                return Some(turn);
+            }
         }
         line.clear();
     }
@@ -216,4 +279,49 @@ fn user_input(record: &Value) -> Option<(String, Option<String>)> {
         }
         _ => None,
     }
+}
+
+/// Collect receipts without holding the composer lock or deciding whether injection succeeded.
+pub(super) fn observe(
+    request: &super::Request<'_>,
+    offset: u64,
+    frame: &str,
+    timing: &super::Timing,
+) {
+    let path = request.rollout.to_path_buf();
+    let session = request.session.to_string();
+    let nonce = request.nonce.to_string();
+    let target_turn = request.target_turn.to_string();
+    let frame = frame.to_string();
+    let window = timing.confirm_window;
+    let poll = timing.confirm_poll;
+    let _ = std::thread::Builder::new()
+        .name("codex-receipt".into())
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + window;
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    tracing::debug!(%nonce, "Codex injection receipt not observed within diagnostic window");
+                    return;
+                }
+                if let Some(observed_turn) = submitted(&path, offset, &nonce) {
+                    if let Some(row) = crate::services::tui_input::human_frame::history::receipt_row(
+                        &nonce, &path,
+                    ) {
+                        crate::services::tui_prompt_dedupe::observe_codex_prompt_in_turn_at(
+                            &session,
+                            &frame,
+                            Some(&row),
+                            observed_turn.as_deref(),
+                            chrono::Utc::now(),
+                        );
+                    }
+                    let joined = observed_turn.as_deref() == Some(target_turn.as_str());
+                    tracing::debug!(%nonce, ?observed_turn, joined, "Codex injection receipt diagnostic");
+                    return;
+                }
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                std::thread::sleep(poll.min(left));
+            }
+        });
 }

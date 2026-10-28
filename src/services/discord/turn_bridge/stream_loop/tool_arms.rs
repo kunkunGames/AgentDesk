@@ -50,7 +50,7 @@ pub(super) async fn handle_stream_tool_message(
     let voice_progress_playback_channel_id = ctx.voice_progress_playback_channel_id;
     let single_message_panel_footer_mode = ctx.single_message_panel_footer_mode;
     let footer_owner = ctx.footer_owner;
-    let current_msg_id = &mut *ctx.current_msg_id;
+    let (current_msg_id, captured_nonce) = (&mut *ctx.current_msg_id, ctx.captured_nonce);
 
     let mut state_dirty = *state.state_dirty;
     let inflight_state = &mut *state.inflight_state;
@@ -321,6 +321,7 @@ pub(super) async fn handle_stream_tool_message(
                     confirmed_offset,
                     any_tool_used: &mut any_tool_used,
                     has_post_tool_text: &mut has_post_tool_text,
+                    captured_nonce,
                 });
                 restart_visible_authority = Some(authority);
                 authority == VisibleMutationAuthority::Authorized
@@ -357,9 +358,13 @@ pub(super) async fn handle_stream_tool_message(
                 // correlation keys, so the boundary rewrite is recorded with a
                 // joinable key instead of an anonymous one.
                 let body_correlation = BodyMutationCorrelation::from_inflight_row(&inflight_state);
-                chunk_compose::append_tool_boundary_separator(
+                let preserve_progress = !matches!(stream_body_ownership_peek(
+                    channel_id, inflight_state, gateway.can_deliver_directly(),
+                ), Ok(false));
+                chunk_compose::append_tool_boundary_separator_for_stream(
                     &mut full_response,
                     body_correlation,
+                    preserve_progress,
                 );
                 inflight_state.full_response = full_response.clone();
                 state_dirty = true;
@@ -389,6 +394,7 @@ pub(super) async fn handle_stream_tool_message(
                     confirmed_offset,
                     any_tool_used: &mut any_tool_used,
                     has_post_tool_text: &mut has_post_tool_text,
+                    captured_nonce,
                 },
                 &long_running_placeholder_active,
                 &pending_long_running_retarget_after_state_save,

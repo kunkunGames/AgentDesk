@@ -13,6 +13,7 @@ pub(super) use self::channel_routing::{
     resolve_channel_category, resolve_is_dm_channel, resolve_runtime_channel_binding_status,
     resolve_thread_parent, synthetic_thread_channel_name, validate_live_channel_routing,
     validate_live_channel_routing_with_dm_hint, validate_rest_channel_routing,
+    validate_rest_channel_routing_with_parent,
 };
 #[cfg(test)]
 use self::restore_cwd::restore_thread_worktree_path_from_db;
@@ -606,9 +607,18 @@ pub(super) async fn bootstrap_thread_session(
     // Always create a worktree for thread sessions to isolate concurrent work.
     let effective_path = {
         let provider_str = shared.settings.read().await.provider.as_str().to_string();
-        match create_git_worktree(parent_path, &ch, &provider_str) {
-            Ok((wt_path, branch)) => {
-                let base_commit = crate::services::platform::git_head_commit(parent_path);
+        // `git worktree add` can block up to the git runner timeout; a burst of thread
+        // bootstraps must not stall the runtime workers.
+        let (repo, channel) = (parent_path.to_string(), ch.clone());
+        let created = tokio::task::spawn_blocking(move || {
+            let (wt_path, branch) = create_git_worktree(&repo, &channel, &provider_str)?;
+            let base_commit = crate::services::platform::git_head_commit(&repo);
+            Ok::<_, String>((wt_path, branch, base_commit))
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("worktree task failed: {error}")));
+        match created {
+            Ok((wt_path, branch, base_commit)) => {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
                     "  [{ts}] 🌿 Thread worktree created: {} (branch: {})",

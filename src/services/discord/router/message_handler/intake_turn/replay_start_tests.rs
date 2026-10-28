@@ -17,6 +17,18 @@ use std::time::Duration;
 
 const STALE: &str = "stale-resume";
 
+fn assert_retry_context_eq(actual: Option<&str>, expected: Option<&str>) {
+    use crate::services::discord::router::response_format::retry_prompt_context::RetryPromptContext;
+    let actual = RetryPromptContext::restore(actual.map(str::to_owned));
+    let expected = RetryPromptContext::restore(expected.map(str::to_owned));
+    assert_eq!(actual.raw, expected.raw, "original reply custody");
+    assert_eq!(
+        actual.selected, expected.selected,
+        "selected prelude custody"
+    );
+    assert_eq!(actual.may_select(), expected.may_select());
+}
+
 mod kickoff_tests {
     //! Exercises late start, durable handback and queue views through actual kickoff.
 
@@ -65,7 +77,11 @@ mod kickoff_tests {
         let runtime_root = runtime_store::agentdesk_root().expect("temporary runtime root");
         let config = crate::runtime_layout::config_file_path(&runtime_root);
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-        std::fs::write(&config, "server: {}\ndata: {dir: data}\nagents: []\n").unwrap();
+        std::fs::write(
+            &config,
+            "server: {}\ndata: {dir: data}\nagents: []\nproviders: {claude: {runtime: pipe}}\n",
+        )
+        .unwrap();
         let config_guard = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
             "AGENTDESK_CONFIG",
             &config,
@@ -74,8 +90,9 @@ mod kickoff_tests {
             "ADK_INTAKE_ROUTING_MODE",
             std::ffi::OsStr::new("disabled"),
         );
-        let boot = serde_json::from_value(serde_json::json!({"server": {}, "agents": []})).unwrap();
+        let boot = serde_json::from_value(serde_json::json!({"server": {}, "agents": [], "providers": {"claude": {"runtime": "pipe"}}})).unwrap();
         crate::services::tui_o::channel_policy::install(&boot).unwrap();
+        crate::services::provider_hosting::install_provider_hosting_config(&boot);
         let db = TestPostgresDb::create().await;
         let pool = db.connect_and_migrate().await;
         let version: String = sqlx::query_scalar("SELECT version()")
@@ -252,7 +269,10 @@ mod kickoff_tests {
             actual.text, original.text,
             "whole original request, including second line"
         );
-        assert_eq!(actual.reply_context, original.reply_context);
+        assert_retry_context_eq(
+            actual.reply_context.as_deref(),
+            original.reply_context.as_deref(),
+        );
         assert_eq!(actual.has_reply_boundary, original.has_reply_boundary);
         assert_eq!(actual.merge_consecutive, original.merge_consecutive);
         assert_eq!(
@@ -320,7 +340,7 @@ mod kickoff_tests {
         sources.sort();
         assert_eq!(stored.0, original.text);
         assert_eq!(stored.1, sources);
-        assert_eq!(stored.2, original.reply_context);
+        assert_retry_context_eq(stored.2.as_deref(), original.reply_context.as_deref());
         assert_eq!(
             stored.3,
             serde_json::json!(
@@ -365,12 +385,15 @@ mod kickoff_tests {
         head_card: MessageId,
         merged_card: MessageId,
     ) {
-        let (checked, role_override) = turn_orchestrator::load_channel_pending_queue_checked(
-            &ProviderKind::Claude,
-            &host.shared.token_hash,
-            channel,
-        )
-        .expect("checked durable queue loader must succeed, never treat a read failure as empty");
+        let (checked, role_override) =
+            turn_orchestrator::test_support::load_channel_pending_queue_checked(
+                &ProviderKind::Claude,
+                &host.shared.token_hash,
+                channel,
+            )
+            .expect(
+                "checked durable queue loader must succeed, never treat a read failure as empty",
+            );
         assert!(role_override.is_none());
         assert_eq!(checked.len(), 2);
         assert_full_item(&checked[0], original);
@@ -497,7 +520,7 @@ mod kickoff_tests {
             return;
         }
         assert_eq!(std::env::var("AGENTDESK_REQUIRE_PG").as_deref(), Ok("1"));
-        crate::services::discord::commands::control::native::tests::runtime().block_on(async {
+        crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(async {
             let channels = [100_000_006_008_881, 100_000_006_008_882, 100_000_006_008_883, 100_000_006_008_884].map(ChannelId::new);
             let fixture = configured_host(&[channels[case]]).await;
             let host = &fixture.host;
@@ -653,7 +676,7 @@ mod kickoff_tests {
             return;
         }
         assert_eq!(std::env::var("AGENTDESK_REQUIRE_PG").as_deref(), Ok("1"));
-        crate::services::discord::commands::control::native::tests::runtime().block_on(async {
+        crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(async {
             let channel = ChannelId::new(100_000_006_008_885);
             let fixture = configured_host(&[channel]).await;
             let host = &fixture.host;
@@ -747,7 +770,7 @@ mod kickoff_tests {
         .key();
         let quoted = |value: &str| value.replace('\'', "''");
         let mode = if cas { "cas" } else { "storage" };
-        let sql = format!(
+        let sql = sqlx::AssertSqlSafe(format!(
             r#"
             CREATE SEQUENCE b_input_begin_refusals;
             CREATE FUNCTION b_input_save_prior_projection() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -784,8 +807,8 @@ mod kickoff_tests {
         "#,
             key = quoted(&key),
             target = quoted(&target)
-        );
-        sqlx::raw_sql(&sql).execute(&host.pool).await.unwrap();
+        ));
+        sqlx::raw_sql(sql).execute(&host.pool).await.unwrap();
     }
 
     fn begin_failure_case(test: &str, cas: bool) {
@@ -793,7 +816,7 @@ mod kickoff_tests {
             return;
         }
         assert_eq!(std::env::var("AGENTDESK_REQUIRE_PG").as_deref(), Ok("1"));
-        crate::services::discord::commands::control::native::tests::runtime().block_on(Box::pin(
+        crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(Box::pin(
             async {
                 let channel = ChannelId::new(if cas {
                     100_000_006_008_887
@@ -875,7 +898,7 @@ mod kickoff_tests {
                     .collect();
                 sources.sort();
                 assert_eq!(stored.4, sources);
-                assert_eq!(stored.5, original.reply_context);
+                assert_retry_context_eq(stored.5.as_deref(), original.reply_context.as_deref());
                 assert_eq!(
                     stored.6,
                     serde_json::json!(
@@ -905,12 +928,13 @@ mod kickoff_tests {
                 assert_full_item(&snapshot.intervention_queue[0], &original);
                 assert_full_item(&snapshot.intervention_queue[1], &tail);
                 assert!(snapshot.cancel_token.is_none());
-                let (restored, role) = turn_orchestrator::load_channel_pending_queue_checked(
-                    &ProviderKind::Claude,
-                    &host.shared.token_hash,
-                    channel,
-                )
-                .expect("durable queue custody must ACK, not soft-skip its loader error");
+                let (restored, role) =
+                    turn_orchestrator::test_support::load_channel_pending_queue_checked(
+                        &ProviderKind::Claude,
+                        &host.shared.token_hash,
+                        channel,
+                    )
+                    .expect("durable queue custody must ACK, not soft-skip its loader error");
                 assert!(role.is_none());
                 assert_eq!(restored.len(), 2);
                 assert_full_item(&restored[0], &original);
@@ -1059,12 +1083,13 @@ mod kickoff_tests {
                 assert_full_item(&snapshot.intervention_queue[0], &original);
                 assert_full_item(&snapshot.intervention_queue[1], &tail);
                 assert!(snapshot.cancel_token.is_none());
-                let (restored, role) = turn_orchestrator::load_channel_pending_queue_checked(
-                    &ProviderKind::Claude,
-                    &host.shared.token_hash,
-                    channel,
-                )
-                .expect("raw Deferred requires a real durable queue ACK");
+                let (restored, role) =
+                    turn_orchestrator::test_support::load_channel_pending_queue_checked(
+                        &ProviderKind::Claude,
+                        &host.shared.token_hash,
+                        channel,
+                    )
+                    .expect("raw Deferred requires a real durable queue ACK");
                 assert!(role.is_none());
                 assert_eq!(restored.len(), 2);
                 assert_full_item(&restored[0], &original);
@@ -1235,7 +1260,6 @@ mod worker_entry_tests {
             preserve_on_cancel: true,
             agent_id: format!("input-b-{channel}"),
             provider: "claude".into(),
-            home_epoch: None,
         };
         let id = insert_pending(&host.pool, &payload, 1, None).await.unwrap();
         // Seed SQL directly to cover rows written by older delivery producers.
@@ -1373,7 +1397,7 @@ mod worker_entry_tests {
         )) {
             return;
         }
-        crate::services::discord::commands::control::native::tests::runtime().block_on(Box::pin(async {
+        crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(Box::pin(async {
             let channel = ChannelId::new(6_008_801);
             let message = 6_008_811;
             let sources = Some(vec![message.to_string(), (message+1).to_string()]);
@@ -1418,7 +1442,7 @@ mod worker_entry_tests {
         )) {
             return;
         }
-        crate::services::discord::commands::control::native::tests::runtime().block_on(Box::pin(async {
+        crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(Box::pin(async {
             let channel = ChannelId::new(6_008_802);
             let message = 6_008_821;
             let sources = Some(vec![message.to_string(), (message+1).to_string()]);
@@ -1460,7 +1484,7 @@ mod worker_entry_tests {
         )) {
             return;
         }
-        crate::services::discord::commands::control::native::tests::runtime().block_on(Box::pin(
+        crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(Box::pin(
             async {
                 let channel = ChannelId::new(6_008_803);
                 let message = 6_008_831;
@@ -1515,7 +1539,7 @@ mod worker_entry_tests {
         )) {
             return;
         }
-        crate::services::discord::commands::control::native::tests::runtime().block_on(Box::pin(async {
+        crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(Box::pin(async {
             let (dormant,active) = (ChannelId::new(6_008_804),ChannelId::new(6_008_805));
             let (host,_registry) = worker_host(&[dormant,active]).await;
             let _rest = crate::services::discord::shared_state::test_rest::install(host.api.http.clone());
@@ -1553,7 +1577,7 @@ mod worker_entry_tests {
         )) {
             return;
         }
-        crate::services::discord::commands::control::native::tests::runtime().block_on(Box::pin(async {
+        crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(Box::pin(async {
             use crate::services::discord::router::intake_dispatch::{IntakeAdmission,IntakeOrigin,IntakeSubmission,admit_text_intake};
             let channel = ChannelId::new(6_008_806);
             let message = 6_008_861;
@@ -1602,7 +1626,7 @@ mod worker_entry_tests {
         )) {
             return;
         }
-        crate::services::discord::commands::control::native::tests::runtime().block_on(Box::pin(async {
+        crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(Box::pin(async {
             let channels = [ChannelId::new(6_008_807),ChannelId::new(6_008_808)];
             let (host,_registry) = worker_host(&channels).await;
             let _rest = crate::services::discord::shared_state::test_rest::install(host.api.http.clone());
@@ -1640,7 +1664,7 @@ mod worker_entry_tests {
         )) {
             return;
         }
-        crate::services::discord::commands::control::native::tests::runtime().block_on(Box::pin(async {
+        crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(Box::pin(async {
             let channels = [6_008_809,6_008_810,6_008_811].map(ChannelId::new);
             let (host,_registry) = worker_host(&channels).await;
             let _rest = crate::services::discord::shared_state::test_rest::install(host.api.http.clone());
@@ -1699,7 +1723,7 @@ mod worker_entry_tests {
         )) {
             return;
         }
-        crate::services::discord::commands::control::native::tests::runtime().block_on(Box::pin(async {
+        crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(Box::pin(async {
             use crate::services::discord::router::intake_dispatch::{
                 IntakeAdmission,IntakeOrigin,IntakeSubmission,admit_text_intake,finish_text_intake_admission,
             };
@@ -1858,8 +1882,9 @@ type Answer = Arc<dyn Fn(&axum::http::Method, &str) -> Option<serde_json::Value>
 
 async fn host_with(channels: &[ChannelId], answer: Answer) -> Host {
     let root = crate::config::TestRuntimeRootGuard::new();
-    let boot = serde_json::from_value(serde_json::json!({"server": {}, "agents": []})).unwrap();
+    let boot = serde_json::from_value(serde_json::json!({"server": {}, "agents": [], "providers": {"claude": {"runtime": "pipe"}}})).unwrap();
     crate::services::tui_o::channel_policy::install(&boot).unwrap();
+    crate::services::provider_hosting::install_provider_hosting_config(&boot);
     let db = TestPostgresDb::create().await;
     let pool = db.connect_and_migrate().await;
     let api = Recorder::start_with(answer).await;
@@ -2004,7 +2029,7 @@ async fn started(
         owner_id: "7".into(),
         agent_id: String::new(),
         attachments: serde_json::json!([]),
-        reply_context: None,
+        reply_context: crate::services::discord::router::response_format::retry_prompt_context::RetryPromptContext::raw(None).requeue(),
         provenance: "new_input",
     };
     let receipt = write::register_or_reuse(&host.pool, &input, "node-a")
@@ -2041,7 +2066,7 @@ fn intake_start_begins_its_receipt_before_the_first_input_only_when_active_pg() 
     )) {
         return;
     }
-    crate::services::discord::commands::control::native::tests::runtime().block_on(async {
+    crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(async {
         let (dormant, active) = (ChannelId::new(6_008_701), ChannelId::new(6_008_702));
         let host = host(&[dormant, active]).await;
         let submitted = run(&host, request(dormant, 6_008_711, "dormant start")).await;
@@ -2115,7 +2140,7 @@ fn undecided_or_held_intake_start_keeps_custody_without_input_pg() {
     )) {
         return;
     }
-    crate::services::discord::commands::control::native::tests::runtime().block_on(async {
+    crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(async {
         let channels = [6_008_731, 6_008_732, 6_008_733, 6_008_734].map(ChannelId::new);
         let [held, lost, fenced, owned] = channels;
         let host = host(&channels).await;
@@ -2226,7 +2251,7 @@ fn exact_retry_starts_only_through_its_continuation_pg() {
     )) {
         return;
     }
-    crate::services::discord::commands::control::native::tests::runtime().block_on(async {
+    crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(async {
         let channels = [6_008_771, 6_008_772].map(ChannelId::new);
         let host = host(&channels).await;
         let mut outcomes = Vec::new();
@@ -2313,7 +2338,7 @@ fn held_dispatch_is_not_inherited_by_an_active_start_pg() {
     )) {
         return;
     }
-    crate::services::discord::commands::control::native::tests::runtime().block_on(async {
+    crate::services::discord::admin_host_guard::tests::intake_replay_rt().block_on(async {
         let (dormant, active) = (ChannelId::new(6_008_771), ChannelId::new(6_008_772));
         // Once set, the thread's card link answers with this dispatch, as for a card thread.
         let linked = Arc::new(std::sync::Mutex::new(None::<String>));
@@ -2388,3 +2413,6 @@ fn held_dispatch_is_not_inherited_by_an_active_start_pg() {
         host.db.drop().await;
     });
 }
+
+#[path = "system_prompt_tests.rs"]
+mod system_prompt_tests;

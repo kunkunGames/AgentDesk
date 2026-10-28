@@ -2,17 +2,17 @@
 //! the consecutive-failure alert.
 use std::sync::Arc;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 
-use super::store::{NewRoutine, RoutineStore};
+use super::store::{ClaimedRoutineRun, NewRoutine, RoutineStore};
 use super::{
     RoutineAgentExecutor, RoutineDiscordLogger, RoutineScriptLoader, after_startup_grace,
     run_due_tick, runtime::RoutineRunOutcome,
 };
 use crate::db::auto_queue::test_support::TestPostgresDb;
-use crate::services::discord::health::HealthRegistry;
+use crate::services::discord::health::{HealthRegistry, register_bot_auth_for_tests};
 
 fn store(pool: &PgPool) -> RoutineStore {
     RoutineStore::new_with_timezone_and_checkpoint_limit(
@@ -47,28 +47,52 @@ async fn run_row(pool: &PgPool, run_id: &str) -> (String, i32, Option<Value>) {
         .expect("routine run row")
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn agent_start_before_provider_registers_defers_then_fails_after_window_pg() {
-    let db = TestPostgresDb::create().await;
-    let pool = db.connect_and_migrate().await;
+async fn insert_boot_agent(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO agents (id, name, provider, discord_channel_cc)
          VALUES ('boot-agent', 'boot agent', 'claude', '6551001')",
     )
-    .execute(&pool)
+    .execute(pool)
     .await
     .unwrap();
-    let store = store(&pool);
+}
+
+async fn claim_boot_agent_run(store: &RoutineStore) -> ClaimedRoutineRun {
     store
         .attach_routine(new_routine("memento-hygiene", Some("boot-agent"), None))
         .await
         .unwrap();
-    let claimed = store
+    store
         .claim_due_runs(1)
         .await
         .unwrap()
         .pop()
-        .expect("due run");
+        .expect("due run")
+}
+
+/// Makes a deferred run due now, with its deferral window opened at `opened`.
+async fn retry_deferred_start(pool: &PgPool, run_id: &str, opened: DateTime<Utc>) {
+    let opened = opened.to_rfc3339();
+    sqlx::query(
+        "UPDATE routine_runs
+         SET result_json = jsonb_set(result_json, '{deferred_since}', to_jsonb($2::text)),
+             next_retry_at = NOW() - INTERVAL '1 second'
+         WHERE id = $1",
+    )
+    .bind(run_id)
+    .bind(&opened)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn agent_start_before_provider_registers_defers_then_fails_after_window_pg() {
+    let db = TestPostgresDb::create().await;
+    let pool = db.connect_and_migrate().await;
+    insert_boot_agent(&pool).await;
+    let store = store(&pool);
+    let claimed = claim_boot_agent_run(&store).await;
     let run_id = claimed.run_id.clone();
     // A registry with no provider registered yet is the state right after a restart.
     let executor = RoutineAgentExecutor::new(
@@ -88,18 +112,71 @@ async fn agent_start_before_provider_registers_defers_then_fails_after_window_pg
     assert_eq!(result["deferred_reason"], "provider_not_ready");
 
     // The runtime never registers: once the deferral window has passed the start fails.
-    let opened = (Utc::now() - Duration::minutes(11)).to_rfc3339();
-    sqlx::query(
-        "UPDATE routine_runs
-         SET result_json = jsonb_set(result_json, '{deferred_since}', to_jsonb($2::text)),
-             next_retry_at = NOW() - INTERVAL '1 second'
-         WHERE id = $1",
-    )
-    .bind(&run_id)
-    .bind(&opened)
-    .execute(&pool)
-    .await
-    .unwrap();
+    retry_deferred_start(&pool, &run_id, Utc::now() - Duration::minutes(11)).await;
+    let outcomes = executor.poll_agent_runs(&store, 10, false).await.unwrap();
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(outcomes[0].status, "failed", "{outcomes:?}");
+    let (status, _, _) = run_row(&pool, &run_id).await;
+    assert_eq!(status, "failed");
+
+    pool.close().await;
+    db.drop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dm_agent_start_before_runtime_is_ready_defers_then_fails_after_window_pg() {
+    let db = TestPostgresDb::create().await;
+    let pool = db.connect_and_migrate().await;
+    insert_boot_agent(&pool).await;
+    let store = store(&pool);
+    let claimed = claim_boot_agent_run(&store).await;
+    let run_id = claimed.run_id.clone();
+    // Registered for the agent's channel but with no Discord client yet: the DM reservation
+    // reports a runtime that is not ready.
+    let registry = Arc::new(HealthRegistry::new());
+    register_bot_auth_for_tests(&registry, "claude", 6551001, None, Vec::new(), false).await;
+    let executor = RoutineAgentExecutor::new(Arc::new(pool.clone()), Some(registry), 60);
+
+    let outcome = executor
+        .start_agent_run(
+            &store,
+            claimed,
+            "run".into(),
+            Some("4242".into()),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, "deferred", "{outcome:?}");
+    let (status, retry_count, result) = run_row(&pool, &run_id).await;
+    let result = result.expect("deferred result");
+    assert_eq!((status.as_str(), retry_count), ("running", 0));
+    assert_eq!(result["deferred_reason"], "provider_not_ready");
+    assert_eq!(result["dm_user_id"], "4242");
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("DM turn for boot-agent and user 4242")),
+        "{result}"
+    );
+
+    // The re-attempt inside the window reserves the DM again and stays deferred.
+    retry_deferred_start(&pool, &run_id, Utc::now() - Duration::minutes(1)).await;
+    let outcomes = executor.poll_agent_runs(&store, 10, false).await.unwrap();
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(outcomes[0].status, "deferred", "{outcomes:?}");
+    let (_, retry_count, result) = run_row(&pool, &run_id).await;
+    let result = result.expect("deferred result");
+    assert_eq!(
+        (retry_count, &result["dm_user_id"]),
+        (0, &Value::from("4242"))
+    );
+
+    // Once the window has passed the same error fails the run.
+    retry_deferred_start(&pool, &run_id, Utc::now() - Duration::minutes(11)).await;
     let outcomes = executor.poll_agent_runs(&store, 10, false).await.unwrap();
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     assert_eq!(outcomes[0].status, "failed", "{outcomes:?}");
@@ -321,6 +398,114 @@ async fn checkpoint_rejected_completion_counts_toward_the_failure_alert_pg() {
     assert_eq!(alerts().await, 1);
     fail_once().await;
     assert_eq!(alerts().await, 1);
+
+    pool.close().await;
+    db.drop().await;
+}
+
+async fn started_agent_run(
+    pool: &PgPool,
+    store: &RoutineStore,
+    name: &str,
+    strategy: &str,
+    turn: &str,
+) -> String {
+    let mut routine = new_routine(name, None, None);
+    routine.execution_strategy = strategy.to_string();
+    store.attach_routine(routine).await.unwrap();
+    let claimed = store
+        .claim_due_runs(1)
+        .await
+        .unwrap()
+        .pop()
+        .expect("due run");
+    assert!(
+        store
+            .mark_agent_turn_started(&claimed.run_id, turn, None, "agent", "primary")
+            .await
+            .unwrap()
+    );
+    // The turn started before any of its quality events.
+    sqlx::query("UPDATE routine_runs SET started_at = NOW() - INTERVAL '10 minutes' WHERE id = $1")
+        .bind(&claimed.run_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    claimed.run_id
+}
+
+async fn quality_event(pool: &PgPool, turn: &str, event_type: &str, outcome: &str, age_secs: i64) {
+    sqlx::query(
+        "INSERT INTO agent_quality_event (source_event_id, correlation_id, event_type, payload, created_at)
+         VALUES ($1, $1, $2::agent_quality_event_type,
+                 jsonb_build_object('details', jsonb_build_object('outcome', $3::text)),
+                 NOW() - ($4::bigint * INTERVAL '1 second'))",
+    )
+    .bind(turn)
+    .bind(event_type)
+    .bind(outcome)
+    .bind(age_secs)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fresh_terminal_turn_error_ends_run_as_failure_before_timeout_pg() {
+    let db = TestPostgresDb::create().await;
+    let pool = db.connect_and_migrate().await;
+    let store = store(&pool);
+    let executor = RoutineAgentExecutor::new(Arc::new(pool.clone()), None, 1800);
+    let cancelled =
+        started_agent_run(&pool, &store, "fresh-cancelled", "fresh", "discord:7001:1").await;
+    quality_event(&pool, "discord:7001:1", "turn_error", "cancelled", 60).await;
+    let late = started_agent_run(&pool, &store, "fresh-late", "fresh", "discord:7002:1").await;
+    quality_event(&pool, "discord:7002:1", "turn_error", "transport_error", 0).await;
+    let persistent = started_agent_run(&pool, &store, "kept", "persistent", "discord:7003:1").await;
+    quality_event(&pool, "discord:7003:1", "turn_error", "cancelled", 60).await;
+    let retrying = started_agent_run(&pool, &store, "fresh-retry", "fresh", "discord:7004:1").await;
+    quality_event(&pool, "discord:7004:1", "turn_error", "recovery_retry", 60).await;
+    let ok = started_agent_run(&pool, &store, "fresh-ok", "fresh", "discord:7005:1").await;
+    quality_event(&pool, "discord:7005:1", "turn_complete", "completed", 60).await;
+
+    let outcomes = executor.poll_agent_runs(&store, 10, false).await.unwrap();
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(
+        (outcomes[0].run_id.as_str(), outcomes[0].status.as_str()),
+        (cancelled.as_str(), "failed")
+    );
+    assert!(
+        outcomes[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("cancelled")),
+        "{outcomes:?}"
+    );
+    assert_eq!(run_row(&pool, &cancelled).await.0, "failed");
+    for run in [&late, &persistent, &retrying, &ok] {
+        assert_eq!(run_row(&pool, run).await.0, "running", "{run}");
+    }
+
+    // A transcript persisted after the error event still completes the run normally.
+    sqlx::query(
+        "INSERT INTO session_transcripts (turn_id, assistant_message)
+         VALUES ('discord:7002:1', 'partial briefing'), ('discord:7005:1', 'daily briefing')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let outcomes = executor.poll_agent_runs(&store, 10, false).await.unwrap();
+    let mut done: Vec<_> = outcomes
+        .iter()
+        .map(|o| (o.run_id.clone(), o.status.clone()))
+        .collect();
+    done.sort();
+    let mut expected = vec![
+        (late.clone(), "succeeded".to_string()),
+        (ok.clone(), "succeeded".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(done, expected);
 
     pool.close().await;
     db.drop().await;

@@ -54,10 +54,10 @@ pub(super) fn route(
     }
     // 4. goals-disabled carve-out. `classify_codex_goal_command` matches `/goal`
     //    case-sensitively and `raw_slash_invocation_parts` keeps raw case, so
-    //    this branch lowercases itself; otherwise `/GOAL clear` would fall
+    //    this branch compares case-insensitively; otherwise `/GOAL clear` would fall
     //    through and be refused as an unsupported command.
     if raw_slash_invocation_parts(user_text)
-        .is_some_and(|(raw_name, _)| raw_name.to_ascii_lowercase() == "/goal")
+        .is_some_and(|(raw_name, _)| raw_name.eq_ignore_ascii_case("/goal"))
     {
         return PreAdmissionRoute::Continue(GoalCommandKind::NotGoal);
     }
@@ -157,8 +157,9 @@ async fn send_pre_admission_notice(
     reason_code: &'static str,
     notice: &str,
 ) {
+    let notice = crate::services::discord::session_notice::subtext("ℹ️", notice);
     rate_limit_wait(shared, channel_id).await;
-    if let Err(error) = channel_id.say(http, notice).await {
+    if let Err(error) = channel_id.say(http, &notice).await {
         tracing::warn!(
             channel_id = channel_id.get(),
             reason_code,
@@ -172,7 +173,7 @@ async fn send_pre_admission_notice(
             &target,
             session_key.as_deref(),
             reason_code,
-            notice,
+            &notice,
         );
     }
 }
@@ -412,23 +413,52 @@ pub(super) mod pre_admission_control_tests {
         use crate::services::discord::turn_view_reconciler::{
             TurnViewState, note_intake_turn_started_current_with_attempt,
         };
+        use axum::{
+            body::Bytes,
+            http::{Method, Uri},
+            response::IntoResponse,
+        };
         let root = tempfile::tempdir().unwrap();
         let _env = crate::config::TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", root.path());
         let (shared, channel) = fixture(Some(session_with(&["U"], true))).await;
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = requests.clone();
+        let app = axum::Router::new().fallback(axum::routing::any(
+            move |method: Method, uri: Uri, body: Bytes| {
+                let captured = captured.clone();
+                async move {
+                    if method != Method::POST || !uri.path().ends_with("/messages") {
+                        return axum::http::StatusCode::NO_CONTENT.into_response();
+                    }
+                    captured.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+                    axum::Json(serde_json::json!({
+                        "id":"566000000000199", "channel_id":channel.get().to_string(),
+                        "content":"provider response",
+                        "author":{"id":"1","username":"provider","discriminator":"0001","avatar":null},
+                        "timestamp":"2026-10-23T00:00:00+00:00", "edited_timestamp":null,
+                        "tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],
+                        "attachments":[],"embeds":[],"pinned":false,"type":0
+                    })).into_response()
+                }
+            },
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http = Arc::new(
-            serenity::HttpBuilder::new("test-token")
+            serenity::HttpBuilder::new("offline-provider-control")
                 .proxy(format!("http://{}", listener.local_addr().unwrap()))
-                .client(
-                    reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_millis(100))
-                        .build()
-                        .unwrap(),
-                )
                 .ratelimiter_disabled(true)
                 .build(),
         );
-        for (index, text) in ["/model", "/frobnicate"].into_iter().enumerate() {
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (index, text) in [
+            "/model gpt**test",
+            "/frobnicate",
+            "/goal pause",
+            "/goal resume",
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let message = MessageId::new(566_000_000_000_101 + index as u64);
             note_intake_turn_started_current_with_attempt(&shared, &http, channel, message, "test")
                 .await;
@@ -463,55 +493,191 @@ pub(super) mod pre_admission_control_tests {
             assert_eq!(data.sessions[&channel].pending_uploads, ["U"]);
             assert!(data.sessions[&channel].cleared);
         }
+        for active in [false, true] {
+            send_codex_goal_lifecycle_notice(
+                &http,
+                &shared,
+                channel,
+                GoalLifecycleCommand::Clear,
+                active,
+            )
+            .await;
+        }
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            6,
+            "every local control and goal notice posts once through the supplied provider HTTP"
+        );
+        for body in requests.iter() {
+            let content = body["content"].as_str().unwrap();
+            assert!(
+                content.starts_with("-# ℹ️ ")
+                    && crate::services::discord::session_notice::is_inline(content),
+                "the real control/goal entrypoints must emit one provider subtext line: {content:?}"
+            );
+        }
+        assert!(requests[0]["content"].as_str().unwrap().contains("(+1줄)"));
+        assert!(requests[1]["content"].as_str().unwrap().contains("(+2줄)"));
+        assert!(
+            requests[4]["content"]
+                .as_str()
+                .unwrap()
+                .contains(r"\`/goal clear\`")
+        );
+        server.abort();
     }
 
-    fn offset(source: &str, token: &str) -> usize {
-        source
-            .find(token)
-            .unwrap_or_else(|| panic!("missing token: {token}"))
+    use crate::services::discord::router::source_guard_support::{Lexed, forge, swap};
+    use crate::test_support::CommentForgery;
+
+    const INTAKE_TURN: &str = include_str!("intake_turn.rs");
+    const PRE_ADMISSION: &str = include_str!("pre_admission_control.rs");
+    const HANDLER: &str = "pub(super) async fn handle_text_message(";
+    const EARLY: &str = "if !pre_admission_control::may_complete_locally(user_text) {";
+    const TAKE: &str = "take_channel_input_state(";
+    const TAKE_ORIGINAL: &str = "take_channel_input_state(shared, original_channel_id)";
+    const GATE: &str = "pre_admission_control::resolve(";
+    const RECORD_CLEARED: &str = "session_was_cleared = Some(cleared);";
+    const DEFERRED_BRANCH: &str = "if let Some(cleared) = session_was_cleared";
+    const FLAG: &str = "(http, shared, &provider, !pending_uploads.is_empty())";
+    const SPLICE: &str = "splice(0..0, taken_uploads)";
+    const SESSION_DRAIN: &str = "mem::take(&mut s.pending_uploads";
+    const LIFECYCLE: &str = "return PreAdmissionRoute::GoalLifecycle(";
+    const UPLOAD_GUARD: &str = "if has_preloaded_uploads {";
+    const CLASSIFY: &str = "match classify_codex_input(user_text)";
+
+    /// Classification 2, as written in the intake handler without comments: early take,
+    /// gate, then the deferred take. A lexical tripwire; takes are not paired with awaits.
+    fn deferred_take_gaps(source: &str) -> Vec<String> {
+        let Some(src) = Lexed::new(source).block(HANDLER) else {
+            return vec![format!("missing {HANDLER}")];
+        };
+        let at = |token| src.find(token);
+        let ordered = match (at(EARLY), at(TAKE), at(GATE), at(DEFERRED_BRANCH), at(FLAG)) {
+            (Some(early), Some(take), Some(gate), Some(branch), Some(flag)) => {
+                let deferred = src.find_all(TAKE).last().copied().unwrap_or(0);
+                early < take
+                    && take < gate
+                    && gate < branch
+                    && gate < deferred
+                    && flag < deferred
+                    && src.slice(early..gate).contains(RECORD_CLEARED)
+            }
+            _ => false,
+        };
+        let mut gaps = Vec::new();
+        if !ordered {
+            gaps.push("early take → gate → deferred take order broken".to_string());
+        }
+        for (token, expected) in [(TAKE_ORIGINAL, 2), (FLAG, 1), (SPLICE, 2)] {
+            if src.count(token) != expected {
+                gaps.push(format!("{token} must appear {expected} time(s)"));
+            }
+        }
+        if src.text().contains(SESSION_DRAIN) {
+            gaps.push("intake must not drain session uploads directly".to_string());
+        }
+        gaps
+    }
+
+    /// Production text before the unit tests: the upload guard sits between the goal
+    /// lifecycle return and the control registry, and nothing writes session uploads.
+    fn upload_guard_gaps(source: &str) -> Vec<String> {
+        let lexed = Lexed::new(source);
+        let Some(end) = lexed.find("#[cfg(test)]") else {
+            return vec!["missing the unit-test boundary".to_string()];
+        };
+        let src = lexed.slice(0..end);
+        let mut gaps = Vec::new();
+        match (
+            src.find(LIFECYCLE),
+            src.find(UPLOAD_GUARD),
+            src.find(CLASSIFY),
+        ) {
+            (Some(lifecycle), Some(guard), Some(classify))
+                if lifecycle < guard && guard < classify => {}
+            found => gaps.push(format!(
+                "lifecycle → upload guard → classify broken: {found:?}"
+            )),
+        }
+        if src.count(UPLOAD_GUARD) != 1 {
+            gaps.push("the upload guard must appear once".to_string());
+        }
+        for tail in [".push(", ".extend(", ".splice(", " ="] {
+            if src.text().contains(&format!(".pending_uploads{tail}")) {
+                gaps.push(format!("session uploads written via {tail}"));
+            }
+        }
+        gaps
     }
 
     /// Ordinary input takes early; only locally completable input defers state.
     /// Both sites use the original channel and preserve prepend order.
     #[test]
     fn intake_turn_keeps_the_gate_above_the_deferred_take() {
-        let src = include_str!("intake_turn.rs");
-        let flag = "(http, shared, &provider, !pending_uploads.is_empty())";
-        let take = "take_channel_input_state(";
-        let early = offset(
-            src,
-            "if !pre_admission_control::may_complete_locally(user_text) {",
-        );
-        let gate = offset(src, "pre_admission_control::resolve(");
-        let deferred = src.rfind(take).unwrap();
-        assert!(early < offset(src, take) && offset(src, take) < gate);
-        assert!(src[early..gate].contains("session_was_cleared = Some(cleared);"));
-        assert!(gate < offset(src, "if let Some(cleared) = session_was_cleared"));
-        assert!(gate < deferred && offset(src, flag) < deferred);
-        assert_eq!(
-            src.matches("take_channel_input_state(shared, original_channel_id)")
-                .count(),
-            2
-        );
-        assert_eq!(src.matches(flag).count(), 1);
-        assert_eq!(src.matches("mem::take(&mut s.pending_uploads").count(), 0);
-        assert_eq!(src.matches("splice(0..0, taken_uploads)").count(), 2);
+        assert_eq!(deferred_take_gaps(INTAKE_TURN), Vec::<String>::new());
     }
 
     /// (f3) S3-20e/20f: the guard stays between the lifecycle branch and the
     /// control registry, and this module never writes session uploads back (O4).
     #[test]
     fn guard_position_and_one_way_upload_ownership_are_pinned() {
-        let src = include_str!("pre_admission_control.rs");
-        let guard = format!("{}{}", "if has_preloaded_", "uploads {");
-        let lifecycle = format!("{}{}", "return PreAdmissionRoute::", "GoalLifecycle(");
-        let classify = format!("{}{}", "match classify_", "codex_input(user_text)");
-        assert!(offset(src, &lifecycle) < offset(src, &guard));
-        assert!(offset(src, &guard) < offset(src, &classify));
-        assert_eq!(src.matches(&guard).count(), 1);
-        for tail in [".push(", ".extend(", ".splice(", " ="] {
-            let write = format!("{}{}", ".pending_uploads", tail);
-            assert_eq!(src.matches(&write).count(), 0, "{write}");
+        assert_eq!(upload_guard_gaps(PRE_ADMISSION), Vec::<String>::new());
+    }
+
+    #[test]
+    fn upload_ownership_guards_reject_commented_reordered_and_coded_writes() {
+        let intake = [
+            HANDLER,
+            EARLY,
+            TAKE,
+            GATE,
+            RECORD_CLEARED,
+            DEFERRED_BRANCH,
+            FLAG,
+            SPLICE,
+        ];
+        type Judge = fn(&str) -> Vec<String>;
+        let cases: [(Judge, &str, &[&str]); 2] = [
+            (deferred_take_gaps, INTAKE_TURN, &intake),
+            (
+                upload_guard_gaps,
+                PRE_ADMISSION,
+                &[LIFECYCLE, UPLOAD_GUARD, CLASSIFY],
+            ),
+        ];
+        for (judge, source, needles) in cases {
+            for needle in needles {
+                for forgery in CommentForgery::ALL {
+                    let forged = forge(source, needle, forgery);
+                    assert!(forged.contains(needle));
+                    assert!(!judge(&forged).is_empty(), "{forgery:?} `{needle}` passes");
+                }
+            }
+        }
+        let gate_first = swap(INTAKE_TURN, TAKE_ORIGINAL, GATE);
+        assert!(!deferred_take_gaps(&gate_first).is_empty());
+        let classify_first = swap(PRE_ADMISSION, UPLOAD_GUARD, CLASSIFY);
+        assert!(!upload_guard_gaps(&classify_first).is_empty());
+        for (judge, source, anchor, write) in [
+            (
+                deferred_take_gaps as Judge,
+                INTAKE_TURN,
+                EARLY,
+                "std::mem::take(&mut s.pending_uploads);",
+            ),
+            (
+                upload_guard_gaps,
+                PRE_ADMISSION,
+                UPLOAD_GUARD,
+                "s.pending_uploads.push(upload);",
+            ),
+        ] {
+            let prose = source.replacen(anchor, &format!("/* {write} */ {anchor} // {write}"), 1);
+            assert_eq!(judge(&prose), Vec::<String>::new());
+            let coded = source.replacen(anchor, &format!("{write}\n{anchor}"), 1);
+            assert_eq!(judge(&coded).len(), 1, "{write}");
         }
     }
 }

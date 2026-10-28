@@ -11,8 +11,8 @@ subcommand starts the server.
 
 Regenerate with `python3 scripts/generate_cli_reference.py`; CI fails when this file drifts.
 
-- Top-level commands: 57
-- Commands including nested subcommands: 110
+- Top-level commands: 55
+- Commands including nested subcommands: 101
 
 ## Global options
 
@@ -75,7 +75,6 @@ Regenerate with `python3 scripts/generate_cli_reference.py`; CI fails when this 
 | [`agentdesk reset-tmux`](#agentdesk-reset-tmux) | Kill all AgentDesk-* tmux sessions and clean temp files |  |
 | [`agentdesk ismcptool`](#agentdesk-ismcptool) | Check if MCP tool(s) are registered in .claude/settings.json |  |
 | [`agentdesk addmcptool`](#agentdesk-addmcptool) | Add MCP tool permission(s) to .claude/settings.json |  |
-| [`agentdesk install-memento-session-hook`](#agentdesk-install-memento-session-hook) | #2655: install (or refresh) the Memento `context()` SessionStart hook and a UserPromptSubmit token-pressure reminder into a Claude Code settings file. Idempotent — running twice produces the same file. |  |
 | [`agentdesk status`](#agentdesk-status) | Show server health, active sessions, and auto-queue status |  |
 | [`agentdesk cards`](#agentdesk-cards) | List kanban cards |  |
 | [`agentdesk dispatch`](#agentdesk-dispatch) | Dispatch operations |  |
@@ -93,6 +92,7 @@ Regenerate with `python3 scripts/generate_cli_reference.py`; CI fails when this 
 | [`agentdesk phase`](#agentdesk-phase) | Phase-gate violation snapshot (issue #2657). |  |
 | [`agentdesk phase status`](#agentdesk-phase-status) | Show current violations (default). |  |
 | [`agentdesk deploy`](#agentdesk-deploy) | Build + deploy dev + promote to release |  |
+| [`agentdesk build-info`](#agentdesk-build-info) | Print this binary's build switches as JSON (read by deploy scripts) |  |
 | [`agentdesk agents`](#agentdesk-agents) | List agents and their status |  |
 | [`agentdesk diag`](#agentdesk-diag) | Show turn/session diagnostics for an agent ID or Discord channel ID |  |
 | [`agentdesk config`](#agentdesk-config) | Runtime config get/set |  |
@@ -122,20 +122,11 @@ Regenerate with `python3 scripts/generate_cli_reference.py`; CI fails when this 
 | [`agentdesk health`](#agentdesk-health) | Show consolidated health snapshot of the current node (server status, dcserver pid, last deploy time, queue lag, Discord/disk/outbox). |  |
 | [`agentdesk machine-compare`](#agentdesk-machine-compare) | Compare release/main/dev state across every registered worker node (`mac-mini`, `mac-book`, …). Renders a side-by-side table with dcserver pid, last deploy, queue lag, and a `diff` column. |  |
 | [`agentdesk activity`](#agentdesk-activity) | Time-windowed activity report: commits / closed issues / merged PRs / deploys / incidents in a single table. Uses gh + git + AgentDesk API. |  |
-| [`agentdesk o`](#agentdesk-o) |  |  |
-| [`agentdesk o boundary`](#agentdesk-o-boundary) | Source boundaries the writer could not decide |  |
-| [`agentdesk o status`](#agentdesk-o-status) | Rejected pieces of a channel and their operator approvals; writes nothing |  |
-| [`agentdesk o resume`](#agentdesk-o-resume) | Approve one more POST of the latest 400/403/404 piece; the writer sends it at its next start |  |
-| [`agentdesk o transition`](#agentdesk-o-transition) | Ask the local server about a transcript transition's cleanup; opens no store here |  |
 | [`agentdesk herdr`](#agentdesk-herdr) | Herdr-hosted executions on this node: read-only status, and retire of an ended one |  |
 | [`agentdesk herdr status`](#agentdesk-herdr-status) | Each local Herdr row, its pane as read now and the held inputs; changes nothing |  |
 | [`agentdesk herdr retire`](#agentdesk-herdr-retire) | Retire a channel's execution once its pane is gone or only its shell is left |  |
 | [`agentdesk herdr terminate`](#agentdesk-herdr-terminate) | Ask the local server to close one execution's pane and retire it; needs the live switch |  |
-| [`agentdesk channel-home`](#agentdesk-channel-home) | Delegated channel homes: status, and the switched delegate, reclaim and force |  |
-| [`agentdesk channel-home status`](#agentdesk-channel-home-status) | Each home row and its open intake by routed epoch; changes nothing |  |
-| [`agentdesk channel-home delegate`](#agentdesk-channel-home-delegate) | Start releasing a gateway-owned channel from this node to `--to` |  |
-| [`agentdesk channel-home reclaim`](#agentdesk-channel-home-reclaim) | Start draining a worker-owned channel back to this node |  |
-| [`agentdesk channel-home force`](#agentdesk-channel-home-force) | Orphan a holder whose lease has been silent past F; nothing adopts the channel after |  |
+| [`agentdesk herdr probe-user-default`](#agentdesk-herdr-probe-user-default) | Check the execution user's own herdr server once; reads no AgentDesk config or database |  |
 
 ## Commands
 
@@ -742,18 +733,6 @@ Usage: `agentdesk addmcptool <TOOLS>...`
 |---|---|---|---|
 | `<TOOLS>...` | `String` (repeatable) |  | Tool names to add |
 
-## `agentdesk install-memento-session-hook`
-
-#2655: install (or refresh) the Memento `context()` SessionStart hook and a UserPromptSubmit token-pressure reminder into a Claude Code settings file. Idempotent — running twice produces the same file.
-
-Usage: `agentdesk install-memento-session-hook [OPTIONS]`
-
-| Argument | Value | Default | Description |
-|---|---|---|---|
-| `--settings-path <SETTINGS_PATH>` | `String` |  | Path to the settings.json to mutate. Defaults to `~/.claude/settings.json` when omitted. |
-| `--dry-run` | flag |  | Skip writing and instead print the rendered settings to stdout. |
-| `--uninstall` | flag |  | Remove the AgentDesk-managed memento hook entries instead of installing them. Useful when an operator wants to revert. (conflicts with `dry_run`) |
-
 ## `agentdesk status`
 
 Show server health, active sessions, and auto-queue status
@@ -898,7 +877,7 @@ Usage: `agentdesk query all`
 
 Phase-gate violation snapshot (issue #2657).
 
-Read-only inspector that flags auto-queue entries dispatched at a higher `batch_phase` than the run's live phase pointer. Mirrors the `/adk-phase` Discord slash command.
+Read-only inspector that flags auto-queue entries dispatched at a higher `batch_phase` than the run's live phase pointer. Same data as `GET /api/queue/phase-gates/violations`.
 
 Usage: `agentdesk phase [COMMAND] [OPTIONS]`
 
@@ -921,6 +900,12 @@ Usage: `agentdesk phase status`
 Build + deploy dev + promote to release
 
 Usage: `agentdesk deploy`
+
+## `agentdesk build-info`
+
+Print this binary's build switches as JSON (read by deploy scripts)
+
+Usage: `agentdesk build-info`
 
 ## `agentdesk agents`
 
@@ -1252,54 +1237,6 @@ Usage: `agentdesk activity [OPTIONS]`
 | `--repo <REPO>` | `String` |  | Repository in owner/repo form. Defaults to the current repo's `origin` remote when omitted. |
 | `--no-agentdesk` | flag |  | Skip the AgentDesk-side deploy / incident lookup (useful when the local API is offline). Pure git + gh report. |
 
-## `agentdesk o`
-
-Usage: `agentdesk o <COMMAND>`
-
-Subcommands:
-
-- `boundary` — Source boundaries the writer could not decide
-- `status` — Rejected pieces of a channel and their operator approvals; writes nothing
-- `resume` — Approve one more POST of the latest 400/403/404 piece; the writer sends it at its next start
-- `transition` — Ask the local server about a transcript transition's cleanup; opens no store here
-
-### `agentdesk o boundary`
-
-Source boundaries the writer could not decide
-
-Usage: `agentdesk o boundary`
-
-### `agentdesk o status`
-
-Rejected pieces of a channel and their operator approvals; writes nothing
-
-Usage: `agentdesk o status [OPTIONS]`
-
-| Argument | Value | Default | Description |
-|---|---|---|---|
-| `--channel <CHANNEL>` (required) | `u64` |  |  |
-
-### `agentdesk o resume`
-
-Approve one more POST of the latest 400/403/404 piece; the writer sends it at its next start
-
-Usage: `agentdesk o resume [OPTIONS]`
-
-| Argument | Value | Default | Description |
-|---|---|---|---|
-| `--channel <CHANNEL>` (required) | `u64` |  |  |
-| `--rejected-serial <REJECTED_SERIAL>` (required) | `u64` |  |  |
-| `--reason <REASON>` (required) | `String` |  |  |
-| `--operator <OPERATOR>` | `String` | `operator` |  |
-
-> Exit: 0 recorded, 1 no store, 3 already recorded, 4 refused, 5 busy, 6 not written, 7 unknown
-
-### `agentdesk o transition`
-
-Ask the local server about a transcript transition's cleanup; opens no store here
-
-Usage: `agentdesk o transition`
-
 ## `agentdesk herdr`
 
 Herdr-hosted executions on this node: read-only status, and retire of an ended one
@@ -1311,6 +1248,7 @@ Subcommands:
 - `status` — Each local Herdr row, its pane as read now and the held inputs; changes nothing
 - `retire` — Retire a channel's execution once its pane is gone or only its shell is left
 - `terminate` — Ask the local server to close one execution's pane and retire it; needs the live switch
+- `probe-user-default` — Check the execution user's own herdr server once; reads no AgentDesk config or database
 
 ### `agentdesk herdr status`
 
@@ -1340,53 +1278,12 @@ Usage: `agentdesk herdr terminate [OPTIONS]`
 | `--execution-nonce <EXECUTION_NONCE>` (required) | `String` |  | Execution nonce the row must still record |
 | `--reason <REASON>` (required) | `String` |  | Why it is terminated, kept in the server's result log |
 
-## `agentdesk channel-home`
+### `agentdesk herdr probe-user-default`
 
-Delegated channel homes: status, and the switched delegate, reclaim and force
+Check the execution user's own herdr server once; reads no AgentDesk config or database
 
-Usage: `agentdesk channel-home <COMMAND>`
-
-Subcommands:
-
-- `status` — Each home row and its open intake by routed epoch; changes nothing
-- `delegate` — Start releasing a gateway-owned channel from this node to `--to`
-- `reclaim` — Start draining a worker-owned channel back to this node
-- `force` — Orphan a holder whose lease has been silent past F; nothing adopts the channel after
-
-### `agentdesk channel-home status`
-
-Each home row and its open intake by routed epoch; changes nothing
-
-Usage: `agentdesk channel-home status`
-
-### `agentdesk channel-home delegate`
-
-Start releasing a gateway-owned channel from this node to `--to`
-
-Usage: `agentdesk channel-home delegate [OPTIONS] <CHANNEL>`
+Usage: `agentdesk herdr probe-user-default [OPTIONS]`
 
 | Argument | Value | Default | Description |
 |---|---|---|---|
-| `<CHANNEL>` | `u64` |  |  |
-| `--provider <PROVIDER>` (required) | `String` |  | claude or codex |
-| `--to <TO>` (required) | `String` |  |  |
-
-### `agentdesk channel-home reclaim`
-
-Start draining a worker-owned channel back to this node
-
-Usage: `agentdesk channel-home reclaim <CHANNEL>`
-
-| Argument | Value | Default | Description |
-|---|---|---|---|
-| `<CHANNEL>` | `u64` |  |  |
-
-### `agentdesk channel-home force`
-
-Orphan a holder whose lease has been silent past F; nothing adopts the channel after
-
-Usage: `agentdesk channel-home force <CHANNEL>`
-
-| Argument | Value | Default | Description |
-|---|---|---|---|
-| `<CHANNEL>` | `u64` |  |  |
+| `--socket <SOCKET>` | `std::path::PathBuf` |  | Absolute socket path; defaults to $HOME/.config/herdr/herdr.sock |

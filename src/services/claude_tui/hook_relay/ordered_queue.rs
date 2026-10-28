@@ -422,7 +422,7 @@ pub(super) fn enqueue_ordered_hook_relay_request_with_binding(
         return Err("ordered hook relay producer lock was unavailable".to_string());
     };
     let request_id = uuid::Uuid::new_v4().to_string();
-    let published_at = Utc::now();
+    let published_at = super::response_window::published_now();
     let delivery_deadline = published_at
         + chrono::Duration::from_std(DELIVERY_TTL)
             .map_err(|err| format!("convert hook relay delivery TTL: {err}"))?;
@@ -548,7 +548,7 @@ pub(super) fn handoff_ordered_hook_event_response_with_timeout(
         event,
         session_id,
         payload,
-        Some(started + timeout),
+        Some(super::response_window::first_deadline(started + timeout)),
         Some(binding),
     )?;
     let response_path = response_path
@@ -571,7 +571,7 @@ pub(super) fn handoff_ordered_hook_event_response_with_timeout(
                 ));
             }
         }
-        if started.elapsed() >= timeout {
+        if super::response_window::caller_deadline_passed(started, timeout) {
             let _ = std::fs::remove_file(&response_path);
             return Err(format!(
                 "ordered hook relay response timed out after {}ms",
@@ -1044,24 +1044,8 @@ mod tests {
     #[cfg(unix)]
     fn atomic_publication_preserves_all_five_consumers_on_sync_failure() {
         // Fault injection proves error handling; this source oracle separately pins the syscalls.
-        let source = include_str!("ordered_queue.rs");
-        let publish = source
-            .split("fn publish_atomic_file(")
-            .nth(1)
-            .unwrap()
-            .split("fn queue_request_paths(")
-            .next()
-            .unwrap();
-        for call in [
-            "|| temp.sync_all()",
-            "runtime_store::fsync_parent_dir(path)",
-            "    sync().map_err(",
-        ] {
-            assert!(
-                publish.contains(call),
-                "atomic publication must invoke {call}"
-            );
-        }
+        let gaps = source_guard_tests::atomic_sync_gaps(source_guard_tests::ORDERED_QUEUE);
+        assert_eq!(gaps, Vec::<String>::new());
         for label in [
             "hook relay quarantine evidence",
             "hook relay queue sequence",
@@ -2523,6 +2507,8 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    mod source_guard_tests;
     #[cfg(unix)]
     mod tq_tests;
 }

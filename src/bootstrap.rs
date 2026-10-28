@@ -25,7 +25,7 @@ pub(crate) fn initialize() -> Result<BootstrapState> {
         let config = crate::config::load().context("Failed to load config")?;
         crate::services::discord_config_audit::LoadedRuntimeConfig {
             config,
-            path: std::path::PathBuf::from("config/agentdesk.yaml"),
+            path: crate::config::resolved_config_path(),
             existed: true,
         }
     };
@@ -92,12 +92,56 @@ pub(crate) fn initialize() -> Result<BootstrapState> {
     Ok(BootstrapState { config })
 }
 
-/// Installs the process-lifetime snapshots from the final reconciled config.
-/// Every server entry calls this before HTTP, bots or intake start; an error must abort boot.
-pub(crate) fn install_boot_snapshots(config: &crate::config::Config) -> Result<()> {
+/// Installs the process-lifetime snapshots, then ensures the installed dedicated Herdr configs.
+/// Static config errors abort boot; migration refusal is carried by the selected hosts.
+pub(crate) fn install_boot_snapshots(
+    config: &crate::config::Config,
+    selection: crate::config::session_hosts::migration::HostsBootSelection,
+) -> Result<()> {
     crate::config::validate_config(config)?;
     crate::services::tui_o::channel_policy::install(config)?;
     crate::services::provider_hosting::install_provider_hosting_config(config);
-    crate::config::session_hosts::install(config)?;
+    crate::config::session_hosts::install_selected(selection);
+    #[cfg(unix)]
+    crate::services::session_host::managed_config::maintenance::boot();
     Ok(())
 }
+
+pub(crate) async fn prepare_session_hosts_boot(
+    candidate: crate::config::session_hosts::BootSessionHosts,
+    pool: Option<&sqlx::PgPool>,
+) -> crate::config::session_hosts::migration::HostsBootSelection {
+    use crate::config::session_hosts::{approval_store::FileApprovalStore, migration};
+    migration::select(
+        candidate,
+        &FileApprovalStore::runtime(),
+        &migration::PgRows(pool),
+        &migration::ConsentHolds,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_and_install_boot_snapshots(
+    config: &crate::config::Config,
+    pool: Option<&sqlx::PgPool>,
+) -> Result<()> {
+    crate::config::validate_config(config)?;
+    let candidate = crate::config::session_hosts::BootSessionHosts::from_config(config)?;
+    let selection = prepare_session_hosts_boot(candidate, pool).await;
+    crate::services::session_host::policy::boot_grants::prepare(selection.hosts()).await;
+    install_boot_snapshots(config, selection)
+}
+
+/// The dcserver preserves its static-validation failure contract before starting HTTP or intake.
+pub(crate) async fn prepare_dcserver_boot(config: &crate::config::Config, pool: &sqlx::PgPool) {
+    if let Err(error) = prepare_and_install_boot_snapshots(config, Some(pool)).await {
+        eprintln!("  ✖ Failed to install boot snapshots: {error:#}");
+        std::process::exit(1);
+    }
+    crate::cli::dcserver::startup::spawn_skill_manifest_audit(config, pool);
+}
+
+#[cfg(all(test, unix))]
+#[path = "config/session_hosts/boot_pg_tests.rs"]
+mod tests;

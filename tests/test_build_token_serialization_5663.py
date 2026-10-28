@@ -24,6 +24,7 @@ import functools
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -329,14 +330,60 @@ class WiringTests(unittest.TestCase):
         self.assertIn('sys.platform == "win32"', source)
 
 
+class DeployLockTimeoutTests(unittest.TestCase):
+    def test_timeout_validation_matches_build_token_before_lock(self) -> None:
+        deploy = (SCRIPTS / "deploy-release.sh").read_text()
+        start = deploy.index('DEPLOY_LOCK_FILE=')
+        end = deploy.index('DEPLOY_MKDIR_LOCK_DIR=', start)
+        self.assertLess(end, deploy.index('\n_acquire_release_deploy_lock "$@"'))
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            locked = root / "lock-entered"
+            script = root / "timeout.sh"
+            script.write_text('set -euo pipefail\nSCRIPT_DIR="$1"\nADK_REL="$2"\n' + deploy[start:end]
+                              + 'printf "%s" "$DEPLOY_LOCK_TIMEOUT_SECS" > "$2/lock-entered"\n')
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("AGENTDESK_DEPLOY_")}
+            env[bt.WAIT_TIMEOUT_ENV] = "5"
+            cases = (("0", None), ("-1", None), ("abc", None), ("nan", None), ("inf", None),
+                     ("1.5", 1.5), ("1800", 1800.0), ("1e9999", None), ("1e-9999", None),
+                     (" 1.5 ", 1.5), ("1_800", 1800.0), ("1e2", 100.0), ("+1", 1.0))
+            for raw, expected in cases:
+                with self.subTest(raw=raw):
+                    result = subprocess.run(["/bin/bash", str(script), str(SCRIPTS), str(root)],
+                                            env=dict(env, AGENTDESK_DEPLOY_LOCK_TIMEOUT_SECS=raw),
+                                            capture_output=True, text=True, timeout=5)
+                    self.assertEqual(bt.wait_timeout_secs({bt.WAIT_TIMEOUT_ENV: raw}),
+                                     expected if expected is not None else bt.DEFAULT_WAIT_TIMEOUT_SECS)
+                    if expected is None:
+                        self.assertEqual(result.returncode, bt.EXIT_USAGE, result.stdout + result.stderr)
+                        self.assertIn("AGENTDESK_DEPLOY_LOCK_TIMEOUT_SECS", result.stderr)
+                        self.assertIn("finite number greater than 0", result.stderr)
+                        self.assertFalse(locked.exists(), "invalid timeout reached deploy lock")
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(locked.read_text(), raw)
+                    locked.unlink(missing_ok=True)
+            for raw in (None, ""):
+                with self.subTest(default=raw):
+                    default_env = dict(env)
+                    if raw is not None:
+                        default_env["AGENTDESK_DEPLOY_LOCK_TIMEOUT_SECS"] = raw
+                    result = subprocess.run(["/bin/bash", str(script), str(SCRIPTS), str(root)],
+                                            env=default_env, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(locked.read_text(), "1800")
+
+
 class DeployPreflightTokenTests(unittest.TestCase):
     def test_source_build_queues_but_artifact_and_host_pressure_refuse(self) -> None:
         # Execute the actual preflight/build branches, never the full deployment.
         deploy = (SCRIPTS / "deploy-release.sh").read_text()
         preflight = deploy.split('if [ "$DEPLOY_TEST_MODE" != "1" ]; then', 1)[1]
         preflight = 'if [ "$DEPLOY_TEST_MODE" != "1" ]; then' + preflight.split("# #743:", 1)[0]
-        build = deploy.split('if [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ]; then')[-1]
-        build = 'if [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ]; then' + build.split("# Rebuild dashboard", 1)[0]
+        build_start = 'if [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ] && [ "$PEER_BINARY_ACCEPTED" != 1 ]; then'
+        self.assertEqual(deploy.count(build_start), 1)
+        build = build_start + deploy.split(build_start, 1)[1].split("# Rebuild dashboard", 1)[0]
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             token, marker = root / "token", root / "built"
@@ -345,6 +392,7 @@ class DeployPreflightTokenTests(unittest.TestCase):
 assert sys.argv[2] == "scripts/build_token.py"
 assert sys.argv[3] == "--"
 assert sys.argv[4:6] == ["bash", "-c"]
+open(sys.argv[-1] + ".waiter", "w").write(str(os.getpid()))
 command = sys.argv[4:-1]
 idx = command.index("cargo")
 assert command[idx:idx + 2] == ["cargo", "build"]
@@ -360,6 +408,8 @@ SCRIPT_DIR="$6"
 SOURCE_BINARY="$4"
 DEPLOY_BUILD_PROFILE="$5"
 DEPLOY_LOCK_TIMEOUT_SECS="${TEST_LOCK_TIMEOUT:-1800}"
+PEER_BINARY_ACCEPTED=0
+_binary_would_revert_o_ledger() { return 1; }
 _preflight_builder_pids() { case "$1" in cargo|rustc) echo 55555;; esac; }
 _preflight_cpu_count() { echo 8; }
 _preflight_loadavg_1min() { echo "${TEST_LOAD:-1}"; }
@@ -390,7 +440,7 @@ ps() {
             for key in list(env):
                 if key.startswith("AGENTDESK_DEPLOY_") or key == bt.LEASE_ENV:
                     env.pop(key)
-            command = ["bash", str(script), str(SCRIPTS), str(driver), str(token), str(marker)]
+            command = ["/bin/bash", str(script), str(SCRIPTS), str(driver), str(token), str(marker)]
             for profile in ("release", "dev"):
                 with self.subTest(profile=profile), token.open("a+") as holder:
                     fcntl.flock(holder, fcntl.LOCK_EX)
@@ -405,6 +455,7 @@ ps() {
                             fcntl.flock(holder, fcntl.LOCK_UN)
                         out, err = child.communicate(timeout=10)
                         self.assertEqual(child.returncode, 0, out + err)
+                        self.assertNotIn("command not found", err)
                         self.assertTrue(marker.exists())
                         marker.unlink()
             for extra, reason in (({"TEST_LOAD": "99"}, "load average"),
@@ -424,19 +475,26 @@ ps() {
                     self.assertNotIn("build token: waiting", result.stderr)
                     self.assertFalse(marker.exists())
 
-            # #5855: the deploy lock is held across the token wait above, so a
-            # wait longer than the deadline a queued peer agreed to wait starves
-            # that peer -- including an artifact deploy that never needs the
-            # token. Without an operator override the wait must be derived from
-            # DEPLOY_LOCK_TIMEOUT_SECS, not build_token's four-hour default.
+            # Inspect the first notice so a missing bound fails before a long wait.
+            # Stop the waiter while the token is held; its shell reaps it before unlock.
             bounded = dict(env, TEST_LOCK_TIMEOUT="1")
             bounded.pop(bt.WAIT_TIMEOUT_ENV, None)
-            with self.subTest(bound="deploy lock deadline"), token.open("a+") as holder:
+            with self.subTest(bound="token wait duration"), token.open("a+") as holder:
                 fcntl.flock(holder, fcntl.LOCK_EX)
-                result = subprocess.run(command + ["release", str(root)], env=bounded,
-                                        capture_output=True, text=True, timeout=30)
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("still held after 1s", result.stderr)
+                with subprocess.Popen(command + ["release", str(root)], env=bounded,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as child:
+                    try:
+                        notice = child.stderr.readline()
+                        self.assertIn("build token: waiting for", notice)
+                        self.assertIn("of 1s;", notice)
+                        out, err = child.communicate(timeout=5)
+                        self.assertEqual(child.returncode, bt.EXIT_TOKEN_TIMEOUT, out + err)
+                        self.assertIn("still held after 1s", err)
+                    finally:
+                        if child.poll() is None:
+                            with contextlib.suppress(ProcessLookupError):
+                                os.kill(int(Path(str(marker) + ".waiter").read_text()), signal.SIGTERM)
+                        child.communicate(timeout=5)
                 self.assertFalse(marker.exists(), "the build must not start without the token")
 
 
@@ -920,6 +978,8 @@ class NestedHolderTests(TokenTestCase):
             "deploy.lock", "a.started", "a.go", "a.waiting", "a.reached", "b.built"))
         lock.touch()
         scenario = self.tmp / "deploy-release.sh"  # beside the isolated build_token.py
+        (scenario.parent / "lib").mkdir(exist_ok=True)
+        shutil.copy2(SCRIPTS / "lib/deploy_allow_degraded.sh", scenario.parent / "lib")
         scenario.write_text(
             self.deploy_head('touch "$A_STARTED"\nuntil [ -e "$A_GO" ]; do sleep 0.05; done\n')
             + '"$TEST_PY" -c "$LOCK_WAIT" "$DEPLOY_LOCK" 20 "$A_WAITING" "$A_REACHED"\n')
@@ -961,6 +1021,8 @@ class NestedHolderTests(TokenTestCase):
         guard_dir.mkdir()
         invoked, passed = guard_dir / "invoked", guard_dir / "passed"
         script = guard_dir / "deploy-release.sh"
+        (script.parent / "lib").mkdir()
+        shutil.copy2(SCRIPTS / "lib/deploy_allow_degraded.sh", script.parent / "lib")
         script.write_text(self.deploy_head() + f'touch "{passed}"\n')
         self.assertEqual(bt.EXIT_NESTED, NESTED_STATUS, "the guard below matches the literal")
         for verdict, marked, want in ((73, True, 73), (1, True, 0), (0, True, 0), (73, False, 0)):
@@ -1070,7 +1132,7 @@ class SccacheEnvTests(TokenTestCase):
     def test_a_resolvable_sccache_reaches_the_child_as_an_absolute_wrapper(self) -> None:
         seen = self.child_env()
         self.assertEqual(seen["RUSTC_WRAPPER"], str(self.tmp / "brew" / "sccache"))
-        self.assertEqual(seen["SCCACHE_CACHE_SIZE"], "40G")
+        self.assertEqual(seen["SCCACHE_CACHE_SIZE"], "15G")
         # 0, not the 600s default: a daemon reaped between two token waits loses
         # the hit counters that say whether the cache is worth anything.
         self.assertEqual(seen["SCCACHE_IDLE_TIMEOUT"], "0")

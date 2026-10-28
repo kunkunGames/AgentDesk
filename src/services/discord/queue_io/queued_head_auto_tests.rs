@@ -47,7 +47,16 @@ impl Fixture {
 
     /// Bodies the pane's transcript acknowledged, in order.
     fn receipts(&self) -> Vec<String> {
-        let body = |record: String| record.split_once('\n').unwrap().1.to_string();
+        let body = |record: String| {
+            let (header, after) = crate::services::tui_input::human_frame::parse(&record)
+                .expect("a receipt contains the owned author header");
+            assert_eq!((header.name, header.author), (AUTHOR_NAME, "200"));
+            after
+                .strip_prefix(' ')
+                .or_else(|| after.strip_prefix('\n'))
+                .expect("one header/body separator")
+                .to_string()
+        };
         self.pane.records().into_iter().map(body).collect()
     }
 
@@ -132,7 +141,7 @@ impl Fixture {
         self.assert_holder_kept().await;
         let snapshot = self.shared.mailbox(self.channel).snapshot().await;
         assert!(snapshot.pending_user_dispatch.is_none());
-        let transcript = self.pane.path("transcript.jsonl");
+        let transcript = self.pane.path(InjectPane::TRANSCRIPT);
         let state = crate::services::tui_turn_state::observe_claude_jsonl_turn_state(&transcript);
         assert!(state.is_busy(), "the pane stayed busy throughout");
     }
@@ -404,6 +413,10 @@ async fn s3_a_slow_check_overlapping_a_reserved_owner_types_the_input_once_pg() 
     until("H is settled", || fixture.terminal() == [h.get()]).await;
     assert_eq!(fixture.receipts(), ["H raced by two workers"]);
     assert_eq!(fixture.pane.keys(), ["paste-buffer", "send-keys"]);
+    until("H's owner finished reporting", || {
+        fixture.rows().iter().any(|row| row.outcome == "injected")
+    })
+    .await;
 
     // B's own enqueue only typed H; nothing new arrives, and the backstop left armed reaches B.
     let b = fixture.queue().await[0].message_id;
@@ -577,9 +590,9 @@ async fn s3_an_attempt_row_never_reports_a_delivery_the_actor_did_not_commit_pg(
 
     let idle = Fixture::new(6_813_532, "all").await;
     let _idle_gate = router::busy_inject_support::open_gate(idle.channel.get());
-    let transcript = std::fs::read_to_string(idle.pane.path("transcript.jsonl")).unwrap();
+    let transcript = std::fs::read_to_string(idle.pane.path(InjectPane::TRANSCRIPT)).unwrap();
     let ended = format!("{transcript}{{\"type\":\"result\"}}\n");
-    idle.pane.set("transcript.jsonl", &ended);
+    idle.pane.set(InjectPane::TRANSCRIPT, &ended);
     idle.pane.idle();
     queue_io::schedule_post_enqueue_idle_queue_kick(idle.shared.clone(), CLAUDE, idle.channel);
     until("the idle attempt was reported", || !idle.rows().is_empty()).await;
@@ -850,3 +863,6 @@ async fn s3_an_unreadable_thread_parent_keeps_the_backlog_watched_until_it_reads
     assert_eq!(injected, [h.get(), b.get()]);
     fixture.assert_still_busy().await;
 }
+
+#[path = "queued_head_mend_tests.rs"]
+mod mend;

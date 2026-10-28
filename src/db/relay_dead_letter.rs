@@ -2,15 +2,11 @@
 //! the silent message-loss vectors (catch-up "too old" drop + intervention-queue
 //! capacity-overflow evict). Preserves dropped content for operator recovery.
 //!
-//! All recording is FIRE-AND-FORGET: a dead-letter write must never block or
-//! fail the origin path (the message was already lost — failing to record it
-//! must not compound the loss). Hot-path callers use [`record_detached`], which
-//! runs the INSERT on a detached `tokio::spawn` so even a PG pool at its
-//! acquire-timeout (3s, `db::postgres`) cannot stall the catch-up loop /
-//! queue-exit feedback / outbox drain (#4260 dual-review r1, codex#1).
+//! Hot-path callers use [`record_detached`]. Catch-up awaits bounded durable
+//! recording before retiring an input from its scanner frontier.
 //!
 //! Retention (#4260 dual-review r1, opus#2): the table is self-maintaining —
-//! after each successful detached insert, the same spawned task best-effort
+//! after each successful recording, a spawned task best-effort
 //! DELETEs rows older than [`RETENTION_DAYS`], so no separate maintenance job
 //! is needed and the table cannot grow unboundedly.
 //!
@@ -74,6 +70,61 @@ pub(crate) async fn insert(
     pool: &PgPool,
     record: &RelayDeadLetterRecord,
 ) -> Result<i64, sqlx::Error> {
+    insert_with_outcome(pool, record).await.map(|(id, _)| id)
+}
+
+async fn insert_with_outcome(
+    pool: &PgPool,
+    record: &RelayDeadLetterRecord,
+) -> Result<(i64, bool), sqlx::Error> {
+    if record.kind == KIND_CATCH_UP_TOO_OLD
+        && let Some(message_id) = record.message_id.as_deref()
+    {
+        let mut tx = pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout = '3s'")
+            .execute(&mut *tx)
+            .await?;
+        let key = format!(
+            "{}:{}{}:{}",
+            record.channel_id.len(),
+            record.channel_id,
+            message_id.len(),
+            message_id
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock(7441, hashtext($1))")
+            .bind(key)
+            .execute(&mut *tx)
+            .await?;
+        // A separate statement takes a fresh snapshot after the preceding writer commits.
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM relay_dead_letter
+             WHERE kind=$1 AND channel_id=$2 AND message_id=$3 ORDER BY id LIMIT 1",
+        )
+        .bind(&record.kind)
+        .bind(&record.channel_id)
+        .bind(message_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let id = match existing {
+            Some(id) => id,
+            None => insert_on(&mut tx, record).await?,
+        };
+        tx.commit().await?;
+        return Ok((id, existing.is_none()));
+    }
+    let mut connection = pool.acquire().await?;
+    insert_on(&mut connection, record)
+        .await
+        .map(|id| (id, true))
+}
+
+async fn insert_on(
+    connection: &mut sqlx::PgConnection,
+    record: &RelayDeadLetterRecord,
+) -> Result<i64, sqlx::Error> {
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO relay_dead_letter
             (kind, channel_id, author_id, message_id, content, reason)
@@ -86,9 +137,50 @@ pub(crate) async fn insert(
     .bind(record.message_id.as_deref())
     .bind(&record.content)
     .bind(&record.reason)
-    .fetch_one(pool)
+    .fetch_one(connection)
     .await?;
     Ok(id)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TooOldRecordOutcome {
+    Inserted,
+    Existing,
+}
+
+/// A missing pool or failed commit cannot retire an unpreserved catch-up input.
+pub(crate) async fn record_too_old(
+    pool: Option<&PgPool>,
+    record: RelayDeadLetterRecord,
+) -> Option<TooOldRecordOutcome> {
+    let pool = pool?;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        insert_with_outcome(pool, &record),
+    )
+    .await
+    {
+        Ok(Ok((_, inserted))) => {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                if let Err(error) = prune_expired(&pool).await {
+                    tracing::warn!(
+                        "[dlq] failed to prune expired relay dead-letter rows (best-effort): {error}"
+                    );
+                }
+            });
+            Some(if inserted {
+                TooOldRecordOutcome::Inserted
+            } else {
+                TooOldRecordOutcome::Existing
+            })
+        }
+        result => {
+            tracing::warn!(kind = %record.kind, channel_id = %record.channel_id,
+                error = ?result, "[dlq] catch-up input not durably preserved; retaining scanner frontier");
+            None
+        }
+    }
 }
 
 /// Best-effort retention sweep: DELETE rows older than [`RETENTION_DAYS`].
@@ -153,11 +245,11 @@ pub(crate) fn record_detached_reporting(
     }))
 }
 
-/// Settled `redelivery_state` values (migration 0120). A row starts `'pending'`;
+/// `redelivery_state` values (migrations 0120 and 0142). A row starts `'pending'`;
 /// [`claim_pending_redeliveries`] moves it to `'claimed'` and only a settle leaves
 /// that state. Settling back to `'pending'` makes the row claimable again, so a
 /// claim is once per attempt, not once per row. A claim lost to a crash stays
-/// `'claimed'` until an operator recovers it.
+/// `'claimed'`; abandoned claims have no automatic recovery.
 ///
 /// The body was posted to the channel.
 pub(crate) const REDELIVERY_DELIVERED: &str = "delivered";
@@ -169,6 +261,10 @@ pub(crate) const REDELIVERY_DECLINED: &str = "declined";
 /// a verdict about the body, so a later claim picks the row up again instead of
 /// retiring it unread.
 pub(crate) const REDELIVERY_PENDING: &str = "pending";
+
+/// Claimed for one attempt; settlement may return it to pending.
+#[cfg(test)]
+const REDELIVERY_CLAIMED: &str = "claimed";
 
 /// One row claimed for redelivery. `id` settles it; the rest reconstruct the body.
 #[derive(Clone, Debug)]
@@ -256,6 +352,9 @@ pub(crate) async fn settle_redelivery(
     .await?;
     Ok(result.rows_affected())
 }
+
+#[cfg(test)]
+mod migration_tests;
 
 #[cfg(test)]
 mod tests {
@@ -376,6 +475,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redelivery_state_check_rejects_unknown_values_pg() {
+        let pg_db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
+            "agentdesk_relay_dlq_state_check",
+            "relay dead letter redelivery state check",
+        )
+        .await;
+        let pool = pg_db.connect_and_migrate().await;
+        let validated: bool = sqlx::query_scalar(
+            "SELECT convalidated FROM pg_constraint \
+             WHERE conrelid = 'relay_dead_letter'::regclass \
+               AND conname = 'relay_dead_letter_redelivery_state_check'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            validated,
+            "existing rows must be validated after head migrations"
+        );
+
+        let id = insert(&pool, &terminal_row("state contract"))
+            .await
+            .unwrap();
+
+        let states = [
+            REDELIVERY_PENDING,
+            REDELIVERY_CLAIMED,
+            REDELIVERY_DELIVERED,
+            REDELIVERY_DECLINED,
+            REDELIVERY_SUPERSEDED,
+        ];
+        for state in states {
+            sqlx::query("UPDATE relay_dead_letter SET redelivery_state = $2 WHERE id = $1")
+                .bind(id)
+                .bind(state)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let error = sqlx::query("UPDATE relay_dead_letter SET redelivery_state = $2 WHERE id = $1")
+            .bind(id)
+            .bind("pendign")
+            .execute(&pool)
+            .await
+            .expect_err("unknown state must fail at write time");
+        assert_eq!(
+            error.as_database_error().and_then(|db| db.constraint()),
+            Some("relay_dead_letter_redelivery_state_check")
+        );
+        let error = sqlx::query(
+            "INSERT INTO relay_dead_letter (kind, channel_id, content, reason, redelivery_state) \
+             VALUES ($1, '5551', 'unknown state', 'state contract', 'pendign')",
+        )
+        .bind(KIND_TERMINAL_NO_DELIVERY_OWNER)
+        .execute(&pool)
+        .await
+        .expect_err("unknown state must also fail on insert");
+        assert_eq!(
+            error.as_database_error().and_then(|db| db.constraint()),
+            Some("relay_dead_letter_redelivery_state_check")
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT redelivery_state FROM relay_dead_letter WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, REDELIVERY_SUPERSEDED);
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn insert_read_back_detached_and_retention_roundtrip_pg() {
         let pg_db = crate::dispatch::test_support::DispatchPostgresTestDb::create(
             "agentdesk_relay_dead_letter",
@@ -453,7 +626,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("count rows");
-        assert_eq!(count, 3, "two explicit inserts + one detached insert");
+        assert_eq!(count, 2, "detached TooOld reuses the explicit row");
 
         // Retention (#4260 dual r1 opus#2): age one row past the horizon; the
         // next detached record must sweep it within the same spawned task.
@@ -481,7 +654,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("count remaining rows");
-        assert_eq!(remaining, 3, "fresh rows survive the sweep (+1 new insert)");
+        assert_eq!(remaining, 2, "fresh rows survive the sweep (+1 new insert)");
 
         pool.close().await;
         pg_db.drop().await;

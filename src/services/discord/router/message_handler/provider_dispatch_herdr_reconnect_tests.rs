@@ -6,9 +6,12 @@ use crate::services::discord::recovery_engine::herdr_reader::{
     ReconnectCounts, reconnect_counts, reconnect_restarted_herdr_panes,
 };
 
+#[path = "root_replaced_recovery_tests.rs"]
+mod root_replaced_recovery_tests;
+
 /// A first turn launches the pane and binds it, as T-E1 does; returns the launched nonce and
 /// session.
-fn launch(fx: &Fixture, launcher: &Arc<Launcher>) -> (String, Started) {
+pub(super) fn launch(fx: &Fixture, launcher: &Arc<Launcher>) -> (String, Started) {
     let started = Mutex::new(None);
     let (result, _) = fx.turn(&HostedRecord::Legacy, &fx.ports(launcher), || {
         if let Some(launched) = fx.start_provider(launcher, true) {
@@ -22,15 +25,6 @@ fn launch(fx: &Fixture, launcher: &Arc<Launcher>) -> (String, Started) {
     (nonce, started.into_inner().unwrap().unwrap())
 }
 
-thread_local! {
-    /// Whether each row the latest pass read had its source bound, as adoption sees it.
-    static BOUND: std::cell::RefCell<Result<Vec<bool>, String>> = const { std::cell::RefCell::new(Ok(Vec::new())) };
-}
-
-fn bound() -> Result<Vec<bool>, String> {
-    BOUND.with_borrow(Clone::clone)
-}
-
 /// What a dcserver restart forgets, then its rehydrate pass on this node's endpoint.
 fn restart_and_reconnect(fx: &Fixture) -> ReconnectCounts {
     crate::services::tui_prompt_dedupe::reset_state_for_tests();
@@ -39,18 +33,10 @@ fn restart_and_reconnect(fx: &Fixture) -> ReconnectCounts {
     let _registry = fx.rig.registry_on_this_thread();
     let _hosts = crate::config::session_hosts::force_for_test(Some(NODE), &[]);
     fx.rig.show_panes(&[PANE]);
-    let pass = reconnect_restarted_herdr_panes(
+    reconnect_restarted_herdr_panes(
         Some(&fx.pool),
         &crate::services::provider::ProviderKind::Claude,
-        // Bound evidence exists only for an observer's own pass.
-        Some(crate::services::discord::codex_adoption_runtime::ObservationRuntimeId::for_tests(7)),
     );
-    let channel = Some(CHANNEL);
-    BOUND.set(pass.map(|rows| {
-        rows.iter()
-            .map(|r| r.bound && r.channel == channel)
-            .collect()
-    }));
     reconnect_counts()
 }
 
@@ -60,7 +46,7 @@ fn second_turn(fx: &Fixture, launcher: &Arc<Launcher>, started: &Started) -> Res
     let (result, _) = fx.turn(&row, &fx.ports(launcher), || {
         if wait_for(&fx.finished, "the prompt", || fx.rig.sends().len() == 4) {
             let session = &started.session;
-            let user = json!({"type": "user", "sessionId": session,
+            let user = json!({"type": "user", "sessionId": session, "timestamp": chrono::Utc::now().to_rfc3339(),
                 "message": {"role": "user", "content": "질문"}});
             let answer = json!({"type": "assistant", "sessionId": session, "message": {
                 "role": "assistant", "stop_reason": "end_turn",
@@ -86,7 +72,6 @@ fn t_r1_a_restart_reconnects_a_matched_bound_pane_and_its_next_turn_prompts_once
         ..ReconnectCounts::default()
     };
     assert_eq!(counts, reconnected);
-    assert_eq!(bound(), Ok(vec![true]), "the restored source is bound");
     let binding =
         crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(fx.logical());
     assert_eq!(
@@ -119,7 +104,6 @@ fn t_r2_a_replaced_root_shell_reconnects_nothing_and_takes_no_input_pg() {
         ..ReconnectCounts::default()
     };
     assert_eq!(counts, withheld);
-    assert_eq!(bound(), Ok(vec![false]));
     let binding =
         crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(fx.logical());
     assert_eq!(binding, None);
@@ -138,7 +122,7 @@ fn t_r2_a_replaced_root_shell_reconnects_nothing_and_takes_no_input_pg() {
 
 /// The launched execution's own SessionStart(clear) Pending of `cleared`, as its hook logs it
 /// before the cleared session's transcript exists; returns where that transcript goes.
-fn clear_pending(fx: &Fixture, cleared: &str) -> std::path::PathBuf {
+pub(super) fn clear_pending(fx: &Fixture, cleared: &str) -> std::path::PathBuf {
     use crate::services::tui_prompt_dedupe::binding_events::{
         self, BindingCause, CauseSource, HookSignal, Proposal,
     };
@@ -178,7 +162,7 @@ fn cleared_turn(
     let row = fx.record();
     let (result, _) = fx.turn(&row, &fx.ports(launcher), || {
         if wait_for(&fx.finished, "the prompt", || fx.rig.sends().len() == 4) {
-            let user = json!({"type": "user", "sessionId": cleared,
+            let user = json!({"type": "user", "sessionId": cleared, "timestamp": chrono::Utc::now().to_rfc3339(),
                 "message": {"role": "user", "content": "질문"}});
             let answer = json!({"type": "assistant", "sessionId": cleared, "message": {
                 "role": "assistant", "stop_reason": "end_turn",
@@ -224,12 +208,7 @@ fn a_restart_after_a_pending_clear_prompts_the_cleared_session_once_pg() {
         ..ReconnectCounts::default()
     };
     assert_eq!(counts, admitted);
-    // Published for health, yet AwaitingClear restores no source: never adoption's bound source.
-    assert_eq!(
-        bound(),
-        Ok(vec![false]),
-        "herdr_awaiting_clear_is_not_bound_source_success"
-    );
+    // Published for health, yet AwaitingClear restores no source.
     let binding =
         crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(fx.logical());
     assert_eq!(binding, None, "no source is restored for a waiting clear");
@@ -340,12 +319,7 @@ fn a_restart_after_two_pending_clears_prompts_the_latest_cleared_session_once_pg
         ..ReconnectCounts::default()
     };
     assert_eq!(counts, admitted);
-    // Published for health, yet AwaitingClear restores no source: never adoption's bound source.
-    assert_eq!(
-        bound(),
-        Ok(vec![false]),
-        "herdr_awaiting_clear_is_not_bound_source_success"
-    );
+    // Published for health, yet AwaitingClear restores no source.
     let binding =
         crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session(fx.logical());
     assert_eq!(binding, None, "no source is restored for a waiting clear");

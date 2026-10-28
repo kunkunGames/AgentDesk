@@ -2,6 +2,8 @@
 //! one prompt to a launch's ready composer, its hold ending only once the hook Source is bound;
 //! a Bound pane takes each later prompt once, never over a draft or changed launch options.
 
+mod first_input;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -19,7 +21,7 @@ use crate::db::dispatched_sessions::hosted_execution::{
 };
 use crate::services::agent_protocol::{RuntimeHandoff, RuntimeHandoffKind, StreamMessage};
 use crate::services::claude::herdr_turn::{
-    HoldRelease, gate, hold, launched, load, not_held, release_hold,
+    HoldRelease, composer, gate, hold, launched, load, not_held, release_hold,
 };
 use crate::services::codex_tui::host_input::{InputRun, PlanRun, legacy_result, run_herdr};
 use crate::services::codex_tui::input::{
@@ -37,7 +39,7 @@ use crate::services::provider::cancel_token_claude_interrupt::{
     HerdrSubmission, HerdrTurnStart, herdr_stop_settlement_available,
 };
 use crate::services::provider::{
-    CancelToken, ProviderKind, ReadOutputResult, cancel_requested, is_readonly_tool_policy,
+    CancelToken, ProviderKind, ReadOutputResult, is_readonly_tool_policy,
 };
 use crate::services::session_host::HerdrTarget;
 use crate::services::tui_prompt_dedupe::binding_context::PreparedIncarnation;
@@ -153,7 +155,8 @@ pub(crate) fn execute(
         };
         first_prompt(&turn, &runtime, ports, &nonce, sender)
     })();
-    crate::services::provider::herdr_before_start::finish_execution(turn.cancel.as_deref());
+    let failed = result.is_err();
+    crate::services::provider::herdr_before_start::finish_execution(turn.cancel.as_deref(), failed);
     result
 }
 
@@ -285,24 +288,24 @@ fn current_record(
 /// Polls the pane until Codex's composer is ready and returns that screen. A modal waits on a
 /// person, so it stops the turn at once; a cancel or the deadline stops it too, nothing written.
 fn composer_ready(target: &HerdrTarget, cancel: Option<&CancelToken>) -> Result<String, String> {
-    let deadline = Instant::now() + COMPOSER_READY_WAIT;
-    loop {
-        if cancel_requested(cancel) {
-            return Err(PROMPT_READY_CANCELLED_ERROR.to_string());
+    use std::ops::ControlFlow;
+    composer::wait_for(cancel, COMPOSER_READY_WAIT, || match target.capture(-80) {
+        Some(screen) if pane_looks_ready_for_codex_prompt(&screen) => {
+            ControlFlow::Break(Ok(screen))
         }
-        let screen = target.capture(-80);
-        match screen {
-            Some(screen) if pane_looks_ready_for_codex_prompt(&screen) => return Ok(screen),
-            Some(screen) if pane_shows_codex_interactive_modal(&screen) => {
-                return Err("herdr turn: a codex modal holds the composer".into());
+        Some(screen) if pane_shows_codex_interactive_modal(&screen) => {
+            ControlFlow::Break(Err("herdr turn: a codex modal holds the composer".into()))
+        }
+        _ => ControlFlow::Continue(()),
+    })
+    .unwrap_or_else(|stop| {
+        Err(match stop {
+            composer::WaitStop::Cancelled => PROMPT_READY_CANCELLED_ERROR.to_string(),
+            composer::WaitStop::TimedOut => {
+                "herdr turn: the codex composer did not become ready".into()
             }
-            _ => {}
-        }
-        if Instant::now() >= deadline {
-            return Err("herdr turn: the codex composer did not become ready".into());
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+        })
+    })
 }
 
 /// A ready composer shown empty; a draft, or a composer the reader cannot read, is left as it is
@@ -366,83 +369,17 @@ fn first_prompt(
     nonce: &str,
     sender: Sender<StreamMessage>,
 ) -> Result<(), String> {
-    let logical = turn.owner.logical_key.as_str();
-    let plan = plan_prompt_submit(turn.prompt)?;
-    // Opened before the prompt, so a fast hook cannot land unseen.
-    let mut logged = subscribe_binding_events(turn.channel_id)
-        .map_err(|error| format!("herdr turn: binding log unavailable: {error}"))?;
-    let target = gate(&current_record(turn, runtime, nonce)?)?;
-    empty_composer(&target, turn.cancel.as_deref())?;
-    crate::services::tui_prompt_dedupe::register_provider_session("codex", logical, logical);
-    crate::services::tui_prompt_dedupe::register_codex_herdr_placeholder(logical, turn.channel_id);
-    hold(nonce)?;
-    #[cfg(test)]
-    crate::services::provider::herdr_before_start::test_input_boundary(turn.cancel.as_deref());
-    let run = observed_input(
-        turn.cancel.as_deref(),
-        || None,
-        || run_herdr(&target, &plan, turn.cancel.as_deref()),
-    )?;
-    let run = match run {
-        crate::services::provider::herdr_before_start::InputRun::Ran(run) => run,
-        crate::services::provider::herdr_before_start::InputRun::Closed => {
-            if !crate::services::provider::herdr_before_start::mutant(
-                "closed_release_callsite_removed_codex_first",
-            ) {
-                release_closed_hold(logical, nonce);
-            }
-            return Ok(());
-        }
+    let Some(submitted) = first_input::submit(turn, runtime, nonce)? else {
+        return Ok(());
     };
-    if run.run != InputRun::Applied {
-        if composer_untouched(&run) {
-            warn_release(logical, release_hold(nonce));
-        }
-        return legacy_result(run.run);
-    }
-    // Submitted: a cancel from here on is remembered on its token, never a reason to stop waiting.
-    let deadline = Instant::now() + SOURCE_WAIT;
-    let source = loop {
-        if let Some(source) = logged_source(turn, nonce) {
-            break source;
-        }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(format!(
-                "herdr turn: no session start of codex execution {nonce}; later prompts stay held"
-            ));
-        }
-        let poll = left.min(Duration::from_millis(200));
-        let _ = runtime.block_on(tokio::time::timeout(poll, logged.changed()));
-    };
-    let record = current_record(turn, runtime, nonce)?;
-    if !ports.attach(&turn.owner, &record, &source, &target)? {
-        return Err(format!("herdr turn: codex execution {nonce} is not bound"));
-    }
-    // The launch's own new rollout begins with this prompt's turn.
-    let start = HerdrTurnStart {
-        execution_nonce: nonce.to_owned(),
-        source: source.path.clone(),
-        file: Some((source.dev, source.ino)),
-        offset: 0,
-        submitted_at: None,
-    };
-    record_turn_start(turn.cancel.as_deref(), start)?;
-    warn_release(logical, release_hold(nonce));
-    read_reply(
-        turn,
-        &target,
-        &source.path,
-        0,
-        source.session_id.clone(),
-        sender,
-    )
+    first_input::observe(turn, runtime, ports, nonce, sender, submitted)
 }
 
 /// One gated write under the token's submission observation, as a stop delivery reads it; a
 /// follow-up's turn start is built and recorded under the same lock, before its input, only then.
 fn observed_input(
     cancel: Option<&CancelToken>,
+    nonce: &str,
     start: impl FnOnce() -> Option<HerdrTurnStart>,
     write: impl FnOnce() -> PlanRun,
 ) -> Result<crate::services::provider::herdr_before_start::InputRun<PlanRun>, String> {
@@ -461,6 +398,7 @@ fn observed_input(
     if !state.prepare_input(&mut submitted) {
         return Ok(HerdrInputRun::Closed);
     }
+    submitted.execution = Some(nonce.to_owned());
     crate::services::tui_o::exact_submission::begin_input()?;
     if let Some(start) = start()
         && !state.record_turn_start(start)
@@ -528,7 +466,7 @@ fn followup(
             ..start
         })
     };
-    let run = observed_input(turn.cancel.as_deref(), start, || {
+    let run = observed_input(turn.cancel.as_deref(), nonce, start, || {
         run_herdr(&target, &plan, turn.cancel.as_deref())
     })?;
     let run = match run {
@@ -562,13 +500,25 @@ fn read_reply(
         session_id: session_id.clone(),
         raw_session_id: Some(session_id.clone()),
     });
+    // Under settlement only the provider's terminal or the row pass's wake ends the read; the
+    // tail asks whether the provider lives only of a final record that lacks its newline.
+    let held = crate::services::provider::herdr_provider_terminal_only(turn.cancel.as_deref())
+        .is_some()
+        && !crate::services::provider::herdr_before_start::mutant("prb_codex_reader_liveness");
+    let gone = || target.provider_absent() == Ok(true) && !target.execution_alive();
     let read = crate::services::codex_tui::rollout_tail::tail_rollout_file_from_offset(
         path,
         offset,
         Some(&session_id),
         sender.clone(),
         turn.cancel.clone(),
-        || target.execution_alive(),
+        || {
+            if held {
+                !gone()
+            } else {
+                target.execution_alive()
+            }
+        },
     )?;
     let ReadOutputResult::Completed { offset } = read else {
         return Ok(());
@@ -619,7 +569,7 @@ mod observed_input_tests {
                     enter_attempted: true,
                 }
             };
-            assert!(observed_input(Some(&token), start, write).is_ok());
+            assert!(observed_input(Some(&token), "nonce", start, write).is_ok());
             seen.push(calls.into_inner());
         }
         HERDR_SETTLEMENT_OVERRIDE.set(true);
@@ -656,6 +606,7 @@ mod coldstop_input_tests {
             let calls = std::cell::Cell::new(0);
             let run = observed_input(
                 Some(&token),
+                &nonce,
                 || {
                     calls.set(calls.get() + 1);
                     None
@@ -709,6 +660,7 @@ mod coldstop_input_tests {
             let state = token.prepare_herdr_interrupt(ProviderKind::Codex, &owner);
             let _ = observed_input(
                 Some(&token),
+                "nonce",
                 || None,
                 || PlanRun {
                     run,
@@ -728,3 +680,6 @@ mod coldstop_input_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod composer_tests;

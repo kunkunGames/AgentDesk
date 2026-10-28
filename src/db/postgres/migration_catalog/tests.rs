@@ -20,7 +20,7 @@ pub(super) async fn install_fixture(pool: &PgPool, lineage: Lineage, version: i6
         .unwrap();
     assert!(database.starts_with("agentdesk_db_auto_queue_"));
     let mut conn = pool.acquire().await.unwrap().detach();
-    let result = fixture.run_direct(&mut conn).await;
+    let result = fixture.run_direct(None, &mut conn, false).await;
     conn.close().await.unwrap();
     result.unwrap();
 }
@@ -63,9 +63,16 @@ fn catalog_receipts(lineage: Lineage) -> Vec<Receipt> {
 
 #[test]
 fn immutable_catalogs_preserve_gaps_up_checksums_and_convergence() {
+    let expected_head = SHARED
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+        .map(|m| m.version)
+        .max()
+        .unwrap_or(146);
+    assert!(expected_head >= 157);
     for lineage in [Lineage::Upstream, Lineage::CampaignV5] {
         let rows = catalog_receipts(lineage);
-        assert_eq!(rows.last().unwrap().version, 146);
+        assert_eq!(rows.last().unwrap().version, expected_head);
         assert!(!rows.iter().any(|r| r.version == 17));
         assert_eq!(inferred_lineage(&rows), Some(lineage));
         for end in 0..=rows.len() {
@@ -79,9 +86,14 @@ fn immutable_catalogs_preserve_gaps_up_checksums_and_convergence() {
         "cd511419d9365160f041dc4e78f02dbcc3b8e4272601f700398a4f0102173d8c5861ca9842245dfe49cf34c9e0474258"
     );
     assert!(
-        super::super::POSTGRES_MIGRATOR
+        Lineage::Upstream
+            .migrator()
             .iter()
-            .all(|m| m.version <= 141 || m.version == 146)
+            .filter(|m| m.version < 147)
+            .all(|m| {
+                m.version <= 141
+                    || (m.version == 146 && m.description == "campaign upstream convergence")
+            })
     );
     assert!(SHARED.iter().all(|m| m.version >= 147));
 }
@@ -123,7 +135,16 @@ async fn native_history_and_office_rows_survive_convergence_and_reentry_pg() {
         &after.as_array().unwrap()[..before.as_array().unwrap().len()],
         before.as_array().unwrap()
     );
-    assert_eq!(after.as_array().unwrap().last().unwrap()["version"], 146);
+    let expected_head = SHARED
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+        .map(|m| m.version)
+        .max()
+        .unwrap_or(146);
+    assert_eq!(
+        after.as_array().unwrap().last().unwrap()["version"],
+        expected_head
+    );
     let office: String =
         sqlx::query_scalar("SELECT office_id FROM departments WHERE id='preserved-department'")
             .fetch_one(&pool)
@@ -149,7 +170,7 @@ async fn native_history_and_office_rows_survive_convergence_and_reentry_pg() {
 async fn upstream_history_converges_and_concurrent_starters_apply_once_pg() {
     // Both the previous upstream floor and its new archive-column migration
     // must converge without rewriting an already installed receipt.
-    for version in [140, 141] {
+    for version in [140, 141, 146] {
         upstream_history_converges_from(version).await;
     }
 }
@@ -186,9 +207,19 @@ async fn upstream_history_converges_from(version: i64) {
         &after.as_array().unwrap()[..before.as_array().unwrap().len()],
         before.as_array().unwrap()
     );
+    let shared_len = SHARED
+        .iter()
+        .filter(|m| !m.migration_type.is_down_migration())
+        .count();
+    let pre_shared_pending = match version {
+        140 => 2,
+        141 => 1,
+        146 => 0,
+        _ => unreachable!("unexpected upstream convergence fixture version {version}"),
+    };
     assert_eq!(
         after.as_array().unwrap().len(),
-        before.as_array().unwrap().len() + if version == 140 { 2 } else { 1 }
+        before.as_array().unwrap().len() + pre_shared_pending + shared_len
     );
     let tables: bool = sqlx::query_scalar("SELECT to_regclass('campaign_graph_occurrences') IS NOT NULL AND to_regclass('offices') IS NULL")
         .fetch_one(&pool).await.unwrap();
@@ -219,7 +250,14 @@ async fn refused_history_is_unchanged_and_diagnostics_remain_available_pg() {
     let (fixture, pool) = empty_fixture().await;
     install_fixture(&pool, Lineage::CampaignV5, 145).await;
     let pending = crate::db::postgres::migration_status(&pool).await.unwrap();
-    assert_eq!(pending.pending_versions, vec![146]);
+    let mut expected_pending = vec![146];
+    expected_pending.extend(
+        SHARED
+            .iter()
+            .filter(|m| !m.migration_type.is_down_migration())
+            .map(|m| m.version),
+    );
+    assert_eq!(pending.pending_versions, expected_pending);
     assert!(pending.history_issues.is_empty());
     sqlx::query("DELETE FROM _sqlx_migrations WHERE version=141")
         .execute(&pool)

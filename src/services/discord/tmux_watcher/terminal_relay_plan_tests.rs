@@ -13,9 +13,11 @@ use crate::services::discord::inflight::RelayOwnerKind;
 use crate::services::discord::{DeliveryLeaseKey, LeaseHolder, LeaseOutcome, LeaseSnapshot};
 
 const SESSION: &str = "AgentDesk-claude-adk-cc";
-const FRAME_START: u64 = 1_534_426;
+pub(super) const FRAME_START: u64 = 1_534_426;
 const TURN_START: u64 = 1_534_500;
-const FRAME_END: u64 = 1_650_085;
+pub(super) const FRAME_END: u64 = 1_650_085;
+/// A partial JSONL line read past the frame, so `current_offset` sits beyond the consumed end.
+pub(super) const UNPROCESSED_TAIL: &str = "{\"type\":\"user\",\"message\":";
 const WATCHER_NONCE: &str = "nonce-bound-while-consuming-this-turn";
 
 fn row(turn_nonce: Option<&str>, owner: RelayOwnerKind) -> InflightTurnState {
@@ -499,9 +501,10 @@ fn reader_pins_the_ledger_and_lease_operands_5464_c1() {
 // #5941: the durable record at the #5175 loss seam, and the observability that
 // stops "there is no record" from reading as "there is no problem".
 
-const LOST_BODY: &str = "the assistant answer the sink declined and the watcher could not send";
+pub(super) const LOST_BODY: &str =
+    "the assistant answer the sink declined and the watcher could not send";
 const LOST_CHANNEL: u64 = 1_479_671_298_497_183_835;
-const SENT_PREFIX: usize = 4_096;
+pub(super) const SENT_PREFIX: usize = 4_096;
 const GENERATION_MTIME_NS: i64 = 1_758_000_000_000_000_000;
 
 /// The incident shape: a soft terminal, `TurnStartOutsideFrame` (the denial the
@@ -509,6 +512,7 @@ const GENERATION_MTIME_NS: i64 = 1_758_000_000_000_000_000;
 /// delivered.
 fn orphan_facts() -> OrphanTerminalFrameFacts<'static> {
     OrphanTerminalFrameFacts {
+        o_tail_covered: None,
         denial: Some(SoftTerminalAuthorityDenial::TurnStartOutsideFrame),
         watcher_direct_fallback_requested: true,
         watcher_direct_fallback_authorized: false,
@@ -545,6 +549,7 @@ fn a_frame_with_no_denial_requires_no_record_5941() {
     // Authority was never refused, so this is not the loss seam: a row here
     // inflates `D` past the §I17 `D <= N+` audit bound.
     let facts = OrphanTerminalFrameFacts {
+        o_tail_covered: None,
         denial: None,
         ..orphan_facts()
     };
@@ -833,10 +838,9 @@ fn the_dead_letter_row_preserves_the_unsent_tail_and_the_delivery_channel_5941()
 }
 
 #[test]
-fn the_production_call_site_hands_the_seam_the_lost_body_5941() {
-    // Wiring the predicate tests above cannot reach: swapping
-    // `watcher_resend_range_end` for `data_start_offset`, or dropping the body,
-    // leaves every behavioural test green while restoring the silent loss.
+fn the_call_site_operands_the_dead_letter_row_cannot_show_stay_pinned_5941() {
+    // The dead-letter row test reads the body, channel and offsets back; these
+    // operands leave no trace in that row under the plan fixture.
     let source = include_str!("terminal_relay_plan.rs");
     let call_site = source
         .split_once("orphan_terminal_frame::observe_orphan_terminal_frame(")
@@ -846,32 +850,35 @@ fn the_production_call_site_hands_the_seam_the_lost_body_5941() {
         .expect("the call must terminate")
         .0;
 
+    assert!(
+        call_site.contains("&orphan_facts,"),
+        "the recorder must receive the populated facts"
+    );
+    let facts = source
+        .split_once("let mut orphan_facts = orphan_terminal_frame::OrphanTerminalFrameFacts {")
+        .expect("the plan must populate the orphan facts")
+        .1
+        .split_once("\n        };")
+        .expect("the facts initializer must terminate")
+        .0;
+
     for operand in [
-        "shared,",
-        "channel_id,",
-        "watcher_provider,",
-        "denial: soft_terminal_authority_denial,",
-        "current_response,",
-        "response_sent_offset,",
-        "full_response_len: full_response.len(),",
-        "data_start_offset,",
-        "terminal_event_consumed_offset: watcher_resend_range_end,",
         "watcher_resend_committed,",
         "placeholder_msg_id,",
         "request_owner_user_id: inflight_before_relay",
         "duplicate_guard_refused_body: direct_terminal_response_decision",
     ] {
         assert!(
-            call_site.contains(operand),
-            "the seam must be fed `{operand}` from the frame being lost: {call_site}"
+            facts.contains(operand),
+            "the seam must be fed `{operand}` from the frame being lost: {facts}"
         );
     }
 
     // #5978 P1-1: the routed flag ANDs in the authorization this seam has already denied,
     // which makes the duplicate conjunct unfalsifiable while every test above stays green.
     assert!(
-        !call_site.contains("direct_terminal_response_refused_duplicate"),
-        "the duplicate conjunct must read the RAW guard verdict, not the routed flag: {call_site}"
+        !facts.contains("direct_terminal_response_refused_duplicate"),
+        "the duplicate conjunct must read the RAW guard verdict, not the routed flag: {facts}"
     );
 
     // The WARN and the counter MOVED with the seam — not duplicated, not
@@ -896,13 +903,10 @@ fn the_production_call_site_hands_the_seam_the_lost_body_5941() {
     let aggregate = module
         .find("metrics::record_relay_terminal_authority_denied(")
         .expect("the seam must emit the aggregate denial counter");
-    assert!(
-        cause < gate,
-        "the per-conjunct cause counter must be emitted BEFORE the record admission gate"
-    );
+    assert!(cause < gate, "the cause counter must precede admission");
     assert!(
         gate < aggregate,
-        "the aggregate counter feeds a threshold-1 alert row and must stay behind the admission"
+        "the aggregate counter must follow admission"
     );
 }
 
@@ -1026,7 +1030,17 @@ fn admitted_losses(channel: u64) -> u64 {
 async fn admitted_losses_over_one_plan_pass(channel_id: u64, already_on_channel: bool) -> u64 {
     let root = tempfile::tempdir().expect("isolated runtime root");
     let _root = crate::config::set_agentdesk_root_for_test(root.path());
-    let shared = crate::services::discord::make_shared_data_for_tests();
+    admitted_losses_under_root(root.path(), channel_id, already_on_channel, None).await
+}
+
+/// The same pass under a root the caller pinned before creating a PostgreSQL database.
+pub(super) async fn admitted_losses_under_root(
+    root: &std::path::Path,
+    channel_id: u64,
+    already_on_channel: bool,
+    pg_pool: Option<sqlx::PgPool>,
+) -> u64 {
+    let shared = crate::services::discord::make_shared_data_for_tests_with_storage(pg_pool);
     let channel = serenity::ChannelId::new(channel_id);
     let http = std::sync::Arc::new(serenity::Http::new("fixture-no-network"));
     let provider = ProviderKind::Claude;
@@ -1037,11 +1051,12 @@ async fn admitted_losses_over_one_plan_pass(channel_id: u64, already_on_channel:
         );
     }
     let before = admitted_losses(channel_id);
-    let output_path = root.path().join("out.jsonl").display().to_string();
-    let all_data = String::new();
+    let output_path = root.join("out.jsonl").display().to_string();
+    let all_data = UNPROCESSED_TAIL.to_string();
     let full_response = format!("{}{LOST_BODY}", "x".repeat(SENT_PREFIX));
     let tool_state = WatcherToolState::new();
     let context = TerminalRelayPlanContext {
+        evidence_source: None,
         http: &http,
         shared: &shared,
         channel_id: channel,
@@ -1058,7 +1073,7 @@ async fn admitted_losses_over_one_plan_pass(channel_id: u64, already_on_channel:
         startup_soft_terminal_authority: tui_direct_binding(),
     };
     let locals = TerminalRelayPlanLocals {
-        current_offset: FRAME_END,
+        current_offset: FRAME_END + UNPROCESSED_TAIL.len() as u64,
         data_start_offset: FRAME_START,
         all_data: &all_data,
         full_response: &full_response,
@@ -1098,7 +1113,7 @@ async fn admitted_losses_over_one_plan_pass(channel_id: u64, already_on_channel:
 
 #[tokio::test]
 async fn the_plan_itself_admits_the_lost_body_to_the_record_5941() {
-    // The only #5941 tests that enter through PRODUCTION. The others hand-build
+    // With the dead-letter row test, these alone enter through PRODUCTION. The others hand-build
     // `OrphanTerminalFrameFacts`, and the wiring test greps the call site's
     // ARGUMENT LIST — so `let current_response = "";` planted on the line ABOVE
     // the call falsifies `record_required` forever, writes zero dead-letter rows

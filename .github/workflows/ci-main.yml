@@ -5,12 +5,6 @@ on:
     branches:
       - main
   workflow_dispatch:
-    inputs:
-      resource_diagnostics:
-        description: Emit PostgreSQL lane memory samples every five seconds
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: ci-main-${{ github.ref }}
@@ -26,55 +20,32 @@ env:
   POSTGRES_SERVICE_IMAGE: ${{ vars.AGENTDESK_POSTGRES_SERVICE_IMAGE }}
 
 jobs:
-  full_non_pg:
-    # The whole non-PG library, adjudicated exactly as the PR `library_sweep`;
-    # fmt/clippy/policy JS run in the separate `lint` job.
-    name: Full tests (ubuntu-latest)
+  # The same nextest build, workers and audit as ci-pr.yml; hardening keeps the jobs equal.
+  rust_build:
+    name: Rust tests build and plan
     runs-on: ubuntu-latest
+    # Timeout, permissions and checkout depth match ci-pr.yml, whose base comparison needs them.
+    timeout-minutes: 100
+    permissions:
+      actions: read
+      contents: read
     env:
-      RUST_BACKTRACE: 1
-      # The id filters miss PG-dependent tests that carry no pg substring, so the
-      # sweep needs its own PostgreSQL and must fail rather than soft-skip.
-      POSTGRES_TEST_DATABASE_URL_BASE: postgresql://postgres:postgres@127.0.0.1:5432
-      POSTGRES_TEST_ADMIN_DB: postgres
-      PGHOST: 127.0.0.1
-      PGPORT: "5432"
-      PGUSER: postgres
-      PGPASSWORD: postgres
-      AGENTDESK_REQUIRE_PG: "1"
-      # Test debuginfo pushes the lib test link past hosted-runner memory (exit 143).
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-
-      - name: Start PostgreSQL service
-        run: ./scripts/ci/postgres-service.sh start
-
-      # Rollback rehearsal executes the runbook's literal rg command.
-      - name: Install ripgrep
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8
         with:
-          tool: ripgrep
-
-      - name: Require ripgrep
-        shell: bash
-        run: rg --version
-
+          fetch-depth: 2
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
           toolchain: "1.94.1"
-
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8
+        with:
+          tool: cargo-nextest@0.9.149
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
-
-      # Cache only cargo registry/git. `target/` is intentionally NOT cached
-      # because sccache (GHA-backed) already caches compiled rustc output and
-      # caching multi-GB `target/` directories starves the 10GB GHA cache
-      # quota, causing constant LRU eviction of sccache shards (observed:
-      # Rust hit-rate collapsed from 99.80% → 0.00% over a few hours of
-      # merges). See PR description and docs/ci/sccache-setup.md §4.2.
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
@@ -82,31 +53,170 @@ jobs:
           cache-bin: false
           shared-key: cargo-dependencies-v2
           save-if: ${{ github.ref == 'refs/heads/main' }}
-
       - name: Ensure swap for the lib test build
         uses: ./.github/actions/ensure-swap
+      - name: Check Rust test source wiring
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+        run: python3 scripts/ci/rust_test_sources.py check
+      - name: Archive, list, compare and plan
+        timeout-minutes: 45
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+        run: |
+          set -euo pipefail
+          NEXTEST_DIR="$RUNNER_TEMP/nextest"
+          mkdir -p "$NEXTEST_DIR"
+          cargo nextest archive --lib --archive-file "$NEXTEST_DIR/lib-tests.tar.zst"
+          cargo nextest list --archive-file "$NEXTEST_DIR/lib-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" \
+            --ignore-default-filter --message-format json > "$NEXTEST_DIR/universe.json"
+          python3 scripts/check_relay_authority_contract.py --nextest-list "$NEXTEST_DIR/universe.json"
+          python3 scripts/ci/rust_test_sources.py compare --platform linux --list "$NEXTEST_DIR/universe.json" \
+            --json-out "$NEXTEST_DIR/compare.json"
+          python3 scripts/ci/nextest_ci.py plan --universe "$NEXTEST_DIR/universe.json" \
+            --archive "$NEXTEST_DIR/lib-tests.tar.zst" --workers 6 --sha "$GITHUB_SHA" --scope linux-lib \
+            --rust-version 1.94.1 --nextest-version "$(cargo nextest --version | awk 'NR==1 {print $2}')" \
+            --target x86_64-unknown-linux-gnu --build-option CARGO_PROFILE_DEV_DEBUG=0 \
+            --build-option CARGO_PROFILE_TEST_DEBUG=0 --retry-mode all-once --output "$NEXTEST_DIR/plan"
+          python3 scripts/ci/nextest_ci.py selector-audit --plan "$NEXTEST_DIR/plan/plan.json"
+      - name: Upload nextest plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nextest-plan
+          path: ${{ runner.temp }}/nextest
+          if-no-files-found: error
+          retention-days: 1
+      # Pull requests compare their plan with this one; the plan alone carries IDs, scope and build identity.
+      - name: Upload nextest baseline
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nextest-baseline
+          path: ${{ runner.temp }}/nextest/plan/plan.json
+          if-no-files-found: error
+          retention-days: 14
 
-      # Same budget as ci-pr.yml; this step ran 35-40 min on main and a 45 min
-      # cap cut a run whose lib tests had all passed, during the filter replay.
-      - name: Library sweep (selection-set gated)
+  # Every worker runs its planned exact IDs once, serially, against its own PostgreSQL server.
+  rust_tests:
+    name: Rust tests (worker ${{ matrix.worker }})
+    needs: rust_build
+    if: ${{ !cancelled() && needs.rust_build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [0, 1, 2, 3, 4, 5]
+    env:
+      RUST_BACKTRACE: 1
+      POSTGRES_TEST_DATABASE_URL_BASE: postgresql://postgres:postgres@127.0.0.1:5432
+      POSTGRES_TEST_ADMIN_DB: postgres
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      AGENTDESK_REQUIRE_PG: "1"
+      CI: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Download nextest plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: nextest-plan
+          path: ${{ runner.temp }}/nextest
+      - name: Start PostgreSQL service
+        run: ./scripts/ci/postgres-service.sh start
+      # Rollback rehearsal executes the runbook's literal rg command.
+      - name: Install ripgrep
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8
+        with:
+          tool: ripgrep
+      - name: Require ripgrep
+        run: rg --version
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: "1.94.1"
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8
+        with:
+          tool: cargo-nextest@0.9.149
+      - name: Verify archive and plan
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+        run: >-
+          python3 scripts/ci/nextest_ci.py verify-archive --plan "$RUNNER_TEMP/nextest/plan/plan.json"
+          --worker ${{ matrix.worker }} --archive "$RUNNER_TEMP/nextest/lib-tests.tar.zst"
+          --config "$RUNNER_TEMP/nextest/plan/worker-${{ matrix.worker }}.toml" --sha "$GITHUB_SHA"
+          --record "$RUNNER_TEMP/nextest-result"
+      - name: Run planned tests
         timeout-minutes: 60
         shell: bash
         env:
           BASH_ENV: /dev/null
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
         run: |
-          source scripts/ci/non-pg-test-filter.sh
-          python3 scripts/run_test_lane.py --lane non-pg-sweep --max-summaries 4 "${NON_PG_SKIP_ARGS[@]}" -- env -u AGENTDESK_ROOT_DIR cargo test --lib -- "${NON_PG_SKIP_ARGS[@]}"
-          run_non_pg_filter_replay
-
+          set +e
+          NEXTEST_DIR="$RUNNER_TEMP/nextest"
+          RESULT_DIR="$RUNNER_TEMP/nextest-result"
+          mkdir -p "$RUNNER_TEMP/nextest-extract"
+          cargo nextest run --archive-file "$NEXTEST_DIR/lib-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" \
+            --extract-to "$RUNNER_TEMP/nextest-extract" --extract-overwrite \
+            --config-file "$NEXTEST_DIR/plan/worker-${{ matrix.worker }}.toml" --profile ci --no-tests fail
+          code=$?
+          echo "$code" > "$RESULT_DIR/exit-code"
+          junit="$(find "$RUNNER_TEMP/nextest-extract" "$GITHUB_WORKSPACE/target" -path '*/nextest/ci/junit.xml' 2>/dev/null | head -n 1)"
+          [ -n "$junit" ] && cp "$junit" "$RESULT_DIR/junit.xml"
+          exit "$code"
       - name: Stop PostgreSQL service
         if: always()
         run: ./scripts/ci/postgres-service.sh stop
-
-      - name: sccache stats
+      # The attempt is part of the name so a rerun never reads an older attempt's results.
+      - name: Upload worker results
         if: always()
-        run: sccache --show-stats || true
+        timeout-minutes: 10
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nextest-worker-${{ matrix.worker }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nextest-result
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Planned == executed per worker, retry policy, and the targeted selectors; any gap is red.
+  test_evidence:
+    name: Rust tests evidence
+    needs: [rust_build, rust_tests]
+    if: ${{ !cancelled() && needs.rust_build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Download nextest plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: nextest-plan
+          path: ${{ runner.temp }}/nextest
+      - name: Download worker results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: nextest-worker-*
+          path: ${{ runner.temp }}/nextest-artifacts
+      - name: Audit worker results
+        shell: bash
+        env:
+          BASH_ENV: /dev/null
+        run: |
+          set -euo pipefail
+          plan="$RUNNER_TEMP/nextest/plan/plan.json"
+          python3 scripts/ci/nextest_ci.py collect-results --plan "$plan" --artifacts "$RUNNER_TEMP/nextest-artifacts" \
+            --output "$RUNNER_TEMP/nextest-results"
+          python3 scripts/ci/nextest_ci.py selector-audit --plan "$plan"
+          status=0
+          python3 scripts/ci/nextest_ci.py audit --plan "$plan" --results "$RUNNER_TEMP/nextest-results" \
+            --json-out "$RUNNER_TEMP/verdict.json" --summary-out "$RUNNER_TEMP/summary.md" || status=$?
+          cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
   lint:
     # The rest of `just check`: fmt, clippy (covers `cargo check`), policy JS, and
@@ -132,7 +242,7 @@ jobs:
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
 
-      # See `full_non_pg` for rationale.
+      # `target/` is not cached: sccache holds compiled output (docs/ci/sccache-setup.md §4.2).
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
@@ -144,7 +254,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
-          node-version: "22"
+          node-version-file: ".nvmrc"
 
       - name: Policy JS unit tests
         run: npm run test:policies
@@ -171,202 +281,16 @@ jobs:
           path: target/clippy-observation/
           if-no-files-found: error
 
-      # The library sweep covers the lib side of the `--all-targets` filters; this
-      # runs their non-lib side and the ClaudeBinary compile-fail doctests.
+      # The nextest workers run every lib test; this runs every non-lib test once, unfiltered,
+      # and the ClaudeBinary compile-fail doctests.
       - name: Non-lib tests and doctests
         shell: bash
         env:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: |
-          source scripts/ci/non-pg-test-filter.sh
-          cargo test --bins --test '*' transition -- "${NON_PG_SKIP_ARGS[@]}" --test-threads=1
-          cargo test --bins --test '*' auto_queue -- "${NON_PG_SKIP_ARGS[@]}"
-          cargo test --bins --test '*' cancel -- "${NON_PG_SKIP_ARGS[@]}"
-          cargo test --bins --test '*' review_decision -- "${NON_PG_SKIP_ARGS[@]}"
-          cargo test --bins --test '*' stall_recovery -- "${NON_PG_SKIP_ARGS[@]}"
-          cargo test --bins --test '*' routines -- "${NON_PG_SKIP_ARGS[@]}"
-          cargo test invariant --bins --test '*' -- "${NON_PG_SKIP_ARGS[@]}"
+          cargo test --bins --test '*' -- --skip _pg --skip pg_ --skip postgres
           cargo test --doc ClaudeBinary
-
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats || true
-
-  pg_shards:
-    permissions:
-      contents: read
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - id: plan
-        shell: bash
-        run: |
-          matrix=$(python3 scripts/check_pg_test_lane_membership.py --pg-shard-matrix)
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-
-  postgres:
-    permissions:
-      contents: read
-    name: PostgreSQL tests (shard ${{ matrix.shard }})
-    needs: pg_shards
-    runs-on: ubuntu-latest
-    # Each shard hashes the real PG selection on its own database;
-    # the run stays green only if both shards succeed.
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.pg_shards.outputs.matrix) }}
-    env:
-      PG_INCLUDE_SHARD: ${{ matrix.shard }}
-      RUST_BACKTRACE: 1
-      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
-      POSTGRES_TEST_DATABASE_URL_BASE: postgresql://postgres:postgres@127.0.0.1:5432
-      POSTGRES_TEST_ADMIN_DB: postgres
-      PGHOST: 127.0.0.1
-      PGPORT: "5432"
-      PGUSER: postgres
-      PGPASSWORD: postgres
-      AGENTDESK_REQUIRE_PG: "1"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-
-      - name: Start PostgreSQL service
-        run: ./scripts/ci/postgres-service.sh start
-
-      # Rollback rehearsal executes the runbook's literal rg command.
-      - name: Install ripgrep
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8
-        with:
-          tool: ripgrep
-
-      - name: Require ripgrep
-        shell: bash
-        run: rg --version
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
-        with:
-          toolchain: "1.94.1"
-
-      - name: Install just
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8
-        with:
-          tool: just@1.51.0
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
-
-      # See ci-main.yml `full_non_pg` for rationale: `target/` excluded so the
-      # GHA cache quota is not starved out from under sccache.
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        with:
-          cache-targets: false
-          cache-bin: false
-          shared-key: cargo-dependencies-v2
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Ensure swap for the lib test build
-        uses: ./.github/actions/ensure-swap
-
-      - name: PostgreSQL lane resource diagnostics
-        if: ${{ inputs.resource_diagnostics == true }}
-        run: |
-          resource_sample() {
-            while true; do
-              printf 'PG_RESOURCE_SAMPLE '
-              date --iso-8601=seconds
-              free -m | awk '/Mem:/ { printf "mem_total_mib=%s mem_used_mib=%s mem_available_mib=%s ", $2, $3, $7 }'
-              docker stats --no-stream --format 'pg_mem={{.MemUsage}}' agentdesk-postgres || true
-              sleep 5
-            done
-          }
-          # No PID handoff: a later step runs in a different shell, so it cannot
-          # `wait` on this sampler. The hosted VM reclaims it when the job ends.
-          resource_sample > "$RUNNER_TEMP/pg-resource-samples.log" 2>&1 &
-
-      - name: just test-postgres-shard
-        # Same budget as ci-pr.yml; shard 1 runs the rest of the PG selection and
-        # ran past 60 min on a healthy 2026-10-14 main run, so 60 cut it.
-        timeout-minutes: 75
-        run: just test-postgres-shard
-        env:
-          # #4245: see Full tests lane — keep test debuginfo off so the build
-          # and serial PostgreSQL suite retain headroom in the bounded step.
-          CARGO_PROFILE_TEST_DEBUG: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-
-      - name: Show PostgreSQL lane resource diagnostics
-        if: always() && inputs.resource_diagnostics == true
-        run: cat "$RUNNER_TEMP/pg-resource-samples.log" || true
-
-      - name: Stop PostgreSQL service
-        if: always()
-        run: ./scripts/ci/postgres-service.sh stop
-
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats || true
-
-  high-risk-recovery:
-    name: High-risk recovery (main)
-    # Unconditional, unlike ci-pr.yml: the main library sweep skips
-    # `high_risk_recovery`, so this lane is main's only runner for those tests.
-    runs-on: ubuntu-latest
-    env:
-      RUST_BACKTRACE: 1
-      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
-      POSTGRES_TEST_DATABASE_URL_BASE: postgresql://postgres:postgres@127.0.0.1:5432
-      POSTGRES_TEST_ADMIN_DB: postgres
-      PGHOST: 127.0.0.1
-      PGPORT: "5432"
-      PGUSER: postgres
-      PGPASSWORD: postgres
-      AGENTDESK_REQUIRE_PG: "1"
-      # Full test debuginfo pushes the lib test link past the hosted runner's memory.
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-
-      - name: Start PostgreSQL service
-        run: ./scripts/ci/postgres-service.sh start
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
-        with:
-          toolchain: "1.94.1"
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
-
-      # See ci-main.yml `full_non_pg` for rationale.
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        with:
-          cache-targets: false
-          cache-bin: false
-          shared-key: cargo-dependencies-v2
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Ensure swap for the lib test build
-        uses: ./.github/actions/ensure-swap
-
-      - name: High-risk recovery lane
-        run: "cargo test --lib high_risk_recovery:: -- --test-threads=1"
-
-      # Serial runs of the watchdog forensics guards; the parallel library sweep
-      # in `full_non_pg` also runs them.
-      - name: Watchdog hang-forensics guards
-        run: |
-          cargo test --lib services::hang_forensics::tests -- --test-threads=1
-          cargo test --lib services::health_diagnostics::tests -- --test-threads=1
-
-      - name: Stop PostgreSQL service
-        if: always()
-        run: ./scripts/ci/postgres-service.sh stop
 
       - name: sccache stats
         if: always()
@@ -384,8 +308,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      # --verify-lib-inventory invokes `cargo test --lib -- --list`; keep the
-      # main-push aggregate job on the pinned Rust toolchain and shared cache.
+      # Keep Rust available for the lib inventory fallback,
+      # on the pinned toolchain and shared cache.
       - name: Install Rust toolchain for lib inventory
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
@@ -410,9 +334,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      # See the matching step in ci-pr.yml: the PyYAML oracle in
-      # `tests/test_check_pg_test_lane_membership.py` is not available on the
-      # clean setup-python interpreter and must be installed explicitly.
+      # See the matching step in ci-pr.yml: install PyYAML for the independent
+      # workflow-shape test oracles; the clean setup-python interpreter lacks it.
       - name: Install script-test Python deps
         run: python3 -m pip install --disable-pip-version-check pyyaml
 
@@ -423,6 +346,8 @@ jobs:
         run: ./scripts/ci-script-checks.sh
         env:
           GFP_EVENT_NAME: ${{ github.event_name }}
+          GFP_REF: ${{ github.ref }}
+          GFP_REF_PROTECTED: ${{ github.ref_protected }}
           GFP_REPOSITORY: ${{ github.repository }}
           GFP_CANDIDATE_SHA: ${{ github.sha }}
           # Main-push CI verifies current coverage drift, but relative anti-growth
@@ -467,6 +392,8 @@ jobs:
         run: ./scripts/ci-script-checks.sh
         env:
           GFP_EVENT_NAME: ${{ github.event_name }}
+          GFP_REF: ${{ github.ref }}
+          GFP_REF_PROTECTED: ${{ github.ref_protected }}
           GFP_REPOSITORY: ${{ github.repository }}
           GFP_CANDIDATE_SHA: ${{ github.sha }}
           TEST_LANE_BASELINE_REF: HEAD
@@ -495,69 +422,9 @@ jobs:
         run: ./scripts/ci-script-checks.sh
         env:
           GFP_EVENT_NAME: ${{ github.event_name }}
+          GFP_REF: ${{ github.ref }}
+          GFP_REF_PROTECTED: ${{ github.ref_protected }}
           GFP_REPOSITORY: ${{ github.repository }}
           GFP_CANDIDATE_SHA: ${{ github.sha }}
           TEST_LANE_BASELINE_REF: HEAD
           SCRIPT_CHECK_SHARD: contracts
-
-  # Warms the shared cargo registry cache and the Windows sccache entries that
-  # the ci-pr.yml `check_fast_cross_os*` jobs restore; main never ran Windows.
-  windows_cache_warm:
-    name: Windows cache warm (windows-latest)
-    runs-on: windows-latest
-    # Advisory: deploys pin on a green CI Main run, so a warm miss must not fail it.
-    continue-on-error: true
-    # Step deadlines fail with a timeout log; reserve setup/post time to avoid job cancellation.
-    timeout-minutes: 120
-    env:
-      # rust-cache and sccache both hash CARGO_* env; keep the PR Windows job env.
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CARGO_PROFILE_TEST_DEBUG: "0"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-
-      - name: Provision Python 3.11
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
-        with:
-          python-version: "3.11"
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
-        with:
-          toolchain: "1.94.1"
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
-
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
-        with:
-          cache-targets: false
-          cache-bin: false
-          shared-key: cargo-dependencies-v2
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # Same compile as the PR `cargo check` job.
-      - name: cargo check
-        timeout-minutes: 40
-        shell: bash
-        env:
-          BASH_ENV: /dev/null
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-        run: cargo check --workspace --all-targets
-
-      # Builds the lib test binary the PR exact-targets runner filters; runs nothing.
-      - name: Build lib test binary
-        timeout-minutes: 40
-        shell: bash
-        env:
-          BASH_ENV: /dev/null
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-        run: cargo test --lib --no-run
-
-      - name: sccache stats
-        if: always()
-        shell: bash
-        run: sccache --show-stats || true

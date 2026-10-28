@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+. "$(dirname "$0")/lib/deploy_allow_degraded.sh"
+_deploy_allow_degraded_validate "$@" || exit 2
+# --strict-prompts: prompt 0건 = inspection unavailable(exit 2); release deploy stops.
 # Under a build-token holder, refuse before detach and the deploy lock: waiting for the lock
 # would deadlock against a deploy that holds it and waits for the token. Only 73 refuses.
 if [ -n "${ADK_BUILD_TOKEN_HOLDER:-}" ]; then
@@ -11,7 +13,6 @@ if [ -n "${ADK_BUILD_TOKEN_HOLDER:-}" ]; then
         exit 73
     fi
 fi
-
 # --- macOS: always run detached (decouple from the invoking shell/session) ---
 # On macOS the deploy restarts the release dcserver mid-run. When invoked from a
 # tmux/agent session's shell, that restart can perturb the caller and, worse,
@@ -136,7 +137,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_defaults.sh
 . "$SCRIPT_DIR/_defaults.sh"
-
+. "$SCRIPT_DIR/_deploy_policy_generation.sh"
 ADK_REL="${AGENTDESK_ROOT_DIR:-$HOME/.adk/release}"
 POST_DEPLOY_SMOKE_SCOPE="${AGENTDESK_POST_DEPLOY_SMOKE_SCOPE:-full}"
 case "$POST_DEPLOY_SMOKE_SCOPE" in
@@ -170,7 +171,7 @@ DEPLOY_DELAY_SECS="${AGENTDESK_DEPLOY_DELAY_SECS:-2}"
 DEPLOY_HEALTH_RETRIES="${AGENTDESK_DEPLOY_HEALTH_RETRIES:-60}"
 DEPLOY_HEALTH_DELAY_SECS="${AGENTDESK_DEPLOY_HEALTH_DELAY_SECS:-2}"
 DEPLOY_LOCK_FILE="${AGENTDESK_DEPLOY_LOCK_FILE:-$ADK_REL/runtime/deploy-release.lock}"
-DEPLOY_LOCK_TIMEOUT_SECS="${AGENTDESK_DEPLOY_LOCK_TIMEOUT_SECS:-1800}"
+DEPLOY_LOCK_TIMEOUT_SECS="$(python3 "$SCRIPT_DIR/build_token.py" --validate-deploy-lock-timeout "${AGENTDESK_DEPLOY_LOCK_TIMEOUT_SECS:-1800}")"
 DEPLOY_MKDIR_LOCK_DIR=""
 CODESIGN_IDENTITY="${AGENTDESK_CODESIGN_IDENTITY:-Developer ID Application: Wonchang Oh (A7LJY7HNGA)}"
 ALLOW_ADHOC_RELEASE_SIGN="${AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN:-0}"
@@ -236,8 +237,6 @@ _idx=0
 _args=("$@")
 while [ "$_idx" -lt "${#_args[@]}" ]; do
     case "${_args[$_idx]}" in
-        --skip-review|--skip-health)
-            PARSED_ARGS+=("${_args[$_idx]}") ;;
         --strict-prompts)
             DEPLOY_STRICT_PROMPTS=1
             PARSED_ARGS+=("${_args[$_idx]}") ;;
@@ -647,8 +646,8 @@ _write_release_source_manifest() {
     AGENTDESK_MANIFEST_SKIP_TURN_DRAIN="${AGENTDESK_SKIP_TURN_DRAIN:-1}" \
     AGENTDESK_MANIFEST_SKIP_FRESHNESS="${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}" \
     AGENTDESK_MANIFEST_SKIP_REMOTE_FRESHNESS="${AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS:-0}" \
-    AGENTDESK_MANIFEST_O_TUI_WRITER="$(_source_o_tui_writer)" \
-    AGENTDESK_MANIFEST_O_LEDGER_OPERATOR_RESUME="$(_source_o_ledger_operator_resume)" \
+    AGENTDESK_MANIFEST_O_TUI_WRITER="$(_binary_build_flag "${REL_BINARY:-}" o_tui_writer)" \
+    AGENTDESK_MANIFEST_O_LEDGER_OPERATOR_RESUME="$(_binary_build_flag "${REL_BINARY:-}" o_ledger_operator_resume)" \
     python3 - "$manifest_tmp" <<PY
 import json
 import os
@@ -971,25 +970,26 @@ _rollback_would_brick_on_migration() {
     return 1
 }
 
-_source_o_tui_writer() {
-    # The O writer build switch in this source: true, false (no switch in the
-    # source) or unknown when a definition exists but does not read as one value.
-    local defs values
-    defs="$(grep -rhE 'const O_TUI_WRITER\b' "$REPO/src" 2>/dev/null || true)"
-    if [ -z "$defs" ]; then
-        echo false
-        return 0
-    fi
-    if printf '%s\n' "$defs" \
-        | grep -qvE '^[[:space:]]*pub\(crate\) const O_TUI_WRITER: bool = (true|false);[[:space:]]*$'; then
-        echo unknown
-        return 0
-    fi
-    values="$(printf '%s\n' "$defs" | sed -E 's/.*= (true|false);.*/\1/' | sort -u)"
-    case "$values" in
-        true|false) echo "$values" ;;
-        *) echo unknown ;;
-    esac
+_binary_build_flag() {
+    # One `agentdesk build-info` switch ($2) of binary $1: true, false or unknown. A missing
+    # command, field or schema reads unknown, so a deleted constant refuses instead of "off".
+    local value
+    value="$(python3 - "$1" "$2" 2>/dev/null <<'PY'
+import json
+import subprocess
+import sys
+
+binary, field = sys.argv[1], sys.argv[2]
+try:
+    run = subprocess.run([binary, "build-info"], capture_output=True, timeout=30, check=True)
+    data = json.loads(run.stdout)
+except Exception:
+    data = None
+value = data.get(field) if isinstance(data, dict) and data.get("schema") == 1 else None
+print("true" if value is True else "false" if value is False else "unknown")
+PY
+)" || value=unknown
+    echo "${value:-unknown}"
 }
 
 _manifest_o_tui_writer() {
@@ -1013,28 +1013,6 @@ print(value)
 PY
 }
 
-_source_o_ledger_operator_resume() {
-    python3 - "$REPO/src/services/tui_o/store/ledger.rs" <<'PY'
-import pathlib
-import re
-import sys
-try:
-    text = pathlib.Path(sys.argv[1]).read_text()
-except FileNotFoundError:
-    print("false")
-    sys.exit(0)
-except OSError:
-    print("unknown")
-    sys.exit(0)
-definitions = [line.strip() for line in text.splitlines() if "const OPERATOR_RESUME_SUPPORTED" in line]
-if not definitions:
-    print("false")
-    sys.exit(0)
-match = re.fullmatch(r"pub const OPERATOR_RESUME_SUPPORTED: bool = (true|false);", definitions[0]) if len(definitions) == 1 else None
-print(match[1] if match else "unknown")
-PY
-}
-
 _rollback_would_revert_o_ledger() {
     # Only first use raises the floor; an unused new build can still roll back after a failed deploy.
     local floor="$ADK_REL/o_store/operator_resume.floor"
@@ -1055,18 +1033,19 @@ PY
     return 0
 }
 
-_source_would_revert_o_ledger() {
+_binary_would_revert_o_ledger() {
+    # Returns 0 (refuse) when the OperatorResume floor exists and binary $1 does not
+    # report a compatible O ledger reader.
     local floor="$ADK_REL/o_store/operator_resume.floor"
     [ -e "$floor" ] || [ -L "$floor" ] || return 1
-    [ "$(_source_o_ledger_operator_resume)" != "true" ]
+    [ "$(_binary_build_flag "$1" o_ledger_operator_resume)" != "true" ]
 }
 
 _rollback_would_revert_o_writer() {
-    # Returns 0 (refuse) when this source may have the O writer on and the
-    # rollback target is not recorded as an O writer build: the old binary would
-    # take Discord output back to the Legacy relay. No override reaches it.
+    # 0 (refuse, no override) when the new binary may run the O writer and the rollback target
+    # is not recorded as an O writer build: rolling back would return output to the Legacy relay.
     local new_value old_value
-    new_value="$(_source_o_tui_writer)"
+    new_value="$(_binary_build_flag "${REL_BINARY:-}" o_tui_writer)"
     if [ "$new_value" = "false" ]; then
         return 1
     fi
@@ -1080,18 +1059,17 @@ _rollback_would_revert_o_writer() {
 }
 
 _external_artifact_would_skip_o_writer() {
-    # Returns 0 (refuse) when this source may have the O writer on and the binary
-    # would come from AGENTDESK_DEPLOY_BINARY: only this source's own build is
-    # known to carry its switch, which the manifest then records for rollback.
+    # 0 (refuse) when the AGENTDESK_DEPLOY_BINARY artifact may run the O writer or OperatorResume;
+    # an artifact without `build-info` reads unknown and is refused.
     local value
     [ -n "${AGENTDESK_DEPLOY_BINARY:-}" ] || return 1
-    if [ "$(_source_o_ledger_operator_resume)" != "false" ]; then
+    if [ "$(_binary_build_flag "$AGENTDESK_DEPLOY_BINARY" o_ledger_operator_resume)" != "false" ]; then
         echo "✗ OperatorResume capability requires this source's own build; external artifact refused" >&2
         return 0
     fi
-    value="$(_source_o_tui_writer)"
+    value="$(_binary_build_flag "$AGENTDESK_DEPLOY_BINARY" o_tui_writer)"
     [ "$value" != "false" ] || return 1
-    echo "✗ O writer switch is ${value} in this source; AGENTDESK_DEPLOY_BINARY is refused — deploy a build of this source" >&2
+    echo "✗ O writer switch is ${value} in this artifact; AGENTDESK_DEPLOY_BINARY is refused — deploy a build of this source" >&2
     return 0
 }
 
@@ -1167,7 +1145,7 @@ print("|".join(ids))
     echo "▸ Pre-existing reader-count alarms (non-blocking after deploy): ${DEPLOY_PREEXISTING_READER_CHANNEL_IDS:-none}"
 }
 
-# #3858: restore the last-known-good release binary and restart the service.
+# Restore the last-known-good release binary and its policies, then restart.
 # Invoked from the EXIT trap (via _cleanup_on_exit) whenever the binary was
 # promoted but the deploy never reached DEPLOY_OK — i.e. ANY non-zero exit after
 # promotion, not only the explicit health-check branch (an unguarded
@@ -1200,7 +1178,7 @@ _rollback_release_binary() {
         echo "   turning a one-node deploy failure into a cluster-wide outage."
         echo ""
         echo "   FAIL-FORWARD: leaving the NEW binary live (it is what is currently running under"
-        echo "   launchd). The rollback backup at $rel_backup is preserved for manual use."
+        echo "   launchd). The rollback backup at $rel_backup (with policies.prev, if any) is kept for manual use."
         echo ""
         echo "   MANUAL INTERVENTION REQUIRED:"
         echo "     1. Check whether the new binary is actually serving:"
@@ -1265,13 +1243,14 @@ _rollback_release_binary() {
     # below. A failed chflags can never leave the good binary restored but the
     # service stopped.
     chflags uchg "$rel_binary" 2>/dev/null || true
+    _restore_policy_generation "$ADK_REL"
     echo "↩ Previous binary restored — restarting release..."
     xattr -d com.apple.quarantine "$HOME/Library/LaunchAgents/$plist.plist" 2>/dev/null || true
     if ! launchctl bootstrap "$domain" "$HOME/Library/LaunchAgents/$plist.plist"; then
         echo "⚠ launchd bootstrap failed during rollback — using tmux fallback"
         start_release_tmux_fallback || true
     fi
-    if wait_for_http_service_health "$plist" "$rel_port" "$DEPLOY_HEALTH_RETRIES" "$DEPLOY_HEALTH_DELAY_SECS" 1 1 1 1; then
+    if (unset AGENTDESK_DEPLOY_ALLOW_DEGRADED; wait_for_http_service_health "$plist" "$rel_port" "$DEPLOY_HEALTH_RETRIES" "$DEPLOY_HEALTH_DELAY_SECS" 1 1 1 1); then
         echo "✓ Rollback succeeded — release healthy on :${rel_port} with previous binary"
     else
         echo "✗ Rollback restart did not reach healthy state — manual intervention required (logs: ${ADK_REL:-}/logs/)"
@@ -1539,6 +1518,7 @@ _cleanup_on_exit() {
     if [ -n "${DEPLOY_MKDIR_LOCK_DIR:-}" ] && [ -d "$DEPLOY_MKDIR_LOCK_DIR" ]; then
         rm -rf "$DEPLOY_MKDIR_LOCK_DIR" 2>/dev/null || true
     fi
+    [ -z "${AGENTDESK_DEPLOY_PEER_ARTIFACT_DIR:-}" ] || _cleanup_peer_binary
     _emit_terminal_deploy_marker "$status"
     _finalize_detached_helper "$status"
 }
@@ -1584,8 +1564,8 @@ _resolve_deploy_peers() {
 _deploy_peer_env_prelude() {
     printf 'AGENTDESK_DEPLOY_PEER_INVOCATION=1'
     local name value
-    # AGENTDESK_DEPLOY_BINARY is deliberately absent: it names a host-local path, so
-    # each peer builds from its own verified source with the provenance gates enabled.
+    # Host-local paths (binary, repo, root, lock) are deliberately absent: the peer resolves
+    # its own, so it builds its synced checkout under the root its verdict is read from.
     for name in \
         AGENTDESK_CODESIGN_IDENTITY \
         AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN \
@@ -1596,7 +1576,6 @@ _deploy_peer_env_prelude() {
         AGENTDESK_DEPLOY_FAST \
         AGENTDESK_DEPLOY_HEALTH_DELAY_SECS \
         AGENTDESK_DEPLOY_HEALTH_RETRIES \
-        AGENTDESK_DEPLOY_LOCK_FILE \
         AGENTDESK_DEPLOY_PEERS \
         AGENTDESK_DEPLOY_PEERS_FILE \
         AGENTDESK_DEPLOY_SKIP_BUILD_CACHE_CLEANUP \
@@ -1604,6 +1583,7 @@ _deploy_peer_env_prelude() {
         AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS \
         AGENTDESK_DEPLOY_TARGET_SHA \
         AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT \
+        AGENTDESK_DEPLOY_ALLOW_DEGRADED \
         AGENTDESK_DEPLOY_MAX_LOADAVG \
         AGENTDESK_DEPLOY_MAX_MEM_PRESSURE_LEVEL \
         AGENTDESK_DEPLOY_HIGH_CPU_PCT \
@@ -1619,8 +1599,6 @@ _deploy_peer_env_prelude() {
         AGENTDESK_BUNDLE_ID \
         AGENTDESK_DCSERVER_LABEL \
         AGENTDESK_PLIST_REL \
-        AGENTDESK_ROOT_DIR \
-        AGENTDESK_REPO_DIR \
         OBSIDIAN_VAULT_ROOT \
         AGENTDESK_OBSIDIAN_AGENTS_SRC
     do
@@ -1939,6 +1917,199 @@ _wait_for_peer_deploy_verdict() {
     done
 }
 
+_peer_binary_platform() {
+    local macos sdk
+    [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || return 1
+    printf 'arch=arm64\n'
+    (cd "$REPO" && rustc -vV) || return 1
+    macos="$(sw_vers -productVersion)" || return 1
+    sdk="$(xcrun --show-sdk-version)" || return 1
+    printf 'macos=%s\nsdk=%s\ndeployment_target=%s\n' "$macos" "$sdk" "${MACOSX_DEPLOYMENT_TARGET:-default}"
+}
+
+_peer_binary_platform_difference() {
+    python3 - "$1" "$2" "${3:-local}" "${4:-remote}" <<'PY'
+import itertools
+import sys
+
+left, right, left_name, right_name = sys.argv[1:]
+pairs = itertools.zip_longest(left.splitlines(), right.splitlines(), fillvalue='<missing>')
+differences = [f'{left_name}={a!r} {right_name}={b!r}' for a, b in pairs if a != b]
+print('; '.join(differences[:2]))
+PY
+}
+
+_peer_binary_signature() {
+    local details
+    codesign --verify --strict "$1" 2>/dev/null || return 1
+    details="$(codesign -dvvv "$1" 2>&1)" || return 1
+    printf '%s\n' "$details" | grep -q '^CDHash=.' || return 1
+    printf '%s\n' "$details" | grep -q '^Identifier=.' || return 1
+    printf '%s\n' "$details" | grep -E '^(Identifier=|CDHash=|Authority=|Signature=)'
+}
+
+_verify_peer_binary() {
+    local directory="$1" sha="$2" platform signature failure
+    PEER_BINARY_FAILURE="platform probe failed"
+    platform="$(_peer_binary_platform)" || return 1
+    PEER_BINARY_FAILURE="signature verification failed"
+    signature="$(_peer_binary_signature "$directory/agentdesk")" || return 1
+    if failure="$(python3 - "$directory" "$sha" "$platform" "$signature" "$DEPLOY_BUILD_PROFILE" <<'PY'
+import hashlib
+import itertools
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+directory, sha, platform, signature, profile = sys.argv[1:]
+binary = Path(directory) / 'agentdesk'
+try:
+    manifest = json.loads((Path(directory) / 'manifest.json').read_text())
+    for field, expected in [('format', 1), ('source_sha', sha), ('platform', platform),
+                            ('profile', profile), ('signature', signature),
+                            ('size', binary.stat().st_size)]:
+        if manifest[field] != expected:
+            if field == 'platform':
+                pairs = itertools.zip_longest(manifest[field].splitlines(), platform.splitlines(), fillvalue='<missing>')
+                differences = [f'manifest={a!r} peer={b!r}' for a, b in pairs if a != b]
+                raise ValueError('platform mismatch: ' + '; '.join(differences[:2]))
+            raise ValueError(field)
+    digest = hashlib.sha256()
+    with binary.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    if digest.hexdigest() != manifest['sha256']:
+        raise ValueError('SHA256')
+    if not os.access(binary, os.X_OK):
+        raise ValueError('executable bit')
+    subprocess.run([str(binary), 'build-info'], check=True, timeout=30,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+    print(str(error))
+    raise SystemExit(1)
+PY
+)"; then
+        return 0
+    fi
+    PEER_BINARY_FAILURE="verification failed: $failure"
+    return 1
+}
+
+_cleanup_peer_binary() {
+    local directory="${AGENTDESK_DEPLOY_PEER_ARTIFACT_DIR:-}"
+    case "$directory" in
+        "$ADK_REL/bin/.peer-transfer."??????)
+            [ "${directory%/*}" = "$ADK_REL/bin" ] || return 0
+            [ ! -L "$directory" ] || return 0
+            rm -f "$directory/agentdesk" "$directory/manifest.json" 2>/dev/null || true
+            rmdir "$directory" 2>/dev/null || true
+            ;;
+    esac
+}
+
+_cleanup_peer_binary_on_peer() {
+    local peer="$1" peer_root="$2" peer_binary_env="$3" command
+    command="$(declare -f _cleanup_peer_binary)
+ADK_REL=$(printf '%q' "$peer_root")
+${peer_binary_env}
+_cleanup_peer_binary"
+    ssh -o ConnectTimeout="$DEPLOY_SSH_CONNECT_TIMEOUT" "$peer" "bash -lc $(printf '%q' "$command")" || true
+}
+
+_select_peer_binary() {
+    PEER_BINARY_ACCEPTED=0
+    [ -n "${AGENTDESK_DEPLOY_PEER_ARTIFACT_DIR:-}" ] || return 0
+    local head started="$SECONDS"
+    head="$(git -C "$REPO" rev-parse HEAD)" || head=""
+    if [ "${DEPLOY_PEER_INVOCATION:-0}" != 1 ]; then
+        PEER_BINARY_FAILURE="not a peer invocation"
+    elif [ -z "$head" ] || [ "$head" != "${DEPLOY_TARGET_SHA:-}" ]; then
+        PEER_BINARY_FAILURE="head/target mismatch: head=${head:-unavailable} target=${DEPLOY_TARGET_SHA:-unset}"
+    elif _verify_peer_binary "$AGENTDESK_DEPLOY_PEER_ARTIFACT_DIR" "$head"; then
+        SOURCE_BINARY="$AGENTDESK_DEPLOY_PEER_ARTIFACT_DIR/agentdesk"
+        PEER_BINARY_ACCEPTED=1
+    fi
+    if [ "$PEER_BINARY_ACCEPTED" = 1 ]; then
+        echo "✓ [peer-binary] verified; using signed release binary (source=$head)"
+    else
+        echo "▸ [peer-binary] fallback: $PEER_BINARY_FAILURE; building on peer"
+        _cleanup_peer_binary
+    fi
+    echo "▸ [timing] phase=peer-verify seconds=$((SECONDS - started)) accepted=$PEER_BINARY_ACCEPTED"
+}
+
+_prepare_peer_binary() {
+    local peer="$1" remote_cd="$2" peer_root="$3" sha="$4"
+    local platform remote_platform signature local_dir remote_dir command started="$SECONDS" rc=0
+    PEER_BINARY_ENV=""
+    PEER_BINARY_FAILURE="artifact unavailable"
+    [ -x "${DEPLOY_PEER_BINARY_SOURCE:-}" ] && [ "${DEPLOY_BUILT_SOURCE_SHA:-}" = "$sha" ] || return 1
+    PEER_BINARY_FAILURE="platform/toolchain probe failed or changed since build"
+    platform="$(_peer_binary_platform)" || return 1
+    if [ -z "${DEPLOY_BINARY_PLATFORM:-}" ] || [ "$platform" != "$DEPLOY_BINARY_PLATFORM" ]; then
+        PEER_BINARY_FAILURE="platform changed since build: $(_peer_binary_platform_difference "${DEPLOY_BINARY_PLATFORM:-}" "$platform" built local)"
+        return 1
+    fi
+    command="${remote_cd} && $(declare -f _peer_binary_platform)
+REPO=\"\$PWD\"
+_peer_binary_platform"
+    remote_platform="$(ssh -o ConnectTimeout="$DEPLOY_SSH_CONNECT_TIMEOUT" "$peer" "bash -lc $(printf '%q' "$command")")" || return 1
+    if [ "$platform" != "$remote_platform" ]; then
+        PEER_BINARY_FAILURE="platform/toolchain mismatch: $(_peer_binary_platform_difference "$platform" "$remote_platform")"
+        return 1
+    fi
+    echo "▸ [timing] phase=peer-compatibility peer=$peer seconds=$((SECONDS - started))"
+    PEER_BINARY_FAILURE="local signature or manifest failed"
+    signature="$(_peer_binary_signature "$DEPLOY_PEER_BINARY_SOURCE")" || return 1
+    local_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentdesk-peer-manifest.XXXXXX")" || return 1
+    if ! python3 - "$DEPLOY_PEER_BINARY_SOURCE" "$local_dir/manifest.json" "$sha" "$platform" "$signature" "$DEPLOY_BUILD_PROFILE" <<'PY'
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+binary, output, sha, platform, signature, profile = sys.argv[1:]
+digest = hashlib.sha256()
+with open(binary, 'rb') as stream:
+    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+        digest.update(chunk)
+manifest = dict(format=1, source_sha=sha, sha256=digest.hexdigest(),
+                size=Path(binary).stat().st_size, signature=signature,
+                platform=platform, profile=profile)
+subprocess.run([binary, 'build-info'], check=True, timeout=30,
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+Path(output).write_text(json.dumps(manifest) + '\n')
+print(f"▸ [peer-binary] source={sha} sha256={manifest['sha256']} size={manifest['size']}")
+PY
+    then
+        rm -f "$local_dir/manifest.json"
+        rmdir "$local_dir" 2>/dev/null || true
+        return 1
+    fi
+    PEER_BINARY_FAILURE="transfer failed"
+    command="mkdir -p $(printf '%q' "$peer_root/bin") && mktemp -d $(printf '%q' "$peer_root/bin/.peer-transfer.XXXXXX")"
+    if remote_dir="$(ssh -o ConnectTimeout="$DEPLOY_SSH_CONNECT_TIMEOUT" "$peer" "bash -lc $(printf '%q' "$command")")" \
+        && [[ "$remote_dir" == "$peer_root/bin/.peer-transfer."?????? ]]; then
+        started="$SECONDS"
+        scp -o ConnectTimeout="$DEPLOY_SSH_CONNECT_TIMEOUT" "$DEPLOY_PEER_BINARY_SOURCE" "$peer:$remote_dir/agentdesk" \
+            && scp -o ConnectTimeout="$DEPLOY_SSH_CONNECT_TIMEOUT" "$local_dir/manifest.json" "$peer:$remote_dir/manifest.json" || rc=$?
+        echo "▸ [timing] phase=peer-transfer peer=$peer seconds=$((SECONDS - started)) rc=$rc"
+        if [ "$rc" = 0 ]; then
+            PEER_BINARY_ENV="AGENTDESK_DEPLOY_PEER_ARTIFACT_DIR=$(printf '%q' "$remote_dir")"
+        else
+            _cleanup_peer_binary_on_peer "$peer" "$peer_root" "AGENTDESK_DEPLOY_PEER_ARTIFACT_DIR=$(printf '%q' "$remote_dir")"
+        fi
+    else
+        rc=1
+    fi
+    rm -f "$local_dir/manifest.json"
+    rmdir "$local_dir" 2>/dev/null || true
+    [ "$rc" = 0 ]
+}
+
 _deploy_to_one_peer() {
     local peer="$1"
     shift
@@ -1952,7 +2123,8 @@ _deploy_to_one_peer() {
     local peer_log_path
     local peer_manifest_path
     local remote_deploy_command
-    env_prelude="$(_deploy_peer_env_prelude)"
+    local peer_started="$SECONDS" verdict_rc=0
+    env_prelude="$(_deploy_peer_env_prelude) AGENTDESK_DEPLOY_PEER_ARTIFACT_DIR="
     expected_repo_head="$(git -C "$REPO" rev-parse HEAD)"
     if [ "$#" -gt 0 ]; then
         quoted_args=$(printf ' %q' "$@")
@@ -2033,7 +2205,6 @@ echo \"\$port\"")"'')"; then
     fi
     peer_log_path="$peer_adk_rel/logs/deploy-release.cluster-${expected_repo_head}.$$.log"
     peer_manifest_path="$peer_adk_rel/runtime/release-source.json"
-    remote_deploy_command="${remote_cd_command} && ${env_prelude} AGENTDESK_DEPLOY_LOG=$(printf '%q' "$peer_log_path") bash scripts/deploy-release.sh${quoted_args}"
 
     # Operator-private routines are excluded from the repo (.gitignore:50), so the
     # peer's own `git fetch` above cannot deliver them. Push them before the peer
@@ -2050,16 +2221,29 @@ echo \"\$port\"")"'')"; then
         fi
     fi
 
+    if _prepare_peer_binary "$peer" "$remote_cd_command" "$peer_adk_rel" "$expected_repo_head"; then
+        env_prelude="$env_prelude $PEER_BINARY_ENV"
+    else
+        echo "▸ [peer-binary] fallback: $PEER_BINARY_FAILURE; building on peer $peer"
+    fi
+    # The child builds the checkout the cd above selected and pre-synced, whatever the peer login env says.
+    remote_deploy_command="${remote_cd_command} && AGENTDESK_REPO_DIR=\"\$PWD\" ${env_prelude} AGENTDESK_DEPLOY_LOG=$(printf '%q' "$peer_log_path") bash scripts/deploy-release.sh${quoted_args}"
+
     PEER_LEG_LAUNCHED=1
     echo "▸ [peer:$peer] Running deploy-release.sh..."
     if ! ssh -o ConnectTimeout="$DEPLOY_SSH_CONNECT_TIMEOUT" "$peer" "bash -lc $(printf '%q' "$remote_deploy_command")"; then
         echo "✗ [peer:$peer] deploy-release.sh failed"
+        if [ -n "$PEER_BINARY_ENV" ]; then
+            _cleanup_peer_binary_on_peer "$peer" "$peer_adk_rel" "$PEER_BINARY_ENV"
+        fi
         return 1
     fi
 
     echo "▸ [peer:$peer] deploy launched; waiting for observed verdict..."
     _wait_for_peer_deploy_verdict \
-        "$peer" "$peer_log_path" "$peer_manifest_path" "$peer_health_port" "$expected_repo_head"
+        "$peer" "$peer_log_path" "$peer_manifest_path" "$peer_health_port" "$expected_repo_head" || verdict_rc=$?
+    echo "▸ [timing] phase=peer-total peer=$peer seconds=$((SECONDS - peer_started)) rc=$verdict_rc"
+    return "$verdict_rc"
 }
 
 _deploy_to_all_peers() {
@@ -2337,11 +2521,13 @@ export AGENTDESK_DEPLOY_DETACHED_CHILD=1
 export AGENTDESK_DEPLOY_LOG_PATH=$(printf '%q' "$log_path")
 export AGENTDESK_DEPLOY_TEST_MODE=$(printf '%q' "$DEPLOY_TEST_MODE")
 export AGENTDESK_SKIP_TURN_DRAIN=$(printf '%q' "${AGENTDESK_SKIP_TURN_DRAIN:-1}")
+export AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED=$(printf '%q' "${AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED:-0}")
 export AGENTDESK_POST_DEPLOY_SMOKE_SCOPE=$(printf '%q' "$POST_DEPLOY_SMOKE_SCOPE")
 export AGENTDESK_CODESIGN_IDENTITY=$(printf '%q' "${AGENTDESK_CODESIGN_IDENTITY:-}")
 export AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN=$(printf '%q' "${AGENTDESK_ALLOW_ADHOC_RELEASE_SIGN:-}")
 export AGENTDESK_CODESIGN_KEYCHAIN_PW_FILE=$(printf '%q' "${AGENTDESK_CODESIGN_KEYCHAIN_PW_FILE:-}")
 export AGENTDESK_CODESIGN_KEYCHAIN_NAME=$(printf '%q' "${AGENTDESK_CODESIGN_KEYCHAIN_NAME:-}")
+export AGENTDESK_DEPLOY_PEER_ARTIFACT_DIR=$(printf '%q' "${AGENTDESK_DEPLOY_PEER_ARTIFACT_DIR:-}")
 export AGENTDESK_DEPLOY_BINARY=$(printf '%q' "${AGENTDESK_DEPLOY_BINARY:-}")
 export AGENTDESK_DEPLOY_FAST=$(printf '%q' "${AGENTDESK_DEPLOY_FAST:-0}")
 export AGENTDESK_DEPLOY_SKIP_FRESHNESS=$(printf '%q' "${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}")
@@ -2349,6 +2535,7 @@ export AGENTDESK_DEPLOY_SKIP_REMOTE_FRESHNESS=$(printf '%q' "${AGENTDESK_DEPLOY_
 export AGENTDESK_DEPLOY_TARGET_SHA=$(printf '%q' "${AGENTDESK_DEPLOY_TARGET_SHA:-}")
 export AGENTDESK_DEPLOY_ALLOW_SCHEMA_AHEAD_OF_PEERS=$(printf '%q' "${AGENTDESK_DEPLOY_ALLOW_SCHEMA_AHEAD_OF_PEERS:-0}")
 export AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT=$(printf '%q' "${AGENTDESK_DEPLOY_FORCE_RESOURCE_PREFLIGHT:-0}")
+$(if [ "${AGENTDESK_DEPLOY_ALLOW_DEGRADED+x}" = x ]; then printf 'export AGENTDESK_DEPLOY_ALLOW_DEGRADED=%q' "$AGENTDESK_DEPLOY_ALLOW_DEGRADED"; fi)
 export AGENTDESK_DEPLOY_MAX_LOADAVG=$(printf '%q' "${AGENTDESK_DEPLOY_MAX_LOADAVG:-}")
 export AGENTDESK_DEPLOY_MAX_MEM_PRESSURE_LEVEL=$(printf '%q' "${AGENTDESK_DEPLOY_MAX_MEM_PRESSURE_LEVEL:-}")
 export AGENTDESK_DEPLOY_HIGH_CPU_PCT=$(printf '%q' "${AGENTDESK_DEPLOY_HIGH_CPU_PCT:-}")
@@ -2391,9 +2578,8 @@ EOF
     echo "    so the wait below covers the cluster verdict too (#5189)."
     echo ""
     echo "    One-shot wait command (polling loop — self-terminates after match):"
-    # `^`-anchored: `grep -qm1` stops at the FIRST match, so a line that merely quotes
-    # a marker (the per-peer ✓ lines do) would end the wait early and be reported as
-    # the verdict. Terminal markers are emitted at column 0 (#5189).
+    # `^`-anchored: `grep -qm1` stops at the first match, so a line quoting a marker (the
+    # per-peer ✓ lines do) would end the wait early; terminal markers start at column 0.
     echo "      LOG=$log_path; until [ -f \"\$LOG\" ] && grep -qm1 -E '^═══ Deploy Complete ═══|^═══ DEPLOY FAILED' \"\$LOG\"; do sleep 3; done; grep -E '^═══ Deploy Complete ═══|^═══ DEPLOY FAILED' \"\$LOG\" | tail -1"
     echo ""
     echo "    ⚠ DO NOT use 'tail -F | grep -m1' — grep -m1 exits on match but tail -F stays alive"
@@ -2409,6 +2595,7 @@ if _self_hosted_release_session; then
 fi
 
 _acquire_release_deploy_lock "$@"
+DEPLOY_RUN_STARTED="$SECONDS"
 
 # #4255: resource-contention pre-flight — refuse (or, with the force hatch,
 # warn) BEFORE any expensive build work when the machine is already saturated by
@@ -2479,7 +2666,7 @@ _schema_order_guard_before_build || exit 1
 # Ensure release dir exists
 mkdir -p "$ADK_REL"/{bin,config,data,logs}
 
-export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-40G}"
+export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-15G}"
 if setup_sccache_env; then
     echo "▸ sccache cache: $SCCACHE_DIR (size $SCCACHE_CACHE_SIZE)"
 else
@@ -2492,16 +2679,10 @@ else
     export CARGO_BUILD_RUSTC_WRAPPER=""
 fi
 
-# Build the release binary from the current workspace by default so deploy
-# always ships code compiled from the current HEAD. An explicit external artifact
-# keeps the override behavior only while this source's O writer switch is false.
+# Build the release binary from HEAD by default; an external AGENTDESK_DEPLOY_BINARY is
+# deployed only while it reports both its O writer and OperatorResume off.
 _ensure_dashboard_dependencies
 _check_repo_remote_freshness
-if _source_would_revert_o_ledger; then
-    echo "✗ OperatorResume floor refuses this source's incompatible O ledger reader" >&2
-    exit 1
-fi
-
 if _external_artifact_would_skip_o_writer; then
     exit 1
 elif [ -n "${AGENTDESK_DEPLOY_BINARY:-}" ]; then
@@ -2514,13 +2695,13 @@ fi
 if [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ] && [ -n "$(_schema_order_peers)" ]; then
     DEPLOY_BUILT_SOURCE_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || true)"
 fi
-if [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ]; then
-    # #5855: the deploy lock is already held here, and a queued peer deploy only
-    # waits DEPLOY_LOCK_TIMEOUT_SECS for it while the token wait below defaults to
-    # four hours -- so a deploy that is merely queued for the token can starve a
-    # peer that never needed the token at all (artifact deploys included). Bound
-    # the wait by the same deadline every peer already agreed to wait. An explicit
-    # operator override still wins.
+echo "▸ [timing] phase=release-preflight seconds=$((SECONDS - DEPLOY_RUN_STARTED))"
+BINARY_PHASE_STARTED="$SECONDS"
+DEPLOY_BINARY_PLATFORM="$(_peer_binary_platform)" || DEPLOY_BINARY_PLATFORM=""
+_select_peer_binary
+if [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ] && [ "$PEER_BINARY_ACCEPTED" != 1 ]; then
+    # Cap token wait duration by the deploy-lock wait; this is not a shared absolute deadline.
+    # An explicit operator override still wins.
     export ADK_BUILD_TOKEN_WAIT_TIMEOUT_SECS="${ADK_BUILD_TOKEN_WAIT_TIMEOUT_SECS:-$DEPLOY_LOCK_TIMEOUT_SECS}"
     if [ "$DEPLOY_BUILD_PROFILE" = "release" ]; then
         echo "▸ Building release binary..."
@@ -2539,10 +2720,19 @@ if [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ]; then
     # reuse an existing artifact, so align the mtime after build.
     [ -e "$SOURCE_BINARY" ] && touch "$SOURCE_BINARY"
 fi
+# The binary itself reports its O ledger reader; refuse before anything is staged.
+if _binary_would_revert_o_ledger "$SOURCE_BINARY"; then
+    echo "✗ OperatorResume floor refuses this build's incompatible O ledger reader" >&2
+    exit 1
+fi
 
 # Rebuild dashboard so deploy never ships a stale dist.
+echo "▸ [timing] phase=release-binary seconds=$((SECONDS - BINARY_PHASE_STARTED)) transferred=$PEER_BINARY_ACCEPTED"
+DASHBOARD_PHASE_STARTED="$SECONDS"
 echo "▸ Building dashboard..."
 (cd "$REPO/dashboard" && npm run build --silent)
+echo "▸ [timing] phase=dashboard-build seconds=$((SECONDS - DASHBOARD_PHASE_STARTED))"
+STAGING_PHASE_STARTED="$SECONDS"
 
 # Re-resolve after fresh build (source path may have changed).
 if ! DASHBOARD_SOURCE=$(_resolve_dashboard_source); then
@@ -2690,7 +2880,7 @@ fi
 # macro) or code changes, leading to runtime migration-mismatch errors. Opt out
 # with AGENTDESK_DEPLOY_SKIP_FRESHNESS=1 when intentional (e.g. bisecting, or
 # when AGENTDESK_DEPLOY_BINARY points at a validated artifact from elsewhere).
-if [ "${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}" != "1" ] && [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ]; then
+if [ "${AGENTDESK_DEPLOY_SKIP_FRESHNESS:-0}" != "1" ] && [ -z "${AGENTDESK_DEPLOY_BINARY:-}" ] && [ "$PEER_BINARY_ACCEPTED" != 1 ]; then
     HEAD_EPOCH=$(git -C "$REPO" log -1 --format=%ct 2>/dev/null || echo 0)
     BIN_EPOCH=$(stat -f %m "$SOURCE_BINARY" 2>/dev/null || stat -c %Y "$SOURCE_BINARY" 2>/dev/null || echo 0)
     if [ "$BIN_EPOCH" -lt "$HEAD_EPOCH" ]; then
@@ -2784,6 +2974,10 @@ cp "$SOURCE_BINARY" "$STAGED_BINARY"
 chmod +x "$STAGED_BINARY"
 xattr -d com.apple.provenance "$STAGED_BINARY" 2>/dev/null || true
 sign_binary_with_fallback "$STAGED_BINARY"
+_cleanup_peer_binary
+DEPLOY_PEER_BINARY_SOURCE="$STAGED_BINARY"
+echo "▸ [timing] phase=release-staging seconds=$((SECONDS - STAGING_PHASE_STARTED))"
+ACTIVATION_PHASE_STARTED="$SECONDS"
 _clean_release_build_cache_after_staging
 
 # ── Fail-closed PostgreSQL tunnel migration (#4378) ───────────────────────────
@@ -3186,16 +3380,16 @@ fi
 _capture_deploy_preexisting_reader_alarms
 AGENTDESK_RESTART_ALLOW_FOREIGN_TURNS=1
 export AGENTDESK_RESTART_ALLOW_FOREIGN_TURNS
-# #5245 Phase 2A-S: `$ADK_REL` remains the sole canonical watched root.
-# Every shipped runtime and restart-marker writer already agrees on this path;
-# `$ADK_REL/runtime` stores other runtime state but is not a restart-marker root.
+# `$ADK_REL` is the sole canonical restart-marker root; `$ADK_REL/runtime` is not one.
 if ! request_restart_drain_mode_or_fail \
     "release" "$PLIST_REL" "$REL_PORT" "$ADK_REL" "deploy-release"; then
     exit 1
 fi
 RESTART_REQUEST_NONCE="${AGENTDESK_RESTART_REQUEST_NONCE:-}"
 # >>> BEGIN restart-durability gate (#5254)
-if [ "${AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED:-0}" != "1" ]; then
+if [ "${AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED:-0}" = "1" ]; then
+    echo "⚠ [gate] release restart durability gate skipped by operator override AGENTDESK_RESTART_PERSISTENCE_NOT_REQUIRED=1 (drain: ${AGENTDESK_RESTART_DRAIN_VERDICT})"
+elif [ "${AGENTDESK_RESTART_DRAIN_PERSISTENCE_NOT_REQUIRED:-0}" != "1" ]; then
     if [ -z "$RESTART_REQUEST_NONCE" ]; then
         echo "✗ [gate] release restart request nonce missing" >&2
         clear_restart_drain_mode "$ADK_REL" || true
@@ -3324,6 +3518,7 @@ unset POST_DEPLOY_SMOKE_LOG_FINGERPRINT_BYTES POST_DEPLOY_SMOKE_LOG_FINGERPRINT_
 REL_BINARY="$ADK_REL/bin/agentdesk"
 REL_BINARY_BACKUP="$ADK_REL/bin/agentdesk.prev"
 chflags nouchg "$REL_BINARY" 2>/dev/null || true
+_arm_policy_generation_backup "$ADK_REL" "$REL_BINARY_BACKUP"
 if [ -f "$REL_BINARY_BACKUP" ]; then
     # #3858 (re-entrancy / finding 2): treat .prev as last-KNOWN-GOOD. A leftover
     # .prev means a PRIOR deploy failed before its success-path cleanup, so it
@@ -3360,7 +3555,7 @@ fi
 # accept the same smoke channels; an unreadable config accepts none.
 DEPLOY_E2E_SMOKE_CHANNEL_IDS=$(_deploy_e2e_smoke_channel_ids "$REPO" \
     "$ADK_REL/config/agentdesk.yaml" "$POST_DEPLOY_SMOKE_RELAY_CELL" "$POST_DEPLOY_SMOKE_CODEX_TURNS_CELL")
-echo "▸ Smoke E2E channels whose reader-count alarm does not block health: ${DEPLOY_E2E_SMOKE_CHANNEL_IDS:-none}"
+echo "▸ Smoke E2E channels whose reader-count or held-start alarm does not block health: ${DEPLOY_E2E_SMOKE_CHANNEL_IDS:-none}"
 echo "▸ Promoting staged binary..."
 mv -f "$STAGED_BINARY" "$REL_BINARY"
 STAGED_BINARY=""
@@ -3368,6 +3563,10 @@ STAGED_BINARY=""
 # ANY non-zero exit before DEPLOY_OK (set on the success path) restores the
 # last-known-good backup and restarts the service — see _rollback_release_binary.
 ROLLBACK_ARMED=1
+DEPLOY_PEER_BINARY_SOURCE="$REL_BINARY"
+# Swap policies with nothing fallible since promotion, so rollback and fail-forward see one generation.
+_swap_policy_generation "$ADK_REL" "$POLICIES_STAGED"
+POLICIES_STAGED=""
 # NOTE: the immutable re-lock (chflags uchg) is deferred until AFTER the health
 # check passes (see below). Locking here would force the rollback path to fight
 # the uchg flag on the bad binary, and the lock's only job — blocking unsigned
@@ -3402,12 +3601,6 @@ rm -rf "$ADK_REL/skills.old"
 [ -d "$ADK_REL/skills" ] && mv "$ADK_REL/skills" "$ADK_REL/skills.old"
 mv "$SKILLS_STAGED" "$ADK_REL/skills"
 rm -rf "$ADK_REL/skills.old"
-
-rm -rf "$ADK_REL/policies.old"
-[ -d "$ADK_REL/policies" ] && mv "$ADK_REL/policies" "$ADK_REL/policies.old"
-mv "$POLICIES_STAGED" "$ADK_REL/policies"
-POLICIES_STAGED=""
-rm -rf "$ADK_REL/policies.old"
 
 # #3288: self-heal policies.dir config drift. The release runtime must load
 # policies from the deployed snapshot ($ADK_REL/policies, staged above from the
@@ -3550,13 +3743,14 @@ fi
 
 # Health check (server health + dashboard availability)
 REL_PORT="$(_resolve_release_server_port)"
+HEALTH_PHASE_STARTED="$SECONDS"
 echo "▸ Waiting for release health on :${REL_PORT}..."
 REL_HEALTHY=false
 # #4348 Defect 1: the trailing `1` opts the DEPLOY readiness gate into treating a
 # serving node that is unhealthy SOLELY because no provider runtimes are
 # registered (leader-only / no-agent-session node) as deploy-ready. Runtime
 # /api/health keeps reporting unhealthy for monitoring; only this gate relaxes.
-if wait_for_http_service_health "$PLIST_REL" "$REL_PORT" "$DEPLOY_HEALTH_RETRIES" "$DEPLOY_HEALTH_DELAY_SECS" 1 1 1 1; then
+if _deploy_wait_with_allow_degraded "$PLIST_REL" "$REL_PORT" "$DEPLOY_HEALTH_RETRIES" "$DEPLOY_HEALTH_DELAY_SECS" 1 1 1 1; then
     REL_HEALTHY=true
 fi
 
@@ -3577,6 +3771,8 @@ fi
 # to roll back with no .prev, and a hiccup in a non-critical step (lock, manifest)
 # must never tear down a healthy, health-confirmed binary.
 DEPLOY_OK=1
+echo "▸ [timing] phase=release-health seconds=$((SECONDS - HEALTH_PHASE_STARTED))"
+echo "▸ [timing] phase=release-activation seconds=$((SECONDS - ACTIVATION_PHASE_STARTED))"
 # #5147: ship the .dSYM next to the promoted binary. `sample` (which the
 # self-watchdog runs to capture hang dumps) and `atos` look for
 # `<binary>.dSYM` in the binary's own directory before falling back to
@@ -3644,9 +3840,9 @@ fi
 chflags uchg "$REL_BINARY" 2>/dev/null || true
 chflags nouchg "$REL_BINARY_BACKUP" 2>/dev/null || true
 rm -f "$REL_BINARY_BACKUP" 2>/dev/null || true
-# #3858 (re-review finding 1): also drop any stray atomic-backup temp so an
-# interrupted prior backup copy never lingers in bin/.
+# Also drop a stray atomic-backup temp, then the policy backup paired with .prev.
 rm -f "$REL_BINARY_BACKUP.tmp" 2>/dev/null || true
+_drop_policy_generation_backup "$ADK_REL" "$REL_BINARY_BACKUP"
 
 if _health_json_unhealthy_only_no_provider_runtimes "${WAIT_FOR_HTTP_SERVICE_LAST_HEALTH_JSON:-}"; then
     echo "✓ Release is serving on :${REL_PORT} (deploy-ready: no provider runtimes registered —"
@@ -3670,6 +3866,13 @@ POST_DEPLOY_SMOKE_CORE_API_ENDPOINTS=(
     "/api/health/detail"
     "/api/agents"
     "/api/sessions"
+    "/api/claude-accounts"
+    "/api/docs"
+)
+# Paths served only by the admin routers (agents, integrations, ops) that
+# compose_api_router skips when modules.admin_api=false, as on a runner.
+POST_DEPLOY_SMOKE_ADMIN_API_ENDPOINTS=(
+    "/api/agents"
     "/api/claude-accounts"
     "/api/docs"
 )
@@ -3729,6 +3932,44 @@ _post_deploy_smoke_optional_accounts_absent() {
         "$POST_DEPLOY_SMOKE_HEALTH_DETAIL_BODY" >/dev/null 2>&1
 }
 
+# Echo /api/health `modules.<name>` as true/false, read as a value (not `jq -e`).
+# Non-zero when the body, `modules` object or boolean field is missing, so callers keep full checks.
+_post_deploy_smoke_resolve_health_module() {
+    local health_body="$1" module="$2" value
+    if [ -z "$health_body" ] || [ ! -s "$health_body" ]; then
+        return 1
+    fi
+    if ! value=$(jq -r --arg module "$module" '
+        if (type == "object") and ((.modules | type) == "object")
+            and ((.modules[$module] | type) == "boolean") then
+            .modules[$module]
+        else
+            error("modules.\($module) is not boolean")
+        end
+    ' "$health_body"); then
+        return 1
+    fi
+    case "$value" in
+        true | false) printf '%s\n' "$value" ;;
+        *) return 1 ;;
+    esac
+}
+
+# An admin-router path answering 404 is an unmounted router only when this run's
+# /api/health says modules.admin_api=false; any other status or health shape still fails.
+_post_deploy_smoke_profile_unmounted() {
+    local endpoint="$1" http_code="$2" admin_path admin_api
+    [ "$http_code" = "404" ] || return 1
+    for admin_path in "${POST_DEPLOY_SMOKE_ADMIN_API_ENDPOINTS[@]}"; do
+        [ "$admin_path" = "$endpoint" ] || continue
+        admin_api=$(_post_deploy_smoke_resolve_health_module \
+            "${POST_DEPLOY_SMOKE_HEALTH_BODY:-}" admin_api 2>> "$POST_DEPLOY_SMOKE_EVIDENCE") || return 1
+        [ "$admin_api" = "false" ]
+        return
+    done
+    return 1
+}
+
 _post_deploy_smoke_probe_apis() {
     local endpoint body_path http_code
     local failed=0
@@ -3751,6 +3992,10 @@ _post_deploy_smoke_probe_apis() {
         if [ "$http_code" != "200" ]; then
             if _post_deploy_smoke_optional_accounts_absent "$endpoint" "$http_code" "$body_path"; then
                 _post_deploy_smoke_note "api endpoint=${endpoint} optional=not_installed; no Claude runtime configured" || return 1
+                continue
+            fi
+            if _post_deploy_smoke_profile_unmounted "$endpoint" "$http_code"; then
+                _post_deploy_smoke_note "api endpoint=${endpoint} skipped=profile(admin_api=false)" || return 1
                 continue
             fi
             _post_deploy_smoke_fail "core API ${endpoint}: expected HTTP 200, got ${http_code}" || true
@@ -4105,7 +4350,7 @@ _post_deploy_smoke_classified_note() {
 }
 
 _post_deploy_smoke_check_relay_round_trip() {
-    local cluster_standby channel_id relay_output relay_log
+    local cluster_standby gateway channel_id relay_output relay_log
     local resolve_rc cell_busy cell_guard_rc rc=0 verdict
     local run_id
     local config_path="$ADK_REL/config/agentdesk.yaml"
@@ -4122,6 +4367,14 @@ _post_deploy_smoke_check_relay_round_trip() {
         _post_deploy_smoke_note "relay E-1=skipped cluster_standby=true (no standby injection)" || return 1
         return 0
     fi
+    # A runner (modules.gateway=false) owns no relay; skip before any config read.
+    # An unreadable gateway flag falls through to the round-trip.
+    if gateway=$(_post_deploy_smoke_resolve_health_module \
+        "$POST_DEPLOY_SMOKE_HEALTH_BODY" gateway 2>> "$POST_DEPLOY_SMOKE_EVIDENCE") \
+        && [ "$gateway" = "false" ]; then
+        _post_deploy_smoke_note "relay E-1=skipped modules.gateway=false (runner: relay belongs to the gateway)" || return 1
+        return 0
+    fi
     # Positive breadcrumb (#5026): the standby gate passed and the round-trip is
     # actually executing. Absence of this line in a deploy log means the relay
     # check did not run, which is what silently held for every prior deploy.
@@ -4133,8 +4386,7 @@ _post_deploy_smoke_check_relay_round_trip() {
         return 0
     fi
 
-    # Reuse the #3729 wrapper's config resolver: channel ids remain
-    # machine-local agentdesk.yaml data and are never hard-coded here.
+    # Resolve machine-local channel ids through the existing E2E config resolver.
     if channel_id=$(python3 - "$REPO" "$config_path" "$POST_DEPLOY_SMOKE_RELAY_CELL" \
         2>> "$POST_DEPLOY_SMOKE_EVIDENCE" <<'PY'
 import sys
@@ -4169,79 +4421,11 @@ PY
     fi
 
     POST_DEPLOY_SMOKE_RELAY_CHANNEL_ID="$channel_id"
+    python3 "$REPO/scripts/e2e/post_deploy_turn_smoke.py" cell-reset --base-url "http://${ADK_DEFAULT_LOOPBACK}:${REL_PORT}" --config "$config_path" --cell "$POST_DEPLOY_SMOKE_RELAY_CELL" --cell "$POST_DEPLOY_SMOKE_CODEX_TURNS_CELL" --queue-runtime-root "$ADK_REL/runtime" --state-output "$POST_DEPLOY_SMOKE_TMP_DIR/cell-reset.json" --health-detail-output "$POST_DEPLOY_SMOKE_HEALTH_DETAIL_BODY" --sessions-output "$POST_DEPLOY_SMOKE_SESSIONS_BODY" >> "$POST_DEPLOY_SMOKE_EVIDENCE" 2>&1 || { rc=$?; if [ "$rc" -eq 3 ]; then _post_deploy_smoke_note "relay E-1=skipped: foreign active turn on cell" || return 1; return 0; fi; _post_deploy_smoke_fail "relay E-1: cell-reset refused (see smoke evidence)" || true; return 1; }
 
-    # E-1 is a real live turn, so reuse the E2E driver's mailbox/session busy
-    # predicates against the authenticated core-probe snapshots before sending.
-    # An unreadable snapshot skips the injection fail-open: safety requires
-    # proving the target cell idle, while the already-recorded API finding (if
-    # any) remains the smoke result.
-    if cell_busy=$(python3 - "$REPO" "$POST_DEPLOY_SMOKE_HEALTH_DETAIL_BODY" \
-        "$POST_DEPLOY_SMOKE_SESSIONS_BODY" "$POST_DEPLOY_SMOKE_RELAY_CELL" "$channel_id" \
-        2>> "$POST_DEPLOY_SMOKE_EVIDENCE" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-repo, health_path, sessions_path, cell, channel_id = sys.argv[1:]
-sys.path.insert(0, str(Path(repo) / "scripts" / "e2e"))
-import run_tui_relay as cell_driver
-
-try:
-    with Path(health_path).open(encoding="utf-8") as handle:
-        detail = json.load(handle)
-    with Path(sessions_path).open(encoding="utf-8") as handle:
-        sessions_payload = json.load(handle)
-    mailboxes = detail.get("mailboxes") if isinstance(detail, dict) else None
-    if not isinstance(mailboxes, list):
-        raise ValueError("health/detail mailboxes is not a list")
-    sessions = (
-        sessions_payload.get("sessions")
-        if isinstance(sessions_payload, dict)
-        else sessions_payload
-    )
-    if not isinstance(sessions, list):
-        raise ValueError("sessions payload is not a list")
-
-    provider = cell_driver.cell_provider(cell)
-    busy = []
-    for mailbox in mailboxes:
-        if not isinstance(mailbox, dict):
-            continue
-        if cell_driver._mailbox_channel_id(mailbox) != str(channel_id):
-            continue
-        if cell_driver._mailbox_provider(mailbox) != provider:
-            continue
-        reasons = cell_driver._mailbox_busy_reasons(mailbox)
-        if reasons:
-            busy.append(
-                f"mailbox {provider}:{channel_id} [{', '.join(reasons)}]"
-            )
-
-    workspace_substring = cell_driver.cell_workspace_substring(cell)
-    for session in sessions:
-        if not isinstance(session, dict):
-            continue
-        status = str(session.get("status") or "").lower()
-        if status not in {"turn_active", "turn_busy", "active"}:
-            continue
-        session_key = str(session.get("session_key") or "")
-        session_channel = str(
-            session.get("channel_id") or session.get("channelId") or ""
-        )
-        if session_channel == str(channel_id) or workspace_substring in session_key:
-            busy.append(
-                f"session {session_key or session_channel or '<unknown>'} status={status}"
-            )
-except Exception as error:
-    print(f"{type(error).__name__}: {error}", file=sys.stderr)
-    raise SystemExit(2) from error
-
-if busy:
-    print("; ".join(busy))
-    raise SystemExit(0)
-raise SystemExit(1)
-PY
-    ); then
+    # Reuse the E2E driver's mailbox/session busy predicates before sending E-1.
+    # An unreadable snapshot skips injection; existing API findings remain the smoke result.
+    if cell_busy=$(python3 "$REPO/scripts/e2e/post_deploy_turn_smoke.py" cell-guard --health-detail "$POST_DEPLOY_SMOKE_HEALTH_DETAIL_BODY" --sessions "$POST_DEPLOY_SMOKE_SESSIONS_BODY" --cell "$POST_DEPLOY_SMOKE_RELAY_CELL" --channel-id "$channel_id" 2>> "$POST_DEPLOY_SMOKE_EVIDENCE"); then
         _post_deploy_smoke_note "relay E-1=skipped: foreign active turn on cell" || return 1
         _post_deploy_smoke_note "relay E-1 cell-busy evidence=${cell_busy}" || return 1
         return 0
@@ -4298,6 +4482,7 @@ _post_deploy_smoke_check_durable_record() {
         _post_deploy_smoke_note "durable_record_probe=unevaluable: E-35 channel unavailable; probe did not run" || return 1
         return 0
     fi
+    python3 "$REPO/scripts/e2e/post_deploy_turn_smoke.py" reset-status --reset-state "$POST_DEPLOY_SMOKE_TMP_DIR/cell-reset.json" --cell "$POST_DEPLOY_SMOKE_RELAY_CELL" --channel-id "$POST_DEPLOY_SMOKE_RELAY_CHANNEL_ID" >> "$POST_DEPLOY_SMOKE_EVIDENCE" 2>&1 || { POST_DEPLOY_SMOKE_DURABLE_COVERAGE="unevaluable: cell-reset blocked E-35"; _post_deploy_smoke_note "durable_record_probe=skipped: cell-reset blocked E-35" || return 1; return 0; }
     output="$ADK_REL/logs/post-deploy-smoke-durable-${POST_DEPLOY_SMOKE_STAMP}"
     log="$POST_DEPLOY_SMOKE_TMP_DIR/relay-e35.log"
     (
@@ -4342,10 +4527,15 @@ _post_deploy_smoke_run_turn_scenario() {
     local verdict rc=0 judge_rc=0
     local run_id="${POST_DEPLOY_SMOKE_STAMP}-${scenario}-${cell}"
     # Same idle proof as E-1, read fresh: an earlier phase may have left the cell busy.
-    if ! idle=$(cd "$REPO" && python3 scripts/e2e/post_deploy_turn_smoke.py preflight \
+    if idle=$(cd "$REPO" && python3 scripts/e2e/post_deploy_turn_smoke.py preflight \
         --base-url "http://${ADK_DEFAULT_LOOPBACK}:${REL_PORT}" --cell "$cell" \
-        --channel-id "$channel_id" --queue-runtime-root "$ADK_REL/runtime" 2>&1); then
-        _post_deploy_smoke_note "relay ${scenario}=skipped: ${cell} not proven idle (${idle})" || return 1
+        --channel-id "$channel_id" --queue-runtime-root "$ADK_REL/runtime" --reset-state "$POST_DEPLOY_SMOKE_TMP_DIR/cell-reset.json" 2>&1); then :; else
+        rc=$?; if [ "$rc" -eq 4 ]; then _post_deploy_smoke_fail "relay ${scenario} cell=${cell} result=FAIL ${idle}" || true; POST_DEPLOY_SMOKE_TURN_COVERAGE+=" ${scenario}=FAIL"; return 1; fi
+        if [[ "$idle" == "skipped: blocked by E-1 FAIL"* ]]; then
+            _post_deploy_smoke_note "relay ${scenario}=${idle}" || return 1
+        else
+            _post_deploy_smoke_note "relay ${scenario}=skipped: ${cell} not proven idle (${idle})" || return 1
+        fi
         POST_DEPLOY_SMOKE_TURN_COVERAGE+=" ${scenario}=skipped"
         return 0
     fi
@@ -4617,6 +4807,7 @@ turn scenarios: ${POST_DEPLOY_SMOKE_TURN_COVERAGE:-not run: turn scenarios did n
     return 0
 }
 
+SMOKE_PHASE_STARTED="$SECONDS"
 # >>> BEGIN smoke-disposition region (#5244)
 echo "▸ Running post-deploy functional smoke (#4262)..."
 # INVARIANT: the ENTIRE smoke block is fail-open. We are past DEPLOY_OK, so a
@@ -4672,6 +4863,7 @@ else
     _report_post_deploy_smoke_failure || true
 fi
 # <<< END smoke-disposition region (#5244)
+echo "▸ [timing] phase=smoke seconds=$((SECONDS - SMOKE_PHASE_STARTED))"
 
 # >>> BEGIN retired-relay-watchdog cleanup
 # Retire an old installation after a successful deploy; an absent job is a no-op.
@@ -4698,5 +4890,6 @@ _write_release_source_manifest
 # transcript carries NO terminal marker, which is the truth — there is no verdict
 # yet. A refused peer exits non-zero and the EXIT trap prints DEPLOY FAILED instead.
 _finish_cluster_stage "$@" || exit 1
+echo "▸ [timing] phase=deploy-total seconds=$((SECONDS - DEPLOY_RUN_STARTED))"
 
 echo "═══ Deploy Complete ═══"

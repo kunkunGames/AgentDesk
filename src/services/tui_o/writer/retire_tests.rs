@@ -5,10 +5,16 @@ use crate::services::tui_o::store::rotation::{
 };
 use crate::services::tui_o::store::spool::source_key;
 
+#[cfg(unix)]
+#[path = "clear_end_proof_tests.rs"]
+mod clear_end_proof_tests;
+#[cfg(unix)]
+#[path = "codex_end_proof_tests.rs"]
+mod codex_end_proof_tests;
 #[path = "legacy_hop_retry_tests.rs"]
 mod legacy_hop_retry_tests;
 #[path = "transition_actor_tests.rs"]
-mod transition_actor_tests;
+pub(crate) mod transition_actor_tests;
 
 fn session_start() -> String {
     HookEventKind::SessionStart.as_str().to_owned()
@@ -38,14 +44,14 @@ fn resumed(seq: u64, tmux: &str, source: &SourceId) -> BindingEvent {
     hop_at(seq, tmux, Some(source), source, BindingCause::Resume, &hook)
 }
 
-/// Six 256 KiB thinking records, longer than one read, that post nothing.
+/// Six signature-only records span more than one read and post nothing.
 fn backlog(first: u32) -> Vec<u8> {
     let thinking = |i: u32| {
         let text = "x".repeat(256 << 10);
         codex_line(
             serde_json::json!({"type": "assistant", "uuid": format!("u-t{i}"),
             "apiBlockIndex": 0, "message": {"id": format!("t{i}"),
-            "content": [{"type": "thinking", "thinking": text}]}}),
+            "content": [{"type": "thinking", "thinking": "", "signature": text}]}}),
         )
     };
     let lines: Vec<u8> = (first..first + 6).flat_map(thinking).collect();
@@ -56,12 +62,12 @@ fn backlog(first: u32) -> Vec<u8> {
 fn len(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().len()
 }
-
 fn owed_link(source: &SourceId, seq: u64) -> SourceLink {
     SourceLink {
         source: source.clone(),
         seq,
         parent: None,
+        hot_candidate: None,
         committed_at: Utc::now(),
         boundary: Boundary::Owed { from: 0 },
     }
@@ -285,6 +291,7 @@ async fn a_legacy_hop_is_proven_only_by_evidence_from_the_pane_the_log_names() {
     let unnamed = legacy_rotation(|_, _| {
         let refused = BindingRecord::Rejected {
             detail: "regression".into(),
+            closes: None,
         };
         event(2, refused, Utc::now())
     });
@@ -463,7 +470,7 @@ async fn readers_s1a_capture_none_keeps_barrier_and_halts() {
     let mut frames = 0;
     writer
         .store()
-        .for_each_frame(&new, |_| frames += 1)
+        .for_each_frame(&new, |_, _| frames += 1)
         .unwrap();
     assert_eq!(frames, 0);
     assert!(matches!(
@@ -838,7 +845,7 @@ async fn readers_s1a_dormant_partial_tail_commits_and_posts_once() {
     }
     let mut ranges = Vec::new();
     w.store()
-        .for_each_frame(&old, |frame| {
+        .for_each_frame(&old, |frame, _| {
             if let SpoolFrame::Record(record) = frame {
                 ranges.push((record.start, record.end));
             }
@@ -1311,7 +1318,7 @@ async fn readers_s1a_spoolfull_pending_keeps_fd_and_successor_barrier() {
         }
         let mut ranges = Vec::new();
         w.store()
-            .for_each_frame(&old, |frame| {
+            .for_each_frame(&old, |frame, _| {
                 if let SpoolFrame::Record(record) = frame {
                     ranges.push((record.start, record.end));
                 }
@@ -1518,7 +1525,7 @@ async fn readers_s1b_actor_on_late_tail_spools_and_posts_once() {
     let mut spans = Vec::new();
     writer
         .store()
-        .for_each_frame(&old, |frame| {
+        .for_each_frame(&old, |frame, _| {
             if let SpoolFrame::Record(record) = frame {
                 spans.push((record.start, record.end));
             }

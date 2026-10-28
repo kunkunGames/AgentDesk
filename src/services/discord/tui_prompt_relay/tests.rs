@@ -3,6 +3,8 @@ use super::observed_prompt_decision::is_local_only_slash_command_prompt;
 use super::*;
 use crate::services::discord::gateway::TurnGateway;
 
+#[cfg(unix)]
+mod absent_tmux_host_tests;
 mod compact_summary_tests;
 
 fn compact_command_name_first_stub() -> &'static str {
@@ -238,6 +240,8 @@ fn abort_cleanup_records_marker_and_keeps_hourglass() {
 
     let shared = super::super::make_shared_data_for_tests();
     let record = super::super::tui_direct_pending_start::TuiDirectPendingStart {
+        hosted_source: None,
+        hosted_source_checked: false,
         provider: "claude".to_string(),
         channel_id: 4242,
         tmux_session_name: "tmux-4242".to_string(),
@@ -534,14 +538,12 @@ fn drift_triggered_restore_makes_routine_session_route_again() {
 // runtime binding + channel mapping must NOT spam the per-poll drift/skip
 // WARN forever. After the rehydrate pass evicts the mirror, the next idle
 // relay iteration finds NO runtime binding to iterate and NO channel mapping
-// to drift on — proving the 0.5s spam is stopped. A unique, never-created
-// session name guarantees `tmux_session_has_live_pane` is false.
+// to drift on — proving the 0.5s spam is stopped. A private `tmux` that reports
+// every session missing pins the dead verdict against PATH-swapping fixtures.
 #[cfg(unix)]
 #[test]
 fn dead_orphaned_session_mirror_is_evicted_and_stops_drift_spam() {
-    let _guard = crate::services::tui_prompt_dedupe::TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _host = absent_tmux_host_tests::AbsentTmuxHost::isolate();
     let shared = super::super::make_shared_data_for_tests();
     // A session that does not exist on this host (pane gone / orphaned).
     let tmux = "AgentDesk-claude-adk-cc-t1504468805772902471-DEAD-ORPHAN-fix3105";
@@ -748,28 +750,64 @@ fn hard_probe_failure_preserves_dead_looking_session() {
 fn formats_ssh_direct_prompt_notification() {
     let output = format_ssh_direct_prompt_notification("claude", "AgentDesk-claude-a", "hi");
 
-    assert!(output.contains("터미널에 직접 주입된 입력"));
-    assert!(output.contains("(tmux : `AgentDesk-claude-a`)"));
-    assert!(output.contains("```text\nhi\n```"));
+    assert_eq!(output, "-# ⌨️ hi");
 }
 
 #[test]
 fn formats_ssh_direct_prompt_notification_with_truncation() {
-    let prompt = "x".repeat(SSH_DIRECT_PROMPT_PREVIEW_LIMIT + 20);
-    let output = format_ssh_direct_prompt_notification("codex", "AgentDesk-codex-a", &prompt);
+    for (raw, escaped, fits) in [
+        ("x", "x", 1994),
+        ("한", "한", 1994),
+        ("😀", "😀", 997),
+        ("*", r"\*", 997),
+        ("@", "@\u{200b}", 997),
+        ("\\", r"\\", 997),
+        ("\n", "\n-# ", 498),
+    ] {
+        let exact = format_ssh_direct_prompt_notification("codex", "s", &raw.repeat(fits));
+        assert_eq!(exact, format!("-# ⌨️ {}", escaped.repeat(fits)));
+        assert!(exact.encode_utf16().count() <= 2000);
 
-    assert!(output.contains("터미널에 직접 주입된 입력"));
-    assert!(output.contains("(tmux : `AgentDesk-codex-a`)"));
-    assert!(output.contains("..."));
-    assert!(output.len() < prompt.len() + 120);
+        let output = format_ssh_direct_prompt_notification("codex", "s", &raw.repeat(fits + 1));
+        let (shown, suffix) = output.rsplit_once("… (이하 ").expect("overflow marker");
+        let omitted: usize = suffix.strip_suffix("자)").unwrap().parse().unwrap();
+        assert!(omitted > 0 && omitted <= fits + 1);
+        assert_eq!(
+            shown,
+            format!("-# ⌨️ {}", escaped.repeat(fits + 1 - omitted))
+        );
+        assert!(output.encode_utf16().count() <= 2000, "{raw:?}");
+        let one_more = format!("{shown}{escaped}… (이하 {}자)", omitted - 1);
+        assert!(
+            one_more.encode_utf16().count() > 2000,
+            "maximal prefix: {raw:?}"
+        );
+    }
+}
+
+#[test]
+fn formats_ssh_direct_prompt_notification_preserves_safe_multiline_text() {
+    let prompt = "  **bold** @everyone <@123456789012345678>\r\n\n# heading\u{2028}> quote\u{2029}[link](https://x.y)\n``` @here\n- item\n1. item\n\\_~||\n";
+    let output = format_ssh_direct_prompt_notification("claude", "s", prompt);
+    assert_eq!(
+        output,
+        concat!(
+            "-# ⌨️   \\*\\*bold\\*\\* @\u{200b}everyone ‹@\u{200b}123456789012345678›\n",
+            "-# \n-# \\# heading\n-# › quote\n-# \\[link\\]\\(https://x\\.y\\)\n",
+            "-# \\`\\`\\` @\u{200b}here\n-# \\- item\n-# 1\\. item\n-# \\\\\\_\\~\\|\\|\n-# "
+        )
+    );
+    assert!(!super::super::session_notice::is_inline(&output));
+    let other = super::super::session_notice::subtext("⚠️", "first **bold**\nsecond");
+    assert_eq!(other, r"-# ⚠️ first \*\*bold\*\* (+1줄)");
+    assert!(super::super::session_notice::is_inline(&other));
 }
 
 #[test]
 fn formats_ssh_direct_prompt_notification_escapes_code_fence() {
     let output = format_ssh_direct_prompt_notification("codex", "tmux`name", "a ``` fence");
 
-    assert!(output.contains("(tmux : `tmux'name`)"));
-    assert!(output.contains("a ` ` ` fence"));
+    assert_eq!(output, r"-# ⌨️ a \`\`\` fence");
 }
 
 #[test]
@@ -780,7 +818,7 @@ fn formats_ssh_direct_prompt_notification_strips_terminal_controls() {
         "\u{15}\u{1b}[31mhello\u{1b}[0m\n\tworld",
     );
 
-    assert!(output.contains("hello\n\tworld"));
+    assert_eq!(output, "-# ⌨️ hello\n-# \tworld");
     assert!(!output.contains('\u{15}'));
     assert!(!output.contains('\u{1b}'));
 }
@@ -803,7 +841,7 @@ fn notification_strip_drops_bare_control_bytes_but_keeps_whitespace() {
             output
         );
     }
-    assert!(output.contains("ringpagedelc1\n\tkeep"));
+    assert_eq!(output, "-# ⌨️ ringpagedelc1\n-# \tkeep");
 }
 
 // #3100: a human typing directly into the TUI is a real active turn.
@@ -848,6 +886,7 @@ async fn task_notification_status_only_preserves_existing_turn_request_anchor() 
         Some("1469870512812462284".into()),
     );
     let prompt = ObservedTuiPrompt {
+        hosted_source: None,
         provider: ProviderKind::Claude.as_str().to_string(),
         tmux_session_name: tmux.to_string(),
         prompt: "<task-notification><status>killed</status></task-notification>".to_string(),
@@ -1591,7 +1630,7 @@ fn slash_command_control_note_loop_and_generic_stdout_show_body() {
         stdout_note.contains("Set model to Fable 5"),
         "generic stdout notes must include a short body preview",
     );
-    assert!(stdout_note.contains("```text"));
+    assert!(super::super::session_notice::is_inline(&stdout_note));
 }
 
 // #4033 regression guard: broad `<local-command-stdout>...</local-command-stdout>`
@@ -1723,8 +1762,9 @@ fn local_command_stdout_negative_cases_stay_human_direct() {
 
     let rendered = format_ssh_direct_prompt_notification("claude", "sess-mid-body", mid_body_tag);
     assert!(
-        rendered.contains("<local-command-stdout>x</local-command-stdout>"),
-        "a mid-body stdout tag should remain part of the human prompt preview",
+        rendered
+            == "-# ⌨️ please explain this transcript:\n-# ‹local\\-command\\-stdout›x‹/local\\-command\\-stdout›",
+        "a later quoted stdout line stays visible as literal human input",
     );
 }
 
@@ -1814,6 +1854,7 @@ fn slash_command_control_turn_dedupes_double_post_but_not_distinct_commands() {
 
 fn local_control_prompt(tmux: &str, body: &str, entry_id: &str) -> ObservedTuiPrompt {
     ObservedTuiPrompt {
+        hosted_source: None,
         provider: "claude".to_string(),
         tmux_session_name: tmux.to_string(),
         prompt: body.to_string(),
@@ -2237,10 +2278,20 @@ fn system_continuation_note_is_neutral_not_active_turn() {
     assert!(!note.contains("터미널에 직접 주입된 입력"));
     assert_eq!(
         note,
-        "🧩 Session continued (compact/resume) · tmux: `AgentDesk-claude-adk-cc`"
+        "-# 🧩 Session continued (compact/resume) · tmux: AgentDesk-claude-adk-cc"
     );
     assert!(!note.contains("```text"));
     assert!(!note.contains("Summary:"));
+    let slash = format_slash_command_control_note(
+        "AgentDesk-claude-adk-cc",
+        "/compact",
+        "<command-name>/compact</command-name>",
+    );
+    assert!(slash.contains("tmux: AgentDesk-claude-adk-cc"));
+    assert!(
+        !slash.contains('`'),
+        "slash tmux name must be plain text without literal backticks"
+    );
 }
 
 #[cfg(unix)]
@@ -2456,6 +2507,7 @@ fn bridge_adapter_tail_guard_clears_only_current_external_lease() {
     let tmux = "AgentDesk-codex-bridge-guard";
     let channel_id = ChannelId::new(940_000_000_000_003);
     let original = ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(channel_id.get()),
         turn_id: Some("external:codex:940000000000003:bridge-guard:1".to_string()),
         session_key: Some("host:AgentDesk-codex-bridge-guard".to_string()),
@@ -2540,6 +2592,7 @@ fn claude_bridge_lease_clears_when_tail_dedup_skips_spawn() {
     let tmux = "AgentDesk-claude-bridge-dedup-skip";
     let channel_id = ChannelId::new(940_000_000_000_004);
     let lease = ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(channel_id.get()),
         turn_id: Some("external:claude:940000000000004:dedup-skip:2".to_string()),
         session_key: Some("host:AgentDesk-claude-bridge-dedup-skip".to_string()),
@@ -2610,6 +2663,7 @@ async fn claude_bridge_lease_guard_cleans_no_binding_precondition_skip() {
     let tmux = "AgentDesk-claude-bridge-no-binding";
     let channel_id = ChannelId::new(940_000_000_000_005);
     let prompt = ObservedTuiPrompt {
+        hosted_source: None,
         provider: ProviderKind::Claude.as_str().to_string(),
         tmux_session_name: tmux.to_string(),
         prompt: "direct input without runtime binding".to_string(),
@@ -2625,6 +2679,7 @@ async fn claude_bridge_lease_guard_cleans_no_binding_precondition_skip() {
         steer_echo: false,
     };
     let lease = ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(channel_id.get()),
         turn_id: Some("external:claude:940000000000005:no-binding:1".to_string()),
         session_key: Some("host:AgentDesk-claude-bridge-no-binding".to_string()),
@@ -2686,6 +2741,7 @@ fn task_notification_repeat_clears_its_recorded_external_lease() {
     let tmux = "AgentDesk-task-card-repeat-lease";
     let channel_id = ChannelId::new(950_000_000_000_001);
     let prompt = ObservedTuiPrompt {
+        hosted_source: None,
             provider: ProviderKind::Claude.as_str().to_string(),
             tmux_session_name: tmux.to_string(),
         prompt: "<task-notification><task-id>repeat-x</task-id><status>completed</status></task-notification>".to_string(),
@@ -2701,6 +2757,7 @@ fn task_notification_repeat_clears_its_recorded_external_lease() {
             steer_echo: false,
         };
     let lease = ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(channel_id.get()),
         turn_id: Some("external:claude:950000000000001:repeat:1".to_string()),
         session_key: Some("host:AgentDesk-task-card-repeat-lease".to_string()),
@@ -2751,6 +2808,7 @@ fn task_notification_repeat_lease_clear_preserves_newer_turn() {
     let tmux = "AgentDesk-task-card-repeat-newer";
     let channel_id = ChannelId::new(950_000_000_000_002);
     let prompt = ObservedTuiPrompt {
+        hosted_source: None,
         provider: ProviderKind::Claude.as_str().to_string(),
         tmux_session_name: tmux.to_string(),
         prompt: "<task-notification><task-id>repeat-y</task-id></task-notification>".to_string(),
@@ -2766,6 +2824,7 @@ fn task_notification_repeat_lease_clear_preserves_newer_turn() {
         steer_echo: false,
     };
     let repeat_lease = ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(channel_id.get()),
         turn_id: Some("external:claude:950000000000002:repeat:1".to_string()),
         session_key: Some("host:AgentDesk-task-card-repeat-newer".to_string()),
@@ -3290,16 +3349,17 @@ fn s3t5_codex_abort_and_recv_error_use_shared_fail_closed_completion() {
 
 // #5464 S2 — the completion ACK partition, pinned by BEHAVIOR.
 //
-// `finish_idle_bridge_completion` takes four dispositions and EXACTLY ONE —
-// `Finalized` — is an acknowledgement: only it may return `Ok`, and only it
-// may clear the prompt anchor. Three were already pinned (s3t1/s3t5 for
-// `EntryAborted`/`RecvError`, s3t4 for `Finalized`); `Err(Elapsed)` had no
-// behavioral coverage, so `docs/relay-state-contract.md:41` — "Never use
-// `>= N`, another turn's ACK, timeout-as-success, blind skip, or blind
-// resend" — rested on nothing executable for the timeout case. Driving all
-// four against ONE anchor makes a changed production disposition RED on its
-// per-arm assertion. The expected-table invariant separately guarantees that
-// the table itself names exactly one acknowledgement before any arm runs.
+// `finish_idle_bridge_completion` accepts four completion dispositions, but
+// has a fifth outcome when `Finalized` arrives with OUR uncommitted durable
+// row: delivery validation returns `Err` and the prompt anchor must survive.
+// `s3t1`/`s3t5` pin `EntryAborted`/`RecvError`, `s3t4` pins the absent/foreign
+// `Finalized` acknowledgement, and `completion_timeout_is_not_an_ack...` pins
+// `Err(Elapsed)`. The matching-own-row `Finalized` outcome is exercised in
+// `bridge_completion::tests::tui_direct_bridge_completion_rejects_uncommitted_matching_inflight`;
+// its retained-anchor assertion kills X6 (clearing before delivery validation).
+// These checks keep the contract at `docs/relay-state-contract.md:41` — never
+// use timeout-as-success, blind skip, or blind resend — executable on each
+// completion path.
 #[cfg(unix)]
 #[test]
 fn completion_timeout_is_not_an_ack_and_preserves_anchor() {
@@ -3674,6 +3734,7 @@ fn idle_stream_commit_offset_only_on_successful_delivery() {
 fn bridge_adapter_inflight_marks_external_input_as_bridge_owned() {
     let output_path = PathBuf::from("/tmp/adk-bridge-adapter.jsonl");
     let lease = ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(42),
         turn_id: Some("external:codex:42:tmux:1".to_string()),
         session_key: Some("token:AgentDesk-codex-owner-split".to_string()),
@@ -3714,6 +3775,7 @@ fn drain_wait_does_not_block_on_own_synthetic_inflight() {
     // ExternalInput + same tmux session => our own => non-blocking.
     let output_path = PathBuf::from("/tmp/adk-selfblock.jsonl");
     let lease = ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(7),
         turn_id: Some("external:claude:7:tmux:1".to_string()),
         session_key: Some("token:AgentDesk-claude-self".to_string()),
@@ -3771,6 +3833,7 @@ fn drain_wait_does_not_block_on_own_synthetic_inflight() {
 fn synthetic_watcher_inflight_marks_existing_tui_turn_without_prompt_resubmit() {
     let output_path = PathBuf::from("/tmp/adk-tui-direct-watcher.jsonl");
     let lease = ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(42),
         turn_id: Some("external:codex:42:tmux:2".to_string()),
         session_key: Some("token:AgentDesk-codex-owner-split".to_string()),
@@ -3815,6 +3878,7 @@ fn synthetic_watcher_inflight_marks_existing_tui_turn_without_prompt_resubmit() 
 
 fn s1_lease_5833(turn_id: Option<&str>) -> ExternalInputRelayLease {
     ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(42),
         turn_id: turn_id.map(str::to_string),
         session_key: Some("token:AgentDesk-claude-s1".to_string()),
@@ -3868,6 +3932,7 @@ fn s5833_s1t1_synthetic_owns_durable_key_bridge_entry_is_read_only() {
     inflight::save_inflight_state(&synthetic).expect("save authoritative synthetic row");
     let before = inflight::load_inflight_state(&ProviderKind::Claude, 42).unwrap();
     bridge.started_at = before.started_at.clone();
+    bridge.turn_nonce = before.turn_nonce.clone();
     bridge.external_turn_id = Some("bridge-must-not-restamp-durable-key".into());
     assert!(matches!(
         inflight::patch_bridge_entry_state_if_identity_unchanged(
@@ -3977,11 +4042,9 @@ async fn s5833_r2_synthetic_refresh_preserves_existing_episode_key() {
         &ProviderKind::Claude,
         channel,
         tmux,
-        "prompt",
-        anchor,
+        ("prompt", anchor),
         &original_lease,
-        None,
-        None,
+        (None, None),
     )
     .await;
     assert!(initial.claimed);
@@ -4084,8 +4147,7 @@ fn s5833_r2_codex_repair_replaces_stale_durable_key() {
     assert_eq!(
         repair
             .lines()
-            .filter(|line| *line
-                == "                                repaired.restamp_external_turn_lease(&lease);")
+            .filter(|line| line.trim() == "repaired.restamp_external_turn_lease(&lease);")
             .count(),
         1
     );
@@ -4229,7 +4291,7 @@ fn s5833_s1t3_moved_builder_is_behaviour_identical() {
     );
     assert_eq!(state.user_msg_id, 101);
     assert_eq!(state.current_msg_id, 202);
-    assert_eq!(state.current_msg_len, "...".len());
+    assert_eq!(state.current_msg_len, "⠋ 계속 처리 중".len());
     assert_eq!(state.user_text, "typed in TUI");
     assert_eq!(state.session_id, None);
     assert_eq!(
@@ -4665,6 +4727,7 @@ fn external_turn_test_lease(
     tmux_session_name: &str,
 ) -> ExternalInputRelayLease {
     ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(channel_id.get()),
         turn_id: Some(format!(
             "external:claude:{}:{tmux_session_name}:test",
@@ -4765,6 +4828,7 @@ async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free(
     let prompt_text = "This session is being continued from a previous conversation that ran out of context.\n\
          Summary: compacted transcript body";
     let prompt = ObservedTuiPrompt {
+        hosted_source: None,
         provider: provider.as_str().to_string(),
         tmux_session_name: tmux.to_string(),
         prompt: prompt_text.to_string(),
@@ -4791,14 +4855,7 @@ async fn compact_continuation_injection_skips_synthetic_and_leaves_mailbox_free(
 
     let mut lease = external_turn_test_lease(channel_id, tmux);
     let deferred = synthetic_start_wiring::wire_tui_direct_synthetic_turn_start(
-        &shared,
-        provider.as_str(),
-        channel_id,
-        &prompt,
-        anchor_id,
-        false,
-        &decision,
-        &mut lease,
+        &shared, channel_id, &prompt, anchor_id, false, &decision, &mut lease,
     )
     .await;
     assert!(
@@ -4846,6 +4903,7 @@ async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
     let notification_anchor_id = MessageId::new(940_000_000_004_183);
     let placeholder_anchor_id = MessageId::new(940_000_000_004_283);
     let prompt = ObservedTuiPrompt {
+        hosted_source: None,
         provider: provider.as_str().to_string(),
         tmux_session_name: tmux.to_string(),
         prompt: "please review PR #1234".to_string(),
@@ -4890,7 +4948,6 @@ async fn genuine_tui_direct_typed_prompt_still_creates_synthetic_inflight() {
     let mut lease = external_turn_test_lease(channel_id, tmux);
     let deferred = synthetic_start_wiring::wire_tui_direct_synthetic_turn_start(
         &shared,
-        provider.as_str(),
         channel_id,
         &prompt,
         anchor_id,
@@ -5274,7 +5331,7 @@ fn claude_idle_transcript_scan_replays_full_prompt_after_mid_line_shrink() {
         .append(true)
         .open(&transcript)
         .expect("open partial transcript")
-        .write_all(prompt[split..].as_bytes())
+        .write_all(&prompt.as_bytes()[split..])
         .expect("finish prompt line");
 
     assert_eq!(
@@ -5978,6 +6035,7 @@ fn observed_lease_early_return_guard_clears_recorded_lease_on_drop() {
     let tmux = "AgentDesk-early-return-guard-clear";
     let channel_id = ChannelId::new(960_000_000_000_001);
     let lease = ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(channel_id.get()),
         turn_id: Some("external:claude:960000000000001:early:1".to_string()),
         session_key: Some("host:AgentDesk-early-return-guard-clear".to_string()),
@@ -6033,6 +6091,7 @@ fn observed_lease_early_return_guard_disarm_preserves_lease() {
     let tmux = "AgentDesk-early-return-guard-disarm";
     let channel_id = ChannelId::new(960_000_000_000_002);
     let lease = ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(channel_id.get()),
         turn_id: Some("external:claude:960000000000002:early:1".to_string()),
         session_key: Some("host:AgentDesk-early-return-guard-disarm".to_string()),
@@ -6080,6 +6139,7 @@ fn observed_lease_early_return_guard_does_not_clobber_newer_lease() {
     let tmux = "AgentDesk-early-return-guard-noclobber";
     let channel_id = ChannelId::new(960_000_000_000_003);
     let base = ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(channel_id.get()),
         turn_id: Some("external:claude:960000000000003:early:1".to_string()),
         session_key: Some("host:AgentDesk-early-return-guard-noclobber".to_string()),
@@ -6361,6 +6421,7 @@ fn contending_turn_identities_keep_exactly_one_relay_owner() {
 
     // Axis 3: both identities record into the ONE `(provider, tmux)` slot.
     let contending_lease = |turn_id: &str| ExternalInputRelayLease {
+        hosted_source: None,
         channel_id: Some(channel.get()),
         turn_id: Some(turn_id.to_string()),
         session_key: Some(format!("token:{tmux}")),
@@ -6424,7 +6485,13 @@ mod synthetic_terminal_ordering_tests;
 mod retired_pending_start_claim_tests;
 
 #[cfg(unix)]
-mod pending_start_input_fence_tests;
+mod pending_start_worker_claim_tests;
+
+#[cfg(unix)]
+mod herdr_synthetic_transition_tests;
+
+#[cfg(unix)]
+mod herdr_synthetic_claim_window_tests;
 
 #[cfg(unix)]
 mod relayerless_claim_tests {
@@ -6652,3 +6719,218 @@ mod fenced_admission_tests;
 
 #[cfg(unix)]
 mod codex_direct_owner_tests;
+
+#[cfg(unix)]
+async fn observed_prompt_note_on_wire(active_loop: bool) -> serde_json::Value {
+    use crate::services::discord::admin_host_guard::tests::Recorder;
+    let _root = crate::config::TestRuntimeRootGuard::new();
+    let _legacy = crate::services::tui_o::cutover::test_override::force_channels(&[]);
+    let api = if active_loop {
+        // A lost receipt ends the active path immediately after its real note POST.
+        Recorder::start_with(Arc::new(|_, _| {
+            Some(serde_json::json!({"receipt": "unreadable"}))
+        }))
+        .await
+    } else {
+        Recorder::start().await
+    };
+    let registry = Arc::new(super::super::health::HealthRegistry::new());
+    let mut shared = super::super::make_shared_data_for_tests_with_storage(None);
+    Arc::get_mut(&mut shared).unwrap().health_registry = Arc::downgrade(&registry);
+    let channel = ChannelId::new(if active_loop { 74_190_202 } else { 74_190_201 });
+    shared.settings.write().await.allowed_channel_ids = vec![channel.get()];
+    registry.register("claude".into(), shared.clone()).await;
+    let _http = super::super::shared_state::test_rest::install(api.http.clone());
+    let tmux = format!("p2-mentions-{}", uuid::Uuid::new_v4());
+    shared
+        .tmux_watchers
+        .restore_owner_channel_for_tmux_session(&tmux, channel);
+    let body = if active_loop {
+        "/loop @everyone @here <@&5678> <@1234> inspect relay"
+    } else {
+        "<local-command-stdout>@everyone @here <@&5678> <@1234> local result</local-command-stdout>"
+    };
+    let kind = if active_loop {
+        "/loop"
+    } else {
+        "local-command-stdout"
+    };
+    let rendered = format_slash_command_control_note(&tmux, kind, body);
+    assert!(rendered.contains("@everyone @here ‹@&5678› ‹@1234›"));
+    let prompt = local_control_prompt(&tmux, body, "p2-mentions-entry");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        relay_observed_prompt(&shared, prompt),
+    )
+    .await
+    .expect("observed prompt reaches its POST boundary");
+
+    if active_loop {
+        assert!(
+            super::super::inflight::load_inflight_state_read_only(
+                &ProviderKind::Claude,
+                channel.get()
+            )
+            .is_none(),
+            "the invalid receipt must return before creating the synthetic inflight"
+        );
+    }
+    let calls = api.take();
+    assert_eq!(calls.len(), 1, "one actual observed note POST: {calls:?}");
+    let prefix = format!("POST /api/v10/channels/{}/messages ", channel.get());
+    let body: serde_json::Value = serde_json::from_str(
+        calls[0]
+            .strip_prefix(&prefix)
+            .expect("actual observed note POST"),
+    )
+    .unwrap();
+    assert_eq!(body["content"], rendered);
+    body
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn local_stdout_note_p2_allowed_mentions_preserve_rendered_body() {
+    let body = observed_prompt_note_on_wire(false).await;
+    assert_eq!(
+        body["allowed_mentions"]["parse"],
+        serde_json::json!(["users"])
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn active_loop_note_p2_allowed_mentions_preserve_rendered_body() {
+    let body = observed_prompt_note_on_wire(true).await;
+    assert_eq!(
+        body["allowed_mentions"]["parse"],
+        serde_json::json!(["users"])
+    );
+}
+
+#[cfg(unix)]
+async fn synthetic_prompt_note_on_wire(route: u8) -> serde_json::Value {
+    use crate::services::discord::admin_host_guard::tests::Recorder;
+    let _root = crate::config::TestRuntimeRootGuard::new();
+    let api = Recorder::start().await;
+    let registry = Arc::new(super::super::health::HealthRegistry::new());
+    let mut shared = super::super::make_shared_data_for_tests_with_storage(None);
+    Arc::get_mut(&mut shared).unwrap().health_registry = Arc::downgrade(&registry);
+    let channel = ChannelId::new(74_190_210 + u64::from(route));
+    shared.settings.write().await.allowed_channel_ids = vec![channel.get()];
+    registry.register("claude".into(), shared.clone()).await;
+    let _http = super::super::shared_state::test_rest::install(api.http.clone());
+    let tmux = format!("p2-@everyone @here-{}", uuid::Uuid::new_v4());
+    let raw = match route {
+        0 => "/clear",
+        1 => "/loop @everyone @here <@&5678> <@1234> inspect relay",
+        2 => "@everyone @here <@&5678> <@1234> steering input",
+        _ => unreachable!(),
+    };
+    let mut prompt = local_control_prompt(&tmux, raw, "p2-synthetic-entry");
+    prompt.steer_echo = route == 2;
+    let rendered = if route == 2 {
+        format_ssh_direct_prompt_notification("claude", &tmux, raw)
+    } else {
+        format_slash_command_control_note(&tmux, if route == 0 { "/clear" } else { "/loop" }, raw)
+    };
+    let confirmed = (route == 1)
+        .then(|| crate::services::tui_o::turn_mode::TestConfirmation::new(channel.get()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        match route {
+            0 => {
+                synthetic_start_wiring::post_suppressed_injection_note(
+                    &api.http,
+                    channel,
+                    &prompt,
+                    InjectedPromptClass::SlashCommandControl,
+                    Some("/clear"),
+                )
+                .await
+            }
+            1 => {
+                let decision = relay_observed_prompt_injected_prompt_decision(raw);
+                let observation = task_notification_prompt::observe(
+                    &shared,
+                    &prompt,
+                    channel,
+                    decision.injected_class,
+                );
+                assert!(
+                    synthetic_start_wiring::post_passive_prompt_notice(
+                        &shared,
+                        &prompt,
+                        channel,
+                        &decision,
+                        observation
+                    )
+                    .await
+                    .is_none(),
+                    "the confirmed prompt must take the notice-only sender"
+                );
+            }
+            2 => synthetic_start_wiring::post_steer_echo(&shared, &prompt, channel).await,
+            _ => unreachable!(),
+        }
+    })
+    .await
+    .expect("synthetic note POST finishes");
+    drop(confirmed);
+    let calls = api.take();
+    assert_eq!(calls.len(), 1, "one actual synthetic note POST: {calls:?}");
+    let prefix = format!("POST /api/v10/channels/{}/messages ", channel.get());
+    let body: serde_json::Value = serde_json::from_str(
+        calls[0]
+            .strip_prefix(&prefix)
+            .expect("actual synthetic note POST"),
+    )
+    .unwrap();
+    assert_eq!(body["content"], rendered);
+    if route == 2 {
+        assert!(
+            body["content"]
+                .as_str()
+                .unwrap()
+                .contains("@\u{200b}everyone"),
+            "steer echo keeps its existing mention escape"
+        );
+    } else {
+        assert!(
+            body["content"]
+                .as_str()
+                .unwrap()
+                .contains("@everyone @here")
+        );
+    }
+    body
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn suppressed_prompt_note_p2_allowed_mentions_preserve_body() {
+    let body = synthetic_prompt_note_on_wire(0).await;
+    assert_eq!(
+        body["allowed_mentions"]["parse"],
+        serde_json::json!(["users"])
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn passive_loop_note_p2_allowed_mentions_preserve_body() {
+    let body = synthetic_prompt_note_on_wire(1).await;
+    assert_eq!(
+        body["allowed_mentions"]["parse"],
+        serde_json::json!(["users"])
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn steer_echo_note_p2_allowed_mentions_preserve_existing_escape() {
+    let body = synthetic_prompt_note_on_wire(2).await;
+    assert_eq!(
+        body["allowed_mentions"]["parse"],
+        serde_json::json!(["users"])
+    );
+}

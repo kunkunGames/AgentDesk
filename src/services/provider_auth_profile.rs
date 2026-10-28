@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::services::provider::ProviderKind;
 use crate::utils::format::expand_tilde_string as expand_tilde;
 
+#[cfg(all(test, unix))]
+mod direct_spawn_tests;
 pub mod fallback;
 
 pub const DEFAULT_PROFILE_ID: &str = "default";
@@ -538,24 +540,6 @@ pub fn extra_account_home(
         provider,
         profile_id,
     ))
-}
-
-/// Returns true only for the deterministic, AgentDesk-managed home assigned to
-/// this `(provider, profile_id)`.  This intentionally excludes imported or
-/// global homes: otherwise a config/API caller could turn a named account into
-/// an arbitrary credential-directory reader.
-pub fn is_managed_extra_account_home(
-    provider: &ProviderKind,
-    profile_id: &str,
-    home: &Path,
-) -> bool {
-    validate_managed_profile_home(
-        provider,
-        profile_id,
-        home,
-        ManagedHomeValidationMode::Catalog,
-    )
-    .is_ok()
 }
 
 pub fn extra_account_home_at(root: &Path, provider: &ProviderKind, profile_id: &str) -> PathBuf {

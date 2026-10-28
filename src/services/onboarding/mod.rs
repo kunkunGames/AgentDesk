@@ -1214,13 +1214,7 @@ mod credential_token_permission_tests {
 }
 
 fn onboarding_config_path(runtime_root: &Path) -> PathBuf {
-    let canonical = crate::runtime_layout::config_file_path(runtime_root);
-    let legacy = crate::runtime_layout::legacy_config_file_path(runtime_root);
-    if canonical.is_file() || !legacy.is_file() {
-        canonical
-    } else {
-        legacy
-    }
+    crate::config::config_path::config_path_in(runtime_root)
 }
 
 fn default_secondary_command_provider(primary_provider: &str) -> &'static str {
@@ -1747,7 +1741,6 @@ fn write_agentdesk_channel_bindings(
 ) -> Result<(), String> {
     let config_path = onboarding_config_path(runtime_root);
     let mut config = load_onboarding_config(runtime_root)?;
-
     for mapping in resolved_channels {
         let workspace = tilde_display_path(&runtime_root.join("workspaces").join(&mapping.role_id));
         let agent_index = if let Some(index) = config
@@ -1768,10 +1761,13 @@ fn write_agentdesk_channel_bindings(
                 voice: crate::config::AgentVoiceConfig::default(),
                 provider: provider.to_string(),
                 channels: crate::config::AgentChannels::default(),
+                peer_keywords: Vec::new(),
+                peer_directory: true,
                 keywords: Vec::new(),
                 department: None,
                 avatar_emoji: None,
                 preferred_intake_node_labels: None,
+                memory_group: None,
             });
             config.agents.len() - 1
         };
@@ -2300,6 +2296,15 @@ fn validate_complete_request(
             ));
         }
     };
+    for mapping in &body.channels {
+        if let Err(error) = crate::utils::input_validation::validate_agent_id(&mapping.role_id) {
+            return Err(bad_request(
+                rerun_policy,
+                explicit_rerun_policy,
+                error.to_string(),
+            ));
+        }
+    }
     let request_fingerprint = match requested_channel_fingerprint(body, provider) {
         Ok(fingerprint) => fingerprint,
         Err(error) => {
@@ -2575,7 +2580,11 @@ async fn complete_with_options(
     body: &CompleteBody,
     options: &CompleteExecutionOptions,
 ) -> (StatusCode, serde_json::Value) {
-    let body = &channel::apply_runtime_config_defaults(state, body);
+    let mut body = channel::apply_runtime_config_defaults(state, body);
+    for mapping in &mut body.channels {
+        mapping.role_id = mapping.role_id.trim().to_string();
+    }
+    let body = &body;
     let provider = body.provider.as_deref().unwrap_or("claude");
 
     let (rerun_policy, explicit_rerun_policy, request_fingerprint) =
@@ -2881,19 +2890,52 @@ async fn complete_with_options(
 }
 
 #[cfg(test)]
-mod canonical_status_tests {
+mod input_validation_tests {
     use super::*;
 
-    #[test]
-    fn new_agents_start_with_core_canonical_idle_status() {
-        let migration = include_str!("../../../migrations/postgres/0089_drop_agent_archive.sql");
-
-        assert_eq!(ONBOARDING_NEW_AGENT_STATUS, "idle");
-        assert!(
-            migration.contains("status IN ('idle', 'working')"),
-            "onboarding must use a status allowed by agents_status_known_check"
-        );
+    fn request(id: &str) -> CompleteBody {
+        serde_json::from_value(json!({
+            "token": "fixture",
+            "guild_id": "123",
+            "channels": [{"channel_id": "456", "channel_name": "test", "role_id": id}]
+        }))
+        .unwrap()
     }
+
+    #[test]
+    fn onboarding_rejects_unsafe_workspace_agent_ids_before_effects() {
+        for id in [
+            "",
+            ".",
+            "..",
+            "../bad",
+            "a/b",
+            "a\\b",
+            "a.b",
+            "a b",
+            "요리사",
+        ] {
+            assert!(
+                validate_complete_request(&request(id), "claude").is_err(),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn onboarding_preserves_existing_agent_id_formats() {
+        for id in ["project-agentdesk", "agent_2", "GPT-6_1", "123", "-", "_"] {
+            assert!(
+                validate_complete_request(&request(id), "claude").is_ok(),
+                "{id}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_status_tests {
+    mod migration_value_pg_tests;
 }
 
 // Provider check + AI prompt generation handlers moved to `provider` submodule.

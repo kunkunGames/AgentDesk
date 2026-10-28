@@ -1,5 +1,6 @@
 pub(crate) mod binding_context;
 pub(crate) mod binding_events;
+pub(crate) mod hosted_source;
 pub(crate) mod pending;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -21,6 +22,7 @@ use chrono::{DateTime, Utc};
 
 mod synthetic_prompt;
 use self::synthetic_prompt::{
+    is_codex_agents_md_prompt, is_environment_context_prompt,
     is_synthetic_tui_user_prompt_for_provider, reject_synthetic_claude_user_prompt,
     reject_synthetic_tui_user_prompt,
 };
@@ -71,6 +73,13 @@ static STATE: LazyLock<Mutex<TuiPromptDedupeState>> =
 // Tests that also mutate process env must acquire `shared_test_env_lock()` before
 // this lock. Keep that env -> dedupe order globally to avoid AB/BA deadlocks.
 pub(crate) static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+#[cfg(test)]
+pub(crate) fn run_serial_test(future: impl std::future::Future<Output = ()>) {
+    crate::test_support::serial_runtime::run(
+        || TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner()),
+        future,
+    );
+}
 static OBSERVED_PROMPTS: LazyLock<broadcast::Sender<ObservedTuiPrompt>> =
     LazyLock::new(|| broadcast::channel(OBSERVED_PROMPT_BUFFER).0);
 
@@ -125,6 +134,7 @@ pub struct ObservedTuiPrompt {
     pub(crate) native_turn_id: Option<String>,
     /// A steering input that joined its running native turn: its text is shown, nothing is owned.
     pub(crate) steer_echo: bool,
+    pub(crate) hosted_source: Option<hosted_source::HostedSourcePin>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +181,7 @@ pub(crate) struct ExternalInputRelayLease {
     /// captures the RECORDED lease (via the value returned from the record call)
     /// and clears only its OWN generation, so it can never clobber a newer lease.
     pub generation: u64,
+    pub hosted_source: Option<hosted_source::HostedSourcePin>,
 }
 
 impl ExternalInputRelayLease {
@@ -182,6 +193,7 @@ impl ExternalInputRelayLease {
             relay_owner: ExternalInputRelayOwner::Unassigned,
             runtime_kind: None,
             generation: EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+            hosted_source: None,
         }
     }
 }
@@ -330,7 +342,6 @@ impl PromptKey {
 mod extract;
 mod handoff;
 mod injected_steer;
-pub(crate) mod native_clear;
 mod observation;
 mod prompt_identity;
 mod runtime_binding;
@@ -341,7 +352,7 @@ mod state;
 pub(crate) use session_rotation::*;
 #[cfg(test)]
 pub(crate) use shadow_peek::hold_binding_peek_lock_for_tests;
-pub(crate) use shadow_peek::{peek_tmux_runtime_binding, try_peek_tmux_runtime_binding};
+pub(crate) use shadow_peek::peek_tmux_runtime_binding;
 
 #[cfg(test)]
 use extract::native_turn_is_open;
@@ -363,6 +374,8 @@ pub(crate) use handoff::{
 pub(crate) use handoff::{codex_replay_restored_handoff_inputs, codex_restore_has_custody};
 #[cfg(test)]
 pub(crate) use handoff::{durable_handoff_present_for_tests, held_handoff_inputs_for_tests};
+#[cfg(test)]
+pub(crate) use injected_steer::retain_injected_steer;
 use injected_steer::{Claim, InjectedSteer, claim_injected_steer};
 pub(crate) use injected_steer::{register_injected_steer, withdraw_injected_steer};
 use observation::clear_ssh_direct_observation_pending;
@@ -394,6 +407,9 @@ mod test_clock {
 
     // The shared state and Tokio workers must observe the same test clock.
     static OFFSET: Mutex<Duration> = Mutex::new(Duration::ZERO);
+    // Mimics a Windows host booted more recently than the instant being dated.
+    static BEFORE_BOOT_UNDATABLE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     fn offset() -> std::sync::MutexGuard<'static, Duration> {
         OFFSET.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -409,6 +425,12 @@ mod test_clock {
 
         pub(crate) fn reset() {
             *offset() = Duration::ZERO;
+            BEFORE_BOOT_UNDATABLE.store(false, Ordering::SeqCst);
+        }
+
+        /// Makes every `checked_sub` fail until the next `reset`.
+        pub(crate) fn refuse_dates_before_boot() {
+            BEFORE_BOOT_UNDATABLE.store(true, Ordering::SeqCst);
         }
 
         /// Moves the clock forward without restamping anything, so recorded entries age.
@@ -422,6 +444,13 @@ mod test_clock {
 
         pub(crate) fn duration_since(self, earlier: Self) -> Duration {
             self.0.duration_since(earlier.0)
+        }
+
+        pub(crate) fn checked_sub(self, by: Duration) -> Option<Self> {
+            if BEFORE_BOOT_UNDATABLE.load(Ordering::SeqCst) {
+                return None;
+            }
+            self.0.checked_sub(by).map(Self)
         }
     }
 

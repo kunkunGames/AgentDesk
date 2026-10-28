@@ -1,6 +1,7 @@
 //! Durable, revision-fenced campaign DAGs on the canonical PostgreSQL pool.
 //! This ledger records checkpoints; it does not dispatch or replay work.
 //! [`handoff`] publishes prepared finite batches; the service owns file handoff.
+//! Callers write node state; github-sync also makes linked nodes follow their issue (`issue_sync`).
 pub(crate) mod graph;
 pub(crate) mod handoff;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -70,6 +71,9 @@ pub struct NodeInput {
     pub summary: Option<String>,
     #[serde(default)]
     pub benefit: Option<String>,
+    /// Work left after merge (deploy, observation); while set, a closed issue does not complete the node.
+    #[serde(default)]
+    pub post_merge_hold: Option<String>,
     #[serde(default)]
     pub details: String,
     #[serde(default)]
@@ -94,11 +98,50 @@ pub struct CampaignInput {
     pub auto_queue: Option<bool>,
 }
 
+/// Server-owned node fields are absent from `NodeInput`, so a whole-document PUT
+/// can neither drop nor forge them; `checkpoint` carries them over.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Node {
     #[serde(flatten)]
     pub input: NodeInput,
     pub updated_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_closed_from: Option<AutoClosedFrom>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_drift: Option<IssueDrift>,
+}
+
+/// What github-sync replaced when the linked issue closed, so a reopen can put it back.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AutoClosedFrom {
+    pub status: NodeStatus,
+    pub stage: String,
+    pub updated_at: DateTime<Utc>,
+    pub to_status: NodeStatus,
+    pub to_stage: String,
+    pub issue_url: String,
+    /// Identifies the closing, so a node a person reopened is not closed again for it.
+    pub issue_closed_at: Option<DateTime<Utc>>,
+    pub synced_at: DateTime<Utc>,
+    /// A later write changed status or stage; stays set even if the values come back.
+    #[serde(default)]
+    pub manually_changed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftReason {
+    /// Saved as completed while the linked issue is open.
+    OpenIssue,
+    /// The issue reopened after an automatic close, but a person had changed the node.
+    ChangedAfterAutoClose,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct IssueDrift {
+    pub issue_url: String,
+    pub reason: DriftReason,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -162,6 +205,16 @@ pub fn validate(input: &CampaignInput) -> Result<(), CampaignError> {
         validate_id(&node.id)?;
         if ids.insert(node.id.as_str(), index).is_some() {
             return Err(invalid(format!("duplicate node id: {}", node.id)));
+        }
+        if node
+            .post_merge_hold
+            .as_ref()
+            .is_some_and(|hold| hold.len() > 512)
+        {
+            return Err(invalid(format!(
+                "node {} post_merge_hold exceeds 512 bytes",
+                node.id
+            )));
         }
         if node.title.trim().is_empty()
             || node.title.len() > 512
@@ -228,14 +281,45 @@ pub fn validate(input: &CampaignInput) -> Result<(), CampaignError> {
     Ok(())
 }
 
+fn trimmed(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// The issue a node links to, as one comparable identity.
+pub(crate) fn issue_identity(issue_url: Option<&str>) -> Option<(String, i64)> {
+    issue_url
+        .and_then(issue_ref)
+        .map(|(repo, number)| (repo.to_lowercase(), number))
+}
+
+/// Carries the server-owned fields of `old` onto its resubmitted `input`. A changed issue
+/// link drops them; a changed status or stage marks the automatic close as overridden.
+fn carry_server_fields(
+    old: &Node,
+    input: &NodeInput,
+) -> (Option<AutoClosedFrom>, Option<IssueDrift>) {
+    if issue_identity(old.input.issue_url.as_deref()) != issue_identity(input.issue_url.as_deref())
+    {
+        return (None, None);
+    }
+    let auto_closed_from = old.auto_closed_from.clone().map(|mut auto| {
+        auto.manually_changed |= old.input.status != input.status || old.input.stage != input.stage;
+        auto
+    });
+    let issue_drift = old
+        .issue_drift
+        .clone()
+        .filter(|_| matches!(input.status, NodeStatus::Completed | NodeStatus::Skipped));
+    (auto_closed_from, issue_drift)
+}
+
 fn checkpoint(id: String, mut input: CampaignInput, previous: Option<&Campaign>) -> Campaign {
     for node in &mut input.nodes {
-        node.group = node
-            .group
-            .as_deref()
-            .map(str::trim)
-            .filter(|group| !group.is_empty())
-            .map(str::to_owned);
+        node.group = trimmed(node.group.as_deref());
+        node.post_merge_hold = trimmed(node.post_merge_hold.as_deref());
     }
     let now = Utc::now();
     let previous_nodes: HashMap<_, _> = previous
@@ -257,11 +341,18 @@ fn checkpoint(id: String, mut input: CampaignInput, previous: Option<&Campaign>)
             .nodes
             .into_iter()
             .map(|input| {
-                let updated_at = previous_nodes
-                    .get(input.id.as_str())
+                let old = previous_nodes.get(input.id.as_str());
+                let updated_at = old
                     .filter(|old| old.input == input)
                     .map_or(now, |old| old.updated_at);
-                Node { input, updated_at }
+                let (auto_closed_from, issue_drift) =
+                    old.map_or((None, None), |old| carry_server_fields(old, &input));
+                Node {
+                    input,
+                    updated_at,
+                    auto_closed_from,
+                    issue_drift,
+                }
             })
             .collect(),
         created_at: previous.map_or(now, |p| p.created_at),
@@ -540,9 +631,31 @@ async fn replace_checkpoint_on_tx(
         return Err(CampaignError::Conflict);
     }
     let campaign = checkpoint(id.to_owned(), input, Some(&previous));
+    store_revision_with_prune(tx, expected_revision, &campaign, prune_history).await?;
+    Ok(campaign)
+}
+
+/// Writes `campaign` over the locked row still at `expected_revision`, with its history snapshot.
+async fn store_revision(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    expected_revision: i64,
+    campaign: &Campaign,
+) -> Result<(), CampaignError> {
+    store_revision_with_prune(tx, expected_revision, campaign, true).await
+}
+
+/// The shared write; `prune_history = false` retains every historical snapshot
+/// for automatic occurrence retirement.
+async fn store_revision_with_prune(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    expected_revision: i64,
+    campaign: &Campaign,
+    prune_history: bool,
+) -> Result<(), CampaignError> {
+    let id = campaign.id.as_str();
     let affected = sqlx::query(
         "UPDATE campaigns SET revision = $2, document = $3, updated_at = $4 WHERE id = $1 AND revision = $5")
-        .bind(id).bind(campaign.revision).bind(Json(&campaign)).bind(campaign.updated_at)
+        .bind(id).bind(campaign.revision).bind(Json(campaign)).bind(campaign.updated_at)
         .bind(expected_revision).execute(&mut **tx).await?.rows_affected();
     if affected != 1 {
         return Err(CampaignError::Conflict);
@@ -552,14 +665,16 @@ async fn replace_checkpoint_on_tx(
     )
     .bind(id)
     .bind(campaign.revision)
-    .bind(Json(&campaign))
+    .bind(Json(campaign))
     .execute(&mut **tx)
     .await?;
     if prune_history {
         prune_revisions(tx, id).await?;
     }
-    Ok(campaign)
+    Ok(())
 }
+
+pub mod issue_sync;
 
 #[cfg(test)]
 mod tests;

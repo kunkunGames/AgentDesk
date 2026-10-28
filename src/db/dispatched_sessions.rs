@@ -1,15 +1,22 @@
 use serde_json::json;
 use sqlx::{PgPool, Row};
 
-use crate::db::agents::resolve_agent_channel_for_provider_pg;
+use crate::db::auto_queue::run_owner_guard as owner_guard;
 use crate::db::session_agent_resolution::{
     normalize_thread_channel_id, parse_thread_channel_id_from_session_key,
 };
 use crate::services::discord::session_identity::tmux_name_from_session_key;
 use crate::services::session_activity::SessionActivityResolver;
 
+#[path = "dispatched_sessions/force_kill.rs"]
+mod force_kill;
 #[path = "dispatched_sessions/hosted_execution.rs"]
 pub(crate) mod hosted_execution;
+#[cfg(unix)]
+pub(crate) use force_kill::{
+    ForceKillHosted, load_force_kill_session_hosted_pg, prepare_force_kill_retry_pg,
+};
+pub(crate) use force_kill::{disconnect_session_and_prepare_retry_pg, load_force_kill_session_pg};
 #[path = "dispatched_sessions/thread_gc.rs"]
 mod thread_gc;
 pub use thread_gc::gc_stale_thread_sessions_pg;
@@ -52,86 +59,6 @@ pub(crate) struct RetryDispatchMeta {
     pub(crate) title: Option<String>,
     pub(crate) context: Option<String>,
     pub(crate) retry_count: i64,
-}
-
-pub(crate) async fn load_force_kill_session_pg(
-    pool: &PgPool,
-    session_key: &str,
-    provider_name: Option<&str>,
-) -> Result<
-    Option<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )>,
-    String,
-> {
-    let resolved_session_key =
-        resolve_session_locator_pg(pool, session_key, "force-kill session").await?;
-    let Some(resolved_session_key) = resolved_session_key else {
-        return Ok(None);
-    };
-    let row = sqlx::query(
-        "SELECT active_dispatch_id, agent_id, thread_channel_id, provider, instance_id
-         FROM sessions
-         WHERE session_key = $1",
-    )
-    .bind(&resolved_session_key)
-    .fetch_optional(pool)
-    .await
-    .map_err(|error| {
-        format!(
-            "load postgres session {session_key}: {}",
-            crate::utils::redact::redact_known_secrets(&error.to_string())
-        )
-    })?;
-
-    let Some(row) = row else {
-        return Ok(None);
-    };
-
-    let active_dispatch_id: Option<String> = row
-        .try_get("active_dispatch_id")
-        .map_err(|error| format!("decode active_dispatch_id for {session_key}: {error}"))?;
-    let agent_id: Option<String> = row
-        .try_get("agent_id")
-        .map_err(|error| format!("decode agent_id for {session_key}: {error}"))?;
-    let thread_channel_id: Option<String> = row
-        .try_get("thread_channel_id")
-        .map_err(|error| format!("decode thread_channel_id for {session_key}: {error}"))?;
-    let session_provider: Option<String> = row
-        .try_get("provider")
-        .map_err(|error| format!("decode provider for {session_key}: {error}"))?;
-    let instance_id: Option<String> = row
-        .try_get("instance_id")
-        .map_err(|error| format!("decode instance_id for {session_key}: {error}"))?;
-
-    let effective_provider = provider_name.or(session_provider.as_deref());
-    let runtime_channel_id =
-        if let Some(channel_id) = normalize_thread_channel_id(thread_channel_id.as_deref()) {
-            Some(channel_id)
-        } else if let Some(agent_id) = agent_id.as_deref() {
-            resolve_agent_channel_for_provider_pg(pool, agent_id, effective_provider)
-            .await
-            .map_err(|error| {
-                format!(
-                    "resolve postgres channel for session {session_key} / agent {agent_id}: {error}"
-                )
-            })?
-            .and_then(|channel| normalize_thread_channel_id(Some(channel.as_str())))
-        } else {
-            None
-        };
-
-    Ok(Some((
-        active_dispatch_id,
-        agent_id,
-        runtime_channel_id,
-        session_provider,
-        instance_id,
-    )))
 }
 
 /// #3306: narrow durable-truth accessor for the idle-relay drift self-heal.
@@ -343,108 +270,6 @@ pub(crate) async fn rebind_session_provider_by_id_pg(
     .await
     .map(|result| result.rows_affected())
     .map_err(|error| format!("rebind session #{session_id} provider binding: {error}"))
-}
-
-pub(crate) async fn disconnect_session_and_prepare_retry_pg(
-    pool: &PgPool,
-    session_key: &str,
-    active_dispatch_id: Option<&str>,
-    retry: bool,
-) -> Result<Option<RetryDispatchMeta>, String> {
-    // Session disconnect is independently durable. Dispatch failure still
-    // goes through the canonical pipeline, either standalone or in the retry
-    // transaction, and terminal dispatches remain authoritative.
-    {
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|error| format!("begin postgres force-kill transaction: {error}"))?;
-
-        sqlx::query(
-            "UPDATE sessions
-             SET status = 'disconnected',
-                 active_dispatch_id = NULL
-             WHERE session_key = $1",
-        )
-        .bind(session_key)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| format!("disconnect postgres session {session_key}: {error}"))?;
-
-        tx.commit()
-            .await
-            .map_err(|error| format!("commit postgres force-kill transaction: {error}"))?;
-    }
-
-    let mut retry_meta = None;
-    if let Some(dispatch_id) = active_dispatch_id {
-        let current_status = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT status
-             FROM task_dispatches
-             WHERE id = $1",
-        )
-        .bind(dispatch_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|error| format!("load postgres dispatch status {dispatch_id}: {error}"))?
-        .flatten();
-
-        let current_status_str = current_status.as_deref();
-        // Terminal states: never overwrite. `cancelled` in particular must
-        // remain `cancelled`; rewriting it to `failed` would corrupt
-        // incident metrics (Finding 4).
-        let is_terminal = matches!(
-            current_status_str,
-            Some("completed") | Some("cancelled") | Some("failed")
-        );
-
-        if retry && !is_terminal {
-            retry_meta = sqlx::query(
-                "SELECT
-                    kanban_card_id,
-                    to_agent_id,
-                    dispatch_type,
-                    title,
-                    context,
-                    COALESCE(retry_count, 0)::BIGINT AS retry_count
-                 FROM task_dispatches
-                 WHERE id = $1",
-            )
-            .bind(dispatch_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|error| format!("load postgres retry metadata {dispatch_id}: {error}"))?
-            .map(|row| {
-                Ok(RetryDispatchMeta {
-                    origin_dispatch_id: dispatch_id.to_string(),
-                    card_id: row.try_get("kanban_card_id")?,
-                    to_agent_id: row.try_get("to_agent_id")?,
-                    dispatch_type: row.try_get("dispatch_type")?,
-                    title: row.try_get("title")?,
-                    context: row.try_get("context")?,
-                    retry_count: row.try_get("retry_count")?,
-                })
-            })
-            .transpose()
-            .map_err(|error: sqlx::Error| {
-                format!("decode postgres retry metadata {dispatch_id}: {error}")
-            })?;
-        } else if !is_terminal {
-            let changed =
-                fail_force_killed_dispatch_without_retry_pg(pool, dispatch_id, Some(session_key))
-                    .await?;
-            if changed == 0 {
-                return Ok(None);
-            }
-        }
-
-        // Retry-capable force-kill defers d1 failure to the replacement
-        // transaction. If that transaction dies before commit, d1 failure is
-        // rolled back too; the session disconnect above is already committed.
-        // A normal returned error is handled by the standalone fallback.
-    }
-
-    Ok(retry_meta)
 }
 
 pub(crate) async fn fail_force_killed_dispatch_without_retry_pg(
@@ -666,6 +491,17 @@ pub(crate) async fn create_retry_dispatch_pg(
         })?;
 
     let owner_before_failed_sync = prepare_retry_owner_on_pg_tx(&mut tx, meta).await?;
+    // Without an entry owner the copied context run is locked here, before the origin row.
+    let locked_owner_run = owner_before_failed_sync
+        .as_ref()
+        .map(|owner| owner.run_id.clone());
+    let locked_owner_run = locked_owner_run.as_deref();
+    owner_guard::guard_context_owner_publication_on_pg_tx(
+        &mut tx,
+        meta.context.as_deref(),
+        locked_owner_run,
+    )
+    .await?;
     let reason = json!({"reason": "force_kill_session", "retry": true});
     let mut deferred_observability = Vec::new();
     let changed = crate::dispatch::set_dispatch_status_on_pg_tx_async(
@@ -717,32 +553,18 @@ pub(crate) async fn create_retry_dispatch_pg(
         }
     }
 
-    sqlx::query(
-        "INSERT INTO task_dispatches (
-            id,
-            kanban_card_id,
-            to_agent_id,
-            dispatch_type,
-            status,
-            title,
-            context,
-            retry_count,
-            created_at,
-            updated_at
-        ) VALUES (
-            $1, $2, $3, $4, 'pending', $5, $6, $7, NOW(), NOW()
-        )",
-    )
-    .bind(&dispatch_id)
-    .bind(&meta.card_id)
-    .bind(meta.to_agent_id.as_deref())
-    .bind(dispatch_type)
-    .bind(title)
-    .bind(meta.context.as_deref().unwrap_or("{}"))
-    .bind(meta.retry_count + 1)
-    .execute(&mut *tx)
-    .await
-    .map_err(|error| format!("insert postgres retry dispatch {dispatch_id}: {error}"))?;
+    let row = owner_guard::NewRetryDispatchRow {
+        id: &dispatch_id,
+        kanban_card_id: &meta.card_id,
+        to_agent_id: meta.to_agent_id.as_deref(),
+        dispatch_type,
+        title,
+        context: meta.context.as_deref().unwrap_or("{}"),
+        retry_count: meta.retry_count + 1,
+    };
+    owner_guard::insert_retry_dispatch_row_on_pg_tx(&mut tx, &row, locked_owner_run)
+        .await
+        .map_err(|error| format!("insert postgres retry dispatch {dispatch_id}: {error}"))?;
 
     sqlx::query(
         "INSERT INTO dispatch_events (
@@ -1566,36 +1388,8 @@ mod selector_cleanup_tests {
         .expect("upsert selector session"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] mod selector_cleanup_tests
     }
 
-    // #4979 S6: session-authority PG tests live below `*_pg_tests` so
-    // `just test-postgres` selects them through its `_pg` filter. That filter
-    // is a substring match on the whole test path, not a module-scope rule —
-    // seven of these tests already carried `_pg` in their own fn names and so
-    // were selected before the move; the module marker is what now covers the
-    // rest.
-    //
-    // Two edits could undo this, and they are protected very differently.
-    // Measured rc, not inferred:
-    //
-    //   1. Renaming the module away from the marker (`…_pg_tests` →
-    //      `…_tests`), keeping the `#[cfg(test)]`:
-    //        membership rc=1  (PG test-lane manifest drift)
-    //        coverage   rc=1  (2 newly uncovered modules)
-    //      Regenerating the manifest silences membership — new rule1/rule2 debt
-    //      is warn-only during the #5071 T0 rollout — but coverage still fails,
-    //      because the renamed nested module becomes a *new* uncovered module
-    //      rather than folding back into the parent. So the marker is well
-    //      guarded; the coverage gate is the signal that survives a regen.
-    //
-    //   2. Removing the nested `#[cfg(test)]` alone:
-    //        membership rc=0, coverage rc=0
-    //      This is harmless for lane selection — the path still contains the
-    //      marker — and the gates stay green because the tests fold back into
-    //      the parent, which `test_lane_coverage_baseline.txt` already carries
-    //      as uncovered debt. So unlike the sibling slices (#5088 S3, #5092 S5)
-    //      where the parent is genuinely covered, this attribute is NOT
-    //      load-bearing here; it is defence-in-depth for when that parent debt
-    //      is repaid. Do not copy a "removing this breaks the gate" claim out
-    //      of this file without checking whether the parent is baselined.
+    // Session-authority tests backed by PostgreSQL; native non-PG runs leave them out because
+    // their bodies reach a PG fixture.
     #[cfg(test)]
     mod session_authority_pg_tests {
         use super::*;

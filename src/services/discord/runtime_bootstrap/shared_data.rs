@@ -4,15 +4,12 @@ use super::*;
 /// builder. Field names match the original arguments so the builder body stays
 /// explicit at the ownership boundary.
 pub(super) struct RuntimeServices {
-    pub(super) home_availability: Option<home_availability::Registration>,
     pub(super) initial_skills: Vec<(String, String)>,
     pub(super) token_hash: String,
     pub(super) api_port: u16,
     pub(super) voice_barge_in: Arc<voice_barge_in::VoiceBargeInRuntime>,
     pub(super) health_registry: Arc<health::HealthRegistry>,
     pub(super) pg_pool: Option<sqlx::PgPool>,
-    pub(super) intake_delivery_capabilities:
-        Arc<intake_delivery_capability::SettlementCapabilityCache>,
     pub(super) engine: Option<crate::engine::PolicyEngine>,
 }
 
@@ -66,14 +63,12 @@ pub(super) fn run_bot_build_shared_data(
     // #3479 Item 3: destructure the grouped params back into the original
     // variable names so the construction body below is byte-identical.
     let RuntimeServices {
-        home_availability,
         initial_skills,
         token_hash,
         api_port,
         voice_barge_in,
         health_registry,
         pg_pool,
-        intake_delivery_capabilities,
         engine,
     } = services;
     let ProcessLifecycleCounters {
@@ -103,7 +98,6 @@ pub(super) fn run_bot_build_shared_data(
             active_meetings: HashMap::new(),
         }),
         mailboxes: ChannelMailboxRegistry::default(),
-        queue_park_ledger: Default::default(),
         session_transition_locks: dashmap::DashMap::new(),
         settings: tokio::sync::RwLock::new(bot_settings),
         api_timestamps: dashmap::DashMap::new(),
@@ -123,7 +117,7 @@ pub(super) fn run_bot_build_shared_data(
                 crate::services::discord::placeholder_controller::PlaceholderController::default(),
             ),
             placeholder_live_events: Arc::new(
-                crate::services::discord::placeholder_live_events::PlaceholderLiveEvents::default(),
+                crate::services::discord::placeholder_live_events::PlaceholderLiveEvents::with_tool_activity_display(crate::config::load_graceful().placeholder.tool_activity_display),
             ),
             placeholder_live_events_enabled,
             status_panel_v2_enabled,
@@ -159,7 +153,7 @@ pub(super) fn run_bot_build_shared_data(
         // `Instant::now` ↔ `TurnFinalizer::spawn` ↔ `broadcast::channel`) is
         // preserved.
         restart: RestartLifecycle {
-            _home_availability: home_availability,
+            replay_restart: std::sync::OnceLock::new(),
             recovering_channels: dashmap::DashMap::new(),
             shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             intake_worker_lifecycle:
@@ -257,7 +251,6 @@ pub(super) fn run_bot_build_shared_data(
         provider: provider.clone(),
         api_port,
         pg_pool,
-        intake_delivery_capabilities,
         policy: PolicyRuntime { engine },
         health_registry: Arc::downgrade(&health_registry),
         known_slash_commands: tokio::sync::OnceCell::new(),

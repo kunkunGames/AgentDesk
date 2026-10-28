@@ -3,12 +3,12 @@ use std::str::FromStr;
 use sqlx::Connection;
 
 use super::gateway_lease_recovery::{
-    GATEWAY_LEASE_APPLICATION_PREFIX, GatewayLeaseHolder, PromotionHandoffOutcome,
-    STANDBY_PROMOTION_IN_PROGRESS, TerminalProof, attempt_clean_standby_promotion,
-    follow_promotion_handoff_chain, gateway_holder_is_reapable, gateway_lease_application_name_for,
-    reap_orphaned_gateway_lease_for_instance_with_min_age, recover_cancelled_promotion,
-    restart_artifact_proof, restart_file_nonce, restart_request_artifact_path, terminal_proof,
-    try_create_restart_marker, wait_for_promotion_handoff,
+    GatewayLeaseHolder, PromotionHandoffOutcome, STANDBY_PROMOTION_IN_PROGRESS, TerminalProof,
+    attempt_clean_standby_promotion, follow_promotion_handoff_chain, gateway_holder_is_reapable,
+    gateway_lease_application_name_for, reap_orphaned_gateway_lease_for_instance_with_min_age,
+    recover_cancelled_promotion, restart_artifact_proof, restart_file_nonce,
+    restart_request_artifact_path, terminal_proof, try_create_restart_marker,
+    wait_for_promotion_handoff,
 };
 use crate::services::discord::ProviderKind;
 
@@ -1173,7 +1173,7 @@ async fn activation_facts_use_the_configured_home_id_and_local_starts_hold_pg() 
     std::fs::write(pending.join("claude_6470011_1.json"), record.to_string()).unwrap();
     assert_eq!(
         host.local_custody(own, Claude),
-        Ok(Custody::Active),
+        Ok(Custody::PendingStart),
         "a durable pending start holds over the row"
     );
 
@@ -1189,3 +1189,67 @@ async fn activation_facts_use_the_configured_home_id_and_local_starts_hold_pg() 
     pool.close().await;
     fixture.drop().await;
 }
+
+/// A cancelled promotion's preflight and a deferred rollback leave the runtime's writer as it was:
+/// the same generation runs and still takes work.
+#[tokio::test]
+async fn promotion_cancel_keeps_the_writer_incarnation_pg() {
+    use super::shutdown::home_lifecycle_tests::{eventually, hosted};
+    use crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui;
+    const CH: u64 = 9_300_000_000_000_111;
+    let _flag = PROMOTION_FLAG_LOCK.lock().await;
+    STANDBY_PROMOTION_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+    let label = "promotion cancel keeps the writer pg";
+    let Some(fixture) = PromotionFixture::new(label).await else {
+        return;
+    };
+    let _candidates =
+        crate::services::tui_o::cutover::test_override::force_candidates(&[(CH, ClaudeTui)]);
+    let hosted = hosted(&[CH], &[]);
+    let generation = hosted.handles[0].generation();
+    let mut writers: Vec<_> = hosted
+        .handles
+        .into_iter()
+        .map(|writer| (writer.generation(), writer.into_detached()))
+        .collect();
+    assert!(
+        eventually(20, || hosted.ready.accepts(CH)).await,
+        "the writer takes work"
+    );
+    let incarnation = || (hosted.ready.hosted_by(CH), hosted.ready.accepts(CH));
+    let before = incarnation();
+    assert_eq!(before.0, Some(generation));
+    let existing_nonce = "deploy-cancelled-writer";
+    let marker = format!("nonce={existing_nonce}\nsource=deploy\n");
+    std::fs::write(fixture.root.path().join("restart_pending"), &marker).unwrap();
+    let cancelled = format!("restart_cancelled.{existing_nonce}");
+    std::fs::write(fixture.root.path().join(cancelled), &marker).unwrap();
+
+    let promoted = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        attempt_clean_standby_promotion(
+            &fixture.shared(),
+            &ProviderKind::Claude,
+            fixture.lease(label).await,
+        ),
+    )
+    .await
+    .expect("cancelled promotion handoff resolves");
+    assert!(!promoted);
+    fixture.assert_recovered();
+    assert_eq!(
+        incarnation(),
+        before,
+        "a cancelled promotion keeps the writer"
+    );
+    super::deferred_restart::rollback_deferred_restart(&fixture.shared());
+    assert_eq!(incarnation(), before, "a deferred rollback keeps it too");
+    for (_, writer) in writers.drain(..) {
+        writer.abort();
+        let _ = writer.await;
+    }
+    fixture.close(label).await;
+}
+
+#[path = "o_writer_host_custody_tests.rs"]
+mod codex_custody;

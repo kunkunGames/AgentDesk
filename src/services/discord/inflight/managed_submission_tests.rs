@@ -1,14 +1,10 @@
 #![cfg(unix)]
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use super::fault::{FenceWriteFault, arm};
 use super::*;
 use crate::services::claude_tui::host_input::{SpyGuard, SpyState};
-use crate::services::claude_tui::input::{
-    send_followup_prompt_or_idle_transcript, send_fresh_prompt,
-};
+use crate::services::claude_tui::input::submission::tests::ScriptedTmux;
+use crate::services::claude_tui::input::{send_fresh_prompt, send_warm_followup};
 use crate::services::claude_tui::submission_fence;
 use crate::services::provider::CancelToken;
 use crate::services::turn_host::HerdrRefusal;
@@ -23,7 +19,7 @@ fn ready_pane() -> String {
     )
 }
 
-fn managed_row(channel: u64) -> (InflightTurnState, ManagedSubmission) {
+pub(super) fn managed_row(channel: u64) -> (InflightTurnState, ManagedSubmission) {
     let mut state = InflightTurnState::new(
         ProviderKind::Claude,
         channel,
@@ -45,7 +41,7 @@ fn managed_row(channel: u64) -> (InflightTurnState, ManagedSubmission) {
     (state, submission)
 }
 
-fn durable_phase(channel: u64) -> Option<SubmissionPhase> {
+pub(super) fn durable_phase(channel: u64) -> Option<SubmissionPhase> {
     super::super::load_inflight_state(&ProviderKind::Claude, channel)
         .expect("row survives")
         .managed_submission
@@ -85,60 +81,65 @@ fn cg_b2c_guarded_owner_rearms_pending_after_an_applied_input() {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Entry {
+pub(super) enum Entry {
     Fresh,
     Warm,
 }
 
-fn submit(
-    entry: Entry,
-    channel: u64,
-    prompt: &str,
-    transcript: &std::path::Path,
-) -> Result<(), String> {
+fn submit(entry: Entry, channel: u64, prompt: &str) -> Result<(), String> {
     let session = format!("AgentDesk-claude-zp1-{channel}");
     let token = CancelToken::new();
     match entry {
         Entry::Fresh => send_fresh_prompt(&session, prompt, Some(&token)),
-        Entry::Warm => {
-            send_followup_prompt_or_idle_transcript(&session, prompt, Some(&token), transcript)
-        }
+        Entry::Warm => send_warm_followup(&session, prompt, Some(&token)),
     }
 }
 
-struct Run {
-    result: Result<(), String>,
-    /// Each pane write with the durable phase read just before it.
-    sends: Vec<(String, Option<SubmissionPhase>)>,
+pub(super) struct Run {
+    pub(super) result: Result<(), String>,
+    /// Each pane write with the durable managed phase it met.
+    pub(super) sends: Vec<(String, String)>,
 }
 
-/// Drives the real input entry through the host spy inside `submission`'s scope.
-fn run(
+/// Drives the real input entry inside `submission`'s scope: readiness reads the host spy, and
+/// the managed attempt types into a scripted `tmux` showing `screen`.
+fn run_on(
+    entry: Entry,
+    channel: u64,
+    prompt: &str,
+    submission: &ManagedSubmission,
+    fail_send: Option<usize>,
+    screen: &str,
+) -> Run {
+    let spy = SpyGuard::install(SpyState {
+        captures: std::iter::repeat_n(Some(ready_pane()), 24).collect(),
+        ..SpyState::default()
+    });
+    let tmux = ScriptedTmux::new(screen);
+    let root = super::super::inflight_runtime_root().unwrap();
+    tmux.witness(&inflight_state_path(&root, &ProviderKind::Claude, channel));
+    if let Some(n) = fail_send {
+        tmux.fail_send(n);
+    }
+    let result =
+        submission_fence::with_scope(Some(submission.fence()), || submit(entry, channel, prompt));
+    assert!(
+        !spy.calls().iter().any(|call| is_payload_or_enter(call)),
+        "the managed attempt types only after its one pre-read: {:?}",
+        spy.calls()
+    );
+    let sends = tmux.sends().into_iter().zip(tmux.phases()).collect();
+    Run { result, sends }
+}
+
+pub(super) fn run(
     entry: Entry,
     channel: u64,
     prompt: &str,
     submission: &ManagedSubmission,
     fail_send: Option<usize>,
 ) -> Run {
-    let dir = tempfile::tempdir().unwrap();
-    let transcript = dir.path().join("session.jsonl");
-    std::fs::write(&transcript, "{\"type\":\"result\"}\n").unwrap();
-    let sends = Rc::new(RefCell::new(Vec::new()));
-    let seen = sends.clone();
-    let _spy = SpyGuard::install(SpyState {
-        captures: std::iter::repeat_n(Some(ready_pane()), 24).collect(),
-        fail_send: fail_send.map(|at| (at, Err("cut: provider process lost".to_string()))),
-        on_send: Some(Box::new(move |call: &str| {
-            seen.borrow_mut()
-                .push((call.to_string(), durable_phase(channel)));
-        })),
-        ..SpyState::default()
-    });
-    let result = submission_fence::with_scope(Some(submission.fence()), || {
-        submit(entry, channel, prompt, &transcript)
-    });
-    let sends = sends.borrow().clone();
-    Run { result, sends }
+    run_on(entry, channel, prompt, submission, fail_send, &ready_pane())
 }
 
 fn is_payload_or_enter(call: &str) -> bool {
@@ -156,16 +157,16 @@ fn the_first_host_payload_already_sees_may_have_submitted_at_every_cut() {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let chunked = "x".repeat(2_000);
-    // (label, prompt, index of Enter among the sends)
     let plans = [
-        ("literal", "single line prompt".to_string(), 1),
-        ("chunked literal", chunked, 2),
-        ("paste", "first line\nsecond line".to_string(), 2),
+        ("single line", "single line prompt".to_string()),
+        ("long line", chunked),
+        ("multiline", "first line\nsecond line".to_string()),
     ];
     let mut channel = 6_801_000;
     for entry in [Entry::Fresh, Entry::Warm] {
-        for (label, prompt, enter_at) in &plans {
-            for cut in [Some(0), Some(1), Some(*enter_at), None] {
+        for (label, prompt) in &plans {
+            // The writes are load, paste and Enter; a cut fails one of them.
+            for cut in [Some(0), Some(1), Some(2), None] {
                 channel += 1;
                 let (_, submission) = managed_row(channel);
                 assert_eq!(durable_phase(channel), Some(SubmissionPhase::Waiting));
@@ -173,17 +174,11 @@ fn the_first_host_payload_already_sees_may_have_submitted_at_every_cut() {
                 let case = format!("{entry:?} {label} cut={cut:?}");
                 let first = run
                     .sends
-                    .iter()
-                    .find(|(call, _)| is_payload_or_enter(call))
+                    .first()
                     .unwrap_or_else(|| panic!("{case}: no payload reached the host"));
-                assert!(
-                    first.0.starts_with("literal:") || first.0.starts_with("load:"),
-                    "{case}: first host write {:?}",
-                    first.0
-                );
+                assert_eq!(first.0, "load", "{case}: first host write");
                 assert_eq!(
-                    first.1,
-                    Some(SubmissionPhase::MayHaveSubmitted),
+                    first.1, "may_have_submitted",
                     "{case}: the fence must be durable before the first payload"
                 );
                 assert_eq!(
@@ -217,7 +212,8 @@ fn a_refused_fence_write_holds_every_payload_and_late_input() {
             let (_, control) = managed_row(channel);
             let ran = run(entry, channel, prompt, &control, None);
             assert_eq!(ran.result, Ok(()), "{entry:?} control");
-            assert!(ran.sends.iter().any(|(call, _)| is_payload_or_enter(call)));
+            let keys: Vec<&str> = ran.sends.iter().map(|(key, _)| key.as_str()).collect();
+            assert_eq!(keys, ["load", "paste", "Enter"], "{entry:?} control");
             assert!(matches!(
                 control.classify_failure(),
                 SubmissionFailure::SubmissionIndeterminate
@@ -230,7 +226,7 @@ fn a_refused_fence_write_holds_every_payload_and_late_input() {
                 arm(channel, fault);
                 let refused = run(entry, channel, prompt, &submission, None);
                 let error = refused.result.expect_err(&case);
-                assert!(error.contains("held before submit"), "{case}: {error}");
+                assert!(error.contains("SubmissionFence"), "{case}: {error}");
                 assert!(
                     refused.sends.is_empty(),
                     "{case}: no load, paste, literal or Enter may reach the pane: {:?}",
@@ -386,39 +382,24 @@ fn legacy_and_unmanaged_routes_stay_unknown() {
     }
 }
 
-/// A composer that stops being ready between the readiness wait and the mutation fails before
-/// the fence, so the row stays Waiting: Waiting keeps meaning "no payload was allowed".
+/// A menu at the one pre-read refuses before the fence, so the row stays Waiting: Waiting keeps
+/// meaning "no payload was allowed".
 #[test]
-fn a_composer_change_after_readiness_fails_before_the_fence() {
+fn a_menu_at_the_pre_read_fails_before_the_fence() {
     let _root = crate::config::TestRuntimeRootGuard::new();
     let _dedupe = crate::services::tui_prompt_dedupe::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let draft = format!(
-        "\n\n{RULE}\n\u{276f} [User: ann (ID: 7)] 남은 초안 한글\n{RULE}\n  ⏵⏵ bypass permissions on"
+    let menu = format!(
+        "Do you want to proceed?\n\u{276f} 1. Yes\n  2. No\nEnter to select · Esc to cancel\n{}",
+        ready_pane()
     );
     for (index, entry) in [Entry::Fresh, Entry::Warm].into_iter().enumerate() {
         let channel = 6_805_001 + index as u64;
         let (_, submission) = managed_row(channel);
-        let dir = tempfile::tempdir().unwrap();
-        let transcript = dir.path().join("session.jsonl");
-        std::fs::write(&transcript, "{\"type\":\"result\"}\n").unwrap();
-        let spy = SpyGuard::install(SpyState {
-            captures: [Some(ready_pane()), Some(ready_pane())]
-                .into_iter()
-                .chain(std::iter::repeat_n(Some(draft.clone()), 8))
-                .collect(),
-            ..SpyState::default()
-        });
-        let result = submission_fence::with_scope(Some(submission.fence()), || {
-            submit(entry, channel, "hello", &transcript)
-        });
-        assert!(result.is_err(), "{entry:?}: {result:?}");
-        assert!(
-            !spy.calls().iter().any(|call| is_payload_or_enter(call)),
-            "{entry:?}: {:?}",
-            spy.calls()
-        );
+        let ran = run_on(entry, channel, "hello", &submission, None, &menu);
+        assert!(ran.result.is_err(), "{entry:?}: {:?}", ran.result);
+        assert!(ran.sends.is_empty(), "{entry:?}: {:?}", ran.sends);
         assert_eq!(
             durable_phase(channel),
             Some(SubmissionPhase::Waiting),
@@ -434,7 +415,7 @@ fn a_composer_change_after_readiness_fails_before_the_fence() {
 #[test]
 fn cg_d1_off_restart_keeps_durable_may_have_submitted_and_refuses_resend() {
     let _root = crate::config::TestRuntimeRootGuard::new();
-    let _boot = crate::config::session_hosts::force_with_claude_guard_for_test(None, &[], &[]);
+    let _boot = crate::config::session_hosts::force_for_test(None, &[]);
     let _dedupe = crate::services::tui_prompt_dedupe::TEST_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -445,17 +426,21 @@ fn cg_d1_off_restart_keeps_durable_may_have_submitted_and_refuses_resend() {
     let row = super::super::load_inflight_state(&ProviderKind::Claude, channel).unwrap();
     let birth = InflightEpisodePin::from_state(&row);
     let restarted = ManagedSubmission(Arc::new(Attempt {
+        native_session_id: row.session_id.clone(),
         provider: ProviderKind::Claude,
         channel_id: channel,
         birth,
         target: row.tmux_session_name.clone().unwrap(),
         gate: Mutex::new(Gate::Open),
         guarded: Mutex::new(GuardedState::Dormant),
+        evidence: Mutex::new(evidence::Evidence::default()),
     }));
-    let session = row.tmux_session_name.as_deref().unwrap();
-    assert!(crate::services::claude_tui::guarded_outcome::held(session).is_none());
-    let result = run(Entry::Fresh, channel, "managed prompt", &restarted, None);
-    assert!(result.result.unwrap_err().contains("held before submit"));
+    // The row already left Waiting, so the restarted attempt is never admitted to type.
+    let result = crate::services::claude_tui::guarded_outcome::with_owner(
+        Some(restarted.observer()),
+        || run(Entry::Fresh, channel, "managed prompt", &restarted, None),
+    );
+    assert!(result.result.unwrap_err().contains("IdentityMismatch"));
     assert!(
         result.sends.is_empty(),
         "the durable fence prevents OFF from resending"
@@ -466,7 +451,9 @@ fn cg_d1_off_restart_keeps_durable_may_have_submitted_and_refuses_resend() {
     );
     assert!(matches!(
         restarted.classify_failure(),
-        SubmissionFailure::PreSubmitPersistenceRefused(_)
+        SubmissionFailure::GuardedStopped(
+            crate::services::claude_tui::host_input::InputRun::Refused(_)
+        )
     ));
     assert_eq!(
         InflightEpisodePin::from_state(
@@ -474,4 +461,186 @@ fn cg_d1_off_restart_keeps_durable_may_have_submitted_and_refuses_resend() {
         ),
         InflightEpisodePin::from_state(&row)
     );
+}
+
+#[test]
+fn a2_transient_admission_hold_clears_only_at_an_accepted_payload_fence() {
+    use crate::services::claude_tui::guarded_outcome;
+    use crate::services::claude_tui::input::PreparationHold;
+    use crate::services::tui_prompt_dedupe::{self, TuiRuntimeBinding};
+    use std::io::Write;
+    let _root = crate::config::TestRuntimeRootGuard::new();
+    let (mut row, _) = managed_row(7_314_292);
+    row.session_id = Some("native-warm-sid".into());
+    let cap = install_managed_submission_boundary(&mut row, &TurnHost::Tmux).unwrap();
+    super::super::clear_inflight_state(&ProviderKind::Claude, row.channel_id);
+    super::super::save_inflight_state_create_new(&row).unwrap();
+    let session = row.tmux_session_name.as_deref().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("warm.jsonl");
+    std::fs::write(&path, "").unwrap();
+    tui_prompt_dedupe::register_tmux_runtime_binding(
+        session,
+        TuiRuntimeBinding {
+            runtime_kind: RuntimeHandoffKind::ClaudeTui,
+            output_path: path.display().to_string(),
+            relay_output_path: None,
+            input_fifo_path: None,
+            session_id: None,
+            last_offset: 0,
+            relay_last_offset: None,
+        },
+    );
+    cap.observer().preparation_held(&PreparationHold::before(
+        session,
+        "cleanup_not_owned",
+        "transient cleanup refusal".into(),
+    ));
+    assert!(cap.preparation_hold().is_some());
+    guarded_outcome::with_owner(Some(cap.observer()), || {
+        guarded_outcome::receipt(session, &row.user_text)
+    });
+    cap.fence().before_first_payload().unwrap();
+    assert!(
+        cap.preparation_hold().is_none(),
+        "an accepted fence supersedes only a before-payload refusal"
+    );
+    writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}",
+        serde_json::json!({"type":"user", "sessionId":row.session_id, "message":{"content":row.user_text}})).unwrap();
+    let (sender, _rx) = std::sync::mpsc::channel();
+    crate::services::claude::emit_claude_tui_watcher_handoff(
+        &sender,
+        path.to_str().unwrap(),
+        session,
+        &path,
+    );
+    cap.observer().receipt_finished(session);
+    assert!(
+        cap.exact_user_receipt(),
+        "warm binding without SID uses the attempt native SID"
+    );
+    cap.observer()
+        .preparation_held(&PreparationHold::uncertain(session, "lost ACK".into()));
+    cap.fence().before_first_payload().unwrap();
+    assert!(
+        cap.preparation_hold().is_some_and(|h| !h.may_requeue()),
+        "an uncertain send remains sticky"
+    );
+    tui_prompt_dedupe::clear_tmux_runtime_binding(session);
+}
+
+#[test]
+fn a2_resolved_fresh_sid_survives_nested_receipt_recapture() {
+    use crate::services::claude_tui::guarded_outcome;
+    use crate::services::tui_prompt_dedupe::{self, TuiRuntimeBinding};
+    use std::io::Write;
+    let _root = crate::config::TestRuntimeRootGuard::new();
+    let (mut row, _) = managed_row(7_314_293);
+    row.session_id = Some("previous-session-sid".into());
+    let cap = install_managed_submission_boundary(&mut row, &TurnHost::Tmux).unwrap();
+    super::super::clear_inflight_state(&ProviderKind::Claude, row.channel_id);
+    super::super::save_inflight_state_create_new(&row).unwrap();
+    let session = row.tmux_session_name.as_deref().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fresh-native.jsonl");
+    std::fs::write(&path, "").unwrap();
+    tui_prompt_dedupe::register_tmux_runtime_binding(
+        session,
+        TuiRuntimeBinding {
+            runtime_kind: RuntimeHandoffKind::ClaudeTui,
+            output_path: path.display().to_string(),
+            relay_output_path: None,
+            input_fifo_path: None,
+            session_id: Some("resolved-fresh-sid".into()),
+            last_offset: 0,
+            relay_last_offset: None,
+        },
+    );
+    guarded_outcome::with_owner(Some(cap.observer()), || {
+        guarded_outcome::fresh_receipt(
+            session,
+            &row.user_text,
+            path.to_str().unwrap(),
+            "resolved-fresh-sid",
+        );
+        guarded_outcome::capture_preparation(|| {
+            guarded_outcome::receipt(session, &row.user_text);
+            cap.fence().before_first_payload().unwrap();
+            writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}",
+                serde_json::json!({"type":"user", "sessionId":"resolved-fresh-sid", "message":{"content":row.user_text}})).unwrap();
+            Ok(())
+        })
+        .unwrap();
+    });
+    let (sender, _rx) = std::sync::mpsc::channel();
+    crate::services::claude::emit_claude_tui_watcher_handoff(
+        &sender,
+        path.to_str().unwrap(),
+        session,
+        &path,
+    );
+    cap.observer().receipt_finished(session);
+    assert!(
+        cap.exact_user_receipt(),
+        "resolved fresh SID survives nested adapters and an older inflight SID"
+    );
+    tui_prompt_dedupe::clear_tmux_runtime_binding(session);
+}
+
+#[test]
+fn a2_fresh_launch_receipt_survives_stale_binding_until_real_handoff() {
+    use crate::services::claude_tui::guarded_outcome;
+    use crate::services::tui_prompt_dedupe::{self, TuiRuntimeBinding};
+    let _root = crate::config::TestRuntimeRootGuard::new();
+    for (index, old_sid) in [None, Some("old-sid".to_string())].into_iter().enumerate() {
+        let (row, cap) = managed_row(7_314_294 + index as u64);
+        let session = row.tmux_session_name.as_deref().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("previous.jsonl");
+        let new = dir.path().join("launch.jsonl");
+        std::fs::write(&old, "previous transcript\n").unwrap();
+        tui_prompt_dedupe::register_tmux_runtime_binding(
+            session,
+            TuiRuntimeBinding {
+                runtime_kind: RuntimeHandoffKind::ClaudeTui,
+                output_path: old.display().to_string(),
+                relay_output_path: None,
+                input_fifo_path: None,
+                session_id: old_sid.clone(),
+                last_offset: 0,
+                relay_last_offset: None,
+            },
+        );
+        guarded_outcome::with_owner(Some(cap.observer()), || {
+            guarded_outcome::fresh_receipt(
+                session,
+                &row.user_text,
+                new.to_str().unwrap(),
+                "launch-sid",
+            );
+            guarded_outcome::capture_preparation(|| {
+                // Repeat all submission snapshots while the old binding is still live.
+                for _ in 0..3 {
+                    guarded_outcome::receipt(session, &row.user_text);
+                }
+                Ok(())
+            })
+            .unwrap();
+            cap.fence().before_first_payload().unwrap();
+            std::fs::write(&new, serde_json::json!({"type":"user", "sessionId":"launch-sid", "message":{"content":row.user_text}}).to_string()+"\n").unwrap();
+            let (sender, _rx) = std::sync::mpsc::channel();
+            crate::services::claude::emit_claude_tui_watcher_handoff(
+                &sender,
+                new.to_str().unwrap(),
+                session,
+                &new,
+            );
+            cap.observer().receipt_finished(session);
+            assert!(
+                cap.exact_user_receipt(),
+                "fresh launch transcript must survive stale binding recapture: old_sid={old_sid:?}"
+            );
+        });
+        tui_prompt_dedupe::clear_tmux_runtime_binding(session);
+    }
 }

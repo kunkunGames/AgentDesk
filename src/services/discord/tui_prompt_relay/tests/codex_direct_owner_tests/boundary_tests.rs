@@ -52,6 +52,7 @@ fn token_count_line() -> String {
 /// Codex's Stop hook for `turn` on the live hook broadcast the rollout tail reads.
 fn publish_stop(tmux: &str, turn: &str) {
     crate::services::claude_tui::hook_server::publish_hook_event_for_tests(HookEvent {
+        original_context: None,
         provider: "codex".to_string(),
         session_id: tmux.to_string(),
         kind: HookEventKind::Stop,
@@ -108,7 +109,7 @@ impl Fixture {
         automatic: bool,
     ) -> Self {
         enable_session_bound_delivery();
-        // The observer announces direct input through the notify utility bot.
+        // The channel provider owns automatic input notices.
         let registry = Arc::new(crate::services::discord::health::HealthRegistry::new());
         Arc::get_mut(&mut shared)
             .expect("fresh shared")
@@ -142,6 +143,7 @@ impl Fixture {
             )
             .await;
         let rest = crate::services::discord::shared_state::test_rest::install(http.clone());
+        registry.register("codex".into(), shared.clone()).await;
         let observed = crate::services::tui_prompt_dedupe::subscribe_observed_prompts();
         // The PG entry test uses production's callback; other scenarios relay observations explicitly.
         let (hooks, hook_rx) = tokio::sync::broadcast::channel(64);
@@ -186,6 +188,7 @@ impl Fixture {
     fn send_hook(&self, prompt: &str, turn: &str) {
         self.hooks
             .send(HookEvent {
+                original_context: None,
                 provider: "codex".to_string(),
                 session_id: self.codex.tmux.clone(),
                 kind: HookEventKind::UserPromptSubmit,
@@ -302,14 +305,30 @@ impl Fixture {
     }
 
     fn completed_turns(&mut self) -> usize {
-        let mut turns = 0;
-        while let Ok(signal) = self.finalized.try_recv() {
-            if matches!(signal, inflight::InflightSignal::Completed { channel_id, .. } if channel_id == self.codex.channel.get())
-            {
-                turns += 1;
-            }
-        }
-        turns
+        completion_wait_tests::drain(&mut self.finalized, self.codex.channel.get()).len()
+    }
+
+    /// HTTP precedes finalization; each owning bridge turn must finish before the settle drain.
+    async fn wait_completed_turns(&mut self, turn_ids: &[u64]) -> usize {
+        let tmux = self.codex.tmux.clone();
+        let settle = async move {
+            let visits = poll_notes(&tmux, PollNote::Visit);
+            assert!(
+                wait_for(Duration::from_secs(10), || poll_notes(
+                    &tmux,
+                    PollNote::Visit
+                ) >= visits + 2)
+                .await,
+                "the idle loop stopped during the completion settle window"
+            );
+        };
+        completion_wait_tests::wait(
+            &mut self.finalized,
+            self.codex.channel.get(),
+            turn_ids,
+            settle,
+        )
+        .await
     }
 
     /// The answer only edits `anchor` (streaming edits included) and its last edit's JSON
@@ -408,7 +427,7 @@ impl Fixture {
                 "answers keep input order"
             );
         }
-        assert_eq!(self.completed_turns(), answers.len());
+        assert_eq!(self.wait_completed_turns(&anchors).await, answers.len());
         if let Some(tails) = tails {
             assert_eq!(tail_starts(self.codex.channel), tails, "one tail per input");
         }
@@ -531,6 +550,10 @@ async fn cursor_past_prompt(root: PathBuf, channel: u64, tmux: &str, answer_firs
     fx.append(&after);
     fx.scanned_past(prompt_end).await;
     super::super::super::relay_observed_prompt(&fx.shared, event).await;
+    let input = fx.sent(PROMPT);
+    assert_eq!(input.len(), 1, "one active input mirror");
+    let content: serde_json::Value = serde_json::from_str(&input[0].2).unwrap();
+    assert_eq!(content["content"], format!("-# ⌨️ {PROMPT}"));
     let anchor = fx
         .codex
         .row()
@@ -546,7 +569,11 @@ async fn cursor_past_prompt(root: PathBuf, channel: u64, tmux: &str, answer_firs
     );
     tokio::time::sleep(Duration::from_secs(2)).await;
     fx.assert_answer(RESPONSE, anchor);
-    assert_eq!(fx.completed_turns(), 1, "one bridge turn delivers");
+    assert_eq!(
+        fx.wait_completed_turns(&[anchor]).await,
+        1,
+        "one bridge turn delivers"
+    );
     assert_eq!(tail_starts(fx.codex.channel), 1, "one tail");
     fx.assert_released().await;
     fx.assert_cursor_follows_eof().await;
@@ -654,7 +681,7 @@ fn codex_direct_answer_keeps_its_boundary_when_a_discord_prompt_lands_first() {
             );
             tokio::time::sleep(Duration::from_secs(2)).await;
             fx.assert_answer(RESPONSE, anchor);
-            assert_eq!(fx.completed_turns(), 1);
+            assert_eq!(fx.wait_completed_turns(&[anchor]).await, 1);
             assert_eq!(
                 tail_starts(fx.codex.channel),
                 1,
@@ -967,7 +994,7 @@ fn codex_direct_answer_keeps_its_boundary_behind_a_burst_of_later_inputs() {
             );
             tokio::time::sleep(Duration::from_secs(2)).await;
             fx.assert_answer(RESPONSE, anchor);
-            assert_eq!(fx.completed_turns(), 1);
+            assert_eq!(fx.wait_completed_turns(&[anchor]).await, 1);
             assert_eq!(tail_starts(fx.codex.channel), 1);
             fx.assert_released().await;
             fx.finish();
@@ -1209,6 +1236,8 @@ fn codex_direct_deferred_input_restored_under_a_later_lease_keeps_its_boundary()
     });
 }
 
+/// Completion identity and the final settle drain shared by direct-input fixtures.
+mod completion_wait_tests;
 /// A TUI input typed while a Discord prompt is handed to Codex, across a restart too.
 mod handoff_tests;
 /// Answers ending around a Stop hook, a queued shell turn, or a Discord turn's steer.
@@ -1279,7 +1308,7 @@ fn codex_6903_discovery_keeps_live_input_out_of_bootstrap_history() {
             fx.polls(3).await;
             assert_eq!(fx.sent("LIVE_DISCOVERY_6903_ANSWER").len(), 1);
             fx.assert_answer("LIVE_DISCOVERY_6903_ANSWER", anchor);
-            assert_eq!(fx.completed_turns(), 1);
+            assert_eq!(fx.wait_completed_turns(&[anchor]).await, 1);
             assert_eq!(tail_starts(fx.codex.channel), 1);
             while let Ok(event) = fx.observed.try_recv() {
                 assert!(
@@ -1287,6 +1316,92 @@ fn codex_6903_discovery_keeps_live_input_out_of_bootstrap_history() {
                         || event.prompt != "LIVE_DISCOVERY_6903"
                 );
             }
+            fx.finish();
+        })
+    });
+}
+
+#[test]
+fn notify_prompt_entrypoints_use_the_channel_provider_and_preserve_direct_text() {
+    run(|root| {
+        Box::pin(async move {
+            let channel = 7_228_800_101;
+            let tmux = "AgentDesk-codex-notify-inline";
+            let fx = Fixture::start(&root, channel, tmux).await;
+            let (notify_requests, notify_http, _notify_server) = recording_discord(channel).await;
+            fx._registry
+                .set_utility_bot_http_for_tests(
+                    crate::services::discord::bot_role::UtilityBotRole::Notify,
+                    notify_http,
+                )
+                .await;
+            let _confirmed = crate::services::tui_o::turn_mode::TestConfirmation::new(channel);
+            let cases = [
+                (
+                    "first **bold**\nsecond\nthird",
+                    false,
+                    "-# ⌨️ ",
+                    Some("-# ⌨️ first \\*\\*bold\\*\\*\n-# second\n-# third"),
+                ),
+                (
+                    "steer `now`\nmore",
+                    true,
+                    "-# ⌨️ ",
+                    Some("-# ⌨️ steer \\`now\\`\n-# more"),
+                ),
+                ("/loop 5m inspect\nnext", false, "-# 🔁 ", None),
+                ("/compact", false, "-# 🧹 ", None),
+                ("<command-name>/clear</command-name>", false, "-# ⚙️ ", None),
+                (
+                    "This session is being continued from a previous conversation. Summary: hidden",
+                    false,
+                    "-# 🧩 ",
+                    None,
+                ),
+            ];
+            for (i, (text, steer, prefix, expected)) in cases.into_iter().enumerate() {
+                let mut prompt =
+                    super::super::local_control_prompt(tmux, text, &format!("inline-{i}"));
+                prompt.provider = "codex".into();
+                prompt.steer_echo = steer;
+                let before = fx.requests.lock().unwrap().len();
+                super::super::super::relay_observed_prompt(&fx.shared, prompt).await;
+                let posts = fx.requests.lock().unwrap()[before..]
+                    .iter()
+                    .filter(|(method, path, _)| method == "POST" && path.ends_with("/messages"))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    posts.len(),
+                    1,
+                    "the real prompt entrypoint posts one provider notice: {text}"
+                );
+                let wire: serde_json::Value = serde_json::from_str(&posts[0].2).unwrap();
+                let content = wire["content"].as_str().unwrap();
+                assert!(
+                    content.starts_with(prefix),
+                    "old prompt header returned: {content:?}"
+                );
+                if prefix == "-# ⌨️ " {
+                    assert!(content.lines().all(|line| line.starts_with("-# ")));
+                    assert!(!crate::services::discord::session_notice::is_inline(
+                        content
+                    ));
+                } else {
+                    assert!(crate::services::discord::session_notice::is_inline(content));
+                }
+                if let Some(expected) = expected {
+                    assert_eq!(content, expected);
+                }
+                assert!(
+                    notify_requests.lock().unwrap().is_empty(),
+                    "notify fallback selected"
+                );
+            }
+            assert!(
+                fx.codex.row().is_none(),
+                "passive and control notices create no inflight"
+            );
             fx.finish();
         })
     });

@@ -5,39 +5,84 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
 use super::deliver::{ChannelWriter, Step};
-use super::pieces::{Derived, OwedWork};
+use super::pieces::{Derived, OwedWork, TOOL_CALL_CARD};
 use super::rotation::Owe;
 use super::rotation::provenance::origin;
 use super::{AlarmSink, DeliveryLease, DiscordPort};
 use crate::services::tui_o::shadow::identity::{RecordFact, classify};
-use crate::services::tui_o::shadow::{CapturedRecord, ShadowProvider, SourceId, UnitKey};
+use crate::services::tui_o::shadow::{CapturedRecord, ShadowProvider, SourceId, UnitKey, UnitKind};
 use crate::services::tui_o::store::codex_provenance::Sidecar;
 use crate::services::tui_o::store::ledger::{LedgerState, PieceOutcome};
 use crate::services::tui_o::store::spool::{SpoolFrame, source_key};
 use crate::services::tui_o::store::{ChannelStore, StoreError};
 use crate::services::tui_prompt_dedupe::codex_verified::provenance::admission;
 
+type Coordinate = (SourceId, Range<u64>);
+
 pub(crate) struct OwedLog {
+    #[cfg(test)]
+    replay_metadata: Option<ReplayMetadata>,
+    replay_deferred: bool,
     channel: u64,
     provider: ShadowProvider,
     pub work: Vec<OwedWork>,
     /// Every source and range a unit key was owed from, a repeat that derived nothing included.
-    pub associations: BTreeMap<UnitKey, Vec<(SourceId, Range<u64>)>>,
+    pub associations: BTreeMap<UnitKey, Vec<Coordinate>>,
+    pending_card_members: Vec<UnitKey>,
+    card_members: BTreeMap<UnitKey, Vec<UnitKey>>,
 }
 
 impl OwedLog {
     pub(crate) fn new(channel: u64, provider: ShadowProvider) -> Self {
         let (work, associations) = (Vec::new(), BTreeMap::new());
         Self {
+            #[cfg(test)]
+            replay_metadata: None,
+            replay_deferred: false,
             channel,
             provider,
             work,
             associations,
+            pending_card_members: Vec::new(),
+            card_members: BTreeMap::new(),
         }
+    }
+
+    fn card_coordinates(&self, key: &UnitKey) -> Vec<Coordinate> {
+        let Some(members) = self.card_members.get(key) else {
+            return Vec::new();
+        };
+        let coordinates: Option<Vec<_>> = members
+            .iter()
+            .map(|member| {
+                let candidates = self.associations.get(member)?;
+                let first = candidates.first()?;
+                candidates
+                    .iter()
+                    .all(|candidate| candidate == first)
+                    .then(|| first.clone())
+            })
+            .collect();
+        coordinates.unwrap_or_default()
     }
 }
 
 impl Owe for OwedLog {
+    fn finish_replay(&mut self, ledger: &LedgerState) -> super::ReplaySummary {
+        #[cfg(test)]
+        {
+            self.replay_metadata = Some(ReplayMetadata {
+                associations: self.associations.clone(),
+                cards: self.card_members.clone(),
+                pending: self.pending_card_members.clone(),
+            });
+        }
+        let summary =
+            super::replay::filter(ledger, |keep| self.work.retain(|work| keep(&work.derived)));
+        self.replay_deferred = summary.deferred;
+        summary
+    }
+
     fn owe(&mut self, source: &SourceId, record: &CapturedRecord, derived: Vec<Derived>) {
         let range = record.start..record.end;
         let value = serde_json::from_slice(&record.line).unwrap_or_default();
@@ -54,13 +99,64 @@ impl Owe for OwedLog {
                 self.associations.entry(key).or_default().push(association);
             }
         }
-        self.work
-            .extend(derived.into_iter().map(|derived| OwedWork {
+        for derived in derived {
+            if let Derived::Excluded { unit_key, reason } = &derived
+                && unit_key.kind == UnitKind::Tool
+                && reason == TOOL_CALL_CARD
+            {
+                self.pending_card_members.push(unit_key.clone());
+            }
+            if let Some(key) = card_key(&derived) {
+                let mut members = std::mem::take(&mut self.pending_card_members);
+                if !members.last().is_some_and(|member| {
+                    member.channel_id == key.channel_id
+                        && member.provider == key.provider
+                        && key.native_key.strip_suffix("#card") == Some(member.native_key.as_str())
+                }) {
+                    members.clear();
+                }
+                self.card_members.insert(key.clone(), members);
+            }
+            // A closing prompt or another source cannot lend its origin to earlier tools.
+            let (source, range) = card_key(&derived)
+                .and_then(|key| self.card_coordinates(key).last().cloned())
+                .unwrap_or_else(|| (source.clone(), range.clone()));
+            self.work.push(OwedWork {
                 derived,
-                source: source.clone(),
-                range: range.clone(),
+                source,
+                range,
                 origin: None,
-            }));
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+struct ReplayMetadata {
+    associations: BTreeMap<UnitKey, Vec<Coordinate>>,
+    cards: BTreeMap<UnitKey, Vec<UnitKey>>,
+    pending: Vec<UnitKey>,
+}
+
+impl OwedLog {
+    pub(super) fn refilter_after_open(
+        &mut self,
+        ledger: &LedgerState,
+    ) -> Option<super::ReplaySummary> {
+        super::replay::after_open(&mut self.replay_deferred, ledger)
+            .then(|| self.finish_replay(ledger))
+    }
+}
+
+fn card_key(derived: &Derived) -> Option<&UnitKey> {
+    match derived {
+        Derived::Piece(piece)
+            if piece.unit_key.kind == UnitKind::Tool
+                && piece.unit_key.native_key.ends_with("#card") =>
+        {
+            Some(&piece.unit_key)
+        }
+        _ => None,
     }
 }
 
@@ -78,11 +174,23 @@ thread_local! {
     pub(crate) static PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Reads the sidecar, then each work's source spool once, matching records to work by their
-/// original coordinates; origins change only after every source was read.
+#[cfg(test)]
 pub(crate) fn reevaluate(
     store: &mut ChannelStore,
     work: &mut [OwedWork],
+) -> Result<Reevaluation, StoreError> {
+    let coordinates = work
+        .iter()
+        .map(|item| vec![(item.source.clone(), item.range.clone())])
+        .collect::<Vec<_>>();
+    reevaluate_at(store, work, &coordinates)
+}
+
+/// Every required native record must share one closed span; an empty set remains Unknown.
+fn reevaluate_at(
+    store: &mut ChannelStore,
+    work: &mut [OwedWork],
+    coordinates: &[Vec<Coordinate>],
 ) -> Result<Reevaluation, StoreError> {
     let snapshot = match store.codex_provenance() {
         Sidecar::Present(snapshot) => snapshot,
@@ -90,35 +198,44 @@ pub(crate) fn reevaluate(
         Sidecar::Unavailable(reason) => return Ok(demote(work, Reevaluation::Unavailable(reason))),
     };
     // Sources in the order work first names them, each with its ranges indexed to work.
-    let mut by_source: Vec<(SourceId, HashMap<(u64, u64), Vec<usize>>)> = Vec::new();
-    for (at, item) in work.iter().enumerate() {
-        let slot = match by_source
-            .iter()
-            .position(|(source, _)| *source == item.source)
-        {
-            Some(slot) => slot,
-            None => {
-                by_source.push((item.source.clone(), HashMap::new()));
-                by_source.len() - 1
-            }
-        };
-        let range = (item.range.start, item.range.end);
-        by_source[slot].1.entry(range).or_default().push(at);
+    type WorkByRange = HashMap<(u64, u64), Vec<(usize, usize)>>;
+    let mut by_source: Vec<(SourceId, WorkByRange)> = Vec::new();
+    for (at, members) in coordinates.iter().enumerate() {
+        for (member, (source, range)) in members.iter().enumerate() {
+            let slot = match by_source
+                .iter()
+                .position(|(candidate, _)| candidate == source)
+            {
+                Some(slot) => slot,
+                None => {
+                    by_source.push((source.clone(), HashMap::new()));
+                    by_source.len() - 1
+                }
+            };
+            by_source[slot]
+                .1
+                .entry((range.start, range.end))
+                .or_default()
+                .push((at, member));
+        }
     }
-    let mut found = vec![None; work.len()];
+    let mut found = coordinates
+        .iter()
+        .map(|members| vec![None; members.len()])
+        .collect::<Vec<_>>();
     for (source, ranges) in &by_source {
-        let scanned = store.for_each_frame(source, |frame| {
+        let scanned = store.for_each_frame(source, |frame, _| {
             let SpoolFrame::Record(record) = frame else {
                 return;
             };
             #[cfg(test)]
             PROBES.with(|probes| probes.set(probes.get() + 1));
-            for &at in ranges
+            for &(at, member) in ranges
                 .get(&(record.start, record.end))
                 .into_iter()
                 .flatten()
             {
-                found[at] = origin(&snapshot, source, &record);
+                found[at][member] = origin(&snapshot, source, &record);
             }
         });
         if let Err(error) = scanned {
@@ -126,9 +243,16 @@ pub(crate) fn reevaluate(
             return Err(error);
         }
     }
-    let attributed = found.iter().flatten().count();
-    for (item, origin) in work.iter_mut().zip(found) {
-        item.origin = origin;
+    let mut attributed = 0;
+    for (item, origins) in work.iter_mut().zip(found) {
+        item.origin = origins.last().cloned().flatten().filter(|last| {
+            origins.iter().all(|origin| {
+                origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.span == last.span)
+            })
+        });
+        attributed += usize::from(item.origin.is_some());
     }
     Ok(Reevaluation::Present { attributed })
 }
@@ -147,7 +271,7 @@ fn unit_key(derived: &Derived) -> Option<&UnitKey> {
 }
 
 /// Only a recorded Posted or a legitimate Excluded settles work; any other outcome is kept debt.
-fn acked(ledger: &LedgerState, derived: &Derived) -> bool {
+pub(super) fn acked(ledger: &LedgerState, derived: &Derived) -> bool {
     match derived {
         Derived::Piece(piece) => {
             let latest = ledger.latest_piece(&piece.unit_key, piece.index);
@@ -162,16 +286,39 @@ fn acked(ledger: &LedgerState, derived: &Derived) -> bool {
 
 /// One FIFO pass. A piece posts only under its exact episode permit; work of an episode it
 /// cannot identify stops the pass, and work behind held work of its episode or unit key waits.
+/// `delivered` runs after each settled work leaves the log.
 pub(crate) async fn deliver_owed<P: DiscordPort, L: DeliveryLease, A: AlarmSink>(
     writer: &mut ChannelWriter<P, L, A>,
     log: &mut OwedLog,
+    mut delivered: impl FnMut(&mut ChannelWriter<P, L, A>, &OwedLog),
 ) {
-    if reevaluate(writer.store(), &mut log.work).is_err() {
+    let coordinates = log
+        .work
+        .iter()
+        .map(|work| {
+            card_key(&work.derived)
+                .map(|key| log.card_coordinates(key))
+                .unwrap_or_else(|| vec![(work.source.clone(), work.range.clone())])
+        })
+        .collect::<Vec<_>>();
+    for (work, members) in log.work.iter_mut().zip(&coordinates) {
+        if card_key(&work.derived).is_some()
+            && let Some((source, range)) = members.last()
+        {
+            work.source = source.clone();
+            work.range = range.clone();
+        }
+    }
+    if reevaluate_at(writer.store(), &mut log.work, &coordinates).is_err() {
         return;
     }
     let (mut held_units, mut held_episodes) = (HashSet::new(), HashSet::new());
     let mut at = 0;
+    let mut budget = super::replay::Budget::new();
     while at < log.work.len() {
+        if writer.stopping() {
+            return;
+        }
         let work = &log.work[at];
         let unit = unit_key(&work.derived).cloned();
         let episode = (work.origin.as_ref()).map(|o| {
@@ -195,9 +342,24 @@ pub(crate) async fn deliver_owed<P: DiscordPort, L: DeliveryLease, A: AlarmSink>
             }
             Err(_) => Step::Withheld,
         };
+        if step == Step::Done {
+            writer.boot.drained();
+        }
+        if let Some(summary) = log.refilter_after_open(writer.store().ledger()) {
+            writer.boot.replay("refilter", 0, summary, 0);
+            delivered(writer, log);
+            at = 0;
+            budget.yield_if_due().await;
+            continue;
+        }
         match step {
             Step::Done if acked(writer.store().ledger(), &log.work[at].derived) => {
+                if let Some(key) = card_key(&log.work[at].derived) {
+                    log.card_members.remove(key);
+                }
                 log.work.remove(at);
+                delivered(writer, log);
+                budget.yield_if_due().await;
                 continue;
             }
             Step::Done | Step::Withheld => {}
@@ -206,6 +368,7 @@ pub(crate) async fn deliver_owed<P: DiscordPort, L: DeliveryLease, A: AlarmSink>
         held_units.extend(unit);
         held_episodes.extend(episode);
         at += 1;
+        budget.yield_if_due().await;
     }
 }
 

@@ -11,6 +11,17 @@ struct RolePromptCacheEntry {
 
 static ROLE_PROMPT_CACHE: OnceLock<Mutex<HashMap<PathBuf, RolePromptCacheEntry>>> = OnceLock::new();
 
+impl RoleBinding {
+    pub(in crate::services::discord) fn inspection_prompt(&self) -> Option<String> {
+        let (path, _) = resolve_role_prompt_path(Path::new(&self.prompt_file))?;
+        read_role_prompt(&path)
+    }
+
+    pub(in crate::services::discord) fn inspection_peer_guidance(&self) -> Option<String> {
+        render_peer_agent_guidance_with_cache(&self.role_id, false)
+    }
+}
+
 pub(in crate::services::discord) fn load_role_prompt(binding: &RoleBinding) -> Option<String> {
     let prompt_path = Path::new(&binding.prompt_file);
     let (resolved_path, metadata) = resolve_role_prompt_path(prompt_path)?;
@@ -26,13 +37,7 @@ pub(in crate::services::discord) fn load_role_prompt(binding: &RoleBinding) -> O
         return Some(entry.content.clone());
     }
 
-    let raw = fs::read_to_string(&resolved_path).ok()?;
-    const MAX_CHARS: usize = 12_000;
-    let content = if raw.chars().count() <= MAX_CHARS {
-        raw
-    } else {
-        raw.chars().take(MAX_CHARS).collect()
-    };
+    let content = read_role_prompt(&resolved_path)?;
     if let Ok(mut guard) = cache.lock() {
         guard.insert(
             resolved_path,
@@ -44,6 +49,16 @@ pub(in crate::services::discord) fn load_role_prompt(binding: &RoleBinding) -> O
         );
     }
     Some(content)
+}
+
+fn read_role_prompt(path: &Path) -> Option<String> {
+    Some(
+        fs::read_to_string(path)
+            .ok()?
+            .chars()
+            .take(12_000)
+            .collect(),
+    )
 }
 
 fn resolve_role_prompt_path(prompt_path: &Path) -> Option<(PathBuf, fs::Metadata)> {
@@ -86,10 +101,48 @@ mod role_prompt_cache_tests {
             model: None,
             reasoning_effort: None,
             peer_agents_enabled: false,
-            quality_feedback_injection_enabled: false,
             auth_profile: "default".to_string(),
             memory: ResolvedMemorySettings::default(),
         }
+    }
+
+    #[test]
+    fn system_prompt_inspection_does_not_populate_role_or_peer_caches() {
+        let root = tempfile::tempdir().unwrap();
+        let _root = crate::config::set_agentdesk_root_for_test(root.path());
+        let path = root.path().join("inspection-role.md");
+        fs::write(&path, "uncached role content").unwrap();
+        let mut binding = binding(&path);
+        binding.role_id = format!("inspection-{}", root.path().display());
+        assert_eq!(
+            binding.inspection_prompt().as_deref(),
+            Some("uncached role content")
+        );
+        assert!(
+            ROLE_PROMPT_CACHE
+                .get()
+                .is_none_or(|cache| !cache.lock().unwrap().contains_key(&path))
+        );
+        assert_eq!(binding.inspection_peer_guidance(), None);
+        assert!(
+            !peer_guidance_cache()
+                .lock()
+                .unwrap()
+                .entries
+                .contains_key(&binding.role_id)
+        );
+        assert_eq!(
+            load_role_prompt(&binding).as_deref(),
+            Some("uncached role content")
+        );
+        assert!(
+            ROLE_PROMPT_CACHE
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .contains_key(&path)
+        );
     }
 
     #[test]
@@ -535,27 +588,7 @@ pub(in crate::services::discord) fn is_known_agent(role_id: &str) -> bool {
     is_known_agent_from_role_map(role_id)
 }
 
-pub(super) fn load_peer_agents() -> Vec<PeerAgentInfo> {
-    let peers = agentdesk_config::load_peer_agents();
-    if !peers.is_empty() {
-        return peers;
-    }
-    if org_schema::org_schema_exists() {
-        let peers = org_schema::load_peer_agents();
-        if !peers.is_empty() {
-            return peers;
-        }
-    }
-    load_peer_agents_from_role_map()
-}
-
-/// #2663: process-local cache for the rendered `[Peer Agent Directory]`
-/// block. The peer agent directory is ~1.5KB and rebuilt every turn even
-/// though the underlying config files (`agentdesk.yaml`, `org_schema`,
-/// `role_map`) change once per deploy at most. The cache key is
-/// `(current_role_id, mtime_fingerprint)`; whenever any input file's mtime
-/// changes (or a file disappears) the fingerprint shifts and the next call
-/// re-renders.
+/// Cache peer guidance by role and the selected config file's modification time.
 fn peer_guidance_cache() -> &'static std::sync::Mutex<PeerGuidanceCacheState> {
     static CELL: std::sync::OnceLock<std::sync::Mutex<PeerGuidanceCacheState>> =
         std::sync::OnceLock::new();
@@ -569,35 +602,21 @@ struct PeerGuidanceCacheState {
     entries: std::collections::HashMap<String, Option<String>>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PeerSourceFingerprint {
-    /// `Option<SystemTime>` per source path; `None` means the file does not
-    /// exist (deletion is also a cache-busting event).
-    parts: Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>,
-}
-
-fn peer_source_paths() -> Vec<std::path::PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(root) = crate::config::runtime_root() {
-        paths.push(crate::runtime_layout::config_file_path(&root));
-        paths.push(crate::runtime_layout::legacy_config_file_path(&root));
-        paths.push(crate::runtime_layout::role_map_path(&root));
-        paths.push(crate::runtime_layout::org_schema_path(&root));
-    }
-    paths
+    path: Option<PathBuf>,
+    modified: Option<SystemTime>,
 }
 
 fn current_peer_source_fingerprint() -> PeerSourceFingerprint {
-    let parts = peer_source_paths()
-        .into_iter()
-        .map(|path| {
-            let mtime = std::fs::metadata(&path)
-                .and_then(|meta| meta.modified())
-                .ok();
-            (path, mtime)
-        })
-        .collect();
-    PeerSourceFingerprint { parts }
+    let path =
+        crate::config::runtime_root().map(|root| crate::config::config_path::config_path_in(&root));
+    let modified = path.as_ref().and_then(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+    PeerSourceFingerprint { path, modified }
 }
 
 /// #2663: test-only helper to drop the peer guidance cache between scenarios.
@@ -613,11 +632,15 @@ pub(in crate::services::discord) fn invalidate_peer_guidance_cache_for_tests() {
 pub(in crate::services::discord) fn render_peer_agent_guidance(
     current_role_id: &str,
 ) -> Option<String> {
+    render_peer_agent_guidance_with_cache(current_role_id, true)
+}
+
+fn render_peer_agent_guidance_with_cache(current_role_id: &str, memoize: bool) -> Option<String> {
     // #2663: fast path — same role, unchanged source files → reuse cached
     // rendering (a String clone is much cheaper than the load+filter+format
     // pipeline below).
     let fingerprint = current_peer_source_fingerprint();
-    {
+    if memoize {
         let guard = peer_guidance_cache()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -628,25 +651,27 @@ pub(in crate::services::discord) fn render_peer_agent_guidance(
         }
     }
 
-    let peers: Vec<PeerAgentInfo> = load_peer_agents()
+    let peers: Vec<PeerAgentInfo> = agentdesk_config::load_peer_agents()
         .into_iter()
         .filter(|agent| agent.role_id != current_role_id)
         .collect();
     if peers.is_empty() {
-        let mut guard = peer_guidance_cache()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.fingerprint.as_ref() != Some(&fingerprint) {
-            guard.fingerprint = Some(fingerprint);
-            guard.entries.clear();
+        if memoize {
+            let mut guard = peer_guidance_cache()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if guard.fingerprint.as_ref() != Some(&fingerprint) {
+                guard.fingerprint = Some(fingerprint);
+                guard.entries.clear();
+            }
+            guard.entries.insert(current_role_id.to_string(), None);
         }
-        guard.entries.insert(current_role_id.to_string(), None);
         return None;
     }
 
     let mut lines = vec![
         "[Peer Agent Directory]".to_string(),
-        "Other specialist agents share this workspace. For requests mostly outside your scope:".to_string(),
+        "Other specialist agents work in this AgentDesk. For requests mostly outside your scope:".to_string(),
         "1. Name 1-2 peer agents that fit better and why.".to_string(),
         "2. Ask \"해당 에이전트에게 전달할까요?\" and wait for approval.".to_string(),
         "3. On approval, call `agentdesk send-to-agent --from <self> --to <peer> --message \"...\" --expect-reply <true|false> [--channel-kind cc|cdx]` to forward context via the announce bot so the peer intake_gate can trigger. Use `true` when a reply is needed, otherwise `false`.".to_string(),
@@ -675,16 +700,18 @@ pub(in crate::services::discord) fn render_peer_agent_guidance(
     // If the fingerprint changed since the fast-path check, we reset the
     // role-keyed map so we never serve a rendering produced against an
     // out-of-date source file.
-    let mut guard = peer_guidance_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if guard.fingerprint.as_ref() != Some(&fingerprint) {
-        guard.fingerprint = Some(fingerprint);
-        guard.entries.clear();
+    if memoize {
+        let mut guard = peer_guidance_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.fingerprint.as_ref() != Some(&fingerprint) {
+            guard.fingerprint = Some(fingerprint);
+            guard.entries.clear();
+        }
+        guard
+            .entries
+            .insert(current_role_id.to_string(), Some(rendered.clone()));
     }
-    guard
-        .entries
-        .insert(current_role_id.to_string(), Some(rendered.clone()));
     Some(rendered)
 }
 

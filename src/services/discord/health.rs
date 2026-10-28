@@ -21,7 +21,6 @@ use crate::services::provider::ProviderKind;
 //   * `outbound::{send_target,send_gate,manual_delivery,send_api}` — manual
 //     send-to-agent/outbound dispatch, re-exported here for compatibility
 mod headless_turn;
-pub(in crate::services::discord) mod legacy_supervision;
 pub(in crate::services::discord) mod liveness_authority;
 pub(in crate::services::discord) mod mailbox;
 pub(crate) mod o_transition;
@@ -51,40 +50,56 @@ pub(crate) async fn run_orphan_token_auto_heal_pass_for_tests(
     provider: &ProviderKind,
     runtimes: &[Arc<SharedData>],
 ) -> usize {
-    relay_auto_heal::run_orphan_token_auto_heal_pass(registry, provider, runtimes).await
+    let tick = tick_mailboxes::TickMailboxes::enumerate(provider, runtimes.to_vec()).await;
+    relay_auto_heal::run_orphan_token_auto_heal_pass(registry, provider, &tick).await
 }
 pub(in crate::services::discord) use relay_auto_heal::relay_recovery_retry_delay_secs;
 mod relay_dead_reattach;
 mod relay_progress;
+mod routine_process;
+pub(crate) use routine_process::cancel_routine_process_turn;
 mod runtime_resolve;
 mod session_enrichment;
 mod snapshot;
 mod stall_liveness;
 mod stall_verdict;
 pub(in crate::services::discord) mod tail_evidence;
+#[cfg(test)]
+pub(in crate::services::discord) mod test_support;
+#[path = "health/recovery/tick_mailboxes.rs"]
+mod tick_mailboxes;
 pub(in crate::services::discord) use tail_evidence::TailObservation;
 // #5188 (R5/R6): a delivery binding pointed at a transcript Claude abandoned.
+mod tmux_preflight;
 mod transcript_binding_stall;
-// Dormant until the input supervisor publishes views for channels it retires.
-#[allow(dead_code)]
-pub(in crate::services::discord) mod transcript_turn;
+#[cfg(test)]
+pub(in crate::services::discord) use recovery::run_stall_watchdog_pass;
+pub(crate) use tmux_preflight::attach_tmux_probe_preflight;
+pub(crate) use tmux_preflight::spawn as spawn_tmux_probe_preflight;
+#[cfg(test)]
+pub(in crate::services::discord) use transcript_binding_stall::o_witness_backdate_for_tests;
 mod turn_deliver;
+mod unbound_owners;
 mod unpaired_active_token;
 #[cfg(all(test, unix))]
 pub(in crate::services::discord) mod watchdog_test_support;
+#[cfg(test)]
+pub(crate) use super::tmux_watcher_registry::owner_publication_fence_held_for_tests;
+pub(in crate::services::discord) use unbound_owners::UnboundRuntimeSnapshot;
 pub(in crate::services::discord) mod watcher_respawn;
 #[cfg(all(test, unix))]
 pub(in crate::services::discord) use watcher_respawn::lock_watcher_absence_for_test;
 pub(in crate::services::discord) use watcher_respawn::reclaim_watcherless_session_bound_relay;
 
-// `HeadlessAgentTurnReservation` has no external referent today (callers
-// destructure the reserve/start tuple); kept re-exported for the reserve→start
-// API surface, same convention as the recovery/snapshot blocks below.
+// Keep the reservation type re-exported for the reserve/start API surface.
 #[cfg(all(test, unix))]
 pub(crate) use super::turn_presence::activity::tests::{
     BindingRoot, ReadyPane, bind_turn_mode_transcript, settled_reason,
 };
+mod presence_unknown;
 pub(crate) use super::turn_presence::supervisor::status as turn_presence_status;
+#[cfg(all(test, unix))]
+pub(crate) use super::turn_presence::supervisor::tests::seed_long_unknown_for_tests;
 #[cfg(test)]
 pub(crate) use super::turn_presence::supervisor::tests::seed_presence_for_tests;
 pub(crate) use crate::services::discord::outbound::manual_delivery::ManualOutboundDeliveryId;
@@ -107,6 +122,10 @@ pub use headless_turn::{
     start_reserved_headless_agent_turn_with_owner_channel,
 };
 pub use mailbox::purge_idle_channel_mailbox_registry_entry;
+pub(crate) use presence_unknown::attach_turn_presence_unknown;
+pub(crate) use transcript_binding_stall::attach_o_stall_reasons;
+#[cfg(all(test, unix))]
+pub(crate) use transcript_binding_stall::o_verdict_for_tests;
 #[cfg(all(test, unix))]
 pub(crate) use turn_deliver::inject_tests::{
     InjectPane, claim_kinded, end_turn, inject_hook, queue_texts, register_inject_runtime,
@@ -126,6 +145,8 @@ pub(crate) use turn_deliver::{
 // #5147: re-exported as a module (not as loose constants) so a consumer reads
 // `self_watchdog::TCP_TIMEOUT` — a name that says which timeout — rather than a
 // bare `TCP_TIMEOUT` at the health root.
+#[cfg(test)]
+pub(crate) use recovery::STALL_WATCHDOG_INTERVAL_SECS;
 #[cfg(all(test, unix))]
 pub(crate) use recovery::StaleSweepWarrantFixture;
 #[allow(unused_imports)]
@@ -149,7 +170,7 @@ pub use recovery::{
     stop_runtime_turn_preserving_watcher,
 };
 pub(crate) use recovery::{
-    STALL_WATCHDOG_INTERVAL_SECS, channel_has_active_turn, clear_resume_runtime_owner_after_death,
+    channel_has_active_turn, clear_resume_runtime_owner_after_death,
     rebind_channel_provider_session, release_zombie_foreground_turn_by_tmux_name,
     resume_runtime_for_channel, retain_resume_runtime_owner_before_teardown, stop_channel_runtime,
 };
@@ -161,7 +182,7 @@ pub(crate) use runtime_resolve::{resolve_intake_worker_runtime, resolve_utility_
 #[allow(unused_imports)]
 pub use snapshot::{
     DiscordHealthSnapshot, HealthStatus, WatcherStateLookup, WatcherStateSnapshot,
-    active_request_owner_for_channel, build_health_snapshot, build_public_health_snapshot,
+    build_health_snapshot, build_public_health_snapshot,
 };
 
 /// Per-provider snapshot for the health response.
@@ -387,6 +408,10 @@ impl UtilityBotUserIdResolution {
 }
 
 impl HealthRegistry {
+    #[cfg(test)]
+    pub(in crate::services::discord) fn age_for_tests(&mut self, seconds: i64) {
+        self.started_at_unix = chrono::Utc::now().timestamp() - seconds;
+    }
     pub fn new() -> Self {
         Self {
             providers: tokio::sync::Mutex::new(Vec::new()),
@@ -457,13 +482,6 @@ impl HealthRegistry {
             && providers
                 .iter()
                 .all(|entry| entry.role == ProviderRuntimeRole::Standby)
-    }
-
-    #[cfg(test)]
-    pub(in crate::services::discord) async fn provider_entries_guard(
-        &self,
-    ) -> tokio::sync::MutexGuard<'_, Vec<ProviderEntry>> {
-        self.providers.lock().await
     }
 
     pub(in crate::services::discord) async fn provider_runtimes(&self) -> Vec<Arc<SharedData>> {
@@ -559,9 +577,7 @@ impl HealthRegistry {
     /// a `String` per provider; the registry list is a handful of entries.
     ///
     /// The cost is that a provider registered or removed mid-build is not
-    /// observed by that build. That was already the contract for
-    /// `active_request_owner_for_channel`, and a health snapshot is a sample,
-    /// not a transaction.
+    /// observed by that build; a health snapshot is a sample, not a transaction.
     pub(super) async fn provider_entries_snapshot(&self) -> Vec<ProviderEntry> {
         self.providers.lock().await.clone()
     }
@@ -651,18 +667,6 @@ impl HealthRegistry {
         hashes
     }
 
-    /// #3293: every registered runtime regardless of provider. Used by the
-    /// provider-unfiltered mailbox-registry purge, which must visit every
-    /// instance registry because a bogus entry may live in any of them.
-    pub(in crate::services::discord) async fn all_registered_shared(&self) -> Vec<Arc<SharedData>> {
-        self.providers
-            .lock()
-            .await
-            .iter()
-            .map(|entry| entry.shared.clone())
-            .collect()
-    }
-
     pub(super) async fn register_http(&self, provider: String, http: Arc<serenity::Http>) {
         self.discord_http.lock().await.push((provider, http));
     }
@@ -715,7 +719,7 @@ impl HealthRegistry {
 
     /// `expected_episode` pins the inflight row the absence sweep observed, so
     /// the rebind adopts that row instead of clearing and re-minting it.
-    pub(crate) async fn rebind_inflight_after_force_clean(
+    pub(in crate::services::discord) async fn rebind_inflight_after_force_clean(
         &self,
         provider: &crate::services::provider::ProviderKind,
         channel_id: u64,
@@ -963,196 +967,5 @@ impl HealthRegistry {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{path::Path, sync::MutexGuard};
-    use tempfile::TempDir;
-
-    struct EnvVarGuard {
-        key: String,
-        previous_value: Option<std::ffi::OsString>,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl EnvVarGuard {
-        fn set_path(key: &str, path: &Path) -> Self {
-            let lock = crate::config::shared_test_env_lock()
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            let previous_value = std::env::var_os(key);
-            unsafe { std::env::set_var(key, path) };
-            Self {
-                key: key.to_string(),
-                previous_value,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous_value {
-                Some(value) => unsafe { std::env::set_var(&self.key, value) },
-                None => unsafe { std::env::remove_var(&self.key) },
-            }
-        }
-    }
-
-    // Probe candidates are the hashes of the provider's own runtimes in any role, each once.
-    #[tokio::test]
-    async fn registered_token_hashes_are_the_providers_own_in_any_role() {
-        let registry = HealthRegistry::new();
-        let runtime = |hash: &str| {
-            let mut shared = crate::services::discord::make_shared_data_for_tests();
-            Arc::get_mut(&mut shared).unwrap().token_hash = hash.to_string();
-            shared
-        };
-        registry.register("claude".into(), runtime("h-b")).await;
-        registry
-            .register_standby("Claude".into(), runtime("h-a"))
-            .await;
-        registry
-            .register_worker("claude".into(), runtime("h-b"))
-            .await;
-        registry.register("codex".into(), runtime("h-c")).await;
-        let hashes = |provider| registry.registered_token_hashes(provider);
-        assert_eq!(hashes(&ProviderKind::Claude).await, ["h-a", "h-b"]);
-        assert_eq!(hashes(&ProviderKind::Codex).await, ["h-c"]);
-        assert!(hashes(&ProviderKind::Qwen).await.is_empty());
-    }
-
-    fn write_test_bot_token(root: &Path, bot_name: &str, token: &str) {
-        crate::runtime_layout::ensure_credential_layout(root).unwrap();
-        let path = crate::runtime_layout::credential_token_path(root, bot_name);
-        crate::utils::secret_file::write_secret_file(&path, format!("{token}\n"))
-            .expect("write test bot token");
-    }
-
-    #[test]
-    fn reload_bot_tokens_reports_success_and_invalidates_user_id_cache() {
-        let temp = TempDir::new().expect("temp runtime root");
-        let _env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
-        write_test_bot_token(temp.path(), "announce", "announce-token");
-        write_test_bot_token(temp.path(), "notify", "notify-token");
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        runtime.block_on(async {
-            let registry = HealthRegistry::new();
-            *registry
-                .utility_bot(UtilityBotRole::Announce)
-                .user_id
-                .lock()
-                .await = Some((11, 0));
-            *registry
-                .utility_bot(UtilityBotRole::Notify)
-                .user_id
-                .lock()
-                .await = Some((22, 0));
-
-            let report = registry.reload_bot_tokens().await;
-
-            assert!(report.runtime_root_available);
-            assert!(report.any_reloaded);
-            assert!(report.utility_bot_user_ids_invalidated);
-            assert_eq!(report.announce.status, BotTokenReloadStatus::Reloaded);
-            assert!(report.announce.reloaded);
-            assert!(report.announce.user_id_cache_invalidated);
-            assert_eq!(
-                *registry
-                    .utility_bot(UtilityBotRole::Announce)
-                    .user_id
-                    .lock()
-                    .await,
-                None
-            );
-            assert_eq!(report.notify.status, BotTokenReloadStatus::Reloaded);
-            assert!(report.notify.reloaded);
-            assert!(report.notify.user_id_cache_invalidated);
-            assert_eq!(
-                *registry
-                    .utility_bot(UtilityBotRole::Notify)
-                    .user_id
-                    .lock()
-                    .await,
-                None
-            );
-            assert!(resolve_bot_http(&registry, "announce").await.is_ok());
-            assert!(resolve_bot_http(&registry, "notify").await.is_ok());
-        });
-    }
-
-    #[test]
-    fn reload_bot_tokens_keeps_previous_client_when_credential_is_missing() {
-        let temp = TempDir::new().expect("temp runtime root");
-        let _env = EnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
-        write_test_bot_token(temp.path(), "announce", "announce-token");
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        runtime.block_on(async {
-            let registry = HealthRegistry::new();
-            let first = registry.reload_bot_tokens().await;
-            assert_eq!(first.announce.status, BotTokenReloadStatus::Reloaded);
-            assert!(resolve_bot_http(&registry, "announce").await.is_ok());
-
-            std::fs::remove_file(crate::runtime_layout::credential_token_path(
-                temp.path(),
-                "announce",
-            ))
-            .expect("remove announce token");
-            let second = registry.reload_bot_tokens().await;
-
-            assert_eq!(
-                second.announce.status,
-                BotTokenReloadStatus::MissingOrInvalid
-            );
-            assert!(!second.announce.reloaded);
-            assert!(second.announce.previous_client_kept);
-            assert!(resolve_bot_http(&registry, "announce").await.is_ok());
-        });
-    }
-
-    #[tokio::test]
-    async fn utility_bot_user_id_cache_rejects_stale_http_after_reload() {
-        let registry = HealthRegistry::new();
-        let runtime = registry.utility_bot(UtilityBotRole::Announce);
-        let old_http = Arc::new(serenity::Http::new("Bot old-token"));
-        let new_http = Arc::new(serenity::Http::new("Bot new-token"));
-
-        *runtime.http.lock().await = Some(old_http.clone());
-        let old_generation = runtime.token_generation.load(Ordering::SeqCst);
-        assert!(
-            HealthRegistry::cache_utility_bot_user_id_if_current(
-                &runtime.http,
-                &runtime.user_id,
-                &runtime.token_generation,
-                old_generation,
-                &old_http,
-                11,
-            )
-            .await
-        );
-        assert_eq!(*runtime.user_id.lock().await, Some((11, old_generation)));
-
-        runtime.token_generation.fetch_add(1, Ordering::SeqCst);
-        *runtime.http.lock().await = Some(new_http);
-        *runtime.user_id.lock().await = None;
-        assert!(
-            !HealthRegistry::cache_utility_bot_user_id_if_current(
-                &runtime.http,
-                &runtime.user_id,
-                &runtime.token_generation,
-                old_generation,
-                &old_http,
-                22,
-            )
-            .await
-        );
-        assert_eq!(*runtime.user_id.lock().await, None);
-    }
-}
+#[path = "health/registry_tests.rs"]
+mod tests;

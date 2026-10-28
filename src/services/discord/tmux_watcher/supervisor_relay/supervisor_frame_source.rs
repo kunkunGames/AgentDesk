@@ -3,6 +3,7 @@
 //! out of the parent `supervisor_relay`, which re-exports it; both stay under
 //! the 700-line cap.
 
+use crate::services::cluster::stream_relay::{ReadSource, SourceFileIdentity};
 use crate::services::discord::tmux::tmux_watcher::loop_poll_prologue::WatcherSourceAuthority;
 
 #[derive(Clone, Copy)]
@@ -15,6 +16,25 @@ pub(in crate::services::discord::tmux::tmux_watcher) struct SupervisorFrameSourc
     /// it answers the same provenance question one coordinate finer. `None`
     /// when unnameable; a named range is authoritative, so never invented here.
     pub(in crate::services::discord::tmux::tmux_watcher) source_span: Option<(u64, u64)>,
+    /// The opened file the read came from; kept out of `WatcherSourceAuthority`
+    /// equality so the watcher generation never splits a UTF-8 carry.
+    pub(in crate::services::discord::tmux::tmux_watcher) source_file: SourceFileIdentity,
+    /// The reading watcher's `watcher_instance_id`, once the forward names it.
+    pub(in crate::services::discord::tmux::tmux_watcher) producer: Option<u64>,
+}
+
+impl SupervisorFrameSourceAuthority {
+    /// Both halves or nothing: a frame without a named file and watcher folds
+    /// under the sink's single-source rules.
+    pub(in crate::services::discord::tmux::tmux_watcher) fn read_source(
+        self,
+    ) -> Option<ReadSource> {
+        let producer = self.producer?;
+        (self.source_file != SourceFileIdentity::Unavailable).then_some(ReadSource {
+            file: self.source_file,
+            producer,
+        })
+    }
 }
 
 impl From<i64> for SupervisorFrameSourceAuthority {
@@ -23,6 +43,8 @@ impl From<i64> for SupervisorFrameSourceAuthority {
             generation_mtime_ns,
             source_stamp: None,
             source_span: None,
+            source_file: SourceFileIdentity::Unavailable,
+            producer: None,
         }
     }
 }
@@ -33,6 +55,8 @@ impl From<WatcherSourceAuthority> for SupervisorFrameSourceAuthority {
             generation_mtime_ns: authority.generation_mtime_ns,
             source_stamp: authority.source_stamp,
             source_span: None,
+            source_file: authority.source_file,
+            producer: None,
         }
     }
 }
@@ -49,14 +73,16 @@ pub(in crate::services::discord::tmux::tmux_watcher) fn source_authority_with_sp
     }
 }
 
+type SourceSpan = Option<(u64, u64)>;
+
 /// #5948 (I18): split one contiguous source byte range at the same boundary
 /// `split_decoded_chunk_at_terminal_boundary` splits the payload at, so each
 /// forwarded frame names exactly the bytes it carries. `None` in ⇒ `None` out on
 /// both sides: a range the caller cannot name must never be invented for it.
 pub(in crate::services::discord::tmux::tmux_watcher) fn split_source_span_at_terminal_boundary(
-    span: Option<(u64, u64)>,
+    span: SourceSpan,
     terminal_len: usize,
-) -> (Option<(u64, u64)>, Option<(u64, u64)>) {
+) -> (SourceSpan, SourceSpan) {
     let Some((start, end)) = span else {
         return (None, None);
     };

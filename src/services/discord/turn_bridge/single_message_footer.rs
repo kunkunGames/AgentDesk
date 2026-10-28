@@ -1,7 +1,6 @@
 //! #3089 S2 single-message status-panel footer helpers for the turn bridge.
 
 use super::*;
-
 pub(super) fn make_owner(
     user_msg_id: Option<MessageId>,
     started_at_unix: i64,
@@ -11,28 +10,29 @@ pub(super) fn make_owner(
         started_at_unix,
     )
 }
-
 pub(super) fn make_owner_now(
     user_msg_id: Option<MessageId>,
 ) -> (i64, super::footer_view_reconciler::CompletionFooterOwner) {
     let started_at_unix = chrono::Utc::now().timestamp();
     (started_at_unix, make_owner(user_msg_id, started_at_unix))
 }
-
 pub(super) fn bridge_single_message_panel_footer_enabled(status_panel_v2_enabled: bool) -> bool {
+    #[cfg(test)]
+    if SEPARATE_PANEL_FOR_TESTS.get() {
+        return false;
+    }
     super::single_message_panel::footer_mode_enabled(
         crate::services::discord::single_message_panel_enabled(),
         status_panel_v2_enabled,
     )
 }
-
 #[cfg(test)]
 thread_local! {
     /// Lets a test reach the two-message completion that the process-wide footer flag hides.
     pub(super) static SEPARATE_PANEL_FOR_TESTS: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
-
+#[cfg(test)]
 pub(super) fn bridge_separate_status_panel_enabled(status_panel_v2_enabled: bool) -> bool {
     #[cfg(test)]
     if SEPARATE_PANEL_FOR_TESTS.get() {
@@ -43,7 +43,6 @@ pub(super) fn bridge_separate_status_panel_enabled(status_panel_v2_enabled: bool
         status_panel_v2_enabled,
     )
 }
-
 pub(super) fn bridge_status_panel_dirty_should_edit_separate_panel(
     status_panel_dirty: bool,
     single_message_panel_footer_mode: bool,
@@ -102,13 +101,19 @@ pub(super) fn bridge_should_create_separate_status_panel(
     status_panel_msg_id: Option<MessageId>,
     current_msg_id: MessageId,
 ) -> bool {
-    !single_message_panel_footer_mode
+    !super::super::footer_retirement::retired()
+        && !single_message_panel_footer_mode
         && status_panel_v2_enabled
         && (status_panel_msg_id.is_none() || status_panel_msg_id == Some(current_msg_id))
 }
 
+#[cfg(test)]
 pub(super) fn bridge_should_complete_separate_status_panel(status_panel_v2_enabled: bool) -> bool {
-    bridge_separate_status_panel_enabled(status_panel_v2_enabled)
+    if super::super::footer_retirement::retired() {
+        status_panel_v2_enabled
+    } else {
+        bridge_separate_status_panel_enabled(status_panel_v2_enabled)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -212,13 +217,17 @@ pub(super) fn build_bridge_single_message_panel_status_block(
     current_tool_line: Option<&str>,
     full_response: &str,
 ) -> String {
-    if bridge_single_message_panel_footer_enabled(shared.ui.status_panel_v2_enabled) {
-        let panel_text = shared.ui.placeholder_live_events.render_status_panel(
-            channel_id,
-            provider,
-            started_at_unix,
-        );
-        return super::single_message_panel::compose_footer_status_block(indicator, &panel_text);
+    // Retired snapshots omit this block, but keep its budget to preserve rollover offsets.
+    if bridge_single_message_panel_footer_enabled(shared.ui.status_panel_v2_enabled)
+        || (super::super::footer_retirement::retired()
+            && crate::services::discord::single_message_panel_enabled()
+            && shared.ui.status_panel_v2_enabled)
+    {
+        let content = (full_response, indicator);
+        return shared
+            .ui
+            .placeholder_live_events
+            .render_footer_status_panel(channel_id, provider, started_at_unix, content);
     }
     if shared.ui.status_panel_v2_enabled {
         super::formatting::build_processing_status_block(indicator)
@@ -379,6 +388,7 @@ pub(super) async fn complete_bridge_terminal_footer_or_status_panel<G: TurnGatew
     this_turn_status_panel_generation: u64,
     tmux_session_name: Option<&str>,
     permits_channel_effects: bool,
+    provider_failure: bool,
 ) -> bool {
     complete_bridge_terminal_footer_or_status_panel_with_sniffer(
         shared,
@@ -397,6 +407,7 @@ pub(super) async fn complete_bridge_terminal_footer_or_status_panel<G: TurnGatew
         this_turn_status_panel_generation,
         tmux_session_name.map(str::to_string),
         permits_channel_effects,
+        provider_failure,
         |tmux_session_name| async move {
             // #4353: `super::super::tmux` is cfg(unix). No tmux pane means nothing
             // can be pending in one.
@@ -439,6 +450,7 @@ pub(super) async fn complete_bridge_terminal_footer_or_status_panel_with_sniffer
     this_turn_status_panel_generation: u64,
     tmux_session_name: Option<String>,
     permits_channel_effects: bool,
+    provider_failure: bool,
     sniff_background_agent_pending: S,
 ) -> bool
 where
@@ -493,7 +505,8 @@ where
             this_turn_user_msg_id,
             started_at_unix,
         );
-        return match terminal_text {
+        // A provider failure notice is the turn's last word, so it gets no success footer.
+        return match terminal_text.filter(|_| !provider_failure) {
             Some(text) => {
                 if tui_direct_completion_footer_suppressed(
                     single_message_panel_footer_mode,
@@ -542,6 +555,7 @@ where
         "turn_terminal_delivery",
         this_turn_user_msg_id,
         permits_channel_effects,
+        provider_failure,
     )
     .await
 }
@@ -549,7 +563,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::discord::DISCORD_MSG_LIMIT;
+    use crate::services::discord::{DISCORD_MSG_LIMIT, footer_retirement::legacy_for_test};
 
     const PANEL: &str = "🟢 진행 중 — Claude (<t:1700000000:R>)\n\nSubagents\n└ review inspect";
 
@@ -579,16 +593,17 @@ mod tests {
         }
     }
 
-    fn isolate_agentdesk_runtime_root() -> (std::sync::MutexGuard<'static, ()>, RuntimeRootGuard) {
-        let lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let root = RuntimeRootGuard::new();
-        (lock, root)
+    fn isolate_agentdesk_runtime_root() -> (
+        crate::config::test_env_lock::SharedTestEnvLockGuard,
+        RuntimeRootGuard,
+    ) {
+        let lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
+        (lock, RuntimeRootGuard::new())
     }
 
     #[test]
     fn bridge_footer_mode_requires_both_flags() {
+        let _legacy = legacy_for_test();
         assert!(super::single_message_panel::footer_mode_enabled(true, true));
         assert!(!super::single_message_panel::footer_mode_enabled(
             true, false
@@ -600,6 +615,7 @@ mod tests {
 
     #[test]
     fn bridge_footer_streaming_edit_text_includes_panel_footer() {
+        let _legacy = legacy_for_test();
         let status_block = super::single_message_panel::compose_footer_status_block("⠸", PANEL);
         let rendered = super::super::build_turn_bridge_streaming_edit_text(
             true,
@@ -616,6 +632,7 @@ mod tests {
 
     #[test]
     fn bridge_mid_turn_placeholder_context_uses_subtext_and_compact_format_4848() {
+        let _legacy = legacy_for_test();
         let shared = super::super::make_shared_data_for_tests();
         let channel_id = ChannelId::new(4_848_301);
         assert!(
@@ -660,6 +677,7 @@ mod tests {
 
     #[test]
     fn bridge_footer_disables_separate_panel_creation_and_binding() {
+        let _legacy = legacy_for_test();
         let footer_mode = super::single_message_panel::footer_mode_enabled(true, true);
         let current = MessageId::new(7);
 
@@ -811,6 +829,7 @@ mod tests {
                 0,
                 Some("AgentDesk-claude-background-test".to_string()),
                 true,
+                false,
                 move |tmux_session_name| async move {
                     sniffer_observed_tmux_session
                         .lock()
@@ -884,6 +903,7 @@ mod tests {
 
     #[test]
     fn bridge_pathological_panel_stays_within_discord_limit() {
+        let _legacy = legacy_for_test();
         let huge_panel = format!(
             "🟢 진행 중 — Claude (<t:1700000000:R>)\n\nSubagents\n{}",
             "└ reviewer ".repeat(1_000)

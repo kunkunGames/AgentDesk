@@ -136,10 +136,10 @@ async fn fail(
     let fid = crate::db::campaigns::graph::digest(format!("{id}:{key}:{fingerprint}").as_bytes());
     let runtime:Value=sqlx::query_scalar("SELECT jsonb_build_object('role',t.role,'graph_version',t.version,'contract_digest',t.contract_digest,'artifact_manifest',t.artifact_manifest,'provider',a.provider,'agent_id',d.to_agent_id,'dispatch_status',d.status,'observed_tool_calls',(SELECT COUNT(*) FROM campaign_graph_progress p WHERE p.dispatch_id=d.id)) FROM campaign_graph_tasks t LEFT JOIN task_dispatches d ON d.id=$2 LEFT JOIN agents a ON a.id=d.to_agent_id WHERE t.task_key=$1")
         .bind(key).bind(dispatch).fetch_one(&mut *tx).await?;
-    let is_review: bool = sqlx::query_scalar(&format!(
+    let is_review: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT EXISTS(SELECT 1 FROM campaign_graph_tasks t WHERE t.task_key=$1 AND ({}))",
         crate::db::campaigns::graph::learning::budget::REVIEW_TASK_SQL
-    ))
+    )))
     .bind(key)
     .fetch_one(&mut *tx)
     .await?;
@@ -245,10 +245,10 @@ pub(super) async fn observe(
         if matches!(status.as_str(), "pending" | "dispatched" | "running") {
             let samples:Vec<String>=sqlx::query_scalar("SELECT fingerprint||':'||output_digest FROM campaign_graph_progress WHERE dispatch_id=$1 AND output_digest IS NOT NULL ORDER BY recorded_at DESC LIMIT 8").bind(&did).fetch_all(pool).await?;
             let stalled = observation::repeated(&samples, 8);
-            let captured_review: bool = sqlx::query_scalar(&format!(
+            let captured_review: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT EXISTS(SELECT 1 FROM campaign_graph_tasks t WHERE t.task_key=$1 AND ({}))",
                 crate::db::campaigns::graph::learning::budget::REVIEW_TASK_SQL
-            ))
+            )))
             .bind(&key)
             .fetch_one(pool)
             .await?;

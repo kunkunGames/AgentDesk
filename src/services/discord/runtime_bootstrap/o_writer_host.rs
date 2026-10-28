@@ -1,13 +1,11 @@
 //! Gateway side of the O writer host: the gateway's own HTTP client and bot id, the shared
-//! delivery lease cells, the process alarm router and the facts a first activation checks. Off the
-//! gateway, a delegated channel's writer posts through the bot token's REST client instead.
+//! delivery lease cells, the process alarm router and the facts a first activation checks.
 
 use super::*;
 
 use std::future::Future;
 use std::time::Duration;
 
-use crate::services::cluster::channel_home_boot::ChannelWriters;
 use crate::services::discord::outbound::o_writer_io::{ChannelLeases, GatewayPort};
 use crate::services::discord::outbound::o_writer_legacy::LegacyRelay;
 use crate::services::tui_o::alarm::AlarmRouter;
@@ -31,7 +29,7 @@ struct GatewayHost {
     configured_id: Option<String>,
     /// The boot turn selection a newly adopted channel is confirmed against.
     turn: TurnConfig,
-    /// Off the gateway: the bot token's REST client every hosted channel posts through.
+    #[cfg(test)]
     rest: Option<Arc<serenity::Http>>,
     /// The boot `tui_o` section; the live config overrides its re-post switch once installed.
     boot: Option<TuiOConfig>,
@@ -66,6 +64,7 @@ async fn published_self_id(max_wait: Duration) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 /// A port over the REST client once it names its bot; a failed lookup is retried.
 async fn rest_port(http: Arc<serenity::Http>) -> Arc<GatewayPort> {
     loop {
@@ -85,12 +84,13 @@ impl HostIo for GatewayHost {
     type Alarms = Arc<AlarmRouter>;
     type Bindings = ChannelBindingLog;
 
-    /// Waits for the context the gateway caches on ready, so no token fallback stands in for it;
-    /// off the gateway, for the REST client to name its bot.
+    /// Waits for the context the gateway caches on ready.
     fn port(&self) -> impl Future<Output = Arc<GatewayPort>> + Send {
         let shared = Arc::clone(&self.shared);
+        #[cfg(test)]
         let rest = self.rest.clone();
         async move {
+            #[cfg(test)]
             if let Some(http) = rest {
                 return rest_port(http).await;
             }
@@ -182,6 +182,7 @@ impl HostIo for GatewayHost {
     }
 
     /// Legacy inflight, delivery custody and pending starts, durable or in memory: all local files.
+    /// A pending start alone is told apart from one beside a terminal delivery Legacy holds.
     fn local_custody(&self, channel: u64, provider: ShadowProvider) -> Result<Custody, String> {
         let kind = match provider {
             ShadowProvider::Claude => ProviderKind::Claude,
@@ -197,11 +198,24 @@ impl HostIo for GatewayHost {
                 kind.as_str(),
                 channel,
             );
-        if pending_start || super::super::terminal_delivery_custody::retains_channel(channel)? {
-            return Ok(Custody::Active);
+        #[cfg(test)]
+        {
+            use crate::services::tui_o::writer::activation::test_hook;
+            test_hook::run(channel, test_hook::Step::CustodyRead)?;
         }
-        let row = super::super::inflight::inflight_state_file_exists(&kind, channel);
-        Ok(if row { Custody::Row } else { Custody::Free })
+        // Beside a pending start, delivery custody that cannot be read still counts as held.
+        match (
+            pending_start,
+            super::super::terminal_delivery_custody::retains_channel(channel),
+        ) {
+            (true, Ok(false)) => Ok(Custody::PendingStart),
+            (true, _) | (false, Ok(true)) => Ok(Custody::Active),
+            (false, Err(error)) => Err(error),
+            (false, Ok(false)) => {
+                let row = super::super::inflight::inflight_state_file_exists(&kind, channel);
+                Ok(if row { Custody::Row } else { Custody::Free })
+            }
+        }
     }
 
     fn legacy(&self) -> Arc<dyn LegacyView> {
@@ -224,18 +238,14 @@ impl HostIo for GatewayHost {
             .relay_emission_in_flight(ChannelId::new(channel))
     }
 
-    /// Built for gateway and delegated hosts alike over the port's own client. Off, the turn reads
-    /// nothing, and the transport is built only on the first on turn.
+    /// The re-post transport is built only on its first enabled turn.
     fn repost(&self, channel: u64, port: &Arc<GatewayPort>) -> Option<host::RepostTurn<Self>> {
-        use crate::services::tui_o::repost::{
-            config::RepostSwitch, io::probe::evidence::RunScope, runner,
-        };
+        use crate::services::tui_o::repost::{io::probe::evidence::RunScope, runner};
         let pool = self.shared.pg_pool.clone()?;
         let sidecar = crate::config::runtime_root()?
             .join("tui_o")
             .join("repost")
             .join(format!("{channel}.jsonl"));
-        let switch = RepostSwitch::new(self.boot.as_ref(), crate::config_live_reload::subscribe());
         let holder = self.configured_id.clone();
         let run = RunScope {
             holder: holder.unwrap_or_else(|| "o-writer".into()),
@@ -244,7 +254,7 @@ impl HostIo for GatewayHost {
             evidence_generation: 1,
         };
         let sender = crate::services::tui_o::writer::DiscordPort::bot_id(&**port);
-        let runner = runner::Runner::new(switch, pool, sender, run);
+        let runner = runner::Runner::new(pool, sender, run);
         let (port, mut warned) = (Arc::clone(port), false);
         let open = move || match port.repost_http() {
             Ok(http) => Some(Arc::new(http)),
@@ -287,7 +297,6 @@ fn parts(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     config: Option<&TuiOConfig>,
-    rest: Option<Arc<serenity::Http>>,
 ) -> host::HostParts<GatewayHost> {
     let alarms = Arc::new(AlarmRouter::for_process(config, shared.pg_pool.clone()));
     let boot = crate::services::tui_o::channel_policy::boot();
@@ -301,7 +310,8 @@ fn parts(
             self_id_wait: SELF_ID_WAIT,
             configured_id,
             turn: config.map(|c| c.turn.clone()).unwrap_or_default(),
-            rest,
+            #[cfg(test)]
+            rest: None,
             boot: config.cloned(),
         }),
         runtime_root: crate::config::runtime_root(),
@@ -310,9 +320,19 @@ fn parts(
     }
 }
 
-/// Starts the writer host for this provider's gateway runtime; it never waits on the gateway.
-/// With delegated homes on, its writers are supervised so a reclaimed channel's watch can end and
-/// restart them, and a channel another node's boot row names starts none.
+#[cfg(test)]
+fn parts_with_rest(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    config: Option<&TuiOConfig>,
+    rest: Option<Arc<serenity::Http>>,
+) -> host::HostParts<GatewayHost> {
+    let mut prepared = parts(shared, provider, config);
+    Arc::get_mut(&mut prepared.io).unwrap().rest = rest;
+    prepared
+}
+
+/// Starts the ordinary gateway writer under its PG gateway lease.
 pub(super) fn spawn(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -322,70 +342,7 @@ pub(super) fn spawn(
     let Some(shadow) = shadow_of(provider) else {
         return;
     };
-    // Nothing below runs unless this bot may adopt a channel, so an off or empty writer takes no lock.
-    let Some(writers) = with_writers(|writers| writers.get(provider.as_str()).cloned()) else {
-        host::start(shadow, pg_gateway, || parts(shared, provider, config, None));
-        return;
-    };
-    let (shared, provider, config) = (Arc::clone(shared), provider.clone(), config.cloned());
-    let prepare = move || parts(&shared, &provider, config.as_ref(), None);
-    writers.start_boot(shadow, pg_gateway, prepare);
-}
-
-type Writers = std::collections::BTreeMap<String, Arc<ChannelWriters>>;
-
-#[cfg(not(test))]
-static WRITERS: std::sync::Mutex<Writers> = std::sync::Mutex::new(Writers::new());
-#[cfg(test)]
-thread_local! {
-    static WRITERS: std::sync::Mutex<Writers> = const { std::sync::Mutex::new(Writers::new()) };
-}
-
-fn with_writers<R>(use_writers: impl FnOnce(&mut Writers) -> R) -> R {
-    let locked = |writers: &std::sync::Mutex<Writers>| {
-        use_writers(
-            &mut writers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    };
-    #[cfg(not(test))]
-    return locked(&WRITERS);
-    #[cfg(test)]
-    WRITERS.with(locked)
-}
-
-/// The gateway runtime's supervised writers, made when its delegated homes start, before
-/// [`spawn`] hands them the writers it starts.
-pub(super) fn home_writers(provider: &ProviderKind) -> Arc<ChannelWriters> {
-    let gateway = crate::services::tui_o::ownership::gate(provider.as_str());
-    let make = || Arc::new(ChannelWriters::new(gateway, host::process_readiness()));
-    with_writers(|writers| {
-        Arc::clone(
-            writers
-                .entry(provider.as_str().to_owned())
-                .or_insert_with(make),
-        )
-    })
-}
-
-/// Starts the writer for each delegated channel whose home gate is registered here and whose Herdr
-/// endpoint runs on this node, off the gateway; with none, nothing is built.
-pub(super) fn spawn_delegated(
-    shared: &Arc<SharedData>,
-    provider: &ProviderKind,
-    config: Option<&TuiOConfig>,
-) -> Vec<tokio::task::JoinHandle<()>> {
-    let Some(shadow) = shadow_of(provider) else {
-        return Vec::new();
-    };
-    let delegated = crate::services::cluster::channel_home_boot::delegated_boot_ownership(
-        super::herdr_runs_here,
-    );
-    host::start_delegated(shadow, delegated, || {
-        let rest = shared.serenity_http_or_token_fallback();
-        parts(shared, provider, config, rest)
-    })
+    host::start(shadow, pg_gateway, || parts(shared, provider, config));
 }
 
 #[cfg(test)]
@@ -410,19 +367,13 @@ pub(super) mod test_host {
             boot: None,
         }
     }
-
-    /// The host a standby writer gets: every port posts over `http`.
-    pub(in crate::services::discord::runtime_bootstrap) fn rest(
-        shared: &Arc<SharedData>,
-        http: Arc<serenity::Http>,
-    ) -> Arc<impl HostIo<Port = GatewayPort>> {
-        parts(shared, &ProviderKind::Claude, None, Some(http)).io
-    }
 }
 
 #[cfg(test)]
 mod fence_tests {
     use super::*;
+    #[cfg(unix)]
+    mod b1b_fresh_launch_tests;
     use crate::db::auto_queue::test_support::TestPostgresDb;
     use crate::services::tui_o::shadow::ShadowProvider::Claude;
 
@@ -560,10 +511,9 @@ mod activation_tests;
 mod repost_tests {
     use super::*;
 
-    /// Gateway and delegated hosts both give each writer a re-post turn over its own port, and
-    /// only with a PostgreSQL pool; without one their writers run as before.
+    /// Gateway writers build a re-post turn only with a PostgreSQL pool.
     #[tokio::test]
-    async fn f6_gateway_and_delegated_hosts_build_a_repost_turn_only_with_a_pool() {
+    async fn f6_gateway_hosts_build_a_repost_turn_only_with_a_pool() {
         let unreachable = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://agentdesk@127.0.0.1:1/none")
             .unwrap();
@@ -581,9 +531,7 @@ mod repost_tests {
                 rest: None,
                 boot: None,
             };
-            let delegated = test_host::rest(&shared, Arc::clone(&http));
             assert_eq!(gateway.repost(1, &port).is_some(), pool.is_some());
-            assert_eq!(delegated.repost(1, &port).is_some(), pool.is_some());
         }
     }
 }

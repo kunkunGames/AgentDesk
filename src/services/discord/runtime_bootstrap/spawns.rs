@@ -54,7 +54,8 @@ pub(super) fn run_bot_spawn_reachability_observation(
 ) {
     let shared = shared_for_tmux.clone();
     let provider = provider_for_setup.clone();
-    tokio::spawn(async move {
+    let name = format!("{}:reachability_observation", provider.as_str());
+    crate::services::resident_loops::spawn_resident(name, async move {
         let cadence = std::time::Duration::from_secs(
             health::reachability::observation::REACHABILITY_OBSERVATION_INTERVAL_SECS,
         );
@@ -205,6 +206,74 @@ async fn deferred_restart_marked(provider: &ProviderKind) -> bool {
     true
 }
 
+/// Background work each turn-executing runtime (gateway, confirmed standby, REST runner) starts
+/// once its role is settled; each posts placeholders, so each consumes its own orphan deletes.
+pub(in crate::services::discord) fn run_bot_spawn_execution_runtime_tasks(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+) {
+    run_bot_spawn_deferred_restart_poller(shared, provider);
+    #[cfg(unix)]
+    run_bot_spawn_reachability_observation(shared, provider);
+    run_bot_spawn_orphan_delete_retry(shared, provider);
+}
+
+#[cfg(test)]
+pub(in crate::services::discord) static ORPHAN_RETRY_CADENCE_FOR_TESTS: std::sync::Mutex<
+    Option<(std::time::Duration, std::time::Duration)>,
+> = std::sync::Mutex::new(None);
+
+fn orphan_retry_cadence() -> (std::time::Duration, std::time::Duration) {
+    #[cfg(test)]
+    if let Some(cadence) = *ORPHAN_RETRY_CADENCE_FOR_TESTS.lock().unwrap() {
+        return cadence;
+    }
+    (
+        std::time::Duration::from_secs(
+            crate::services::discord::placeholder_sweeper::INITIAL_DELAY_SECS,
+        ),
+        std::time::Duration::from_secs(
+            crate::services::discord::placeholder_sweeper::SWEEP_INTERVAL_SECS,
+        ),
+    )
+}
+
+/// The runtime's only consumer of its node-local orphan-delete store; the stall sweeper runs on a
+/// gateway alone, so a runner or standby would otherwise never retry a failed delete.
+fn run_bot_spawn_orphan_delete_retry(shared: &Arc<SharedData>, provider: &ProviderKind) {
+    let Some(http) = shared.serenity_http_or_token_fallback() else {
+        tracing::warn!(
+            provider = provider.as_str(),
+            "no Discord REST client; orphan message deletes stay queued"
+        );
+        return;
+    };
+    let shared = shared.clone();
+    let provider = provider.clone();
+    let name = format!("{}:orphan_delete_retry", provider.as_str());
+    crate::services::resident_loops::spawn_resident(name, async move {
+        let (initial, interval) = orphan_retry_cadence();
+        tokio::time::sleep(initial).await;
+        loop {
+            let cleared = crate::services::discord::status_panel_orphan_store::drain(
+                &http,
+                &shared,
+                &provider,
+                &shared.token_hash,
+            )
+            .await;
+            if cleared > 0 {
+                tracing::info!(
+                    provider = provider.as_str(),
+                    cleared,
+                    "orphan delete retry cleared queued messages"
+                );
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
 /// Background: poll for the deferred restart marker for gateway and standby
 /// runtimes. The marker first fences admissions and cancels intake polling;
 /// health counters then provide the drain proof before the wrapper boots out.
@@ -214,7 +283,8 @@ pub(super) fn run_bot_spawn_deferred_restart_poller(
 ) {
     let shared_for_deferred = shared_for_tmux.clone();
     let provider_for_deferred = provider_for_setup.clone();
-    tokio::spawn(async move {
+    let name = format!("{}:deferred_restart_poller", provider_for_deferred.as_str());
+    crate::services::resident_loops::spawn_resident(name, async move {
         loop {
             tokio::time::sleep(DEFERRED_RESTART_POLL_INTERVAL).await;
             // Quick-exit restart (#2713): dcserver no longer waits
@@ -363,7 +433,8 @@ pub(super) fn run_bot_spawn_skills_hot_reload(
 ) {
     let shared_for_skills = shared_for_tmux.clone();
     let provider_for_skills = provider_for_setup.clone();
-    tokio::spawn(async move {
+    let name = format!("{}:skills_hot_reload", provider_for_skills.as_str());
+    crate::services::resident_loops::spawn_resident(name, async move {
         let mut last_fingerprint: (usize, u64) = (0, 0); // (file_count, max_mtime_epoch)
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
@@ -422,8 +493,9 @@ pub(super) fn run_bot_spawn_skills_hot_reload(
 
 /// Background: periodic cleanup for stale Discord upload files. No captures;
 /// behavior-preserving extraction.
-pub(super) fn run_bot_spawn_upload_cleanup() {
-    tokio::spawn(async move {
+pub(super) fn run_bot_spawn_upload_cleanup(provider: &ProviderKind) {
+    let name = format!("{}:discord_upload_cleanup", provider.as_str());
+    crate::services::resident_loops::spawn_resident(name, async move {
         loop {
             tokio::time::sleep(UPLOAD_CLEANUP_INTERVAL).await;
             cleanup_old_uploads(UPLOAD_MAX_AGE);
@@ -474,9 +546,13 @@ pub(super) fn run_bot_spawn_periodic_catch_up(
 /// idle/disconnected thread rows expire after 1 hour, but rows still carrying
 /// an active_dispatch_id stay until the 3-hour safety TTL so warm-resume
 /// sessions keep DB ownership. Behavior-preserving extraction.
-pub(super) fn run_bot_spawn_stale_session_gc(shared_clone: &Arc<SharedData>) {
+pub(super) fn run_bot_spawn_stale_session_gc(
+    shared_clone: &Arc<SharedData>,
+    provider: &ProviderKind,
+) {
     let shared_for_session_gc = shared_clone.clone();
-    tokio::spawn(async move {
+    let name = format!("{}:discord_stale_session_gc", provider.as_str());
+    crate::services::resident_loops::spawn_resident(name, async move {
         // Run every 10 minutes, initial delay 2 minutes
         tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
         loop {
@@ -488,9 +564,13 @@ pub(super) fn run_bot_spawn_stale_session_gc(shared_clone: &Arc<SharedData>) {
 }
 
 #[cfg(unix)]
-pub(super) fn run_bot_spawn_dead_tmux_reaper(shared_clone: &Arc<SharedData>) {
+pub(super) fn run_bot_spawn_dead_tmux_reaper(
+    shared_clone: &Arc<SharedData>,
+    provider: &ProviderKind,
+) {
     let shared_for_reaper = shared_clone.clone();
-    tokio::spawn(async move {
+    let name = format!("{}:discord_dead_tmux_reaper", provider.as_str());
+    crate::services::resident_loops::spawn_resident(name, async move {
         // Initial delay: let startup recovery finish first
         tokio::time::sleep(tokio::time::Duration::from_secs(90)).await;
         loop {

@@ -49,9 +49,15 @@ const BOXED_READY: &str = "earlier output\n\
 struct Launcher {
     creates: AtomicUsize,
     nonces: Mutex<Vec<String>>,
+    /// The next create never reaches the server.
+    unsent: AtomicBool,
 }
 
 impl HerdrLaunchHost for Launcher {
+    fn mode(&self, _: &HerdrLaunchEndpoint) -> crate::config::session_hosts::EndpointMode {
+        crate::config::session_hosts::EndpointMode::LegacyDedicated
+    }
+
     fn restore_resume(&self, _endpoint: &HerdrLaunchEndpoint) -> RestoreResume {
         RestoreResume::Off {
             witness: ServerWitness::for_test(1),
@@ -60,6 +66,9 @@ impl HerdrLaunchHost for Launcher {
 
     fn create(&self, _request: &HerdrCreateRequest) -> HerdrCreateOutcome {
         self.creates.fetch_add(1, Ordering::SeqCst);
+        if self.unsent.swap(false, Ordering::SeqCst) {
+            return HerdrCreateOutcome::NotSent("connect refused".into());
+        }
         HerdrCreateOutcome::Created {
             pane_id: PANE.into(),
         }
@@ -646,6 +655,27 @@ fn cold_start_prompts_once_then_its_own_session_start_binds_it_and_ends_the_hold
     assert_eq!(launcher.creates.load(Ordering::SeqCst), 1);
 }
 
+// A Codex launch whose create never reached the server leaves no Pending behind: the next turn
+// launches one fresh execution and prompts it once.
+#[test]
+fn a_codex_launch_that_never_sent_its_create_is_followed_by_one_fresh_launch_pg() {
+    let fx = Fixture::admitted("unsent");
+    let launcher = Arc::new(Launcher::default());
+    launcher.unsent.store(true, Ordering::SeqCst);
+    let (first, _) = fx.turn(&HostedRecord::Legacy, &fx.ports(&launcher), || {});
+    assert!(first.unwrap_err().contains("NotSent"));
+    assert!(fx.rig.sends().is_empty());
+    let (second, _) = fx.turn(&fx.record(), &fx.ports(&launcher), || {
+        if let Some(nonce) = fx.start_provider(&launcher, true) {
+            fx.answer(&nonce);
+        }
+    });
+    assert_eq!(second, Ok(()));
+    assert_eq!(launcher.creates.load(Ordering::SeqCst), 2);
+    assert_eq!(fx.rig.sends(), prompt_sends());
+    assert_eq!(fx.row(), Some(HostedState::Bound));
+}
+
 // T1-15: a cancel before any write leaves the Pending pane with no hold; the next turn creates
 // nothing and sends only its own prompt once.
 #[test]
@@ -1006,8 +1036,7 @@ fn session_key(provider: &ProviderKind) -> String {
     )
 }
 
-// T1-1/T1-1b/T1-2/T1-10: each provider follows only its own switch at intake and dispatch, with no
-// tmux or provider I/O; on, Codex is O-ready by its own kind and its `!clear` is refused.
+// Each provider follows its own switch at intake and dispatch without pane or provider I/O.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_provider_follows_only_its_own_herdr_switch_at_intake_and_dispatch_pg() {
     use crate::services::agent_protocol::RuntimeHandoffKind::{ClaudeTui, CodexTui};
@@ -1067,6 +1096,7 @@ async fn each_provider_follows_only_its_own_herdr_switch_at_intake_and_dispatch_
                 system_prompt: None,
                 allowed_tools: &[],
                 cancel: Arc::new(CancelToken::new()),
+                codex_observation: None,
                 remote_profile: None,
                 tmux_session_name: Some("AgentDesk-dash"),
                 teardown: None,
@@ -1091,22 +1121,14 @@ async fn each_provider_follows_only_its_own_herdr_switch_at_intake_and_dispatch_
                 .unwrap(),
                 sender,
             );
-            let clear = crate::services::discord::admin_host_guard::read_herdr_clear(
-                Some(pool),
-                &provider,
-                channel,
-                Some(&key),
-            )
-            .await
-            .err();
-            (intake, dispatched, clear)
+            (intake, dispatched)
         }
     };
     let entered = Err("herdr turn: no database".to_string());
     for claude in [false, true] {
         for codex in [false, true] {
             let case = format!("claude={claude} codex={codex}");
-            let (intake, dispatched, _) = judge(ProviderKind::Claude, claude, codex).await;
+            let (intake, dispatched) = judge(ProviderKind::Claude, claude, codex).await;
             match claude {
                 true => assert_eq!((intake, &dispatched), (None, &entered), "{case}"),
                 false => {
@@ -1115,20 +1137,16 @@ async fn each_provider_follows_only_its_own_herdr_switch_at_intake_and_dispatch_
                     assert_eq!(dispatched, Err(unwired.to_string()), "{case}");
                 }
             }
-            let (intake, dispatched, clear) = judge(ProviderKind::Codex, claude, codex).await;
+            let (intake, dispatched) = judge(ProviderKind::Codex, claude, codex).await;
             match codex {
                 true => {
                     assert_eq!((intake, &dispatched), (None, &entered), "{case}");
-                    let unsupported =
-                        crate::services::discord::admin_host_guard::HERDR_CODEX_CLEAR_UNSUPPORTED;
-                    assert_eq!(clear.as_deref(), Some(unsupported), "{case}");
                 }
                 false => {
                     let provider = "codex".to_string();
                     let refused = HerdrRefusal::ProviderUnsupported { provider };
                     assert_eq!(intake, Some(refused.clone()), "{case}");
                     assert_eq!(dispatched, Err(refused.to_string()), "{case}");
-                    assert_eq!(clear, Some(refused.to_string()), "{case}");
                 }
             }
         }
@@ -1546,3 +1564,6 @@ fn coldstop_execute_fresh_pending_bound_closed_arm_releases_hold_pg() {
         );
     }
 }
+
+#[path = "provider_dispatch_codex_live_end_tests.rs"]
+mod live_end;

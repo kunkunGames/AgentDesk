@@ -1,9 +1,7 @@
 use super::*;
 
-/// Spawn the SIGTERM graceful-shutdown handler. On SIGTERM it persists queue /
-/// inflight / last_message state then quick-exits; tmux/TUI processes survive
-/// for the next dcserver instance to rehydrate. Spawned after the lease
-/// keepalive task and before the gateway backend run.
+/// On SIGTERM, persist queue/inflight/last_message state before consuming the shutdown slot.
+/// Spawned once per slot-holding runtime; tmux/TUI sessions survive.
 pub(super) fn run_bot_spawn_sigterm_handler(
     shared: &Arc<SharedData>,
     provider_for_shutdown: ProviderKind,
@@ -297,8 +295,12 @@ pub(super) async fn run_bot_run_gateway_backend(
 }
 
 #[cfg(test)]
-#[path = "shutdown_input_fence_tests.rs"]
-mod input_fence_tests;
+#[path = "shutdown_sigterm_tests.rs"]
+mod sigterm_tests;
+
+#[cfg(test)]
+#[path = "home_lifecycle_tests.rs"]
+pub(super) mod home_lifecycle_tests;
 
 #[cfg(test)]
 mod lifecycle_tests {

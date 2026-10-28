@@ -1,7 +1,32 @@
-//! Pastes one external human input into a busy hosted Claude TUI composer; nothing here enqueues.
-//! A person's draft is first stashed (`stash`); after the paste only Injected or Unconfirmed follow.
+//! Pastes one external human input into a hosted Claude TUI composer; nothing here enqueues.
+//! One pre-paste capture chooses an optional stash; a short settle precedes one Enter.
 
+#[cfg(unix)]
+mod epoch;
+mod ownership;
+pub(crate) use ownership::{
+    ComposerOwner, composer_owner, composer_owner_in_session, draft_sighting,
+    draft_sighting_in_session,
+};
+mod receipt;
+mod submit;
+#[cfg(test)]
+pub(crate) use submit::inject;
+#[cfg(all(test, unix))]
+use submit::{inject_gated, inject_listed};
+pub(crate) use submit::{inject_report, inject_report_any_turn};
+
+#[derive(Clone, Copy)]
+enum TurnGate {
+    BusyOnly,
+    AnyTurn,
+}
+pub(crate) use receipt::exact as exact_receipt;
+#[cfg(test)]
+mod receipt_interleave_tests;
 pub(in crate::services::claude_tui) mod screen;
+#[cfg(test)]
+mod screen_identity_tests;
 #[cfg(test)]
 mod screen_tests;
 pub(in crate::services::claude_tui) mod stash;
@@ -10,111 +35,70 @@ mod stash_tests;
 #[cfg(all(test, unix))]
 pub(crate) use stash_tests::{FAKE_TUI as FAKE_STASH_TUI, StashChannelGuard};
 
-use std::io::{BufRead, Seek, SeekFrom, Write};
+use std::io::{BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use super::composer_lock::{ComposerAdmission, DraftSighting};
-use crate::services::tui_input::actor::gate::{own_draft, own_wrapped_draft};
+use crate::services::platform::tmux::pane_dead_is_live;
 use crate::services::tui_input::bounded_tmux::{BoundedTmuxError, run_bounded_tmux};
-use crate::services::tui_o::shadow::ShadowProvider;
 
 /// Larger inputs are refused before any tmux call.
 pub(crate) const MAX_INPUT_BYTES: usize = 64 * 1024;
 const CAPTURE_SCROLLBACK: &str = "-80";
-const VETOED: &str = "agentdesk-busy-inject-vetoed";
 
 /// Why nothing reached the pane; the caller may queue the input instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Veto {
     InvalidInput,
     LockContended,
-    HumanAttached,
-    AttachUnknown,
     PaneUnavailable,
     Modal,
-    Draft,
     NotBusy,
     TranscriptUnavailable,
     LoadFailed,
-    /// The pane size is unknown or changed, or Claude's rows for the input are not predictable,
-    /// so a paste could not be proven ours and would stay in the composer.
-    UnpredictableRender,
 }
 
-/// A paste was attempted, so the input may sit in the composer or be submitted.
+/// An actual tmux write failed; no observation failure can produce this result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Unconfirmed {
-    PasteFailed,
-    AttachedAfterPaste,
-    CaptureFailed,
-    ModalAfterPaste,
-    DraftNotOwned,
-    ContaminatedSubmit,
-    CursorChangedBeforeEnter,
-    EnterFailed,
-    NotObserved,
+pub(crate) enum WriteFailure {
+    Stash,
+    Paste,
+    Enter,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
+    /// The paste and one Enter were sent; Claude's transcript is diagnostic only.
     Injected,
     NotSent(Veto),
-    Unconfirmed(Unconfirmed),
+    Failed(WriteFailure),
 }
 
-/// Whether the external input reached Claude, read off the outcome.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Delivery {
-    NotAttempted,
-    AttemptedUnconfirmed,
-    Observed,
-}
-
-/// What became of a person's composer draft; only Unchanged and RestoredObserved leave the pane free.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DraftState {
-    Unchanged,
-    StashedVerified,
-    RestoredObserved,
-    Unknown,
-}
-
-/// The delivery and the draft are judged apart: a delivered input is never resent for its draft.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Report {
     pub outcome: Outcome,
-    pub draft: DraftState,
 }
 
 impl Report {
-    fn new(outcome: Outcome, draft: DraftState) -> Self {
-        Self { outcome, draft }
-    }
-
     fn not_sent(veto: Veto) -> Self {
-        Self::new(Outcome::NotSent(veto), DraftState::Unchanged)
-    }
-
-    pub(crate) fn delivery(&self) -> Delivery {
-        match self.outcome {
-            Outcome::NotSent(_) => Delivery::NotAttempted,
-            Outcome::Unconfirmed(_) => Delivery::AttemptedUnconfirmed,
-            Outcome::Injected => Delivery::Observed,
+        Self {
+            outcome: Outcome::NotSent(veto),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReceiptError {
+    ContaminatedSubmit,
+    NotObserved,
 }
 
 pub(crate) struct Timing {
     pub lock_retries: &'static [Duration],
     pub settle: Duration,
-    pub rechecks: usize,
-    pub recheck_interval: Duration,
     pub confirm_window: Duration,
     pub confirm_poll: Duration,
-    /// How long after the submit Claude may take to put a stashed draft back.
-    pub restore_window: Duration,
 }
 
 pub(crate) const TIMING: Timing = Timing {
@@ -124,11 +108,8 @@ pub(crate) const TIMING: Timing = Timing {
         Duration::from_millis(160),
     ],
     settle: Duration::from_millis(200),
-    rechecks: 5,
-    recheck_interval: Duration::from_millis(200),
     confirm_window: Duration::from_secs(3),
     confirm_poll: Duration::from_millis(250),
-    restore_window: Duration::from_secs(2),
 };
 
 pub(crate) struct Request<'a> {
@@ -136,6 +117,8 @@ pub(crate) struct Request<'a> {
     pub transcript: &'a Path,
     pub source: &'a str,
     pub author: &'a str,
+    /// The author's name as Discord shows it.
+    pub name: &'a str,
     pub nonce: &'a str,
     pub text: &'a str,
 }
@@ -145,20 +128,8 @@ pub(crate) fn fresh_nonce() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }
 
-/// The header line keeps the first character off `/`, `!` and `#` and names the source.
-pub(crate) fn frame(source: &str, author: &str, nonce: &str, text: &str) -> String {
-    let clean = |value: &str| -> String {
-        value
-            .chars()
-            .map(|c| if c.is_control() || c == ']' { ' ' } else { c })
-            .collect()
-    };
-    format!(
-        "[📱 {} · {} · {nonce}]\n{text}",
-        clean(source),
-        clean(author)
-    )
-}
+/// The header line keeps the first character off `/`, `!` and `#` and names the person.
+pub(crate) use crate::services::tui_input::human_frame::plain_inject as frame;
 
 fn marker(nonce: &str) -> String {
     format!(" · {nonce}]")
@@ -185,19 +156,57 @@ pub(super) fn transcript_submission(
         return None;
     }
     let marker = marker(nonce);
+    let legacy = expected.is_none_or(|frame| {
+        !frame.starts_with("[User: ")
+            || frame
+                .split(']')
+                .next()
+                .is_some_and(|header| header.contains(" · 📱 v1 mode="))
+    });
+    let registered = expected.is_some_and(|frame| {
+        crate::services::tui_input::human_frame::history::registered(nonce, path, frame)
+    });
     let mut reader = std::io::BufReader::new(file);
     let mut line = Vec::new();
+    let mut position = offset;
     while reader
         .read_until(b'\n', &mut line)
         .is_ok_and(|read| read > 0)
     {
-        // A line without its newline may still be mid-write.
+        let start = position;
+        position += line.len() as u64;
         if line.ends_with(b"\n")
             && let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line)
             && let Some((text, has_nontext)) = human_input_text(&record, expected.is_some())
-            && text.contains(&marker)
         {
-            return Some(expected.is_none_or(|expected| !has_nontext && text == expected));
+            if legacy && text.contains(&marker) {
+                return Some(
+                    expected.is_none_or(|expected| !has_nontext && receipt::exact(&text, expected)),
+                );
+            }
+            if registered && let Some(expected) = expected {
+                if !has_nontext && receipt::exact(&text, expected) {
+                    let kind = match record.get("type").and_then(|v| v.as_str()) {
+                        Some("queue-operation") => "enqueue",
+                        Some("attachment") => "command",
+                        _ => "user",
+                    };
+                    let row = record.get("uuid").and_then(|v| v.as_str()).or_else(|| {
+                        record
+                            .pointer("/attachment/source_uuid")
+                            .and_then(|v| v.as_str())
+                    });
+                    if let Some(confirmed) =
+                        crate::services::tui_input::human_frame::history::receipt(
+                            nonce, path, start, kind, row, expected,
+                        )
+                    {
+                        return Some(confirmed);
+                    }
+                } else if text.contains(expected) {
+                    return Some(false);
+                }
+            }
         }
         line.clear();
     }
@@ -299,103 +308,6 @@ impl Pane {
             .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
-    pub(crate) fn state(&self) -> Option<PaneState> {
-        let out = self.ok(&[
-            "display-message",
-            "-p",
-            "-t",
-            &self.target,
-            "#{session_attached},#{session_last_attached},#{pane_width},#{pane_height}",
-        ])?;
-        let mut fields = out.trim_end_matches('\n').split(',');
-        let attached = fields.next()?.parse().ok()?;
-        // Never-attached sessions report an empty value, else epoch seconds. A reply without it is
-        // read as empty, which any past attach breaks, and its unknown size keeps the stash off.
-        let last = fields.next().unwrap_or_default().to_string();
-        if !last.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let mut size = || fields.next().and_then(|field| field.parse::<usize>().ok());
-        Some(PaneState {
-            generation: Generation { attached, last },
-            size: size().zip(size()),
-        })
-    }
-
-    pub(crate) fn generation(&self) -> Option<Generation> {
-        self.state().map(|state| state.generation)
-    }
-
-    /// Keeps the non-stash callers' no-attached-client contract.
-    pub(crate) fn guarded(
-        &self,
-        g0: &Generation,
-        size: Option<(usize, usize)>,
-        command: &str,
-    ) -> Guard {
-        self.guarded_for_input(g0, size, command, false, None)
-    }
-
-    fn guarded_for_input(
-        &self,
-        g0: &Generation,
-        size: Option<(usize, usize)>,
-        command: &str,
-        stash: bool,
-        cursor: Option<(usize, usize)>,
-    ) -> Guard {
-        let attached = if stash { g0.attached } else { 0 };
-        let vetoed = format!(
-            "display-message -p -t '{}' '{VETOED} #{{session_attached}} #{{session_last_attached}}'",
-            self.target
-        );
-        let mut condition = format!(
-            "#{{&&:#{{==:#{{session_attached}},{attached}}},#{{==:#{{session_last_attached}},{}}}}}",
-            g0.last
-        );
-        if let Some((width, height)) = size {
-            let sized = format!(
-                "#{{&&:#{{==:#{{pane_width}},{width}}},#{{==:#{{pane_height}},{height}}}}}"
-            );
-            condition = format!("#{{&&:{condition},{sized}}}");
-        }
-        if let Some((x, y)) = cursor {
-            let positioned = format!("#{{&&:#{{==:#{{cursor_x}},{x}}},#{{==:#{{cursor_y}},{y}}}}}");
-            condition = format!("#{{&&:{condition},{positioned}}}");
-        }
-        let args = [
-            "if-shell",
-            "-F",
-            "-t",
-            &self.target,
-            &condition,
-            command,
-            &vetoed,
-        ];
-        let Some(out) = self.ok(&args) else {
-            return Guard::Failed;
-        };
-        // A sized guard with the same generation can only have failed its size comparison.
-        match out.trim().strip_prefix(VETOED).map(str::trim) {
-            None if out.trim().is_empty() => Guard::Applied,
-            None => Guard::Failed,
-            Some(rest) => {
-                let mut fields = rest.split_whitespace();
-                match fields.next().map(str::parse::<u32>) {
-                    Some(Ok(count))
-                        if count == attached
-                            && size.is_some()
-                            && fields.next().unwrap_or("") == g0.last =>
-                    {
-                        Guard::Resized
-                    }
-                    Some(Ok(_)) => Guard::Vetoed,
-                    _ => Guard::Gone,
-                }
-            }
-        }
-    }
-
     pub(crate) fn capture(&self) -> Option<String> {
         self.ok(&[
             "capture-pane",
@@ -407,160 +319,41 @@ impl Pane {
             CAPTURE_SCROLLBACK,
         ])
     }
-
-    fn capture_with_cursor(&self) -> Option<(String, (usize, usize))> {
-        let out = self.ok(&[
-            "capture-pane",
-            "-p",
-            "-e",
-            "-t",
-            &self.target,
-            "-S",
-            CAPTURE_SCROLLBACK,
-            ";",
-            "display-message",
-            "-p",
-            "-t",
-            &self.target,
-            "agentdesk-busy-inject-cursor #{cursor_x},#{cursor_y}",
-        ])?;
-        let (capture, position) = out.rsplit_once("\nagentdesk-busy-inject-cursor ")?;
-        let (x, y) = position.trim().split_once(',')?;
-        Some((format!("{capture}\n"), (x.parse().ok()?, y.parse().ok()?)))
-    }
-}
-
-pub(crate) enum Guard {
-    Applied,
-    Vetoed,
-    /// Only a sized guard: the pane is no longer the size the command was planned for.
-    Resized,
-    Gone,
-    Failed,
-}
-
-/// Attach count and last attach second; a change between two reads means a person could type.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Generation {
-    pub(crate) attached: u32,
-    pub(crate) last: String,
-}
-
-pub(crate) struct PaneState {
-    pub(crate) generation: Generation,
-    /// Columns and rows, which decide whether Claude folds or wraps a paste.
-    pub(crate) size: Option<(usize, usize)>,
 }
 
 fn modal(capture: &str) -> bool {
-    use crate::services::claude_tui::startup_dialog::detect_claude_startup_dialog;
-    use crate::services::tmux_common::{
-        tmux_capture_indicates_claude_tui_interactive_modal,
-        tmux_capture_indicates_claude_tui_mcp_auth_required,
-    };
-    let plain = crate::services::codex_tui::input::strip_ansi_escape_sequences(capture);
-    detect_claude_startup_dialog(&plain).is_some()
-        || tmux_capture_indicates_claude_tui_interactive_modal(&plain)
-        || tmux_capture_indicates_claude_tui_mcp_auth_required(&plain)
+    screen::modal(capture)
 }
 
-enum Plan {
-    /// An empty composer, and how Claude will show the paste in it.
-    Direct(screen::Drawn),
-    /// The person's draft rows as Claude shows them, to recognise it when it comes back.
-    Stash(Vec<String>),
-}
-
-/// Pre-mutation pane verdict: an empty composer under a live turn, a draft Claude can stash and
-/// give back, or the veto.
-fn judge_before_paste(
-    capture: &str,
-    transcript: &Path,
-    text: &str,
-    size: Option<(usize, usize)>,
-) -> Result<Plan, Veto> {
-    use crate::services::tmux_common::{
-        tmux_capture_indicates_claude_tui_busy,
-        tmux_capture_indicates_claude_tui_exact_empty_composer,
-        tmux_capture_indicates_claude_tui_prompt_draft,
+/// Read once before any key: whether a visible draft is parked with C-s. An unread composer
+/// deliberately proceeds without C-s.
+pub(in crate::services::claude_tui) fn before_paste(
+    pane: &Pane,
+    stash_allowed: bool,
+) -> Result<bool, Veto> {
+    #[cfg(unix)]
+    if epoch::observe(pane.target().trim_start_matches('=').trim_end_matches(':')).is_err() {
+        return Err(Veto::PaneUnavailable);
+    }
+    if pane
+        .ok(&["display-message", "-p", "-t", pane.target(), "#{pane_dead}"])
+        .is_none_or(|output| !pane_dead_is_live(&output))
+    {
+        return Err(Veto::PaneUnavailable);
+    }
+    let Some(capture) = pane.capture() else {
+        return Ok(false);
     };
-    if modal(capture) {
+    if modal(&capture) {
         return Err(Veto::Modal);
     }
-    let plain = crate::services::codex_tui::input::strip_ansi_escape_sequences(capture);
-    let empty = !tmux_capture_indicates_claude_tui_prompt_draft(&plain)
-        && tmux_capture_indicates_claude_tui_exact_empty_composer(&plain);
-    let stash = if empty {
-        None
-    } else {
-        Some(screen::stashable(capture, text, size).ok_or(Veto::Draft)?)
-    };
-    // Enter on an idle pane would start a new turn instead of queueing behind this one. Claude
-    // hides its busy chrome while the composer holds text, so a draft rests on the transcript.
-    let turn = crate::services::tui_turn_state::observe_claude_jsonl_turn_state(transcript);
-    if !turn.is_busy() || (empty && !tmux_capture_indicates_claude_tui_busy(&plain)) {
-        return Err(Veto::NotBusy);
-    }
-    match stash {
-        Some(draft) => Ok(Plan::Stash(draft)),
-        None => screen::drawn(text, size)
-            .map(Plan::Direct)
-            .ok_or(Veto::UnpredictableRender),
-    }
+    Ok(park_draft(stash_allowed, screen::parkable(&capture)))
 }
 
-/// How a protected pane's draft reads in one capture.
-pub(crate) fn draft_sighting(capture: &str) -> DraftSighting {
-    let screen = screen::read(capture);
-    match (screen.stash, screen.composer) {
-        (screen::Stash::AbsentInRecognizedLayout, screen::Composer::Empty) => {
-            DraftSighting::Settled
-        }
-        (screen::Stash::AbsentInRecognizedLayout, screen::Composer::Text(rows))
-            if !rows.iter().any(|row| row.contains("[📱 ")) =>
-        {
-            DraftSighting::PersonDraft
-        }
-        _ => DraftSighting::Unsettled,
-    }
-}
-
-/// Whose text the composer holds before an automatic key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ComposerOwner {
-    /// Nothing typed: an empty `❯` or a faint placeholder.
-    Empty,
-    /// A Discord prompt AgentDesk typed (`[User: …]`) that never left the composer.
-    AgentDesk,
-    /// Typed text in the measured layout whose removal a later capture can see.
-    Person,
-    Unread,
-}
-
-pub(crate) fn composer_owner(capture: &str) -> ComposerOwner {
-    match screen::typed(capture) {
-        Some(false) => ComposerOwner::Empty,
-        Some(true) => {
-            let screen = screen::read(capture);
-            if screen.stash != screen::Stash::AbsentInRecognizedLayout {
-                return ComposerOwner::Unread;
-            }
-            match screen.composer {
-                screen::Composer::Text(rows) if agentdesk_prompt(&rows) => ComposerOwner::AgentDesk,
-                screen::Composer::Empty => ComposerOwner::Unread,
-                _ => ComposerOwner::Person,
-            }
-        }
-        None => ComposerOwner::Unread,
-    }
-}
-
-/// AgentDesk frames every Discord prompt it types as `[User: …]`.
-fn agentdesk_prompt(rows: &[String]) -> bool {
-    let first = rows.first().map(|row| row.trim_start()).unwrap_or_default();
-    first
-        .get(..6)
-        .is_some_and(|head| head.eq_ignore_ascii_case("[User:"))
+/// The one rule for a visible draft: a listed channel parks it with C-s, any other channel
+/// pastes behind it.
+fn park_draft(stash_allowed: bool, parkable: bool) -> bool {
+    stash_allowed && parkable
 }
 
 /// Channel ids whose panes may take the stash path, comma-separated and read once; unset is none.
@@ -591,78 +384,6 @@ fn stash_channel_listed(channel: Option<u64>, listed: &[u64]) -> bool {
     channel.is_some_and(|channel| listed.contains(&channel))
 }
 
-/// Tries the composer lock a bounded number of times, then injects under it. No channel comes
-/// with this entry, so a person's draft is never stashed: it queues.
-#[cfg(test)]
-pub(crate) fn inject(pane: &Pane, request: &Request<'_>, timing: &Timing) -> Outcome {
-    inject_report(pane, request, None, timing).outcome
-}
-
-/// `inject` with the draft axis kept apart from the delivery, for an input whose channel the
-/// caller resolved, if any.
-pub(crate) fn inject_report(
-    pane: &Pane,
-    request: &Request<'_>,
-    channel: Option<u64>,
-    timing: &Timing,
-) -> Report {
-    #[cfg(all(test, unix))]
-    if !stash_tests::USE_PRODUCTION_CHANNELS.get() {
-        return inject_listed(
-            pane,
-            request,
-            channel,
-            &stash_tests::configured_channels(),
-            timing,
-        );
-    }
-    inject_listed(pane, request, channel, stash_channels_configured(), timing)
-}
-
-/// `inject_report` against an explicit allowlist.
-fn inject_listed(
-    pane: &Pane,
-    request: &Request<'_>,
-    channel: Option<u64>,
-    listed: &[u64],
-    timing: &Timing,
-) -> Report {
-    inject_gated(pane, request, timing, stash_channel_listed(channel, listed))
-}
-
-/// `inject_listed` with the stash path allowed or not.
-fn inject_gated(pane: &Pane, request: &Request<'_>, timing: &Timing, stash: bool) -> Report {
-    let text = frame(request.source, request.author, request.nonce, request.text);
-    // Both names reach tmux command strings, so only plain characters are accepted.
-    let plain = |value: &str, extra: &[char]| {
-        !value.is_empty()
-            && value
-                .chars()
-                .all(|c| c.is_alphanumeric() || extra.contains(&c))
-    };
-    if request.text.trim().is_empty()
-        || text.len() > MAX_INPUT_BYTES
-        || !plain(request.session, &['-', '_'])
-        || !request.nonce.chars().all(|c| c.is_ascii_alphanumeric())
-        || request.nonce.is_empty()
-    {
-        return Report::not_sent(Veto::InvalidInput);
-    }
-    let started = Instant::now();
-    // The whole transaction, restore watch included, runs under the lock: one stash at a time.
-    let locked = at_offsets(
-        timing.lock_retries,
-        || started.elapsed(),
-        std::thread::sleep,
-        || {
-            super::composer_lock::try_with_composer_mutation_lock(request.session, || {
-                inject_locked(pane, request, &text, timing, stash)
-            })
-        },
-    );
-    locked.unwrap_or(Report::not_sent(Veto::LockContended))
-}
-
 /// Runs `attempt` at each offset from the first try until one returns a value.
 pub(crate) fn at_offsets<T>(
     offsets: &[Duration],
@@ -679,227 +400,81 @@ pub(crate) fn at_offsets<T>(
     None
 }
 
-pub(crate) fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
-}
-
 fn inject_locked(
     pane: &Pane,
     request: &Request<'_>,
     text: &str,
     timing: &Timing,
     stash: bool,
+    turn_gate: TurnGate,
 ) -> Report {
-    // The lock fences AgentDesk writers; generation checks fence new clients, not human keys.
-    let floor = unix_seconds();
-    let state = match pane.state() {
-        None => return Report::not_sent(Veto::AttachUnknown),
-        Some(state) if state.generation.attached > 0 && !stash => {
-            return Report::not_sent(Veto::HumanAttached);
-        }
-        // A second attach within this second would leave the generation unchanged.
-        Some(state)
-            if state
-                .generation
-                .last
-                .parse::<u64>()
-                .is_ok_and(|last| last >= floor) =>
-        {
-            return Report::not_sent(Veto::HumanAttached);
-        }
-        Some(state) => state,
-    };
-    let Some(before) = pane.capture() else {
-        return Report::not_sent(Veto::PaneUnavailable);
-    };
-    let capture = || Some(before.clone());
-    let admission = super::composer_lock::composer_admission(request.session, capture);
-    if admission == ComposerAdmission::Held {
-        return Report::not_sent(Veto::Draft);
-    }
-    let plan = match judge_before_paste(&before, request.transcript, text, state.size) {
-        Ok(plan) => plan,
+    let park = match before_paste(pane, stash) {
+        Ok(park) => park,
         Err(veto) => return Report::not_sent(veto),
     };
-    // A person's draft moves only through a stash on an allowlisted channel.
-    let permitted = match plan {
-        Plan::Direct(_) => admission == ComposerAdmission::Any,
-        Plan::Stash(_) => stash,
-    };
-    if !permitted {
-        return Report::not_sent(Veto::Draft);
+    if matches!(turn_gate, TurnGate::BusyOnly)
+        && !crate::services::tui_turn_state::observe_claude_jsonl_turn_state(request.transcript)
+            .is_busy()
+    {
+        return Report::not_sent(Veto::NotBusy);
     }
     let Ok(offset) = std::fs::metadata(request.transcript).map(|meta| meta.len()) else {
         return Report::not_sent(Veto::TranscriptUnavailable);
     };
-    let Ok(mut file) = tempfile::NamedTempFile::new() else {
-        return Report::not_sent(Veto::LoadFailed);
-    };
-    if file
-        .write_all(text.as_bytes())
-        .and_then(|()| file.flush())
-        .is_err()
-    {
-        return Report::not_sent(Veto::LoadFailed);
-    }
-    let buffer = format!("agentdesk-busy-inject-{}", request.nonce);
-    let path = file.path().to_string_lossy().into_owned();
-    if pane.ok(&["load-buffer", "-b", &buffer, &path]).is_none() {
-        return Report::not_sent(Veto::LoadFailed);
-    }
-    let attempt = Attempt {
-        pane,
-        g0: state.generation,
-        request,
-        text,
+    if let Err(error) = crate::services::tui_input::human_frame::history::register(
+        ("claude", request.session, request.nonce, request.author),
+        request.transcript,
         offset,
-        buffer,
-        timing,
-        size: state.size,
-        stash,
-        cursor: std::cell::Cell::new(None),
+        text,
+    ) {
+        tracing::warn!(%error, "busy frame ledger registration failed");
+        return Report::not_sent(Veto::LoadFailed);
+    }
+    let report = Report {
+        outcome: stash::submit(pane, request.nonce, text, timing, park),
     };
-    match plan {
-        Plan::Direct(drawn) => {
-            let mut last = None;
-            let outcome = paste_into_empty(&attempt, &drawn, &mut last);
-            let uncertain = attempt.g0.attached > 0 && matches!(outcome, Outcome::Unconfirmed(_));
-            let draft = if uncertain {
-                DraftState::Unknown
-            } else {
-                DraftState::Unchanged
-            };
-            let report = Report::new(outcome, draft);
-            if uncertain {
-                stash::protect(&attempt, &report, last.as_deref());
-            }
-            report
-        }
-        Plan::Stash(draft) => stash::run(&attempt, &draft),
-    }
-}
-
-/// One locked attempt past the pre-paste verdict, with the frame loaded into a tmux buffer.
-struct Attempt<'a> {
-    pane: &'a Pane,
-    /// The attach generation read just before the pre-paste capture.
-    g0: Generation,
-    request: &'a Request<'a>,
-    text: &'a str,
-    offset: u64,
-    buffer: String,
-    timing: &'a Timing,
-    /// The pane size the paste's rows were predicted for.
-    size: Option<(usize, usize)>,
-    stash: bool,
-    cursor: std::cell::Cell<Option<(usize, usize)>>,
-}
-
-impl Attempt<'_> {
-    fn key(&self, key: &str) -> Guard {
-        let command = format!("send-keys -t '{}' {key}", self.pane.target);
-        let cursor = if key == "Enter" {
-            self.cursor.get()
-        } else {
-            None
-        };
-        self.pane
-            .guarded_for_input(&self.g0, None, &command, self.stash, cursor)
-    }
-
-    /// With `size`, the paste lands only in a pane still that size.
-    fn paste(&self, size: Option<(usize, usize)>) -> Guard {
-        let command = format!(
-            "paste-buffer -p -r -d -b {} -t '{}'",
-            self.buffer, self.pane.target
+    if report.outcome == Outcome::Injected {
+        let request = (
+            request.transcript.to_path_buf(),
+            offset,
+            request.nonce.to_string(),
+            text.to_string(),
         );
-        self.pane
-            .guarded_for_input(&self.g0, size, &command, self.stash, None)
+        let window = timing.confirm_window;
+        let poll = timing.confirm_poll;
+        // Receipt collection never delays the next input or changes its result.
+        let _ = std::thread::Builder::new()
+            .name("claude-receipt".into())
+            .spawn(move || {
+                let (path, offset, nonce, text) = request;
+                let result = await_receipt(
+                    (&path, offset, &nonce, &text),
+                    Instant::now() + window,
+                    poll,
+                );
+                tracing::debug!(%nonce, ?result, "Claude injection receipt diagnostic");
+            });
     }
-
-    fn drop_buffer(&self) {
-        let _ = self.pane.ok(&["delete-buffer", "-b", &self.buffer]);
+    if matches!(report.outcome, Outcome::NotSent(_)) {
+        crate::services::tui_input::human_frame::history::withdraw(
+            request.nonce,
+            request.transcript,
+        );
     }
-
-    /// No client attached or detached since g0, including an initially attached stash input.
-    fn generation_unchanged(&self) -> bool {
-        self.pane.generation().as_ref() == Some(&self.g0)
-    }
-
-    /// Rechecks after the paste until `owns` accepts a capture; the last capture is kept.
-    fn await_own(
-        &self,
-        owns: impl Fn(&str) -> bool,
-        last: &mut Option<String>,
-    ) -> Result<(), Unconfirmed> {
-        std::thread::sleep(self.timing.settle);
-        for attempt in 0..self.timing.rechecks {
-            if attempt > 0 {
-                std::thread::sleep(self.timing.recheck_interval);
-            }
-            if !self.generation_unchanged() {
-                return Err(Unconfirmed::AttachedAfterPaste);
-            }
-            let captured = if self.g0.attached > 0 {
-                self.pane
-                    .capture_with_cursor()
-                    .map(|(capture, cursor)| (capture, Some(cursor)))
-            } else {
-                self.pane.capture().map(|capture| (capture, None))
-            };
-            let Some((after, cursor)) = captured else {
-                return Err(Unconfirmed::CaptureFailed);
-            };
-            let shown_modal = modal(&after);
-            let owned = !shown_modal && owns(&after);
-            *last = Some(after);
-            if shown_modal {
-                return Err(Unconfirmed::ModalAfterPaste);
-            }
-            if owned {
-                self.cursor.set(cursor);
-                return Ok(());
-            }
-        }
-        Err(Unconfirmed::DraftNotOwned)
-    }
-
-    /// One guarded Enter, then the transcript watch; nothing is ever sent twice.
-    fn enter(&self) -> Outcome {
-        // The server does not report when it applied the key, so the window starts just before
-        // the request; a slow reply (an after-send-keys hook) only shortens it.
-        let deadline = Instant::now() + self.timing.confirm_window;
-        // Cursor equality narrows the human-key window; the submitted body still decides success.
-        match self.key("Enter") {
-            Guard::Applied => {}
-            Guard::Vetoed | Guard::Resized => {
-                if self.cursor.get().is_some() && self.generation_unchanged() {
-                    return Outcome::Unconfirmed(Unconfirmed::CursorChangedBeforeEnter);
-                }
-                return Outcome::Unconfirmed(Unconfirmed::AttachedAfterPaste);
-            }
-            Guard::Gone | Guard::Failed => return Outcome::Unconfirmed(Unconfirmed::EnterFailed),
-        }
-        let request = self.request;
-        let receipt = (request.transcript, self.offset, request.nonce, self.text);
-        await_receipt(receipt, deadline, self.timing.confirm_poll)
-            .map_or_else(Outcome::Unconfirmed, |()| Outcome::Injected)
-    }
+    report
 }
 
 /// Polls the transcript after `offset` until `deadline` for the submission carrying `nonce`:
-/// only the exact `text` is a receipt, another body under the nonce is contaminated.
+/// only the exact `text`, bare or in one paste block, is a receipt; another body is contaminated.
 pub(crate) fn await_receipt(
     (transcript, offset, nonce, text): (&Path, u64, &str, &str),
     deadline: Instant,
     poll: Duration,
-) -> Result<(), Unconfirmed> {
+) -> Result<(), ReceiptError> {
     // Only a scan that ends inside the window confirms; later evidence stays NotObserved.
     loop {
         if Instant::now() >= deadline {
-            return Err(Unconfirmed::NotObserved);
+            return Err(ReceiptError::NotObserved);
         }
         if let Some(exact) = transcript_submission(transcript, offset, nonce, Some(text))
             && Instant::now() < deadline
@@ -907,41 +482,10 @@ pub(crate) fn await_receipt(
             return if exact {
                 Ok(())
             } else {
-                Err(Unconfirmed::ContaminatedSubmit)
+                Err(ReceiptError::ContaminatedSubmit)
             };
         }
         let left = deadline.saturating_duration_since(Instant::now());
         std::thread::sleep(poll.min(left));
     }
-}
-
-/// The composer was empty: paste, prove the bytes are ours, then one Enter.
-fn paste_into_empty(
-    attempt: &Attempt<'_>,
-    drawn: &screen::Drawn,
-    last: &mut Option<String>,
-) -> Outcome {
-    // From the paste on, absence of evidence never proves the input was not taken.
-    match attempt.paste(attempt.size) {
-        Guard::Applied => {}
-        guard @ (Guard::Vetoed | Guard::Resized | Guard::Gone) => {
-            attempt.drop_buffer();
-            return Outcome::NotSent(match guard {
-                Guard::Resized => Veto::UnpredictableRender,
-                Guard::Vetoed => Veto::HumanAttached,
-                _ => Veto::PaneUnavailable,
-            });
-        }
-        Guard::Failed => return Outcome::Unconfirmed(Unconfirmed::PasteFailed),
-    }
-    // Exact body, the exact rows Claude wraps it into, or a folded placeholder matching only in
-    // shape and line count; anything else may hold a person's keys.
-    let owns = |after: &str| {
-        own_draft(ShadowProvider::Claude, after, attempt.text, true)
-            || matches!(drawn, screen::Drawn::Rows(rows) if own_wrapped_draft(after, rows))
-    };
-    if let Err(detail) = attempt.await_own(owns, last) {
-        return Outcome::Unconfirmed(detail);
-    }
-    attempt.enter()
 }

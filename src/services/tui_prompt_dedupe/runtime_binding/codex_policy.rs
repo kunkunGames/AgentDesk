@@ -6,6 +6,10 @@ use super::*;
 use crate::services::tmux_common::{self as tc, TmuxSourceAuthority};
 use crate::services::tui_prompt_dedupe::binding_context::{self, BindingContext, SpawnNonceMarker};
 
+pub(crate) mod clear_relaunch;
+mod hold_detail;
+pub(crate) use hold_detail::codex_verified_hold_detail;
+
 pub(super) struct PinnedIncarnation(BindingContext);
 
 impl PinnedIncarnation {
@@ -139,6 +143,9 @@ pub(crate) fn codex_verified_input_blocked(tmux: &str) -> bool {
 
 pub(crate) fn codex_verified_hold_reason(tmux: &str) -> &'static str {
     tc::with_tmux_source_authority(tmux, |authority| {
+        if clear_relaunch::open_under(authority) {
+            return "cleared_awaiting_launch";
+        }
         let SpawnNonceMarker::Known(nonce) =
             binding_context::observe_spawn_nonce_marker(authority.session())
         else {
@@ -261,6 +268,8 @@ pub(crate) fn codex_verified_o_source_allowed(
     channel: u64,
     source: &binding_events::SourceId,
 ) -> bool {
+    #[cfg(all(test, unix))]
+    crate::services::tui_o::writer::tests::restart_policy_call(channel);
     // O's cursor keeps the dev it first stored; the proof reads the file's dev now.
     let same = crate::services::tui_o::shadow::capture::same_file;
     verified_panes(channel).into_iter().all(|tmux| {

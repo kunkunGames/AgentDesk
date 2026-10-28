@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use crate::services::tmux_diagnostics::clear_tmux_exit_reason;
+use crate::services::tui_input::human_frame;
 
 // Same-pane source mutations linearize here; lock order is authority -> STATE.
 static TMUX_SOURCE_AUTHORITY_LOCKS: LazyLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> =
@@ -222,10 +223,8 @@ fn tmux_line_is_claude_tui_prompt_draft(line: &str) -> bool {
     let rest = rest.trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}');
     // AgentDesk injects submitted Discord turns as lines like
     // `❯ [User: name (ID: ...)] ...`. Those are pane history, not an active
-    // composer draft, so do not block the transcript-idle readiness fallback.
-    let discord_submitted_prompt = rest
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("[User:"));
+    // composer draft (a running turn's `· 📱` input still is one).
+    let discord_submitted_prompt = human_frame::opens_discord_prompt(rest);
     !rest.is_empty() && !discord_submitted_prompt
 }
 
@@ -542,56 +541,6 @@ pub(crate) fn sniff_background_agent_pending(tmux_session_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `true` when `line` is a Claude TUI spinner progress footer: a leading spinner
-/// glyph (the rotating set the TUI cycles through) directly followed by a work
-/// verb. Anchoring the verb to the spinner glyph is what distinguishes the TUI
-/// chrome from the same verb appearing in assistant body text.
-fn tmux_line_is_claude_tui_spinner_progress(line: &str) -> bool {
-    let line = line.trim_start();
-    let mut chars = line.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !is_claude_tui_spinner_glyph(first) {
-        return false;
-    }
-    // The remainder after the glyph (and its following space) must lead with a
-    // work verb the TUI uses for the streaming footer. Completed-work summaries
-    // (`✻ Churned for 4m 56s`, `✻ Worked for 2s`) use a past-tense "<verb> for
-    // <duration>" shape and must NOT count as in-progress.
-    let rest = chars.as_str().trim_start();
-    let lower = rest.to_ascii_lowercase();
-    if lower.contains(" for ") && !lower.contains("esc to interrupt") {
-        return false;
-    }
-    const WORK_VERBS: [&str; 7] = [
-        "actioning",
-        "musing",
-        "thinking",
-        "processing",
-        "running",
-        "crunching",
-        "churning",
-    ];
-    if !WORK_VERBS.iter().any(|verb| lower.starts_with(verb)) {
-        return false;
-    }
-    // #3107 codex re-review (F2): the leading glyph + work verb alone is NOT
-    // enough — a plain assistant sentence that happens to begin with a spinner
-    // glyph and a verb (e.g. `· Thinking through the problem and running the
-    // tests`) would otherwise read as the streaming footer. The REAL Claude TUI
-    // spinner line ALWAYS carries a status SUFFIX — it renders like
-    // `✻ Thinking… (12s · ↑ 1.2k tokens · esc to interrupt)`. Require at least
-    // one of those status markers so assistant prose can't trip it:
-    //   - the literal `esc to interrupt`, OR
-    //   - a parenthesized TUI status group containing a duration (`<N>s` /
-    //     `<N>m`), a `tokens` count, and/or the `·` separator the TUI uses.
-    if line_has_claude_tui_interrupt_chrome(line) {
-        return true;
-    }
-    line_has_claude_tui_spinner_status_group(line)
-}
-
 fn is_claude_tui_spinner_glyph(glyph: char) -> bool {
     const SPINNER_GLYPHS: [char; 8] = ['·', '✢', '✳', '✶', '✻', '✽', '✦', '∗'];
     SPINNER_GLYPHS.contains(&glyph)
@@ -760,34 +709,6 @@ fn is_claude_tui_duration_token(token: &str) -> bool {
         && bytes[..bytes.len() - 1]
             .iter()
             .all(|byte| byte.is_ascii_digit())
-}
-
-/// `true` when `line` contains the parenthesized status group the Claude TUI
-/// spinner footer renders next to the work verb, e.g.
-/// `(12s · ↑ 1.2k tokens · esc to interrupt)`. The group must carry at least one
-/// of: a duration token (`<N>s` / `<N>m`), a `tokens` count, or the interior `·`
-/// separator the TUI draws between status fields. A bare parenthetical in
-/// assistant prose (no such marker) does NOT qualify.
-fn line_has_claude_tui_spinner_status_group(line: &str) -> bool {
-    let Some(open) = line.find('(') else {
-        return false;
-    };
-    let after_open = &line[open + 1..];
-    let Some(close_rel) = after_open.find(')') else {
-        return false;
-    };
-    if !after_open[close_rel + 1..].trim().is_empty() {
-        return false;
-    }
-    let group = &after_open[..close_rel];
-    let lower = group.to_ascii_lowercase();
-    if lower.contains("esc to interrupt") || lower.contains("tokens") || group.contains('·') {
-        return true;
-    }
-    // A standalone duration token such as `12s` / `4m` inside the group.
-    group
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(is_claude_tui_duration_token)
 }
 
 pub(crate) fn tmux_capture_indicates_claude_tui_prompt_draft(capture: &str) -> bool {
@@ -990,10 +911,7 @@ fn claude_tui_stranded_followup_draft_backspace_budget(
         .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}');
     // Only AgentDesk-injected `[User: …]` text is recoverable this way; an empty
     // composer or a non-injected suggestion ghost is handled by the normal path.
-    if !rest
-        .get(..6)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("[User:"))
-    {
+    if !human_frame::opens_discord_prompt(rest) {
         return None;
     }
     // A genuine stranded draft sits under ONLY idle-suggestion chrome. (That
@@ -1021,11 +939,7 @@ pub(crate) fn claude_tui_prompt_draft_backspace_budget_from_line(line: &str) -> 
     let rest = trim_prompt_line(line)
         .strip_prefix(CLAUDE_TUI_PROMPT_MARKER)?
         .trim_matches(|ch: char| ch.is_whitespace() || ch == '\u{00a0}');
-    if rest.is_empty()
-        || rest
-            .get(..6)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("[User:"))
-    {
+    if rest.is_empty() || human_frame::opens_discord_prompt(rest) {
         return None;
     }
     Some(rest.chars().count().saturating_add(4).min(512))
@@ -1243,19 +1157,7 @@ pub(crate) fn cleanup_cleared_session_temp_files(
     cleanup_session_temp_files(session.name());
 }
 
-// The caller already holds the source fence; never acquire it a second time.
-pub(crate) fn cleanup_native_clear_fallback_under_source_authority(
-    authority: &TmuxSourceAuthority<'_>,
-    session: &crate::services::session_host::ClearedHostSession,
-) -> bool {
-    if authority.session() != session.name() {
-        return false;
-    }
-    cleanup_session_temp_files_under_source_authority(authority, authority.session());
-    true
-}
-
-fn cleanup_session_temp_files_under_source_authority(
+pub(crate) fn cleanup_session_temp_files_under_source_authority(
     authority: &TmuxSourceAuthority<'_>,
     session_name: &str,
 ) {
@@ -2869,6 +2771,84 @@ Claude Code v2.1.195
 #[cfg(test)]
 mod sentinel_tests {
     use super::*;
+
+    /// `true` when `line` is a Claude TUI spinner progress footer: a leading spinner
+    /// glyph (the rotating set the TUI cycles through) directly followed by a work
+    /// verb. Anchoring the verb to the spinner glyph is what distinguishes the TUI
+    /// chrome from the same verb appearing in assistant body text.
+    fn tmux_line_is_claude_tui_spinner_progress(line: &str) -> bool {
+        let line = line.trim_start();
+        let mut chars = line.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !is_claude_tui_spinner_glyph(first) {
+            return false;
+        }
+        // The remainder after the glyph (and its following space) must lead with a
+        // work verb the TUI uses for the streaming footer. Completed-work summaries
+        // (`✻ Churned for 4m 56s`, `✻ Worked for 2s`) use a past-tense "<verb> for
+        // <duration>" shape and must NOT count as in-progress.
+        let rest = chars.as_str().trim_start();
+        let lower = rest.to_ascii_lowercase();
+        if lower.contains(" for ") && !lower.contains("esc to interrupt") {
+            return false;
+        }
+        const WORK_VERBS: [&str; 7] = [
+            "actioning",
+            "musing",
+            "thinking",
+            "processing",
+            "running",
+            "crunching",
+            "churning",
+        ];
+        if !WORK_VERBS.iter().any(|verb| lower.starts_with(verb)) {
+            return false;
+        }
+        // #3107 codex re-review (F2): the leading glyph + work verb alone is NOT
+        // enough — a plain assistant sentence that happens to begin with a spinner
+        // glyph and a verb (e.g. `· Thinking through the problem and running the
+        // tests`) would otherwise read as the streaming footer. The REAL Claude TUI
+        // spinner line ALWAYS carries a status SUFFIX — it renders like
+        // `✻ Thinking… (12s · ↑ 1.2k tokens · esc to interrupt)`. Require at least
+        // one of those status markers so assistant prose can't trip it:
+        //   - the literal `esc to interrupt`, OR
+        //   - a parenthesized TUI status group containing a duration (`<N>s` /
+        //     `<N>m`), a `tokens` count, and/or the `·` separator the TUI uses.
+        if line_has_claude_tui_interrupt_chrome(line) {
+            return true;
+        }
+        line_has_claude_tui_spinner_status_group(line)
+    }
+
+    /// `true` when `line` contains the parenthesized status group the Claude TUI
+    /// spinner footer renders next to the work verb, e.g.
+    /// `(12s · ↑ 1.2k tokens · esc to interrupt)`. The group must carry at least one
+    /// of: a duration token (`<N>s` / `<N>m`), a `tokens` count, or the interior `·`
+    /// separator the TUI draws between status fields. A bare parenthetical in
+    /// assistant prose (no such marker) does NOT qualify.
+    fn line_has_claude_tui_spinner_status_group(line: &str) -> bool {
+        let Some(open) = line.find('(') else {
+            return false;
+        };
+        let after_open = &line[open + 1..];
+        let Some(close_rel) = after_open.find(')') else {
+            return false;
+        };
+        if !after_open[close_rel + 1..].trim().is_empty() {
+            return false;
+        }
+        let group = &after_open[..close_rel];
+        let lower = group.to_ascii_lowercase();
+        if lower.contains("esc to interrupt") || lower.contains("tokens") || group.contains('·') {
+            return true;
+        }
+        // A standalone duration token such as `12s` / `4m` inside the group.
+        group
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(is_claude_tui_duration_token)
+    }
 
     /// #2442 — round-trip the sentinel through the same code path the
     /// wrappers use, then verify the consumer-side tail-peek picks it up.

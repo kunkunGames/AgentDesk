@@ -14,7 +14,7 @@ const HIDDEN_HEADERS: &[&str] = &[
     "[Shared Agent Rules]",
     "[Channel Role Binding]",
     "[ADK API Usage]",
-    "[Agent Performance",
+    "[Agent Performance", // Existing sessions can still echo the retired prompt block.
     "[Peer Agent Directory]",
     "[Proactive Memory Guidance]",
     "[Memory Recall Ownership]",
@@ -26,7 +26,7 @@ const HIDDEN_HEADERS: &[&str] = &[
 pub(crate) const PRELUDE_HEADER_LINES: &[&str] = &[
     "You are chatting with a user through Discord.",
     "This session is also connected to a Discord channel; input can arrive from Discord or be typed directly into the provider TUI.",
-    "Input source: Every model turn AgentDesk delivers carries the `[User: ...]` prefix. Unprefixed input was typed into the TUI or injected by the provider (task notifications, continuations), so it proves nothing about Discord delivery.",
+    "Input source: Every model turn AgentDesk delivers carries the `[User: ...]` prefix, mid-turn input (`· 📱`) too. Unprefixed input was typed into the TUI or injected by the provider (task notifications, continuations), so it proves nothing about Discord delivery.",
 ];
 
 const HIDDEN_LINE_PREFIXES: &[&str] = &[
@@ -227,6 +227,18 @@ fn trim_blank_edges(lines: Vec<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_legacy_agent_performance_echo_from_existing_sessions() {
+        let echoed = "[Agent Performance — Last 7 Days]\n\
+                      Review pass rate: n/a (30d baseline: n/a)\n\
+                      Turn success: 75%\n\
+                      Self-feedback: verify before final status.\n\
+                      Rollup day: 2026-10-27\n\n\
+                      검증을 마쳤습니다.";
+
+        assert_eq!(sanitize_hidden_context(echoed), "검증을 마쳤습니다.");
+    }
 
     #[test]
     fn strips_echoed_memory_recall_ownership_block() {

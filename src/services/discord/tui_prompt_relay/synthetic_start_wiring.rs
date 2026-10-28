@@ -51,7 +51,13 @@ pub(super) async fn post_suppressed_injection_note(
     } else {
         format_system_continuation_note(&prompt.tmux_session_name, &prompt.prompt)
     };
-    match channel_id.say(&**notify_http, note).await {
+    match super::super::http::dispatch_channel_message(
+        notify_http,
+        channel_id,
+        serenity::CreateMessage::new().content(note),
+    )
+    .await
+    {
         Ok(message) => {
             record_prompt_id_after_post(prompt, None);
             tracing::info!(
@@ -140,7 +146,12 @@ pub(super) async fn post_passive_prompt_notice(
             &prompt.prompt,
         ),
     };
-    let posted = channel.say(&*gate.notify_http, content).await;
+    let posted = super::super::http::dispatch_channel_message(
+        &gate.notify_http,
+        channel,
+        serenity::CreateMessage::new().content(content),
+    )
+    .await;
     record_prompt_id_after_post(prompt, posted.as_ref().err());
     None
 }
@@ -202,12 +213,17 @@ pub(super) async fn post_steer_echo(
     let Some(registry) = shared.health_registry() else {
         return;
     };
-    let notify = super::super::bot_role::UtilityBotRole::Notify;
-    let http = match super::super::health::resolve_utility_bot_http(registry.as_ref(), notify).await
+    let provider = ProviderKind::from_str_or_unsupported(&prompt.provider);
+    let http = match super::super::session_notice::provider_http(
+        registry.as_ref(),
+        &provider,
+        channel_id,
+    )
+    .await
     {
         Ok(http) => http,
-        Err((status, body)) => {
-            tracing::warn!(channel_id = channel_id.get(), %status, %body, "steer echo: notify bot unavailable");
+        Err(error) => {
+            tracing::warn!(channel_id = channel_id.get(), %error, "steer echo: channel provider unavailable");
             return;
         }
     };
@@ -216,7 +232,13 @@ pub(super) async fn post_steer_echo(
         &prompt.tmux_session_name,
         &prompt.prompt,
     );
-    if let Err(error) = channel_id.say(&*http, content).await {
+    if let Err(error) = super::super::http::dispatch_channel_message(
+        &http,
+        channel_id,
+        serenity::CreateMessage::new().content(content),
+    )
+    .await
+    {
         tracing::warn!(channel_id = channel_id.get(), %error, "failed to send steer echo");
     }
 }
@@ -248,6 +270,43 @@ pub(super) fn failed_synthetic_placeholder_cleanup_target(
     anchor_is_owned_placeholder: bool,
 ) -> Option<MessageId> {
     anchor_is_owned_placeholder.then_some(anchor_message_id)
+}
+
+/// For a Codex channel boot selected for turn mode, whether it is confirmed, read under the start
+/// lock a confirmation takes; the lock stays in `guard` through the persist or claim that follows.
+async fn codex_confirmed(
+    lock: &Arc<tokio::sync::Mutex<()>>,
+    guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
+    provider: &ProviderKind,
+    channel: u64,
+) -> bool {
+    // No confirmation reaches an unselected channel, and a waiting worker holds this lock for long.
+    if *provider != ProviderKind::Codex || !crate::services::tui_o::cutover::turn_selected(channel)
+    {
+        return false;
+    }
+    *guard = Some(Arc::clone(lock).lock_owned().await);
+    crate::services::tui_o::turn_mode::transcript_turns(channel)
+}
+
+/// Turn mode was confirmed while this observation waited: no Legacy turn starts for it, so its
+/// owned placeholder and its lease are released.
+async fn release_confirmed_observation(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+    prompt: &ObservedTuiPrompt,
+    anchor_message_id: MessageId,
+    anchor_is_owned_placeholder: bool,
+) {
+    crate::services::tui_prompt_dedupe::clear_external_input_relay_lease_if_generation_matches(
+        &prompt.provider,
+        &prompt.tmux_session_name,
+        channel_id.get(),
+        prompt.external_input_lease_generation,
+    );
+    let (anchor, owned) = (anchor_message_id, anchor_is_owned_placeholder);
+    delete_failed_synthetic_owned_placeholder(shared, provider, channel_id, anchor, owned).await;
 }
 
 pub(super) async fn delete_failed_synthetic_owned_placeholder(
@@ -450,7 +509,6 @@ pub(super) async fn establish_tui_direct_synthetic_lifecycle_anchor(
 ///
 pub(super) async fn wire_tui_direct_synthetic_turn_start(
     shared: &Arc<SharedData>,
-    provider_str: &str,
     channel_id: ChannelId,
     prompt: &ObservedTuiPrompt,
     anchor_message_id: MessageId,
@@ -476,13 +534,17 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
     // original bug). The worker owns the relay-owner handoff.
     let mut deferred_synthetic_start = false;
     let mut claimed = false;
-    if let Some(provider) = ProviderKind::from_str(provider_str) {
+    if let Some(provider) = ProviderKind::from_str(&prompt.provider) {
         // #3154 — TEMPORAL fix for turn-interleaving. An INLINE claim while the
         // PRIOR turn's tail still drains seeds `turn_start_offset` from the prior
         // cursor (duplicate relay), and an inline wait starves OTHER channels. So
         // an un-finalized prior turn persists a DURABLE pending-start and hands
         // the claim to a DETACHED per-channel worker (fresh EOF offset); the
         // common no-interleave case stays on the inline fast path.
+        let lock = super::super::tui_direct_pending_start::channel_lock(
+            provider.as_str(),
+            channel_id.get(),
+        );
         let prior = super::synthetic_start::synthetic_start_prior_turn_view(
             shared,
             &provider,
@@ -491,7 +553,16 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
             anchor_message_id.get(),
         )
         .await;
-        if super::super::tui_direct_pending_start::should_defer_synthetic_turn_start(prior.view) {
+        let defer =
+            super::super::tui_direct_pending_start::should_defer_synthetic_turn_start(prior.view);
+        let mut confirming = None;
+        if codex_confirmed(&lock, &mut confirming, &provider, channel_id.get()).await {
+            let (anchor, owned) = (anchor_message_id, anchor_is_owned_placeholder);
+            release_confirmed_observation(shared, &provider, channel_id, prompt, anchor, owned)
+                .await;
+            return true;
+        }
+        if defer {
             deferred_synthetic_start = true;
             crate::services::tui_prompt_dedupe::hand_native_turn_to_worker(
                 prompt,
@@ -514,22 +585,19 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
                 "deferred TUI-direct synthetic turn-start off the observer loop; prior turn not yet finalized (durable record persisted, detached per-channel worker spawned)"
             );
         } else {
-            let lock = super::super::tui_direct_pending_start::channel_lock(
-                provider.as_str(),
-                channel_id.get(),
-            );
-            let _inline_claim_guard = lock.lock().await;
+            let _inline_claim_guard = match confirming.take() {
+                Some(guard) => guard,
+                None => Arc::clone(&lock).lock_owned().await,
+            };
             let (claim, source) =
                 super::synthetic_start::claim_tui_direct_synthetic_turn_inner::<false>(
                     shared,
                     &provider,
                     channel_id,
                     &prompt.tmux_session_name,
-                    &prompt.prompt,
-                    anchor_message_id,
+                    (&prompt.prompt, anchor_message_id),
                     &*lease,
-                    None,
-                    prompt.native_turn_id.as_deref(),
+                    (None, prompt.native_turn_id.as_deref()),
                 )
                 .await;
             claimed = claim.claimed;
@@ -592,3 +660,7 @@ pub(super) async fn wire_tui_direct_synthetic_turn_start(
     }
     deferred_synthetic_start
 }
+
+#[cfg(test)]
+#[path = "synthetic_start_wiring_codex_tests.rs"]
+mod codex_tests;

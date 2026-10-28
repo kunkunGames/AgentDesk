@@ -97,12 +97,11 @@ fn notice_delivered(sent: &Result<ReplaceLongMessageOutcome, String>) -> bool {
     )
 }
 
-/// Runs a lock-held transition on an input-effect worker with this task's permit, so no inflight
-/// lock spans an await. A worker panic or cancelled join is `None`, as is any refusal.
+/// Runs a lock-held transition on a blocking worker, so no inflight lock spans an await. A worker
+/// panic or cancelled join is `None`, as is any refusal.
 async fn off_scheduler<T: Send + 'static>(
     transition: impl FnOnce() -> Option<T> + Send + 'static,
 ) -> Option<T> {
-    use futures::FutureExt;
     // Tests carry this thread's settlement switch to the worker and restore the worker's own.
     #[cfg(all(test, unix))]
     let settlement =
@@ -116,13 +115,7 @@ async fn off_scheduler<T: Send + 'static>(
             );
         transition()
     };
-    std::panic::AssertUnwindSafe(crate::services::discord::input_runtime::fence::effect::io(
-        work,
-    ))
-    .catch_unwind()
-    .await
-    .ok()
-    .flatten()
+    tokio::task::spawn_blocking(work).await.ok().flatten()
 }
 
 /// `Some` only when the durable row now holds exactly `updated`'s receipt.
@@ -255,6 +248,7 @@ impl InflightTurnState {
             .ok()?;
         let fresh = guard.state();
         if fresh.turn_nonce.as_deref() != Some(receipt.turn_nonce())
+            || fresh.current_msg_id == 0
             || !InflightTurnIdentity::from_state(self).matches_state(fresh)
             || fresh.effective_finalizer_turn_id() != self.effective_finalizer_turn_id()
             || fresh.rebind_origin
@@ -285,6 +279,19 @@ impl InflightTurnState {
         sent: &Result<ReplaceLongMessageOutcome, String>,
     ) -> Option<InflightTurnState> {
         if !notice_delivered(sent) {
+            return None;
+        }
+        let row = self.clone();
+        off_scheduler(move || row.ack_locked()).await
+    }
+
+    /// The same ack for a stop shown as a reply where O owns the body: only a send that returned a
+    /// real message id is a shown notice.
+    pub(in crate::services::discord) async fn ack_before_start_reply(
+        &self,
+        sent: &Result<Option<poise::serenity_prelude::MessageId>, String>,
+    ) -> Option<InflightTurnState> {
+        if !matches!(sent, Ok(Some(_))) {
             return None;
         }
         let row = self.clone();

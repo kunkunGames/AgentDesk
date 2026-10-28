@@ -12,6 +12,7 @@ use super::herdr::contract::{HerdrOutcome, HerdrTransport, ServerHello, ServerWi
 use super::herdr::launch_host::SocketHerdrLaunchHost;
 use super::herdr::model::{HerdrCall, HerdrEndpoint};
 use super::herdr::observe::RestoreUnverified;
+use super::herdr::policy::permit::ExistingMutationEvidence;
 use super::herdr_gate::{HerdrPaneView, HerdrTarget};
 use super::herdr_host::HerdrHost;
 use super::model::{
@@ -158,7 +159,13 @@ impl HerdrRegistry {
                     &configured.socket_path,
                     &configured.herdr_session,
                 )
-                .and_then(|endpoint| endpoint.with_herdr_home(&configured.herdr_home))
+                .and_then(|endpoint| match configured.mode {
+                    crate::config::session_hosts::EndpointMode::LegacyDedicated => {
+                        endpoint.with_herdr_home(&configured.herdr_home)
+                    }
+                    crate::config::session_hosts::EndpointMode::UserDefault => Ok(endpoint),
+                })
+                .map(|endpoint| endpoint.with_mode(configured.mode))
                 .ok()
             })
             .collect();
@@ -207,6 +214,12 @@ impl HerdrRegistry {
         }
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_launch_host(mut self, host: SocketHerdrLaunchHost) -> Self {
+        self.launch = Some(host);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_reads(self, reads: TestReads) -> Self {
         Self {
@@ -217,6 +230,80 @@ impl HerdrRegistry {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.endpoints.is_empty()
+    }
+
+    /// Reads whole registered endpoints. A changed server or exceeded budget is not a census.
+    pub(crate) fn read_pane_census(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, Vec<String>)>, String> {
+        use super::herdr::model::{HERDR_PROTOCOL, HerdrRequest, HerdrResult};
+        let mut census = Vec::new();
+        let mut count = self.endpoints.len();
+        for registered in &self.endpoints {
+            if count > limit {
+                return Err("Herdr census budget exceeded".into());
+            }
+            let before = registered
+                .transport
+                .server_witness()
+                .map_err(|e| format!("{e:?}"))?;
+            if before.socket != registered.endpoint.socket_path() {
+                return Err("Herdr census socket witness mismatch".into());
+            }
+            let call = HerdrCall {
+                id: uuid::Uuid::new_v4().to_string(),
+                request: HerdrRequest::SessionSnapshot {},
+            };
+            let (outcome, answered) = registered.transport.call(&call);
+            if answered.as_ref() != Ok(&before)
+                || registered.transport.server_witness().as_ref() != Ok(&before)
+            {
+                return Err("Herdr census server changed".into());
+            }
+            let reply = outcome.map_err(|e| format!("{e:?}"))?;
+            if reply.id != call.id {
+                return Err("Herdr census reply mismatch".into());
+            }
+            let HerdrResult::SessionSnapshot { snapshot } =
+                reply.body.map_err(|e| format!("{e:?}"))?
+            else {
+                return Err("Herdr census snapshot unavailable".into());
+            };
+            if snapshot.protocol != HERDR_PROTOCOL {
+                return Err("Herdr census protocol mismatch".into());
+            }
+            count = count.saturating_add(snapshot.panes.len());
+            let mut panes: Vec<_> = snapshot
+                .panes
+                .into_iter()
+                .map(|pane| pane.pane_id)
+                .collect();
+            panes.sort();
+            if panes.iter().any(|pane| pane.is_empty())
+                || panes.windows(2).any(|pair| pair[0] == pair[1])
+            {
+                return Err("Herdr census invalid pane identity".into());
+            }
+            if count > limit {
+                #[cfg(test)]
+                if std::env::var("ADK_CODEX_OBSERVATION_MUTANT").as_deref() == Ok("herdr_budget") {
+                    panes.truncate(limit.saturating_sub(self.endpoints.len()));
+                    census.push((
+                        format!("{}:{before:?}", registered.endpoint.config_key()),
+                        panes,
+                    ));
+                    return Ok(census);
+                }
+                return Err("Herdr census budget exceeded".into());
+            }
+            census.push((
+                format!("{}:{before:?}", registered.endpoint.config_key()),
+                panes,
+            ));
+        }
+        census.sort();
+        Ok(census)
     }
 
     /// The one local endpoint's read-only host; none, or several, give no host.
@@ -234,9 +321,53 @@ impl HerdrRegistry {
 
     /// The gated input target of a stored execution located on a registered endpoint.
     pub(crate) fn target(&self, stored: &HostedExecution) -> Option<HerdrTarget> {
+        #[cfg(unix)]
+        let evidence = if let Some(location) = &stored.location {
+            self.endpoints
+                .iter()
+                .find(|r| {
+                    r.endpoint.config_key() == location.endpoint_config_key
+                        && r.endpoint.execution_node() == location.execution_node
+                })
+                .filter(|r| {
+                    r.endpoint.mode() == crate::config::session_hosts::EndpointMode::UserDefault
+                })
+                .and_then(|r| {
+                    self.launch.as_ref().map(|launch| {
+                        launch.mutation_evidence(&r.endpoint, &stored.execution_nonce)
+                    })
+                })
+                .unwrap_or_else(|| Ok(ExistingMutationEvidence::default()))
+        } else {
+            Ok(ExistingMutationEvidence::default())
+        };
+        #[cfg(not(unix))]
+        let evidence = Ok(ExistingMutationEvidence::default());
+        self.target_with_evidence_result(stored, evidence)
+    }
+
+    /// Preloaded evidence only; constructing or judging a target performs no store lookup.
+    pub(crate) fn target_with_evidence(
+        &self,
+        stored: &HostedExecution,
+        evidence: ExistingMutationEvidence,
+    ) -> Option<HerdrTarget> {
+        self.target_with_evidence_result(stored, Ok(evidence))
+    }
+
+    pub(crate) fn target_with_evidence_result(
+        &self,
+        stored: &HostedExecution,
+        evidence: Result<ExistingMutationEvidence, super::herdr::policy::Unverified>,
+    ) -> Option<HerdrTarget> {
         let target = self.endpoints.iter().find_map(|registered| {
             let transport: Arc<dyn HerdrTransport> = Arc::new(registered.transport.clone());
-            HerdrTarget::new(registered.endpoint.clone(), transport, stored)
+            HerdrTarget::new_with_evidence_result(
+                registered.endpoint.clone(),
+                transport,
+                stored,
+                evidence.clone(),
+            )
         });
         #[cfg(test)]
         let target = match &self.reads {
@@ -316,3 +447,7 @@ impl Drop for ForcedRegistry {
         FORCED.with(|forced| forced.set(self.0.take()));
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "herdr_registry_census_tests.rs"]
+mod census_tests;

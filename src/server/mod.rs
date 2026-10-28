@@ -1,3 +1,4 @@
+mod bind_security_diagnostics;
 mod campaign_execution;
 pub(crate) mod campaign_graph;
 pub(crate) mod cluster;
@@ -14,6 +15,7 @@ pub(crate) mod multinode_regression;
 mod outbox_actionable_delivery;
 mod outbox_delivery_alert;
 pub(crate) mod outbox_worker;
+mod policy_tick_logging;
 use outbox_worker::message_outbox_loop;
 mod rate_limit_profiles;
 mod rate_limit_sync;
@@ -51,7 +53,6 @@ const MESSAGE_OUTBOX_MAX_RETRY_COUNT: i64 = 4;
 const MESSAGE_OUTBOX_RETRY_BACKOFF_SECS: [i64; 4] = [60, 300, 900, 3600];
 const POLICY_TICK_ADVISORY_LOCK_ID: i64 = 7_801_001;
 const GITHUB_SYNC_ADVISORY_LOCK_ID: i64 = 7_801_002;
-const POLICY_TICK_WARN_MS: u128 = 500;
 const POLICY_TICK_HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 const CLAUDE_RATE_LIMIT_FORCED_REFRESH_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -384,19 +385,7 @@ pub(crate) async fn run(
     // Auth is fail-open without `server.auth_token`, so a non-loopback bind would hand the
     // mutating control plane to any LAN peer. Force loopback rather than refuse to boot.
     let (bind_host, bind_decision) = routes::resolve_secure_bind_host(&config);
-    if let routes::BindSecurityDecision::ForcedLoopback { requested_host } = &bind_decision {
-        tracing::error!(
-            requested_host = %requested_host,
-            forced_host = %bind_host,
-            port = config.server.port,
-            "SECURITY (#3870): server.host={requested_host} is non-loopback and \
-             server.auth_token is unset — the control-plane auth middleware is fail-open, so \
-             this would expose deploy-gate / agent-CRUD / dispatch endpoints to the LAN with no \
-             auth. Force-binding to loopback ({bind_host}) instead. The server still serves \
-             locally. To expose on the LAN intentionally, set server.auth_token (recommended) \
-             or server.allow_insecure_nonloopback_bind=true."
-        );
-    }
+    bind_security_diagnostics::log_decision(&config, &bind_host, &bind_decision);
     let addr = format!("{}:{}", bind_host, config.server.port);
     let listener = crate::services::platform::network::bind_tcp_listener(&addr).await?;
     tracing::info!("HTTP server listening on {addr}");
@@ -423,6 +412,7 @@ async fn policy_tick_loop(
     tracing::info!("[policy-tick] 3-tier tick started: 30s / 1min / 5min");
 
     let mut count = 0u64;
+    let mut tick_logging = policy_tick_logging::TickLogging::default();
     let mut leader_epoch_slo_api_friction_pending = true;
 
     if shutdown
@@ -516,7 +506,14 @@ async fn policy_tick_loop(
             campaign_execution::kick(pool.clone(), engine.clone());
             campaign_graph::kick(pool.clone(), engine.clone(), health_registry.clone());
         }
-        fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick30s", "30s").await;
+        fire_tick_hook_by_name_with_pg(
+            &engine,
+            pg_pool.as_deref(),
+            &mut tick_logging,
+            "OnTick30s",
+            "30s",
+        )
+        .await;
 
         // ── 1min tier: every 2nd tick (60s) ──
         if count % 2 == 0 {
@@ -528,7 +525,14 @@ async fn policy_tick_loop(
             {
                 tracing::warn!("[policy-tick] campaign handoff failed: {error}");
             }
-            fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick1min", "1min").await;
+            fire_tick_hook_by_name_with_pg(
+                &engine,
+                pg_pool.as_deref(),
+                &mut tick_logging,
+                "OnTick1min",
+                "1min",
+            )
+            .await;
             if let Some(pool) = pg_pool.as_deref().or_else(|| engine.pg_pool()) {
                 match crate::services::stale_turn_reconciler::reconcile_stale_turns_pg(
                     pool,
@@ -598,7 +602,14 @@ async fn policy_tick_loop(
 
         // ── 5min tier: every 10th tick (300s) ──
         if is_five_min_policy_tick(count) {
-            fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick5min", "5min").await;
+            fire_tick_hook_by_name_with_pg(
+                &engine,
+                pg_pool.as_deref(),
+                &mut tick_logging,
+                "OnTick5min",
+                "5min",
+            )
+            .await;
             refresh_memory_health_for_five_min_tick().await;
             cleanup_stale_pending_queue_tmp_files_for_five_min_tick().await;
             if let Some(pool) = pg_pool.as_deref().or_else(|| engine.pg_pool()) {
@@ -663,7 +674,14 @@ async fn policy_tick_loop(
             }
 
             // Also fire legacy OnTick for backward compat
-            fire_tick_hook_by_name_with_pg(&engine, pg_pool.as_deref(), "OnTick", "legacy").await;
+            fire_tick_hook_by_name_with_pg(
+                &engine,
+                pg_pool.as_deref(),
+                &mut tick_logging,
+                "OnTick",
+                "legacy",
+            )
+            .await;
         }
 
         if let Some(conn) = advisory_lock {
@@ -675,6 +693,7 @@ async fn policy_tick_loop(
 async fn fire_tick_hook_by_name_with_pg(
     engine: &PolicyEngine,
     pg_pool: Option<&PgPool>,
+    tick_logging: &mut policy_tick_logging::TickLogging,
     hook_name: &str,
     label: &str,
 ) {
@@ -682,7 +701,7 @@ async fn fire_tick_hook_by_name_with_pg(
         fire_tick_hook_by_name_with_timeout(engine, hook_name, label, POLICY_TICK_HOOK_TIMEOUT)
             .await;
     if let Some(pool) = pg_pool.or_else(|| engine.pg_pool()) {
-        record_tick_hook_execution_pg(pool, label, &execution).await;
+        record_tick_hook_execution_pg(pool, tick_logging, label, &execution).await;
     }
     crate::kanban::drain_hook_side_effects_with_backends(engine);
 }
@@ -767,6 +786,7 @@ async fn fire_tick_hook_by_name_with_timeout(
 
 async fn record_tick_hook_execution_pg(
     pg_pool: &PgPool,
+    tick_logging: &mut policy_tick_logging::TickLogging,
     label: &str,
     execution: &PolicyTickHookExecution,
 ) {
@@ -777,39 +797,7 @@ async fn record_tick_hook_execution_pg(
     let key_skip_ms = format!("last_tick_{}_skip_ms", label);
     let status = execution.outcome.status();
 
-    match execution.outcome {
-        PolicyTickHookOutcome::Ok => {
-            if execution.elapsed.as_millis() > POLICY_TICK_WARN_MS {
-                tracing::warn!(
-                    "[policy-tick] {} took {}ms",
-                    label,
-                    execution.elapsed.as_millis()
-                );
-            } else {
-                tracing::debug!(
-                    "[policy-tick] {} took {}ms",
-                    label,
-                    execution.elapsed.as_millis()
-                );
-            }
-        }
-        PolicyTickHookOutcome::Error | PolicyTickHookOutcome::JoinError => {
-            tracing::warn!(
-                "[policy-tick] {} hook {}: {}",
-                label,
-                status,
-                execution.error.as_deref().unwrap_or("unknown error")
-            );
-        }
-        PolicyTickHookOutcome::Timeout => {
-            tracing::warn!(
-                "[policy-tick] {} hook timed out after {}ms",
-                label,
-                execution.elapsed.as_millis()
-            );
-        }
-        PolicyTickHookOutcome::SkippedInFlight => {}
-    }
+    tick_logging.record(label, execution);
 
     let upsert_sql = "INSERT INTO kv_meta (key, value)
                       VALUES ($1, $2)
@@ -1681,6 +1669,14 @@ async fn github_sync_loop(pg_pool: Arc<PgPool>, interval_minutes: u64) {
                 .await
             {
                 Ok(result) => {
+                    if result.campaign_nodes.failed() {
+                        tracing::warn!(
+                            "[github-sync] {}: campaign node sync failed: {:?}",
+                            repo.id,
+                            result.campaign_nodes
+                        );
+                        had_errors = true;
+                    }
                     if result.closed_count > 0
                         || result.inconsistency_count > 0
                         || result.stale_card_issue_check_count > 0
@@ -1729,6 +1725,8 @@ struct PendingMessageOutboxRow {
     reason_code: Option<String>,
     session_key: Option<String>,
     retry_count: i64,
+    attachment:
+        Result<Option<Arc<crate::services::message_outbox::StoredOutboxAttachment>>, &'static str>,
     claim_owner: String,
     claimed_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2233,27 +2231,6 @@ mod message_outbox_retry_tests {
     }
 }
 
-impl PendingMessageOutboxRow {
-    fn delivery_ids(&self) -> (String, String) {
-        let reason = self
-            .reason_code
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("message");
-        let session = self
-            .session_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(self.target.as_str());
-        (
-            format!("message_outbox:{}:{reason}:{session}", self.source),
-            format!("message_outbox:{}:deliver", self.id),
-        )
-    }
-}
-
 async fn mark_message_outbox_sent_pg(
     pool: &PgPool,
     outbox_id: i64,
@@ -2264,7 +2241,7 @@ async fn mark_message_outbox_sent_pg(
         "UPDATE message_outbox
             SET status = 'sent',
                 sent_at = NOW(),
-                error = NULL,
+                error = NULL, attachment_filename = NULL, attachment_content_type = NULL, attachment_data = NULL,
                 retry_count = 0,
                 next_attempt_at = NULL,
                 claimed_at = NULL,
@@ -2412,75 +2389,7 @@ async fn schedule_message_outbox_retry_pg(
     Ok(())
 }
 
-async fn claim_pending_message_outbox_batch_pg(
-    pool: &PgPool,
-    claim_owner: &str,
-) -> Vec<PendingMessageOutboxRow> {
-    let rows = match sqlx::query(
-        "WITH claimed AS (
-            SELECT id
-              FROM message_outbox
-             WHERE (
-                    status = 'pending'
-                    AND (
-                        next_attempt_at IS NULL
-                        OR next_attempt_at <= NOW()
-                    )
-                 )
-                OR (
-                    status = 'processing'
-                    AND (
-                        claimed_at IS NULL
-                        OR claimed_at <= NOW() - ($1::bigint * INTERVAL '1 second')
-                    )
-                )
-             ORDER BY id ASC
-             FOR UPDATE SKIP LOCKED
-             LIMIT 10
-        )
-        UPDATE message_outbox mo
-           SET status = 'processing',
-               claimed_at = NOW(),
-               claim_owner = $2,
-               error = NULL
-          FROM claimed
-         WHERE mo.id = claimed.id
-        RETURNING mo.id, mo.target, mo.content, mo.bot, mo.source, mo.reason_code, mo.session_key, mo.retry_count, mo.claim_owner, mo.claimed_at",
-    )
-    .bind(MESSAGE_OUTBOX_CLAIM_STALE_SECS)
-    .bind(claim_owner)
-    .fetch_all(pool)
-    .await
-    {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!("[outbox-pg] failed to claim message_outbox rows: {error}");
-            return Vec::new();
-        }
-    };
-
-    let mut claimed = rows
-        .into_iter()
-        .filter_map(|row| {
-            Some(PendingMessageOutboxRow {
-                id: row.try_get::<i64, _>("id").ok()?,
-                target: row.try_get::<String, _>("target").ok()?,
-                content: row.try_get::<String, _>("content").ok()?,
-                bot: row.try_get::<String, _>("bot").ok()?,
-                source: row.try_get::<String, _>("source").ok()?,
-                reason_code: row.try_get::<Option<String>, _>("reason_code").ok()?,
-                session_key: row.try_get::<Option<String>, _>("session_key").ok()?,
-                retry_count: row.try_get::<i64, _>("retry_count").unwrap_or(0),
-                claim_owner: row.try_get::<String, _>("claim_owner").ok()?,
-                claimed_at: row
-                    .try_get::<chrono::DateTime<chrono::Utc>, _>("claimed_at")
-                    .ok()?,
-            })
-        })
-        .collect::<Vec<_>>();
-    claimed.sort_by_key(|row| row.id);
-    claimed
-}
+use outbox_worker::claim::claim_pending_message_outbox_batch_pg;
 
 async fn drain_message_outbox_batch_once<F, Fut>(
     pg_pool: &PgPool,
@@ -2536,7 +2445,10 @@ where
                 continue;
             }
         }
-        let (status, err_text) = deliver(row.clone()).await;
+        let (status, err_text) = match &row.attachment {
+            Err(error) => ("invalid_attachment".to_string(), error.to_string()),
+            Ok(_) => deliver(row.clone()).await,
+        };
         if status == "200 OK" {
             if mark_message_outbox_sent_pg(pg_pool, row.id, &row.claim_owner, row.claimed_at)
                 .await
@@ -2551,7 +2463,7 @@ where
             }
         } else {
             let error_text = format!("{status}: {err_text}");
-            let action = outbox_actionable_delivery::failure_action(row);
+            let action = outbox_actionable_delivery::failure_action(row, &status);
             match action {
                 MessageOutboxFailureAction::Fail { retry_count } => {
                     let failed_update = mark_message_outbox_failed_pg(
@@ -2690,12 +2602,12 @@ async fn routine_runtime_loop(
     let discord_logger =
         RoutineDiscordLogger::new_with_health_registry(pg_pool.clone(), health_registry.clone());
     let agent_executor =
-        RoutineAgentExecutor::new(pg_pool, health_registry, routines_config.agent_timeout_secs);
+        RoutineAgentExecutor::new(pg_pool, health_registry, routines_config.agent_timeout_secs)
+            .with_headless_fresh_agents(routines_config.headless_fresh_agents);
     match store.recover_stale_running_runs().await {
         Ok(recovered) if !recovered.is_empty() => {
             for run in &recovered {
-                // Reap the interrupted run's orphaned fresh session (ownership proof required),
-                // or it is later misreported as an abrupt "session ended".
+                // Reap owned orphaned fresh sessions before they look like abrupt exits.
                 agent_executor
                     .teardown_recovered_fresh_session(&store, run)
                     .await;

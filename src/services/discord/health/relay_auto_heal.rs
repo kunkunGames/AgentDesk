@@ -335,6 +335,7 @@ impl SharedData {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn apply_watchdog_orphan_token_cleanup(
     registry: &HealthRegistry,
     provider: &ProviderKind,
@@ -358,73 +359,9 @@ pub(super) async fn apply_watchdog_orphan_token_cleanup(
     }
 }
 
-pub(super) async fn run_orphan_token_auto_heal_pass(
-    registry: &HealthRegistry,
-    provider: &ProviderKind,
-    runtimes: &[Arc<SharedData>],
-) -> usize {
-    let mut applied = 0usize;
-    for shared in runtimes {
-        let mut redrive_channels = std::collections::HashSet::new();
-        let mailbox_snapshots = shared.mailboxes.snapshot_all().await;
-        for (channel_id, mailbox) in mailbox_snapshots {
-            redrive_channels.insert(channel_id);
-            if mailbox.cancel_token.is_some()
-                && !super::legacy_supervision::legacy_retired(
-                    provider.as_str(),
-                    channel_id.get(),
-                    "orphan_token_auto_heal",
-                )
-            {
-                match apply_orphan_pending_token_cleanup(
-                    registry,
-                    provider,
-                    shared.clone(),
-                    channel_id,
-                    RelayRecoveryApplySource::ProbeAutoHeal,
-                )
-                .await
-                {
-                    Ok(true) => applied += 1,
-                    Ok(false) => {}
-                    Err(RelayRecoveryError::SnapshotNotFound { .. }) => {}
-                    Err(error) => trace_orphan_auto_heal_error(provider, channel_id, &error),
-                }
-            }
-
-            match redrive_undelivered_backlog(registry, provider, shared.clone(), channel_id).await
-            {
-                Ok(true) => applied += 1,
-                Ok(false) => {}
-                Err(RelayRecoveryError::SnapshotNotFound { .. }) => {}
-                Err(error) => trace_orphan_auto_heal_error(provider, channel_id, &error),
-            }
-        }
-
-        let watcher_owner_channels: Vec<ChannelId> = shared
-            .tmux_watchers
-            .iter()
-            .filter_map(|entry| {
-                shared
-                    .tmux_watchers
-                    .owner_channel_for_tmux_session(entry.key())
-            })
-            .collect();
-        for channel_id in watcher_owner_channels {
-            if !redrive_channels.insert(channel_id) {
-                continue;
-            }
-            match redrive_undelivered_backlog(registry, provider, shared.clone(), channel_id).await
-            {
-                Ok(true) => applied += 1,
-                Ok(false) => {}
-                Err(RelayRecoveryError::SnapshotNotFound { .. }) => {}
-                Err(error) => trace_orphan_auto_heal_error(provider, channel_id, &error),
-            }
-        }
-    }
-    applied + relay_recovery::leaked_row_sweep::sweep_leaked_inflight_rows(registry, provider).await
-}
+#[path = "relay_auto_heal/producer_resume_pass.rs"]
+mod producer_resume_pass;
+pub(super) use producer_resume_pass::run_orphan_token_auto_heal_pass;
 
 async fn redrive_undelivered_backlog(
     registry: &HealthRegistry,
@@ -450,20 +387,10 @@ impl HealthRegistry {
         channel_id: ChannelId,
         now_unix_secs: i64,
     ) -> Result<bool, RelayRecoveryError> {
-        // A retired key ends here with no snapshot, nudge, reattach or accounting.
-        if retired_target(provider, channel_id, None, "redrive_entry") {
-            return Ok(false);
-        }
-        let snapshot = self
+        let Some(snapshot) = self
             .snapshot_watcher_state_for_shared(provider, shared.clone(), channel_id.get())
-            .await;
-        #[cfg(test)]
-        retired_redrive_tests::checkpoint(channel_id, "redrive_snapshot");
-        // The snapshot await can span a retirement, and it names the owner channel the nudge targets.
-        if retired_target(provider, channel_id, snapshot.as_ref(), "redrive_snapshot") {
-            return Ok(false);
-        }
-        let Some(snapshot) = snapshot else {
+            .await
+        else {
             return Ok(false);
         };
         #[cfg(test)]
@@ -515,11 +442,6 @@ impl HealthRegistry {
                 {
                     return Ok(false);
                 }
-                #[cfg(test)]
-                retired_redrive_tests::checkpoint(channel_id, "redrive_reattach");
-                if retired_target(provider, channel_id, Some(&snapshot), "redrive_reattach") {
-                    return Ok(false);
-                }
                 let response = relay_recovery::auto_apply_relay_recovery_for_shared(
                     self,
                     shared.clone(),
@@ -555,21 +477,6 @@ impl HealthRegistry {
         }
         Ok(applied)
     }
-}
-
-/// True when the redrive channel, or the watcher owner channel its nudge targets, is retired.
-fn retired_target(
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    snapshot: Option<&WatcherStateSnapshot>,
-    site: &'static str,
-) -> bool {
-    let retired =
-        |channel| super::legacy_supervision::legacy_retired(provider.as_str(), channel, site);
-    retired(channel_id.get())
-        || snapshot
-            .and_then(|snapshot| snapshot.watcher_owner_channel_id)
-            .is_some_and(|owner| owner != channel_id.get() && retired(owner))
 }
 
 fn redrive_shield_channel_for_action(
@@ -660,12 +567,12 @@ fn nudge_existing_watcher_for_backlog(
     provider: &ProviderKind,
     snapshot: &WatcherStateSnapshot,
     channel_id: ChannelId,
-    now_unix_secs: i64,
+    _now_unix_secs: i64,
     token: RelayFrontierToken,
 ) -> RedriveNudge {
     #[cfg(test)]
     let _test_clock = stall_liveness::set_redrive_grace_test_clock(
-        now_unix_secs,
+        _now_unix_secs,
         snapshot.inflight_identity.clone(),
     );
     if !should_redrive_undelivered_backlog(provider, channel_id, snapshot, token) {
@@ -851,20 +758,6 @@ async fn apply_orphan_pending_token_cleanup(
         }
     }
 
-    #[cfg(test)]
-    orphan_token_tests::snapshot_barrier(channel_id).await;
-    // The helper snapshot can suspend after the sweep admitted this channel.
-    if matches!(
-        source,
-        RelayRecoveryApplySource::ProbeAutoHeal | RelayRecoveryApplySource::StallWatchdog
-    ) && super::legacy_supervision::legacy_retired(
-        provider.as_str(),
-        channel_id.get(),
-        "orphan_token_before_auto_apply",
-    ) {
-        return Ok(false);
-    }
-
     let watchdog_watcher = (source == RelayRecoveryApplySource::StallWatchdog)
         .then(|| {
             shared.tmux_watchers.get(&channel_id).map(|watcher| {
@@ -983,10 +876,10 @@ fn trace_orphan_auto_heal_error(
 
 #[cfg(test)]
 mod orphan_token_tests;
-
+#[cfg(test)]
+mod refusal_dispatch_tests;
 #[cfg(test)]
 mod retired_redrive_tests;
-
 #[cfg(test)]
 mod tests {
     use std::io::{self, Write};
@@ -1040,6 +933,7 @@ mod tests {
         turn_delivered: Arc<AtomicBool>,
         snapshot: WatcherStateSnapshot,
         channel_id: ChannelId,
+        _runtime_root: crate::config::TestRuntimeRootGuard,
     }
 
     impl RedriveCase {
@@ -1063,6 +957,7 @@ mod tests {
         last_relay_offset: u64,
         capture_offset: u64,
     ) -> RedriveCase {
+        let runtime_root = crate::config::TestRuntimeRootGuard::new();
         let channel_id = ChannelId::new(channel_id);
         let tmux_session = format!("AgentDesk-codex-5943-{slug}");
         let output_path = format!("/tmp/agentdesk-5943-{slug}.jsonl");
@@ -1093,6 +988,7 @@ mod tests {
                 capture_offset,
             ),
             channel_id,
+            _runtime_root: runtime_root,
         }
     }
 
@@ -1227,6 +1123,7 @@ mod tests {
 
     #[test]
     fn redrive_nudge_skips_healthy_advancing_backlog() {
+        let _root = crate::config::TestRuntimeRootGuard::new();
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(4_178_301);
         let tmux_session = "AgentDesk-codex-4178-healthy-drain";
@@ -1268,6 +1165,7 @@ mod tests {
 
     #[test]
     fn redrive_nudge_requires_matching_output_path() {
+        let _root = crate::config::TestRuntimeRootGuard::new();
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(4_178_302);
         let tmux_session = "AgentDesk-codex-4178-output-path";
@@ -1312,6 +1210,7 @@ mod tests {
 
     #[test]
     fn redrive_nudge_skips_if_live_frontier_advanced_after_snapshot() {
+        let _root = crate::config::TestRuntimeRootGuard::new();
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(4_178_303);
         let tmux_session = "AgentDesk-codex-4178-live-frontier";
@@ -1358,6 +1257,7 @@ mod tests {
     // would double-send the bytes that POST is about to commit).
     #[test]
     fn redrive_stale_frontier_token_cannot_nudge_after_reset_4181() {
+        let _root = crate::config::TestRuntimeRootGuard::new();
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(4_181_002);
         let tmux_session = "AgentDesk-codex-4181-reset-token";
@@ -1619,6 +1519,10 @@ mod tests {
     /// escalates to `ReattachWatcher` and a refusal is counted instead.
     #[test]
     fn a_refused_redrive_propagates_as_a_refusal_not_a_missed_nudge_5943() {
+        refused_redrive_with_seeded_baseline(|| {});
+    }
+
+    pub(super) fn refused_redrive_with_seeded_baseline(after_seed: impl FnOnce()) {
         let provider = ProviderKind::Codex;
         let mut case = redrive_case(5_943_016, "refusal-propagates", 0, 24_553_403);
         case.snapshot.durable_frontier = restart_durable_witness(22_299_791);
@@ -1636,6 +1540,7 @@ mod tests {
         };
         // The first pass only seeds the no-progress grace.
         nudge(now);
+        after_seed();
         assert_eq!(
             nudge(now + GRACE_SECS),
             RedriveNudge::RefusedUnrestored(UnrestoredFrontier {
@@ -1677,6 +1582,7 @@ mod tests {
 
     #[test]
     fn redrive_nudge_yields_while_relay_emission_in_flight() {
+        let _root = crate::config::TestRuntimeRootGuard::new();
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(4_181_777);
         let tmux_session = "AgentDesk-codex-4181-inflight-slot";
@@ -1935,9 +1841,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn redrive_planner_refused_reattach_response_cools_down_instead_of_committing() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let tmp = tempfile::tempdir().expect("temp runtime root");
         let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
             "AGENTDESK_ROOT_DIR",
@@ -2106,9 +2010,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn redrive_reuse_no_op_reattach_response_cools_down_instead_of_committing_5021() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let tmp = tempfile::tempdir().expect("temp runtime root");
         let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
             "AGENTDESK_ROOT_DIR",
@@ -2316,9 +2218,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn redrive_actions_and_cap_alarm_continue_while_producer_is_vouched_4615() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let tmp = tempfile::tempdir().expect("temp runtime root");
         let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
             "AGENTDESK_ROOT_DIR",
@@ -2479,9 +2379,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn redrive_entrypoint_resumes_a_freshly_born_turn_at_its_birth_offset_5943() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let tmp = tempfile::tempdir().expect("temp runtime root");
         let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
             "AGENTDESK_ROOT_DIR",
@@ -2594,9 +2492,7 @@ mod tests {
 
     #[test]
     fn redrive_frozen_backlog_backs_off_and_caps_once_4299() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(4_299_001);
         let tmux_session = "AgentDesk-codex-4299-green";
@@ -2701,9 +2597,6 @@ mod tests {
     /// re-ran every poll and never capped. Nudge-lane schedule, one alarm, dormant.
     #[test]
     fn six_refused_redrives_back_off_and_cap_once_5943() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         let provider = ProviderKind::Codex;
         let mut case = redrive_case(5_943_021, "refused-cap", 0, 24_553_403);
         case.snapshot.durable_frontier = restart_durable_witness(22_299_791);
@@ -2764,9 +2657,7 @@ mod tests {
 
     #[test]
     fn frontier_reset_rearms_capped_attempt_episode_4181() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let shared = crate::services::discord::make_shared_data_for_tests();
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(4_181_008);
@@ -2800,9 +2691,7 @@ mod tests {
 
     #[test]
     fn frontier_reset_invalidates_placeholder_shield_episode_4181() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let shared = crate::services::discord::make_shared_data_for_tests();
         let provider = ProviderKind::Codex;
         let channel_id = ChannelId::new(4_181_009);
@@ -2905,9 +2794,7 @@ mod tests {
 
     #[test]
     fn redrive_cap_resets_only_for_progress_identity_or_watcher_4299() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let tmp = tempfile::tempdir().expect("temp runtime root");
         let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
             "AGENTDESK_ROOT_DIR",
@@ -3212,9 +3099,7 @@ mod tests {
 
     #[test]
     fn redrive_owner_shield_freezes_first_episode_snapshot_4299() {
-        let _env_lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let tmp = tempfile::tempdir().expect("temp runtime root");
         let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
             "AGENTDESK_ROOT_DIR",

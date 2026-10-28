@@ -1,5 +1,6 @@
 use super::extract::{Decision, Observation, decide_observation};
 use super::*;
+use crate::services::tui_input::human_frame::opens_inject;
 
 pub fn record_discord_originated_prompt(provider: &str, tmux_session_name: &str, prompt: &str) {
     let tmux_session_name = tmux_session_name.trim();
@@ -73,9 +74,7 @@ pub fn observe_prompt_by_tmux_at(
         provider,
         tmux_session_name,
         &[prompt.to_string()],
-        None,
-        None,
-        None,
+        (None, None, None),
         PromptObservationEffect::NotifyAndLease,
         observed_at,
     )
@@ -99,9 +98,7 @@ pub fn observe_prompt_by_tmux_with_entry_id_at(
         provider,
         tmux_session_name,
         &[prompt.to_string()],
-        entry_id,
-        None,
-        None,
+        (entry_id, None, None),
         PromptObservationEffect::NotifyAndLease,
         observed_at,
     )
@@ -142,7 +139,7 @@ pub(crate) fn observe_codex_prompt_in_turn_at(
         (entry_id, None, native_turn),
         PromptObservationEffect::NotifyAndLease,
         observed_at,
-        handoff::Evidence::Live,
+        (handoff::Evidence::Live, None),
     )
 }
 
@@ -164,7 +161,7 @@ pub(crate) fn observe_codex_record_prompt_at(
         (entry_id, None, native_turn),
         PromptObservationEffect::NotifyAndLease,
         observed_at,
-        handoff::Evidence::Record(record),
+        (handoff::Evidence::Record(record), None),
     )
 }
 
@@ -175,23 +172,14 @@ pub(crate) fn observe_restored_codex_record_prompt_at(
     (prompt, entry, inferred): (&str, Option<&str>, Option<&str>),
     at: DateTime<Utc>,
 ) -> PromptObservation {
-    let turn = record.turn_id.as_deref().or(inferred);
-    if !handoff::codex_record_admission(tmux, path, start, prompt, (entry, turn), record) {
-        return PromptObservation::Ignored;
-    }
-    observe_inner(
-        "codex",
+    let pin = owner_channel_for_tmux_session(tmux)
+        .and_then(|channel| hosted_source::capture("codex", tmux, channel, path, None));
+    hosted_source::observe_codex_record_at(
         tmux,
-        &[prompt.to_string()],
-        (entry, None, turn),
-        PromptObservationEffect::NotifyAndLease,
+        (path, start, record),
+        (prompt, entry, inferred),
         at,
-        handoff::Evidence::Restored {
-            record,
-            path,
-            start,
-            entry,
-        },
+        pin,
     )
 }
 
@@ -199,22 +187,21 @@ pub(crate) fn observe_restored_codex_record_prompt_at(
 pub(super) fn observe_held_prompt(
     provider: &str,
     tmux_session_name: &str,
-    held: &handoff::ParkedObservation,
+    prompt: &str,
+    entry_id: Option<&str>,
+    native_turn: Option<&str>,
+    observed_at: DateTime<Utc>,
+    hosted_source: Option<hosted_source::HostedSourcePin>,
+    distinct_record: bool,
 ) -> PromptObservation {
     observe_inner(
         provider,
         tmux_session_name,
-        std::slice::from_ref(&held.prompt),
-        (
-            held.entry_ids.first().map(String::as_str),
-            None,
-            held.native_turn.as_deref(),
-        ),
+        &[prompt.to_string()],
+        (entry_id, None, native_turn),
         PromptObservationEffect::NotifyAndLease,
-        held.observed_at,
-        handoff::Evidence::Held {
-            distinct_record: held.distinct_record,
-        },
+        observed_at,
+        (handoff::Evidence::Held { distinct_record }, hosted_source),
     )
 }
 
@@ -229,9 +216,7 @@ pub(crate) fn observe_hook_prompt_by_tmux_with_prompt_id_at(
         provider,
         tmux_session_name,
         &[prompt.to_string()],
-        None,
-        prompt_id.map(ClaudePromptId::HookSubmit),
-        None,
+        (None, prompt_id.map(ClaudePromptId::HookSubmit), None),
         PromptObservationEffect::NotifyAndLease,
         observed_at,
     )
@@ -251,9 +236,7 @@ pub fn observe_prompt_by_tmux_with_row_ids_at(
         provider,
         tmux_session_name,
         &[prompt.to_string()],
-        entry_id,
-        prompt_id.map(ClaudePromptId::TranscriptRow),
-        None,
+        (entry_id, prompt_id.map(ClaudePromptId::TranscriptRow), None),
         PromptObservationEffect::NotifyAndLease,
         observed_at,
     )
@@ -268,9 +251,7 @@ pub fn observe_prompt_candidates_by_tmux(
         provider,
         tmux_session_name,
         prompts,
-        None,
-        None,
-        None,
+        (None, None, None),
         PromptObservationEffect::NotifyAndLease,
         Utc::now(),
     )
@@ -285,9 +266,7 @@ pub(crate) fn observe_prompt_candidates_by_tmux_for_relay_lease(
         provider,
         tmux_session_name,
         prompts,
-        None,
-        None,
-        None,
+        (None, None, None),
         PromptObservationEffect::RelayLeaseOnly,
         Utc::now(),
     )
@@ -303,13 +282,10 @@ fn observe_prompt_candidates_by_tmux_inner(
     provider: &str,
     tmux_session_name: &str,
     prompts: &[String],
-    entry_id: Option<&str>,
-    prompt_id: Option<ClaudePromptId<'_>>,
-    native_turn: Option<&str>,
+    ids: ObservationIds<'_>,
     effect: PromptObservationEffect,
     observed_at: DateTime<Utc>,
 ) -> PromptObservation {
-    let ids = (entry_id, prompt_id, native_turn);
     let evidence = handoff::Evidence::Unattributed;
     observe_inner(
         provider,
@@ -318,21 +294,24 @@ fn observe_prompt_candidates_by_tmux_inner(
         ids,
         effect,
         observed_at,
-        evidence,
+        (evidence, None),
     )
 }
 
 /// `(entry_id, prompt_id, native_turn)` of one observation.
-type ObservationIds<'a> = (Option<&'a str>, Option<ClaudePromptId<'a>>, Option<&'a str>);
+pub(super) type ObservationIds<'a> = (Option<&'a str>, Option<ClaudePromptId<'a>>, Option<&'a str>);
 
-fn observe_inner(
+pub(super) fn observe_inner(
     provider: &str,
     tmux_session_name: &str,
     prompts: &[String],
     (entry_id, prompt_id, native_turn): ObservationIds<'_>,
     effect: PromptObservationEffect,
     observed_at: DateTime<Utc>,
-    evidence: handoff::Evidence<'_>,
+    (evidence, hosted_source): (
+        handoff::Evidence<'_>,
+        Option<hosted_source::HostedSourcePin>,
+    ),
 ) -> PromptObservation {
     handoff::drain_expired_handoffs();
     let provider = normalize_provider(provider);
@@ -393,7 +372,19 @@ fn observe_inner(
         handoff::annotate_record(&provider, tmux_session_name, &candidates, record);
     }
     // An injected input is settled once, by the first observation that names its native turn.
-    match claim_injected_steer(&provider, tmux_session_name, &candidates, native_turn) {
+    let claim = claim_injected_steer(
+        &provider,
+        tmux_session_name,
+        &candidates,
+        native_turn,
+        entry_id,
+    );
+    // A Codex inject header no ledger entry vouches for (expired, restarted or never recorded)
+    // opens no turn below; Claude records no entry, so its pastes keep the ordinary path.
+    let unvouched = claim.is_none()
+        && provider == "codex"
+        && candidates.iter().any(|prompt| opens_inject(prompt));
+    match claim {
         Some(Claim::Deferred) => return PromptObservation::InjectedDeferred,
         Some(Claim::Joined { first }) => {
             // Every observer's entry id is kept, so a rescan after the ledger expires stays quiet.
@@ -436,6 +427,7 @@ fn observe_inner(
             row_prompt_id: None,
             native_turn_id: None,
             steer_echo: false,
+            hosted_source,
         };
         let _ = OBSERVED_PROMPTS.send(event);
         return PromptObservation::PublishedTaskNotification;
@@ -483,6 +475,13 @@ fn observe_inner(
             ),
             PromptIdMatch::Absent | PromptIdMatch::Unannounced => {}
         }
+    }
+    if unvouched {
+        tracing::info!(
+            tmux_session_name,
+            "injected input without its record left unowned"
+        );
+        return PromptObservation::Ignored;
     }
     let local_only_control = candidates
         .first()
@@ -536,6 +535,7 @@ fn observe_inner(
                 ),
             effect,
             observed_at,
+            hosted_source: hosted_source.as_ref(),
         };
         (decide_observation(&mut state, &key, &observation), released)
     };
@@ -560,6 +560,7 @@ fn observe_inner(
                     row_prompt_id: None,
                     native_turn_id: Some(turn),
                     steer_echo: true,
+                    hosted_source,
                 });
             }
             return PromptObservation::JoinedNativeTurn;
@@ -607,6 +608,7 @@ fn observe_inner(
             .map(|(prompt_id, _)| prompt_id.to_string()),
         native_turn_id: native_turn.map(str::to_string),
         steer_echo: false,
+        hosted_source,
     };
     #[cfg(test)]
     handoff::tests::before_owning_publish(&event.prompt);

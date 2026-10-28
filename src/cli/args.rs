@@ -384,22 +384,6 @@ pub(crate) enum Commands {
         #[arg(required = true)]
         tools: Vec<String>,
     },
-    /// #2655: install (or refresh) the Memento `context()` SessionStart hook
-    /// and a UserPromptSubmit token-pressure reminder into a Claude Code
-    /// settings file. Idempotent — running twice produces the same file.
-    InstallMementoSessionHook {
-        /// Path to the settings.json to mutate. Defaults to
-        /// `~/.claude/settings.json` when omitted.
-        #[arg(long)]
-        settings_path: Option<String>,
-        /// Skip writing and instead print the rendered settings to stdout.
-        #[arg(long)]
-        dry_run: bool,
-        /// Remove the AgentDesk-managed memento hook entries instead of
-        /// installing them. Useful when an operator wants to revert.
-        #[arg(long, conflicts_with = "dry_run")]
-        uninstall: bool,
-    },
     /// Show server health, active sessions, and auto-queue status
     Status,
     /// List kanban cards
@@ -454,8 +438,8 @@ pub(crate) enum Commands {
     /// Phase-gate violation snapshot (issue #2657).
     ///
     /// Read-only inspector that flags auto-queue entries dispatched at a
-    /// higher `batch_phase` than the run's live phase pointer. Mirrors the
-    /// `/adk-phase` Discord slash command.
+    /// higher `batch_phase` than the run's live phase pointer. Same data as
+    /// `GET /api/queue/phase-gates/violations`.
     Phase {
         #[command(subcommand)]
         action: Option<PhaseAction>,
@@ -465,6 +449,8 @@ pub(crate) enum Commands {
     },
     /// Build + deploy dev + promote to release
     Deploy,
+    /// Print this binary's build switches as JSON (read by deploy scripts)
+    BuildInfo,
     /// List agents and their status
     Agents,
     /// Show turn/session diagnostics for an agent ID or Discord channel ID
@@ -561,11 +547,8 @@ pub(crate) enum Commands {
         #[arg(long = "no-agentdesk")]
         no_agentdesk: bool,
     },
-    O(crate::cli::o::OArgs),
     /// Herdr-hosted executions on this node: read-only status, and retire of an ended one
     Herdr(crate::cli::herdr::HerdrArgs),
-    /// Delegated channel homes: status, and the switched delegate, reclaim and force
-    ChannelHome(crate::cli::channel_home::ChannelHomeArgs),
 }
 
 /// Subcommands for `adk query` (issue #2651).
@@ -995,6 +978,9 @@ pub(crate) fn parse() -> ParseOutcome {
 }
 
 #[cfg(test)]
+#[path = "removed_channel_home_tests.rs"]
+mod removed_channel_home_tests;
+#[cfg(test)]
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser, error::ErrorKind};
@@ -1117,7 +1103,6 @@ mod tests {
             "reset-tmux",
             "ismcptool",
             "addmcptool",
-            "install-memento-session-hook",
             "status",
             "cards",
             "dispatch",
@@ -1127,6 +1112,7 @@ mod tests {
             "query",
             "phase",
             "deploy",
+            "build-info",
             "agents",
             "diag",
             "config",
@@ -1140,9 +1126,7 @@ mod tests {
             "health",
             "machine-compare",
             "activity",
-            "o",
             "herdr",
-            "channel-home",
             "help",
         ];
 

@@ -2,8 +2,14 @@
 //! the mailbox order reservation, and the hand-off of one input to `claude_tui::busy_inject`, a
 //! Herdr pane's gate (`herdr`) or, once enabled, `codex_tui::busy_inject`.
 
+mod catch_up_race;
+#[cfg(all(test, unix))]
+mod first_input;
 mod herdr;
 mod names;
+mod queued_owner;
+mod queued_provider;
+mod queued_reconcile;
 mod queued_support;
 
 use futures::FutureExt;
@@ -19,7 +25,6 @@ use crate::services::codex_tui::busy_inject as codex_inject;
 use crate::services::discord::SharedData;
 use crate::services::discord::inflight::{InflightTurnState, TurnSource};
 use crate::services::discord::inject_disposition::{self, InjectionOutcome, SourceGuard};
-use crate::services::discord::input_runtime::fence;
 use crate::services::discord::queue_io::queued_head_inject::{
     BindingKey, binding_key, persistence_failed, queued_head_enabled,
 };
@@ -31,7 +36,7 @@ use crate::services::turn_orchestrator::{
     ActiveTurnKind, ChannelMailboxSnapshot, ExpectedClaim, HANDBACK_NOT_WRITTEN, HeadOutcome,
     HeadSettle, InjectionSettlement, Intervention, QueueIdentity, QueuedHeadClaim, ReserveOutcome,
 };
-use names::{codex_unconfirmed_name, codex_veto_name, unconfirmed_name, veto_name};
+use names::{codex_unconfirmed_name, codex_veto_name, veto_name};
 use queued_support::{HEAD_UNKNOWN, queued_target_matches};
 use tokio::sync::OwnedMutexGuard;
 
@@ -41,7 +46,6 @@ pub(crate) const INJECT_ENV: &str = "ADK_BUSY_INJECT";
 
 pub(super) const HOLDER_CHANGED: &str = "holder_changed";
 pub(super) const INPUT_IN_FLIGHT: &str = "input_in_flight";
-const INPUT_RUNTIME_OWNED: &str = "input_runtime_owned";
 const MAILBOX_UNAVAILABLE: &str = "mailbox_unavailable";
 const NOT_BUSY: &str = "not_busy";
 const EPISODE_UNIDENTIFIED: &str = "episode_unidentified";
@@ -109,13 +113,20 @@ pub(crate) enum Origin {
         message: MessageId,
         handback: Box<(Intervention, String)>,
         guard: SourceGuard,
+        /// The author's name as Discord shows it for this message.
+        name: String,
     },
 }
 
 impl Origin {
     pub(crate) fn queued_head_ready(provider: &ProviderKind, channel: ChannelId) -> bool {
+        let supported = *provider == ProviderKind::Claude;
+        #[cfg(test)]
+        let supported = supported
+            || (test_hook::codex_enabled(channel.get())
+                && queued_provider::QueuedProvider::select(provider, channel.get()).is_some());
         !cfg!(windows)
-            && *provider == ProviderKind::Claude
+            && supported
             && mode(channel.get()) != InjectMode::Off
             && queued_head_enabled(channel.get())
     }
@@ -231,8 +242,6 @@ struct Target {
     claim: ExpectedClaim,
     /// Held from the first mailbox read until the owner settles.
     transition: OwnedMutexGuard<()>,
-    /// Keeps an input-runtime gate from closing on the channel until the owner settles.
-    input: Option<fence::Permit>,
     row: Option<RowKey>,
     binding: Option<BindingKey>,
     /// The gated pane of a Herdr-hosted session; the effect then never calls tmux.
@@ -300,6 +309,12 @@ fn live_tui_session(
     tui_session(&request.provider, runtime, row, watcher, named)
 }
 
+// Only confirmed transcript-output Claude channels on tmux can submit without a busy veto.
+fn turn_mode_tmux(channel: u64) -> bool {
+    crate::services::tui_o::turn_mode::transcript_turns(channel)
+        && crate::config::session_hosts::herdr_endpoint(channel).is_none()
+}
+
 /// Whether the transcript shows a turn the input can join: a live Claude turn, or the open Codex
 /// model turn, which the paste is then aimed at.
 fn busy_turn(
@@ -319,6 +334,45 @@ fn busy_turn(
         Some(codex_inject::TurnVerdict::NotBusy) => Err(NOT_BUSY),
         Some(codex_inject::TurnVerdict::NonSteerable(_)) => Err("not_steerable"),
         Some(codex_inject::TurnVerdict::Unknown) | None => Err("turn_unknown"),
+    }
+}
+
+impl SharedData {
+    /// Checks the holder or bound transcript without preparing uploads or touching the pane.
+    pub(crate) async fn has_inject_turn(
+        &self,
+        provider: &ProviderKind,
+        channel: ChannelId,
+    ) -> bool {
+        if crate::services::discord::mailbox_snapshot(self, channel)
+            .await
+            .cancel_token
+            .is_some()
+        {
+            return true;
+        }
+        let runtime = match provider {
+            ProviderKind::Claude => RuntimeHandoffKind::ClaudeTui,
+            ProviderKind::Codex => RuntimeHandoffKind::CodexTui,
+            _ => return false,
+        };
+        let row = crate::services::discord::inflight::load_inflight_state_read_only(
+            provider,
+            channel.get(),
+        );
+        let watcher = self.tmux_watchers.channel_binding(&channel);
+        let named = channel_name(self, channel).await;
+        tui_session(
+            provider,
+            runtime,
+            row.as_ref(),
+            watcher.map(|binding| binding.tmux_session_name),
+            named,
+        )
+        .is_some_and(|(_, transcript)| {
+            (runtime == RuntimeHandoffKind::ClaudeTui && turn_mode_tmux(channel.get()))
+                || busy_turn(runtime, &transcript).is_ok()
+        })
     }
 }
 
@@ -344,15 +398,11 @@ async fn resolve(
     };
     let pane = live(row.as_ref(), named).ok_or(SESSION_UNRESOLVED)?;
     let binding = binding_key(&pane.0);
-    // An idle transcript keeps the caller's own start; a reservation is only for a live turn.
-    let native_turn = busy_turn(runtime, &pane.1)?;
-    let input = if queued {
-        fence::effect::admit(&request.provider, channel).map_err(|_| INPUT_RUNTIME_OWNED)?
+    // Transcript-output Claude follows the resulting native turn, whether idle or busy now.
+    let native_turn = if runtime == RuntimeHandoffKind::ClaudeTui && turn_mode_tmux(channel) {
+        None
     } else {
-        match fence::lookup(&request.provider, channel) {
-            Some(gate) => Some(gate.admit().map_err(|_| INPUT_RUNTIME_OWNED)?),
-            None => None,
-        }
+        busy_turn(runtime, &pane.1)?
     };
     // Held until the pane effect ends. Bounded waiters (claim handback, headless start, /clear,
     // /resume) give up after 3s; intake and kickoff never wait and fall back to their queue.
@@ -395,11 +445,15 @@ async fn resolve(
         turn_id: first.turn_id,
         claim: first.claim,
         transition,
-        input,
         row: first.row,
         binding,
         herdr,
     })
+}
+
+/// Checks the existing effect-free target predicate before origin admission.
+pub(super) async fn external_ready(shared: &Arc<SharedData>, request: &HumanInputRequest) -> bool {
+    resolve(shared, request, false).await.is_ok()
 }
 
 pub(crate) async fn attempt(
@@ -407,6 +461,10 @@ pub(crate) async fn attempt(
     request: &HumanInputRequest,
     origin: Origin,
 ) -> InjectAttempt {
+    let origin = match catch_up_race::own_queued_head(shared, request, origin).await {
+        Ok(attempt) => return attempt,
+        Err(origin) => origin,
+    };
     if let Origin::QueuedHead {
         expected,
         parent,
@@ -416,7 +474,7 @@ pub(crate) async fn attempt(
         if !Origin::queued_head_gate_enabled(&request.provider, request.channel_id, parent, gate) {
             return InjectAttempt::NotSent("queued_gate_off");
         }
-        return queued_attempt(shared, request, expected, parent, gate).await;
+        return queued_owner::queued_attempt(shared, request, expected, parent, gate, None).await;
     }
     let target = match resolve(shared, request, false).await {
         Ok(target) => target,
@@ -434,11 +492,17 @@ pub(crate) async fn attempt(
         Some((reply, _)) => reply.frame(&request.text),
         None => request.text.clone(),
     };
+    // An external input names its author as its idle header does: the source and the id.
+    let name = match &origin {
+        Origin::Discord { name, .. } => name.clone(),
+        _ => format!("{}:{}", request.source, request.author_id),
+    };
     let input = Arc::new(Input {
         channel,
         provider: request.provider.as_str().to_string(),
         source: request.source.clone(),
         author: request.author_id.to_string(),
+        name,
         text,
         nonce: busy_inject::fresh_nonce(),
     });
@@ -450,6 +514,7 @@ pub(crate) async fn attempt(
             message,
             handback,
             guard,
+            ..
         } => (Some(message), *handback, Some(guard)),
         Origin::QueuedHead { .. } => unreachable!("queued origin has its own owner"),
     };
@@ -486,176 +551,6 @@ fn busy_episode(request: &HumanInputRequest, target: &Target) -> Option<String> 
     episode::busy(&request.provider, request.channel_id.get(), &holder)
 }
 
-async fn queued_attempt(
-    shared: &Arc<SharedData>,
-    request: &HumanInputRequest,
-    expected: QueueIdentity,
-    parent: Option<ChannelId>,
-    gate: fn(ChannelId, Option<ChannelId>) -> bool,
-) -> InjectAttempt {
-    let target = match resolve(shared, request, true).await {
-        Ok(target) => target,
-        Err(veto) => return InjectAttempt::NotSent(veto),
-    };
-    let shared = shared.clone();
-    let request = HumanInputRequest {
-        channel_id: request.channel_id,
-        provider: request.provider.clone(),
-        text: request.text.clone(),
-        author_id: request.author_id,
-        source: request.source.clone(),
-        metadata: request.metadata.clone(),
-        channel_name_hint: request.channel_name_hint.clone(),
-    };
-    let permit = target.input.clone();
-    // The detached owner keeps the admitted effect through claim, pane I/O and durable settle.
-    let owner = async move {
-        let mailbox = shared.mailbox(request.channel_id);
-        let persistence = crate::services::discord::queue_persistence_context(
-            &shared,
-            &request.provider,
-            request.channel_id,
-        );
-        let held = mailbox
-            .claim_queued_head_if_enabled(
-                expected,
-                persistence.clone(),
-                request.channel_id,
-                parent,
-                gate,
-            )
-            .await;
-        let held = match held {
-            QueuedHeadClaim::Reserved(ticket) => ticket,
-            QueuedHeadClaim::NotEligible => return InjectAttempt::NotSent("queued_not_eligible"),
-            QueuedHeadClaim::PersistenceFailed(error) => return persistence_failed(error),
-            QueuedHeadClaim::BlockedUnknown => return InjectAttempt::HandbackFailed(HEAD_UNKNOWN),
-            _ => return InjectAttempt::HandbackFailed("queued_head_blocked"),
-        };
-        let item = held.item();
-        let turn_id = Some(format!(
-            "discord:{}:{}",
-            request.channel_id, item.message_id
-        ));
-        let input = Arc::new(Input {
-            channel: request.channel_id.get(),
-            provider: request.provider.as_str().to_string(),
-            source: turn_id.clone().unwrap(),
-            author: item.author_id.to_string(),
-            text: item.text.clone(),
-            nonce: busy_inject::fresh_nonce(),
-        });
-        let mut ticket = Some(held);
-        let work = async {
-            #[cfg(test)]
-            test_hook::before_reserve(input.channel).await;
-            if !queued_target_matches(&shared, &request, &target, true).await {
-                return InjectAttempt::NotSent(HOLDER_CHANGED);
-            }
-            #[cfg(test)]
-            test_hook::owner_crash(input.channel);
-            let marked = mailbox
-                .settle_queued_head(
-                    ticket.take().unwrap(),
-                    HeadOutcome::MayHaveSent,
-                    persistence.clone(),
-                )
-                .await;
-            match marked {
-                HeadSettle::Committed(Some(kept)) => ticket = Some(kept),
-                HeadSettle::NotCommitted(kept, error) => {
-                    persistence_failed(error);
-                    ticket = Some(kept);
-                    return InjectAttempt::Unconfirmed {
-                        turn_id: turn_id.clone(),
-                        detail: "queued_phase_failed",
-                    };
-                }
-                _ => {
-                    return InjectAttempt::Unconfirmed {
-                        turn_id: turn_id.clone(),
-                        detail: "queued_phase_failed",
-                    };
-                }
-            }
-            #[cfg(test)]
-            test_hook::before_queued(input.channel, "may_have_sent").await;
-            if !queued_target_matches(&shared, &request, &target, true).await {
-                return InjectAttempt::NotSent(HOLDER_CHANGED);
-            }
-            let effect = tokio::task::spawn_blocking({
-                let (input, session, transcript, turn_id, permit) = (
-                    input.clone(),
-                    target.session.clone(),
-                    target.transcript.clone(),
-                    turn_id.clone(),
-                    target.input.clone(),
-                );
-                let herdr = target.herdr.clone();
-                move || {
-                    fence::effect::synchronous(permit, || {
-                        run(
-                            (&pane(input.channel, &session), herdr.as_ref()),
-                            &session,
-                            &transcript,
-                            turn_id,
-                            &input,
-                        )
-                    })
-                }
-            });
-            let attempt = effect.await.unwrap_or(InjectAttempt::OwnerFailed {
-                turn_id: turn_id.clone(),
-            });
-            #[cfg(test)]
-            test_hook::before_queued(input.channel, "after_effect").await;
-            if !matches!(attempt, InjectAttempt::NotSent(_))
-                && !queued_target_matches(&shared, &request, &target, false).await
-            {
-                return InjectAttempt::Unconfirmed {
-                    turn_id: turn_id.clone(),
-                    detail: HOLDER_CHANGED,
-                };
-            }
-            attempt
-        };
-        let attempt = std::panic::AssertUnwindSafe(work)
-            .catch_unwind()
-            .await
-            .unwrap_or(InjectAttempt::OwnerFailed {
-                turn_id: turn_id.clone(),
-            });
-        if let Some(ticket) = ticket {
-            let outcome = match attempt {
-                InjectAttempt::Injected { .. } => HeadOutcome::Injected,
-                InjectAttempt::NotSent(_) => HeadOutcome::NotSent,
-                _ => HeadOutcome::Unconfirmed,
-            };
-            if !matches!(
-                mailbox
-                    .settle_queued_head(ticket, outcome, persistence)
-                    .await,
-                HeadSettle::Committed(None)
-            ) {
-                return InjectAttempt::Unconfirmed {
-                    turn_id,
-                    detail: "queued_settle_unknown",
-                };
-            }
-            // A committed NotSent is the actor's proof that the head is back at the queue front.
-            if let (InjectAttempt::NotSent(veto), Some(turn_id)) = (&attempt, turn_id) {
-                let veto = *veto;
-                return InjectAttempt::HandedBack { turn_id, veto };
-            }
-        }
-        attempt
-    };
-    match tokio::spawn(fence::effect::scope(permit, owner)).await {
-        Ok(attempt) => attempt,
-        Err(_) => InjectAttempt::OwnerFailed { turn_id: None },
-    }
-}
-
 struct Owner {
     shared: Arc<SharedData>,
     provider: ProviderKind,
@@ -689,7 +584,6 @@ impl Owner {
             turn_id,
             claim,
             transition,
-            input: permit,
             herdr,
             ..
         } = target;
@@ -698,8 +592,7 @@ impl Owner {
         let persistence = discord(&shared, &provider, channel_id);
         #[cfg(test)]
         test_hook::before_reserve(input.channel).await;
-        let reserve =
-            mailbox.reserve_injection(message, claim, persistence.clone(), permit.clone());
+        let reserve = mailbox.reserve_injection(message, claim, persistence.clone());
         let ticket = match reserve.await {
             ReserveOutcome::Reserved(ticket) => ticket,
             ReserveOutcome::Owned | ReserveOutcome::Consumed => {
@@ -755,15 +648,13 @@ impl Owner {
             }
             InjectAttempt::NotSent(veto) => {
                 let source = [handback.message_id.get()];
-                let handed =
-                    mailbox.hand_back_injected_input(ticket, handback, persistence, permit.clone());
+                let handed = mailbox.hand_back_injected_input(ticket, handback, persistence);
                 #[cfg(test)]
                 let handed = test_hook::hand_back(input.channel, handed);
                 match handed.await {
                     Ok(events) => {
                         let apply = crate::services::discord::apply_queue_exit_feedback;
-                        let feedback = apply(&shared, channel_id, &events);
-                        fence::effect::scope(permit.clone(), feedback).await;
+                        apply(&shared, channel_id, &events).await;
                         InjectAttempt::HandedBack {
                             turn_id: queued_turn,
                             veto,
@@ -771,10 +662,9 @@ impl Owner {
                     }
                     Err(reason) => {
                         if reason == HANDBACK_NOT_WRITTEN {
-                            let failure = fence::Failure::Persistence;
-                            fence::record_failure(&provider, input.channel, &source, failure);
-                            let notice = crate::services::discord::queue_io::input_refusal_notice;
-                            notice(&shared, channel_id, &source, failure).await;
+                            let notice =
+                                crate::services::discord::queue_io::input_persistence_refusal_notice;
+                            notice(&shared, channel_id, &source).await;
                         }
                         InjectAttempt::HandbackFailed(reason)
                     }
@@ -786,19 +676,28 @@ impl Owner {
                     _ => InjectionOutcome::Unconfirmed,
                 };
                 let settle = InjectionSettlement::Delivered(outcome);
-                let permit = permit.clone();
                 let _ = mailbox
-                    .settle_injected_input(ticket, settle, persistence, permit)
+                    .settle_injected_input(ticket, settle, persistence)
                     .await;
                 // Recorded whatever the settle answered, so a restart still finds it.
                 if let Some(message) = message {
-                    record_terminal(&provider, channel_id, message, outcome).await;
+                    if outcome == InjectionOutcome::Observed {
+                        catch_up_race::confirmed(
+                            &shared,
+                            &provider,
+                            channel_id,
+                            &handback.source_message_queued_generations(),
+                        )
+                        .await;
+                    } else {
+                        record_terminal(&provider, channel_id, message, outcome).await;
+                    }
                 }
                 delivered
             }
         };
         // A handed-back message now waits in the queue, so the drain must not see it claimed.
-        drop((guard, transition, permit));
+        drop((guard, transition));
         // Ending the reservation may release a drain it withheld.
         let kick = crate::services::discord::queue_io::schedule_post_enqueue_idle_queue_kick;
         kick(shared, provider, channel_id);
@@ -828,6 +727,7 @@ struct Input {
     provider: String,
     source: String,
     author: String,
+    name: String,
     text: String,
     nonce: String,
 }
@@ -850,12 +750,17 @@ fn run(
         transcript,
         source: &input.source,
         author: &input.author,
+        name: &input.name,
         nonce,
         text: &input.text,
     };
     let inject = || {
-        busy_inject::inject_report(pane, &request, Some(input.channel), &busy_inject::TIMING)
-            .outcome
+        let report = if turn_mode_tmux(input.channel) {
+            busy_inject::inject_report_any_turn
+        } else {
+            busy_inject::inject_report
+        };
+        report(pane, &request, Some(input.channel), &busy_inject::TIMING).outcome
     };
     // A panic may come after the paste, so it is reported like any later failure.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(inject));
@@ -873,7 +778,11 @@ fn run(
                 turn_id: turn_id.clone(),
             }
         }
-        Ok(Outcome::Unconfirmed(detail)) => alert(unconfirmed_name(detail)),
+        Ok(Outcome::Failed(detail)) => alert(match detail {
+            busy_inject::WriteFailure::Stash => "stash_failed",
+            busy_inject::WriteFailure::Paste => "paste_failed",
+            busy_inject::WriteFailure::Enter => "enter_failed",
+        }),
         Err(_) => alert("executor_failed"),
     };
     result
@@ -916,6 +825,7 @@ fn run_codex(
         rollout,
         source: &input.source,
         author: &input.author,
+        name: &input.name,
         nonce,
         text: &input.text,
         target_turn,
@@ -932,19 +842,13 @@ fn run_codex(
     let alert = |detail| unconfirmed(input, session, turn_id.clone(), detail);
     match outcome {
         Ok(codex_inject::Outcome::NotSent(veto)) => InjectAttempt::NotSent(codex_veto_name(veto)),
-        Ok(codex_inject::Outcome::Injected {
-            observed_turn,
-            joined,
-        }) => {
-            // A turn other than the target means it ended before the Enter; the ledger settles it.
+        Ok(codex_inject::Outcome::Injected) => {
             tracing::info!(
                 channel_id = input.channel,
                 tmux_session = %session,
                 nonce = %nonce,
                 target_turn,
-                observed_turn = observed_turn.as_deref().unwrap_or(""),
-                joined,
-                "busy Codex turn took the human input"
+                "busy Codex paste and Enter sent"
             );
             InjectAttempt::Injected { turn_id }
         }
@@ -995,3 +899,6 @@ fn pane(channel_id: u64, session: &str) -> busy_inject::Pane {
 /// Per-channel mode and tmux program for tests, so parallel tests never share a switch.
 #[cfg(test)]
 pub(crate) mod test_hook;
+
+#[cfg(all(test, unix))]
+mod catch_up_race_tests;

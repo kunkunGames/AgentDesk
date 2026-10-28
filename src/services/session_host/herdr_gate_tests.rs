@@ -58,7 +58,8 @@ struct Server {
     conns: Arc<Mutex<BTreeMap<usize, Seen>>>,
     stop: Arc<AtomicBool>,
     version: Arc<Mutex<String>>,
-    close_reply: Arc<Mutex<Option<Value>>>,
+    close_reply: Scripted,
+    process_info: Scripted,
     /// Once set, a close removes the pane from every later snapshot, as a last-pane close does.
     vanish_on_close: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -70,6 +71,9 @@ fn socket_path() -> PathBuf {
     PathBuf::from("/tmp").join(format!("adk-hg-{}-{n}.sock", std::process::id()))
 }
 
+/// A whole reply that takes the default one's place for its request.
+type Scripted = Arc<Mutex<Option<Value>>>;
+
 /// Answers by method, one request per connection, like Herdr.
 fn serve() -> Server {
     let path = socket_path();
@@ -79,11 +83,11 @@ fn serve() -> Server {
     let conns = Arc::new(Mutex::new(BTreeMap::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let version = Arc::new(Mutex::new("0.9.3".into()));
-    let close_reply = Arc::new(Mutex::new(None));
+    let (close_reply, process_info) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)));
     let vanish_on_close = Arc::new(AtomicBool::new(false));
     let gone = Arc::new(AtomicBool::new(false));
     let (state, stopped) = (conns.clone(), stop.clone());
-    let (hello_version, closed) = (version.clone(), close_reply.clone());
+    let (hello_version, closed) = (version.clone(), (close_reply.clone(), process_info.clone()));
     let vanish = vanish_on_close.clone();
     let thread = thread::spawn(move || {
         let mut handlers = Vec::new();
@@ -112,14 +116,15 @@ fn serve() -> Server {
         stop,
         version,
         close_reply,
+        process_info,
         vanish_on_close,
         thread: Some(thread),
     }
 }
 
-/// `close_reply` is set only for a close request.
-fn reply(request: &Value, version: &str, close_reply: Option<Value>, gone: bool) -> Value {
-    if let Some(mut reply) = close_reply {
+/// `scripted` is set only for the request its slot answers.
+fn reply(request: &Value, version: &str, scripted: Option<Value>, gone: bool) -> Value {
+    if let Some(mut reply) = scripted {
         reply["id"] = request["id"].clone();
         return reply;
     }
@@ -134,6 +139,14 @@ fn reply(request: &Value, version: &str, close_reply: Option<Value>, gone: bool)
             "pane_id": PANE, "shell_pid": SHELL, "foreground_process_group_id": PROVIDER,
             "foreground_processes": [{"pid": PROVIDER, "name": "claude"}, {"pid": CHILD, "name": "node"}]
         }}),
+        "pane.read" if !gone && request["params"]["pane_id"] == PANE => {
+            json!({"type": "pane_read", "read": {
+                "pane_id": PANE, "source": request["params"]["source"],
+                "text": include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/tui_input/claude-2.1.293-idle.txt")),
+                "revision": 7, "truncated": false
+            }})
+        }
         "session.snapshot" => json!({"type": "session_snapshot", "snapshot": {
             "version": "0.9.3", "protocol": 22, "workspaces": [], "tabs": [], "layouts": [],
             "agents": [], "panes": panes
@@ -153,7 +166,7 @@ fn answer(
     index: usize,
     conns: &Mutex<BTreeMap<usize, Seen>>,
     version: &Mutex<String>,
-    close_reply: &Mutex<Option<Value>>,
+    (close_reply, process_info): &(Scripted, Scripted),
     (vanish_on_close, gone): &(Arc<AtomicBool>, Arc<AtomicBool>),
 ) {
     let _ = stream.set_nonblocking(false);
@@ -167,10 +180,12 @@ fn answer(
     if let Some(request) = request {
         let close = request["method"] == "pane.close";
         let close_reply = close_reply.lock().unwrap().clone().filter(|_| close);
+        let info = process_info.lock().unwrap().clone();
+        let info = info.filter(|_| request["method"] == "pane.process_info");
         let reply = reply(
             &request,
             &version.lock().unwrap(),
-            close_reply,
+            close_reply.or(info),
             gone.load(Ordering::SeqCst),
         );
         if close && vanish_on_close.load(Ordering::SeqCst) {
@@ -880,7 +895,7 @@ fn m0_close_effect_positive() {
     let mutations = rig.server.mutations();
     assert_eq!(mutations.len(), 1);
     assert_eq!(result, HerdrTerminateResult::Acknowledged);
-    assert_eq!(mutations[0]["method"], "pane.close");
+    assert_closed_method(&mutations[0]["method"]);
     assert_eq!(mutations[0]["params"], json!({"pane_id": PANE}));
     assert!(rig.server.conns().iter().all(|seen| seen.after_reply == 0));
     assert!(matches!(
@@ -955,6 +970,10 @@ fn m0_close_witness_mismatch_zero_bytes() {
         write.request.is_none() && write.after_reply == 0,
         "{write:?}"
     );
+}
+
+fn assert_closed_method(method: &Value) {
+    assert_eq!(method.as_str(), Some("pane.close"));
 }
 
 #[test]
@@ -1969,6 +1988,7 @@ pub(crate) mod p11 {
     pub(crate) const NODE: &str = "mac-mini";
     pub(crate) const EXECUTION: &str = NONCE;
     pub(crate) const LAUNCHED_PANE: &str = LAUNCHED;
+    const FRESH: u32 = 11;
     pub(crate) use crate::db::dispatched_sessions::hosted_execution::HostedState;
 
     /// Re-runs test `path` in a child owning its boot section, O writer list and Herdr
@@ -1980,27 +2000,7 @@ pub(crate) mod p11 {
             return true;
         }
         let home = tempfile::tempdir().unwrap();
-        let config = home.path().join("config.toml");
-        std::fs::write(&config, CANONICAL_CONFIG).unwrap();
-        let old = std::time::SystemTime::now() - Duration::from_secs(3_600);
-        let file = std::fs::File::options().write(true).open(&config).unwrap();
-        file.set_modified(old).unwrap();
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", name, "--nocapture", "--test-threads=1"])
-            .env(TERMINATE_TEST_CHILD, name)
-            .env("HERDR_CONFIG_PATH", &config)
-            .env("XDG_CONFIG_HOME", home.path().join("xdg"))
-            .env_remove(crate::services::herdr_admission::ADMISSION_ENV)
-            .env(
-                crate::services::tui_o::cutover::test_override::CHILD_ENV,
-                "1",
-            )
-            .env(
-                crate::services::tui_o::cutover::test_override::CHANNELS_ENV,
-                format!("[[{channel},\"claude_tui\"]]"),
-            )
-            .output()
-            .unwrap();
+        let output = child_command(path, channel, home.path()).output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -2025,6 +2025,11 @@ pub(crate) mod p11 {
         /// The server and the boot section for `channel`, installed for this whole child
         /// process; nothing under the runtime root is written yet.
         pub(crate) fn boot(channel: u64) -> Self {
+            Self::boot_with(channel, false)
+        }
+
+        /// As `boot`, with the recorded provider's process read as alive when `provider_alive`.
+        pub(crate) fn boot_with(channel: u64, provider_alive: bool) -> Self {
             assert!(std::env::var_os(TERMINATE_TEST_CHILD).is_some());
             let server = serve();
             server.vanish_on_close.store(true, Ordering::SeqCst);
@@ -2052,7 +2057,7 @@ pub(crate) mod p11 {
             Self {
                 server,
                 boot,
-                os: ScriptedOs::new(pending, Ok(false)),
+                os: ScriptedOs::new(pending, Ok(provider_alive)),
                 channel,
             }
         }
@@ -2086,12 +2091,65 @@ pub(crate) mod p11 {
             session_key: &str,
             state: HostedState,
         ) -> LiveSwitches {
+            let held = state != HostedState::Retired;
+            self.insert(pool, (token_hash, session_key), state, held, true)
+                .await
+        }
+
+        /// As `bind` for a Pending execution no attach ever took: no hold, evidence recorded.
+        pub(crate) async fn bind_never_attached(
+            &self,
+            pool: &sqlx::PgPool,
+            token_hash: &str,
+            session_key: &str,
+        ) -> LiveSwitches {
+            let pending = HostedState::Pending;
+            self.insert(pool, (token_hash, session_key), pending, false, true)
+                .await
+        }
+
+        /// As `bind_never_attached` for a launch whose provider was never proven: no evidence.
+        pub(crate) async fn bind_without_evidence(
+            &self,
+            pool: &sqlx::PgPool,
+            token_hash: &str,
+            session_key: &str,
+        ) -> LiveSwitches {
+            let pending = HostedState::Pending;
+            self.insert(pool, (token_hash, session_key), pending, false, false)
+                .await
+        }
+
+        fn record_at_runtime_root(&self, state: HostedState) -> HostedExecution {
+            let mut record = stored(&self.server, state);
+            record.owner.runtime_root = crate::config::runtime_root()
+                .expect("a runtime root for the termination fixture")
+                .display()
+                .to_string();
+            record
+                .source_ref
+                .runtime_root
+                .clone_from(&record.owner.runtime_root);
+            record
+        }
+
+        async fn insert(
+            &self,
+            pool: &sqlx::PgPool,
+            (token_hash, session_key): (&str, &str),
+            state: HostedState,
+            held: bool,
+            evidence: bool,
+        ) -> LiveSwitches {
             let logical = session_key.rsplit_once(':').unwrap().1;
             let marker = crate::services::tmux_common::session_temp_path(logical, "host_kind");
             std::fs::write(marker, "herdr").unwrap();
             self.os
                 .swap(Arc::new(FakeOs::launched(env_naming(&context(NONCE)))));
-            let mut record = stored(&self.server, state);
+            let mut record = self.record_at_runtime_root(state);
+            if !evidence {
+                record.expected = None;
+            }
             record.owner.discord_token_hash = token_hash.into();
             record.owner.channel_id = self.channel.to_string();
             record.owner.logical_key = logical.into();
@@ -2101,21 +2159,18 @@ pub(crate) mod p11 {
                 .bind(session_key).bind(token_hash).bind(self.channel.to_string())
                 .bind(serde_json::to_value(&record).unwrap())
                 .execute(pool).await.unwrap();
-            if state != HostedState::Retired {
+            if held {
                 crate::services::claude::herdr_turn::hold(NONCE).unwrap();
             }
             let switches = LiveSwitches(LiveTerminateSwitch::new());
-            let mut config = switches.0.0.clone();
-            config.runtime.herdr_terminate_enabled = Some(true);
-            config.runtime.herdr_turn_enabled = Some(true);
-            crate::config_live_reload::install(config);
+            switches.set_terminate(Some(true));
             switches
         }
 
         /// The record `bind` stored, as a fresh input target would read it.
         pub(crate) fn record(&self, token_hash: &str, session_key: &str) -> HostedExecution {
             let logical = session_key.rsplit_once(':').unwrap().1;
-            let mut record = stored(&self.server, HostedState::Bound);
+            let mut record = self.record_at_runtime_root(HostedState::Bound);
             record.owner.discord_token_hash = token_hash.into();
             record.owner.channel_id = self.channel.to_string();
             record.owner.logical_key = logical.into();
@@ -2160,7 +2215,7 @@ pub(crate) mod p11 {
             provider: &str,
         ) -> HostedExecution {
             let logical = session_key.rsplit_once(':').unwrap().1;
-            let mut record = stored(&self.server, state);
+            let mut record = self.record_at_runtime_root(state);
             record.owner.provider = provider.into();
             record.owner.discord_token_hash = token_hash.into();
             record.owner.channel_id = self.channel.to_string();
@@ -2191,6 +2246,16 @@ pub(crate) mod p11 {
             EndCheckPause { arrived, release }
         }
 
+        /// A restarted server restored the pane as shell `FRESH` alone.
+        pub(crate) fn restore_shell(&self) {
+            let os = FakeOs::launched(Vec::new()).starting(FRESH, &[start(2_000)]);
+            self.os.swap(Arc::new(os));
+            let info = json!({"pane_id": PANE, "shell_pid": FRESH,
+                "foreground_process_group_id": FRESH, "foreground_processes": [{"pid": FRESH}]});
+            let reply = json!({"result": {"type": "pane_process_info", "process_info": info}});
+            *self.server.process_info.lock().unwrap() = Some(reply);
+        }
+
         /// Every write the server received, as `(method, pane_id)`, in order.
         pub(crate) fn writes(&self) -> Vec<(String, String)> {
             self.server
@@ -2207,6 +2272,16 @@ pub(crate) mod p11 {
 
     /// Restores the live config the child started with.
     pub(crate) struct LiveSwitches(LiveTerminateSwitch);
+
+    impl LiveSwitches {
+        /// The live terminate switch set to `enabled`, the turn switch on.
+        pub(crate) fn set_terminate(&self, enabled: Option<bool>) {
+            let mut config = self.0.0.clone();
+            config.runtime.herdr_terminate_enabled = enabled;
+            config.runtime.herdr_turn_enabled = Some(true);
+            crate::config_live_reload::install(config);
+        }
+    }
 
     /// A held end check: the service waits between its close and its retire CAS.
     pub(crate) struct EndCheckPause {
@@ -2409,3 +2484,9 @@ pub(crate) mod p11 {
         std::mem::forget(herdr_registry::force_for_test(HerdrRegistry::build(&none)));
     }
 }
+
+#[path = "herdr_gate/root_replaced_tests.rs"]
+mod root_replaced_tests;
+
+#[path = "herdr_gate/policy_tests.rs"]
+mod policy;

@@ -1,5 +1,4 @@
 use super::super::*;
-use crate::services::discord::input_runtime::fence::{BootTarget, boot_skip};
 
 /// codex review round-6 P2 (#1332): outcome of filtering loaded
 /// queued-placeholder mappings against the live mailbox queue.
@@ -120,8 +119,8 @@ pub(in crate::services::discord) trait StalePlaceholderDeleter:
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
-struct SerenityStalePlaceholderDeleter {
-    http: Arc<serenity::Http>,
+pub(in crate::services::discord) struct SerenityStalePlaceholderDeleter {
+    pub(in crate::services::discord) http: Arc<serenity::Http>,
 }
 
 impl StalePlaceholderDeleter for SerenityStalePlaceholderDeleter {
@@ -151,17 +150,11 @@ pub(in crate::services::discord) async fn delete_stale_queued_placeholder_cards_
     let mut deleted = 0usize;
     let mut failed = 0usize;
     let mut preserved = 0usize;
-    let mut detach_held = 0usize;
     for (channel_id, user_msg_id, placeholder_msg_id) in stale_cards {
         let (channel_id, placeholder_msg_id) = (*channel_id, *placeholder_msg_id);
-        // A protected channel's card waits for its move or handback.
-        if boot_skip(BootTarget::Channel(&shared.provider, channel_id.get())) {
-            preserved += 1;
-            continue;
-        }
         // Candidates include late/conflicting restores whose owners may still queue.
         // The departing hint deprioritizes an owner; it does not exclude one.
-        let teardown = match queued_card_gate::release_or_rekey_at_boot(
+        let teardown = match queued_card_gate::release_or_rekey(
             shared,
             channel_id,
             placeholder_msg_id,
@@ -169,24 +162,13 @@ pub(in crate::services::discord) async fn delete_stale_queued_placeholder_cards_
         )
         .await
         {
-            None | Some(QueuedCardDisposition::Preserved { .. }) => {
+            QueuedCardDisposition::Preserved { .. } | QueuedCardDisposition::Unmeasured => {
                 preserved += 1;
                 continue;
             }
-            Some(QueuedCardDisposition::Released(teardown)) => teardown,
+            QueuedCardDisposition::Released(teardown) => teardown,
         };
-        let result = match queued_card_gate::teardown_at_boot(shared, deleter, teardown).await {
-            queued_card_gate::BootTeardownOutcome::Held => {
-                preserved += 1;
-                continue;
-            }
-            queued_card_gate::BootTeardownOutcome::DetachHeld(result) => {
-                detach_held += 1;
-                result
-            }
-            queued_card_gate::BootTeardownOutcome::Finished(result) => result,
-        };
-        match result {
+        match queued_card_gate::teardown_via_deleter(shared, deleter, teardown).await {
             Ok(_) => {
                 deleted += 1;
                 tracing::debug!(
@@ -207,7 +189,7 @@ pub(in crate::services::discord) async fn delete_stale_queued_placeholder_cards_
     }
     let ts = chrono::Local::now().format("%H:%M:%S");
     tracing::info!(
-        "  [{ts}] 🧹 STALE-PLACEHOLDER: deleted {deleted}/{} stale 📬 card(s) on bootstrap (failed {failed}, preserved {preserved}, controller detach held {detach_held})",
+        "  [{ts}] 🧹 STALE-PLACEHOLDER: deleted {deleted}/{} stale 📬 card(s) on bootstrap (failed {failed}, preserved {preserved})",
         stale_cards.len(),
     );
 }
@@ -232,6 +214,56 @@ pub(in crate::services::discord) async fn collect_live_queue_message_ids(
     by_channel
 }
 
+/// Queued ids of every channel whose actor answered, and the channels whose actor never did.
+pub(in crate::services::discord) struct LiveQueueObservation {
+    pub(in crate::services::discord) ids:
+        std::collections::HashMap<ChannelId, std::collections::HashSet<u64>>,
+    /// Unmeasured, not empty: restore keeps their cards instead of judging them stale.
+    pub(in crate::services::discord) unmeasured: std::collections::HashSet<ChannelId>,
+}
+
+/// Like `collect_live_queue_message_ids`, but a closed actor or a dropped reply is reported
+/// as unmeasured rather than read as an empty queue.
+pub(in crate::services::discord) async fn observe_live_queue_message_ids(
+    shared: &SharedData,
+) -> LiveQueueObservation {
+    let mut observation = LiveQueueObservation {
+        ids: std::collections::HashMap::new(),
+        unmeasured: std::collections::HashSet::new(),
+    };
+    let snapshots = shared
+        .mailboxes
+        .try_snapshot_all_observed(std::iter::empty())
+        .await;
+    for (channel_id, snapshot) in snapshots {
+        let Ok(snapshot) = snapshot else {
+            observation.unmeasured.insert(channel_id);
+            continue;
+        };
+        let ids = queued_message_ids(&snapshot);
+        if !ids.is_empty() {
+            observation.ids.insert(channel_id, ids);
+        }
+    }
+    observation
+}
+
+/// The channel's queued ids, `None` when its actor never answered; a channel with no actor
+/// has no queue.
+async fn observed_queued_ids(
+    shared: &SharedData,
+    channel: ChannelId,
+) -> Option<std::collections::HashSet<u64>> {
+    match shared.mailbox_peek(channel) {
+        Some(handle) => handle
+            .try_snapshot()
+            .await
+            .ok()
+            .map(|snapshot| queued_message_ids(&snapshot)),
+        None => Some(std::collections::HashSet::new()),
+    }
+}
+
 /// Install disk candidates without overwriting newer map ownership. The actor
 /// remains independent of the persist lock; cleanup always goes through A8.
 pub(in crate::services::discord) async fn install_restored_queued_placeholders(
@@ -248,115 +280,72 @@ pub(in crate::services::discord) async fn install_restored_queued_placeholders(
     }
     let mut uninstalled = Vec::new();
     for (channel, rows) in by_channel {
-        // A protected channel keeps its disk cards for its move or handback, installed or not.
-        if boot_skip(BootTarget::Channel(&shared.provider, channel.get())) {
-            continue;
-        }
         let lock = shared.queued_placeholders_persist_lock(channel);
         let _guard = lock.lock_owned().await;
-        if boot_skip(BootTarget::Channel(&shared.provider, channel.get())) {
-            continue;
-        }
-        #[cfg(test)]
-        tests::n3bc_tests::snapshot_attempt(channel);
-        let snapshot = mailbox_snapshot(shared, channel).await;
-        #[cfg(test)]
-        queued_card_gate::boot_test_boundary(channel, "install_snapshot");
-        if boot_skip(BootTarget::Channel(&shared.provider, channel.get())) {
-            continue;
-        }
-        let queued = queued_message_ids(&snapshot);
-        for (owner, card) in rows {
-            let current = shared
-                .queued
-                .queued_placeholders
-                .get(&(channel, owner))
-                .map(|v| *v);
-            if !queued.contains(&owner.get()) {
-                uninstalled.push((channel, owner, card));
-            } else if let Some(current) = current {
-                if current != card {
-                    uninstalled.push((channel, owner, card));
-                }
-            } else if shared
-                .queued
-                .queued_placeholders
-                .iter()
-                .any(|entry| entry.key().0 == channel && *entry.value() == card)
-            {
-                uninstalled.push((channel, owner, card));
-            } else {
-                shared.insert_queued_placeholder_locked(channel, owner, card);
-            }
-        }
-        // Also prune stale-only/conflict-only snapshots. Save remains best-effort.
-        #[cfg(test)]
-        queued_card_gate::boot_test_boundary(channel, "install_persist");
-        queued_placeholders_store::persist_channel_from_map(
-            &shared.queued.queued_placeholders,
-            &shared.provider,
-            &shared.token_hash,
-            channel,
-        );
+        let (_, refused) = install_channel_rows_locked(shared, channel, rows, true).await;
+        uninstalled.extend(refused);
     }
     uninstalled
 }
 
-#[cfg(test)]
-mod tests;
-
-pub(in crate::services::discord) async fn install_channel_queued_placeholders_checked(
+/// Installs one channel's rows under the caller's persist lock and saves the channel; refuses an
+/// owner an answered queue lacks (if `check_queued`), an owner with another card, or another owner's card.
+pub(in crate::services::discord) async fn install_channel_rows_locked(
     shared: &SharedData,
     channel: ChannelId,
-    loaded: std::collections::HashMap<(ChannelId, MessageId), MessageId>,
-) -> Result<Vec<(ChannelId, MessageId, MessageId)>, String> {
-    if loaded.keys().any(|(id, _)| *id != channel)
-        || boot_skip(BootTarget::Channel(&shared.provider, channel.get()))
-    {
-        return Err("placeholder restore outside the admitted scope".into());
-    }
-    let _guard = shared
-        .queued_placeholders_persist_lock(channel)
-        .lock_owned()
-        .await;
-    let snapshot = shared
-        .mailbox(channel)
-        .try_snapshot()
-        .await
-        .map_err(|error| format!("placeholder mailbox unavailable: {error:?}"))?;
-    let queued = queued_message_ids(&snapshot);
-    let map = &shared.queued.queued_placeholders;
-    let mut inserted = Vec::new();
-    let mut stale = Vec::new();
-    for ((id, owner), card) in loaded {
-        let current = map.get(&(id, owner)).map(|entry| *entry);
-        if !queued.contains(&owner.get())
-            || current.is_some_and(|current| current != card)
-            || (current.is_none()
-                && map
-                    .iter()
-                    .any(|entry| entry.key().0 == id && *entry.value() == card))
+    rows: Vec<(MessageId, MessageId)>,
+    check_queued: bool,
+) -> (
+    Vec<(MessageId, MessageId)>,
+    Vec<(ChannelId, MessageId, MessageId)>,
+) {
+    // An unanswered actor measured no queue, so its owners are not refused as unqueued.
+    let queued = match check_queued {
+        true => observed_queued_ids(shared, channel).await,
+        false => None,
+    };
+    let (mut installed, mut uninstalled) = (Vec::new(), Vec::new());
+    for (owner, card) in rows {
+        let current = shared
+            .queued
+            .queued_placeholders
+            .get(&(channel, owner))
+            .map(|v| *v);
+        if queued
+            .as_ref()
+            .is_some_and(|ids| !ids.contains(&owner.get()))
         {
-            stale.push((id, owner, card));
-        } else if current.is_none() {
-            map.insert((id, owner), card);
-            inserted.push((id, owner));
+            uninstalled.push((channel, owner, card));
+        } else if let Some(current) = current {
+            if current != card {
+                uninstalled.push((channel, owner, card));
+            } else {
+                installed.push((owner, card));
+            }
+        } else if shared
+            .queued
+            .queued_placeholders
+            .iter()
+            .any(|entry| entry.key().0 == channel && *entry.value() == card)
+        {
+            uninstalled.push((channel, owner, card));
+        } else {
+            shared.insert_queued_placeholder_locked(channel, owner, card);
+            installed.push((owner, card));
         }
     }
-    // A failed required save leaves installation unacknowledged and rolls back only our inserts.
-    if let Err(error) = queued_placeholders_store::persist_channel_from_map_checked(
-        map,
+    // Also prune stale-only/conflict-only snapshots. Save remains best-effort.
+    queued_placeholders_store::persist_channel_from_map(
+        &shared.queued.queued_placeholders,
         &shared.provider,
         &shared.token_hash,
         channel,
-    ) {
-        for key in inserted {
-            map.remove(&key);
-        }
-        return Err(error);
-    }
-    Ok(stale)
+    );
+    (installed, uninstalled)
 }
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 mod scoped_recovery_tests;

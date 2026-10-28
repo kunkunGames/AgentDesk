@@ -8,7 +8,8 @@
 //! `C`'s `queued_placeholders_persist_lock`: **(G1)** no queue entry still
 //! maps to `X`, and **(G2)** every queue entry has some card. `G1` false, or
 //! `G1 ∧ ¬G2` (re-key `X` onto a cardless entry) → preserved; only
-//! `G1 ∧ G2` → [`QueuedCardDisposition::Released`].
+//! `G1 ∧ G2` → [`QueuedCardDisposition::Released`]. A mailbox actor that does
+//! not answer measured no queue, so neither predicate is evaluated and `X` is kept.
 //!
 //! `departing` never affects the verdict, only which entry a re-key prefers —
 //! error direction is always over-preservation, never deleting a live card.
@@ -24,8 +25,7 @@ use std::sync::Arc;
 
 use poise::serenity_prelude::{ChannelId, MessageId};
 
-use super::super::input_runtime::fence::{BootTarget, boot_skip};
-use crate::services::turn_orchestrator::Intervention;
+use crate::services::turn_orchestrator::{Intervention, MailboxUnreachable};
 
 use super::super::http::{delete_channel_message, edit_channel_message};
 use super::super::runtime_bootstrap::StalePlaceholderDeleter;
@@ -38,6 +38,9 @@ pub(in crate::services::discord) enum QueuedCardDisposition {
     Preserved { owner: MessageId },
     /// Contract G holds; destruction is permitted through the token.
     Released(QueuedCardTeardown),
+    /// The channel's mailbox actor did not answer, so its queue is unknown; the
+    /// card is kept unchanged and no Discord action on it is permitted.
+    Unmeasured,
 }
 
 /// Permission token for destroying one queued card; private fields, so it
@@ -49,10 +52,6 @@ pub(in crate::services::discord) struct QueuedCardTeardown {
 }
 
 impl QueuedCardTeardown {
-    pub(in crate::services::discord) fn channel_id(&self) -> ChannelId {
-        self.channel_id
-    }
-
     pub(in crate::services::discord) fn card(&self) -> MessageId {
         self.card
     }
@@ -90,7 +89,20 @@ pub(in crate::services::discord) async fn release_or_rekey_locked(
         ),
         "release_or_rekey_locked: guard must be the persist lock of `channel_id`",
     );
-    let snapshot = super::super::mailbox_snapshot(shared, channel_id).await;
+    let snapshot = match shared.mailbox_peek(channel_id) {
+        Some(handle) => match handle.try_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(MailboxUnreachable) => {
+                tracing::warn!(
+                    channel_id = channel_id.get(),
+                    card = card.get(),
+                    "queued card gate: mailbox did not answer; keeping the card"
+                );
+                return QueuedCardDisposition::Unmeasured;
+            }
+        },
+        None => super::super::ChannelMailboxSnapshot::no_actor(channel_id),
+    };
     decide_from_snapshot(shared, channel_id, card, departing, &snapshot).await
 }
 
@@ -158,29 +170,6 @@ pub(in crate::services::discord) async fn release_or_rekey(
     let persist_lock = shared.queued_placeholders_persist_lock(channel_id);
     let persist_guard = persist_lock.lock().await;
     release_or_rekey_locked(shared, channel_id, card, departing, &persist_guard).await
-}
-
-/// Boot holds a protected target before reading its queue or rekeying its card.
-pub(in crate::services::discord) async fn release_or_rekey_at_boot(
-    shared: &SharedData,
-    channel_id: ChannelId,
-    card: MessageId,
-    departing: &[MessageId],
-) -> Option<QueuedCardDisposition> {
-    let lock = shared.queued_placeholders_persist_lock(channel_id);
-    let _guard = lock.lock().await;
-    if boot_skip(BootTarget::Channel(&shared.provider, channel_id.get())) {
-        return None;
-    }
-    #[cfg(test)]
-    boot_test_boundary(channel_id, "gate_snapshot_attempt");
-    let snapshot = super::super::mailbox_snapshot(shared, channel_id).await;
-    #[cfg(test)]
-    boot_test_boundary(channel_id, "gate_snapshot");
-    if boot_skip(BootTarget::Channel(&shared.provider, channel_id.get())) {
-        return None;
-    }
-    Some(decide_from_snapshot(shared, channel_id, card, departing, &snapshot).await)
 }
 
 fn detach(shared: &SharedData, teardown: &QueuedCardTeardown) {
@@ -307,38 +296,6 @@ pub(in crate::services::discord) async fn teardown_via_deleter(
     result
 }
 
-pub(in crate::services::discord) enum BootTeardownOutcome {
-    /// No DELETE request was started.
-    Held,
-    /// DELETE finished; only the later controller detach was held.
-    DetachHeld(Result<(), String>),
-    Finished(Result<(), String>),
-}
-
-pub(in crate::services::discord) async fn teardown_at_boot(
-    shared: &SharedData,
-    deleter: &dyn StalePlaceholderDeleter,
-    teardown: QueuedCardTeardown,
-) -> BootTeardownOutcome {
-    #[cfg(test)]
-    boot_test_boundary(teardown.channel_id, "delete");
-    if boot_skip(BootTarget::Channel(
-        &shared.provider,
-        teardown.channel_id.get(),
-    )) {
-        return BootTeardownOutcome::Held;
-    }
-    let result = deleter.delete(teardown.channel_id(), teardown.card).await;
-    if boot_skip(BootTarget::Channel(
-        &shared.provider,
-        teardown.channel_id.get(),
-    )) {
-        return BootTeardownOutcome::DetachHeld(result);
-    }
-    detach(shared, &teardown);
-    BootTeardownOutcome::Finished(result)
-}
-
 /// Consume the token with no Discord HTTP source yet: drops the controller
 /// row and hands back the card id to park in `queue_exit_placeholder_clears`,
 /// whose deferred drain re-enters the gate (this verdict goes stale meanwhile).
@@ -354,22 +311,8 @@ pub(in crate::services::discord) fn teardown_defer(
 mod tests;
 
 #[cfg(test)]
-type BootTestHooks = std::sync::Mutex<
-    std::collections::HashMap<(ChannelId, &'static str), Box<dyn FnOnce() + Send>>,
->;
-#[cfg(test)]
-pub(in crate::services::discord) static BOOT_TEST_HOOKS: std::sync::LazyLock<BootTestHooks> =
-    std::sync::LazyLock::new(Default::default);
-#[cfg(test)]
-pub(in crate::services::discord) fn boot_test_boundary(channel: ChannelId, stage: &'static str) {
-    let hook = BOOT_TEST_HOOKS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(&(channel, stage));
-    if let Some(hook) = hook {
-        hook();
-    }
-}
+mod unanswered_tests;
+
 #[cfg(test)]
 pub(in crate::services::discord) fn boot_controller_attached(
     shared: &SharedData,

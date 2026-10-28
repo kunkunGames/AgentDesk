@@ -1,5 +1,5 @@
 //! One supervisor per provider runtime over its confirmed turn-mode channels: typing while a direct
-//! turn reads busy, one notice when it stays unknown, and queue wakeups while it reads idle.
+//! turn reads busy, notices when unknown affects a token or waiting input, and idle queue wakeups.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use poise::serenity_prelude::ChannelId;
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::Instant;
 
 use super::activity::{Activity, Reading, reading_now};
@@ -16,9 +16,8 @@ use crate::services::discord::SharedData;
 use crate::services::provider::ProviderKind;
 
 const TICK: Duration = Duration::from_secs(3);
-const TYPING_EVERY: Duration = Duration::from_secs(8);
+const TYPING_EVERY: Duration = Duration::from_secs(6);
 const TYPING_RETRY: Duration = Duration::from_secs(30);
-const UNKNOWN_NOTICE_AFTER: Duration = Duration::from_secs(60);
 const NOTICE_EVERY: Duration = Duration::from_secs(30 * 60);
 const WAKE_EVERY: Duration = Duration::from_secs(30);
 /// Wakes on the same queue head before the supervisor asks why it does not move.
@@ -31,7 +30,54 @@ static REGISTERED: LazyLock<Mutex<HashMap<String, BTreeSet<u64>>>> =
 /// What each supervised channel last published, for the turn endpoint.
 static PRESENCE: LazyLock<Mutex<HashMap<u64, Arc<Mutex<Presence>>>>> =
     LazyLock::new(Default::default);
+static STARTED: LazyLock<Mutex<HashMap<String, usize>>> = LazyLock::new(Default::default);
+
+struct Started(String);
+
+impl Started {
+    fn new(provider: &ProviderKind) -> Self {
+        let provider = provider.as_str().to_string();
+        *lock(&STARTED).entry(provider.clone()).or_default() += 1;
+        Self(provider)
+    }
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        let mut started = lock(&STARTED);
+        if let Some(count) = started.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                started.remove(&self.0);
+            }
+        }
+    }
+}
+
 static PROCESS_STARTED: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
+
+#[path = "unknown_notice_store.rs"]
+mod notice_store;
+#[path = "unknown_notice.rs"]
+mod notices;
+
+pub(crate) struct UnknownSnapshot {
+    pub channel_id: u64,
+    pub provider: String,
+    pub agent_id: Option<String>,
+    pub reason: String,
+    pub hold_leaf: Option<String>,
+    pub unknown_since: DateTime<Utc>,
+    pub elapsed_secs: u64,
+    pub observed_reason: String,
+    pub observation_progress: String,
+    pub notice_state: String,
+    pub notice_store_error: Option<String>,
+}
+
+pub(crate) fn unknown_snapshots() -> Vec<UnknownSnapshot> {
+    notices::snapshots()
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -55,12 +101,23 @@ fn registered(provider: &ProviderKind) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+/// A pending hourglass is safe only while this provider supervises the confirmed channel.
+pub(in crate::services::discord) fn observes(provider: &ProviderKind, channel: u64) -> bool {
+    lock(&STARTED).contains_key(provider.as_str()) && registered(provider).contains(&channel)
+}
+
 /// Spawns the provider's supervisor; call once its bot token is set so no send precedes HTTP.
 pub(in crate::services::discord) fn spawn(shared: Arc<SharedData>, provider: ProviderKind) {
     super::activity::initialize_tail();
     LazyLock::force(&PROCESS_STARTED);
+    let started = Started::new(&provider);
     let effects = Arc::new(LiveEffects { shared, provider });
-    tokio::spawn(Supervisor::new(effects).run());
+    #[cfg(unix)]
+    notices::operator::adopt(&effects);
+    tokio::spawn(async move {
+        let _started = started;
+        Supervisor::new(effects).run().await;
+    });
 }
 
 /// The turn endpoint's `turn_presence` block, or `None` outside turn mode.
@@ -88,9 +145,8 @@ struct Presence {
     late_ok_total: u64,
     last_ok_at: Option<DateTime<Utc>>,
     last_error: Option<String>,
-    unknown_since: Option<Instant>,
     last_notice_at: Option<Instant>,
-    notice_posted_at: Option<DateTime<Utc>>,
+    notice: Option<Arc<notices::Owner>>,
     kickoffs_total: u64,
     last_kick_at: Option<Instant>,
     /// The queue head the latest wakes were for and how many there were.
@@ -116,9 +172,8 @@ impl Presence {
             late_ok_total: 0,
             last_ok_at: None,
             last_error: None,
-            unknown_since: None,
             last_notice_at: None,
-            notice_posted_at: None,
+            notice: None,
             kickoffs_total: 0,
             last_kick_at: None,
             woken_head: None,
@@ -144,7 +199,7 @@ impl Presence {
                 "last_ok_at": self.last_ok_at,
                 "last_error": self.last_error,
             },
-            "unknown_notice": {"posted_at": self.notice_posted_at},
+            "unknown_notice": {"posted_at": self.notice.as_ref().and_then(|notice| notice.posted_at())},
             "kickoffs_total": self.kickoffs_total,
             "queue_held": {
                 "reason": held.map(|held| held.0),
@@ -167,18 +222,32 @@ enum Action {
     Kickoff,
     CheckHeld(u64),
     Notice(String),
+    UnknownDrive,
 }
 
 /// Everything the supervisor reads or sends outside its own state; tests script it.
 #[async_trait]
 trait Effects: Send + Sync + 'static {
     fn channels(&self) -> Vec<u64>;
+    /// Whether an effect point is reading the channel; a read now would supersede it.
+    fn effect_read_pending(&self, _channel: u64) -> bool {
+        false
+    }
+    fn notice_scope(&self, channel: u64) -> notice_store::Scope;
+    fn agent_id(&self, _channel: u64) -> Option<String> {
+        None
+    }
     async fn read(&self, channel: u64) -> Reading;
     /// Whether a mailbox token holds the channel, and its oldest waiting input.
     async fn mailbox(&self, channel: u64) -> (bool, Option<u64>);
     async fn typing(&self, channel: u64) -> Result<(), String>;
+    fn idle(&self, channel: u64);
     fn kickoff(&self, channel: u64);
     async fn legacy_gate_blocked(&self, channel: u64) -> bool;
+    /// The durable row's hold on the channel's queue, when a prior process's Herdr turn owns it.
+    async fn row_hold(&self, _channel: u64) -> Option<&'static str> {
+        None
+    }
     async fn notice(&self, channel: u64, text: String) -> Result<(), String>;
     /// The tmux session and transcript a busy inject would pick, by the same candidate order.
     async fn inject_target(&self, channel: u64) -> Option<(String, String)>;
@@ -198,24 +267,67 @@ impl<E: Effects> Supervisor<E> {
     }
 
     async fn run(mut self) {
-        let mut next_tick = Instant::now();
+        let mut workers = JoinSet::new();
+        loop {
+            for channel in self.effects.channels() {
+                if self.channels.contains_key(&channel) {
+                    continue;
+                }
+                let presence = self.presence(channel);
+                let worker = Self {
+                    effects: self.effects.clone(),
+                    channels: HashMap::from([(channel, presence)]),
+                };
+                workers.spawn(worker.run_channel());
+            }
+            while let Some(result) = workers.try_join_next() {
+                if let Err(error) = result {
+                    tracing::error!(%error, "[turn_presence] channel supervisor failed");
+                }
+            }
+            tokio::time::sleep(TICK).await;
+        }
+    }
+
+    async fn run_channel(self) {
+        // Each channel observes independently; slow reads cannot hold another channel's Idle.
+        tokio::select! {
+            biased;
+            () = self.observe() => {},
+            () = self.refresh_typing() => {},
+        }
+    }
+
+    async fn observe(&self) {
         loop {
             let now = Instant::now();
-            if now >= next_tick {
-                self.tick(now).await;
-                next_tick = now + TICK;
+            self.tick(now).await;
+            tokio::time::sleep_until(now + TICK).await;
+        }
+    }
+
+    async fn refresh_typing(&self) {
+        loop {
+            for presence in self.channels.values() {
+                if let Some(notice) = &lock(presence).notice {
+                    notice.heartbeat(Instant::now());
+                }
             }
             self.send_due(Instant::now()).await;
+            let now = Instant::now();
+            let next_poll = now + TICK;
             let deadline = self
                 .earliest_deadline()
-                .map_or(next_tick, |d| d.min(next_tick));
+                .map_or(next_poll, |d| d.min(next_poll));
             tokio::time::sleep_until(deadline).await;
         }
     }
 
     fn presence(&mut self, channel: u64) -> Arc<Mutex<Presence>> {
         let presence = self.channels.entry(channel).or_insert_with(|| {
-            let presence = Arc::new(Mutex::new(Presence::new()));
+            let mut state = Presence::new();
+            state.notice = Some(notices::Owner::get(self.effects.notice_scope(channel)));
+            let presence = Arc::new(Mutex::new(state));
             lock(&PRESENCE).insert(channel, presence.clone());
             presence
         });
@@ -232,16 +344,36 @@ impl<E: Effects> Supervisor<E> {
         self.channels.values().filter_map(due).min()
     }
 
-    async fn tick(&mut self, now: Instant) {
+    async fn tick(&self, now: Instant) {
         for channel in self.effects.channels() {
-            let presence = self.presence(channel);
+            let Some(presence) = self.channels.get(&channel).cloned() else {
+                continue;
+            };
+            if self.effects.effect_read_pending(channel) {
+                tracing::debug!(
+                    channel,
+                    "[turn_presence] observation deferred to an effect read"
+                );
+                continue;
+            }
             let reading = self.effects.read(channel).await;
             let (token, head) = self.effects.mailbox(channel).await;
             // A judgment a later read or rebuild already moved past is never published.
             let published = reading
                 .publish_if_current(|| {
                     let mut presence = lock(&presence);
-                    apply(&mut presence, channel, now, &reading, token, head)
+                    let actions = apply(
+                        &mut presence,
+                        channel,
+                        now,
+                        &reading,
+                        (token, head),
+                        self.effects.agent_id(channel),
+                    );
+                    if reading.observed.activity == Activity::Idle {
+                        self.effects.idle(channel);
+                    }
+                    actions
                 })
                 .await;
             let Some(actions) = published else {
@@ -256,26 +388,36 @@ impl<E: Effects> Supervisor<E> {
     }
 
     /// Re-sends typing at each due deadline; a mailbox token's own turn types for itself.
-    async fn send_due(&mut self, now: Instant) {
+    async fn send_due(&self, now: Instant) {
         let channels: Vec<_> = self.channels.iter().map(|(c, p)| (*c, p.clone())).collect();
         for (channel, presence) in channels {
-            let due = {
+            let generation = {
                 let presence = lock(&presence);
-                presence.activity == Activity::Busy
+                (presence.activity == Activity::Busy
                     && presence.sending.is_none()
-                    && presence.next_typing_at.is_some_and(|at| at <= now)
+                    && presence.next_typing_at.is_some_and(|at| at <= now))
+                .then_some(presence.generation)
             };
-            if !due {
+            let Some(generation) = generation else {
                 continue;
-            }
+            };
             let (token, _) = self.effects.mailbox(channel).await;
-            let mut guard = lock(&presence);
-            if token {
-                guard.next_typing_at = Some(now + TYPING_EVERY);
-                continue;
+            let now = Instant::now();
+            {
+                let mut guard = lock(&presence);
+                // The observation loop can publish Idle or replace the generation during I/O.
+                if guard.activity != Activity::Busy
+                    || guard.generation != generation
+                    || guard.sending.is_some()
+                    || guard.next_typing_at.is_none_or(|at| at > now)
+                {
+                    continue;
+                }
+                if token {
+                    guard.next_typing_at = Some(now + TYPING_EVERY);
+                    continue;
+                }
             }
-            let generation = guard.generation;
-            drop(guard);
             self.start_typing(channel, &presence, generation, now);
         }
     }
@@ -289,6 +431,12 @@ impl<E: Effects> Supervisor<E> {
     ) {
         let (effects, state) = (self.effects.clone(), presence.clone());
         let mut guard = lock(presence);
+        if guard.activity != Activity::Busy
+            || guard.generation != generation
+            || guard.sending.is_some()
+        {
+            return;
+        }
         guard.next_typing_at = None;
         let task = tokio::spawn(async move {
             let sent = effects.typing(channel).await;
@@ -308,9 +456,10 @@ impl<E: Effects> Supervisor<E> {
                 self.effects.kickoff(channel);
             }
             Action::CheckHeld(head) => {
-                let reason = match self.effects.legacy_gate_blocked(channel).await {
-                    true => "legacy_tui_gate",
-                    false => "unknown",
+                let reason = match self.effects.row_hold(channel).await {
+                    Some(reason) => reason,
+                    None if self.effects.legacy_gate_blocked(channel).await => "legacy_tui_gate",
+                    None => "unknown",
                 };
                 let mut presence = lock(presence);
                 let still = presence.activity == Activity::Idle
@@ -322,6 +471,21 @@ impl<E: Effects> Supervisor<E> {
                     );
                     presence.queue_held = Some((reason, Utc::now(), Instant::now()));
                 }
+            }
+            Action::UnknownDrive => {
+                let Some(owner) = lock(presence).notice.clone() else {
+                    return;
+                };
+                let effects = self.effects.clone();
+                let presence = presence.clone();
+                tokio::spawn(async move {
+                    owner
+                        .drive(move |reason| async move {
+                            lock(&presence).last_notice_at = Some(Instant::now());
+                            effects.notice(channel, unknown_notice(&reason)).await
+                        })
+                        .await;
+                });
             }
             // Posted off the tick like typing, so a slow notice holds no other channel.
             Action::Notice(text) => {
@@ -373,9 +537,10 @@ fn apply(
     channel: u64,
     now: Instant,
     reading: &Reading,
-    token: bool,
-    head: Option<u64>,
+    mailbox: (bool, Option<u64>),
+    agent: Option<String>,
 ) -> Vec<Action> {
+    let (token, head) = mailbox;
     let observed = reading.observed;
     let mut actions = Vec::new();
     let first = presence.observed_at.is_none();
@@ -400,7 +565,6 @@ fn apply(
         presence.next_typing_at = None;
         presence.activity = observed.activity;
         presence.activity_since = Utc::now();
-        presence.unknown_since = (observed.activity == Activity::Unknown).then_some(now);
         presence.woken_head = None;
         presence.queue_held = None;
         presence.held_noticed = false;
@@ -410,17 +574,15 @@ fn apply(
             Activity::Idle | Activity::Unknown => {}
         }
     }
-    match observed.activity {
-        Activity::Busy => {}
-        Activity::Unknown => {
-            let since = presence.unknown_since.unwrap_or(now);
-            if now.duration_since(since) >= UNKNOWN_NOTICE_AFTER && presence.may_notice(now) {
-                presence.last_notice_at = Some(now);
-                presence.notice_posted_at = Some(Utc::now());
-                actions.push(Action::Notice(unknown_notice(observed.reason)));
-            }
+    if let Some(notice) = &presence.notice {
+        let unknown =
+            (observed.activity == Activity::Unknown).then(|| reading.notice_observation());
+        if notice.observe(unknown, token || head.is_some(), agent, now) {
+            actions.push(Action::UnknownDrive);
         }
-        Activity::Idle => wake(presence, now, moved || first, token, head, &mut actions),
+    }
+    if observed.activity == Activity::Idle {
+        wake(presence, now, moved || first, token, head, &mut actions);
     }
     actions
 }
@@ -465,7 +627,6 @@ fn wake(
     {
         presence.held_noticed = true;
         presence.last_notice_at = Some(now);
-        presence.notice_posted_at = Some(Utc::now());
         actions.push(Action::Notice(held_notice(reason)));
     }
 }
@@ -510,20 +671,28 @@ fn clock() -> String {
 }
 
 fn unknown_notice(reason: &str) -> String {
-    format!(
-        "⚠ {} 터미널 턴 상태를 확인하지 못해 진행 표시를 멈췄습니다 (사유: {reason}). 그 동안 들어온 외부 입력은 대기열에 보관됩니다.",
-        clock()
+    crate::services::discord::session_notice::subtext(
+        "⚠️",
+        &format!(
+            "{} 터미널 턴 상태를 확인하지 못해 진행 표시를 멈췄습니다 (사유: {reason}). 그 동안 들어온 외부 입력은 대기열에 보관됩니다.",
+            clock()
+        ),
     )
 }
 
 fn held_notice(reason: &str) -> String {
-    match reason {
+    let text = match reason {
         "legacy_tui_gate" => format!(
-            "⚠ {} 진행 표시는 끝났지만 대기열이 Legacy TUI 판정에 막혀 있습니다.",
+            "{} 진행 표시는 끝났지만 대기열이 Legacy TUI 판정에 막혀 있습니다.",
             clock()
         ),
-        _ => format!("⚠ {} 대기열이 진행되지 않아 확인이 필요합니다.", clock()),
-    }
+        "restarted_herdr_row" | "restarted_herdr_row_unread" => format!(
+            "{} 진행 표시는 끝났지만 대기열이 재시작 전 턴의 정리를 기다리고 있습니다.",
+            clock()
+        ),
+        _ => format!("{} 대기열이 진행되지 않아 확인이 필요합니다.", clock()),
+    };
+    crate::services::discord::session_notice::subtext("⚠️", &text)
 }
 
 /// The mailbox token and the oldest waiting input: queue head, in-memory reservation, then the
@@ -549,8 +718,36 @@ struct LiveEffects {
 
 #[async_trait]
 impl Effects for LiveEffects {
+    fn notice_scope(&self, channel: u64) -> notice_store::Scope {
+        notice_store::Scope {
+            root: crate::services::discord::runtime_store::runtime_root(),
+            provider: self.provider.as_str().into(),
+            token_hash: self.shared.token_hash.clone(),
+            channel,
+        }
+    }
+
+    fn agent_id(&self, channel: u64) -> Option<String> {
+        let config = crate::config_live_reload::current()?;
+        config.agents.iter().find_map(|agent| {
+            agent
+                .channels
+                .iter()
+                .any(|(provider, binding)| {
+                    binding.channel_id().and_then(|id| id.parse::<u64>().ok()) == Some(channel)
+                        && binding.provider().as_deref().unwrap_or(provider)
+                            == self.provider.as_str()
+                })
+                .then(|| agent.id.clone())
+        })
+    }
+
     fn channels(&self) -> Vec<u64> {
         registered(&self.provider)
+    }
+
+    fn effect_read_pending(&self, channel: u64) -> bool {
+        super::activity::effect_reads::pending(channel)
     }
 
     async fn read(&self, channel: u64) -> Reading {
@@ -577,9 +774,23 @@ impl Effects for LiveEffects {
         );
     }
 
+    fn idle(&self, channel: u64) {
+        self.shared
+            .turn_view_reconciler
+            .clear_busy_injected(self.shared.clone(), ChannelId::new(channel));
+    }
+
     async fn legacy_gate_blocked(&self, channel: u64) -> bool {
         let blocked = crate::services::discord::router::hosted_tui_promote_readiness_blocked;
         blocked(&self.shared, &self.provider, ChannelId::new(channel)).await
+    }
+
+    #[cfg(unix)]
+    async fn row_hold(&self, channel: u64) -> Option<&'static str> {
+        let hold =
+            crate::services::discord::recovery_engine::herdr_row_end::owner::restarted_herdr_hold;
+        let generation = self.shared.restart.current_generation;
+        hold(&self.provider, channel, generation).map(|hold| hold.reason())
     }
 
     async fn notice(&self, channel: u64, text: String) -> Result<(), String> {

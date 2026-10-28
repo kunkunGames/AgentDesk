@@ -23,6 +23,16 @@ BINDING = dict(scenario="E-22", cell="claude-tui", channel_id=gap.CHANNEL_ID,
 YAML = Path(__file__).resolve().parents[3] / "tests/e2e/tui_relay/scenarios/E-22-tool-use-text-completeness.yaml"
 
 
+def compatibility_scenario():
+    """Historical preview/retry captures exercise the retained old-chrome API."""
+    scenario = yaml.safe_load(YAML.read_text())
+    scenario["assertions"] = [spec for spec in scenario["assertions"]
+                              if not ({"no_status_chrome", "completion_per_turn"} & spec.keys())]
+    scenario["assertions"].insert(9, {"completion_chrome_after_body": {
+        "body_marker": gap.MARKERS[-1], "required": True}})
+    return scenario
+
+
 def row(mid, content, *, edited=None, author=gap.BOT_ID):
     return {"id": str(mid), "content": content, "channel_id": gap.CHANNEL_ID,
             "author": {"id": author, "bot": True}, "type": 0,
@@ -138,7 +148,7 @@ class E22KnownGapContract(unittest.TestCase):
              patch.object(driver, "assert_cell_idle", return_value={"status": "idle"}), \
              patch.object(assertions.Window, "mark_prompt_sent", mark):
             try:
-                record = driver.run_one_cell(scenario=yaml.safe_load(YAML.read_text()), cell="claude-tui",
+                record = driver.run_one_cell(scenario=compatibility_scenario(), cell="claude-tui",
                     channel_id=gap.CHANNEL_ID, client=discord.DiscordClient("http://offline.invalid"),
                     run_id=RUN, dry_run=False, args=Namespace(queue_runtime_root="/offline-denied"))
             except driver.ScenarioStepAssertionError as error:
@@ -194,7 +204,7 @@ class E22KnownGapContract(unittest.TestCase):
 
     def test_normal_rechecks_revalidate_every_prior_assertion_and_report(self):
         prefix = []
-        for spec in yaml.safe_load(YAML.read_text())["assertions"]:
+        for spec in compatibility_scenario()["assertions"]:
             if "no_duplicate_marker_with_known_gap" in spec:
                 break
             prefix.append(spec)
@@ -266,7 +276,7 @@ class E22KnownGapContract(unittest.TestCase):
         with self.assertRaises(assertions.AssertionError):
             assertions.no_duplicate_marker(window, marker=gap.PRE)
         record["provider_hold_states"] = [{"ok_marker": gap.PRE, "ok_marker_seen": True}]
-        for spec in yaml.safe_load(YAML.read_text())["assertions"]:
+        for spec in compatibility_scenario()["assertions"]:
             driver.run_assertion(spec, window=window, record=record, run_id=RUN)
         result = {"assertions": []}
         driver._merge_record_into_result(result, record)
@@ -544,7 +554,7 @@ class HerdrExpectedFailure(unittest.TestCase):
             client = Mock()
             client.send_control.side_effect = [{'id': '100'}, {'id': '200'}, {'id': '300'}, {'id': '400'}]
             def add(text):
-                r = {'id': str(501 + len(rows)), 'content': text, 'author': {'id': '42', 'bot': True}}
+                r = {'id': str(501 + len(rows)), 'content': text, 'author': {'id': assertions.provider_bot_id('claude'), 'bot': True}}
                 rows.append(r)
             def send(channel, text):
                 sends.append(text)
@@ -576,6 +586,46 @@ class HerdrExpectedFailure(unittest.TestCase):
             self.assertEqual(sum('E18S:OK' in x for x in sends), 1)
             if not refused:
                 self.assertEqual(len(sends), 4)  # HTTP hold, command hold, !stop, one next prompt; no resend.
+
+
+    def test_deadline_in_text_stop_subcase_keeps_send_ids_and_contact(self):
+        import io
+        import urllib.error
+        from unittest.mock import Mock
+        from tui_relay import herdr
+        scenario = driver.yaml.safe_load((Path(__file__).resolve().parents[3] / 'tests/e2e/tui_relay/scenarios/E-18-stop-mid-turn-cancel.yaml').read_text())
+        args = Namespace(cell='claude-herdr', channel_id='41', base_url='http://unused.test', dry_run=False,
+                         hard_reset_session_each=False, reset_before_each=False, allow_destructive=True, final_refetches=1)
+        rows, ids = [], iter(range(450, 500))
+        client = Mock()
+        client.send_control.side_effect = [{'id': '100'}, {'id': '200'}, {'id': '300'}, {'id': '400'}]
+        def send(channel, text):
+            if text == '!stop':
+                raise driver.PhaseDeadlineExpired('phase deadline inside the nested text-stop subcase')
+            if 'E18S:OK' in text:
+                rows.clear()
+            marker = '[E2E:E18S:OK]' if 'E18S:OK' in text else '[E2E:E18:OK]'
+            rows.append({'id': str(501 + len(rows)), 'content': marker, 'author': {'id': assertions.provider_bot_id('claude'), 'bot': True}})
+            return {'id': str(next(ids))}
+        client.send.side_effect = send
+        client.wait_for_message.side_effect = lambda channel, **k: (next((r for r in rows if k['predicate'](r)), None), list(rows))
+        client.fetch_messages.side_effect = lambda *a, **k: list(rows)
+        error = assertions.AssertionError('cancel_turn HTTP 409: session host is not legacy tmux')
+        error.__cause__ = urllib.error.HTTPError('http://unused.test', 409, 'conflict', {}, io.BytesIO())
+        sink = {}
+        with patch.object(herdr, 'observe', return_value={'herdr': {}}), patch.object(herdr.time, 'sleep'), \
+             patch.object(driver, 'tmux', None), patch.object(driver, 'cancel_turn', side_effect=error), \
+             patch.dict('os.environ', {'AGENTDESK_E2E_ALLOW_DESTRUCTIVE': '1'}):
+            with self.assertRaises(driver.PhaseDeadlineExpired):
+                driver.run_scenario(scenario, args=args, client=client, run_id='stop', partial_result_sink=sink)
+        result = sink['result']
+        self.assertTrue(result['real_provider_contacted'], result)
+        self.assertEqual(result['agent_mode_actual'], 'real_live')
+        self.assertEqual([case['id'] for case in result['subcases']], ['E-18', 'E-18-stop'])
+        self.assertEqual(result['prompt_sends'], [
+            {'step': 'send_provider_hold_prompt', 'send_state': 'acknowledged', 'message_id': '450'},
+            {'step': 'send_provider_hold_prompt', 'send_state': 'acknowledged', 'message_id': '451'},
+            {'step': 'send_text_stop', 'send_state': 'attempted'}])
 
 
 class HerdrScopedGapRepairs(unittest.TestCase):
@@ -615,7 +665,8 @@ class HerdrScopedGapRepairs(unittest.TestCase):
                 return {'ok': True, 'message_id': '102'}
         def wait(channel, **kwargs):
             for marker in ('[E2E:E51:run:T1]', '[E2E:E51:run:T2]'):
-                row = {'id': '101' if marker.endswith('T1]') else '103', 'content': marker, 'author': {'bot': True}}
+                row = {'id': '101' if marker.endswith('T1]') else '103', 'content': marker,
+                       'author': {'id': assertions.provider_bot_id('codex'), 'bot': True}}
                 if kwargs['predicate'](row):
                     rows.append(row); return row, rows
             return None, rows

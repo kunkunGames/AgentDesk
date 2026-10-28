@@ -559,10 +559,13 @@ mod tests {
                     ..AgentChannelConfig::default()
                 }),
             ),
+            peer_keywords: Vec::new(),
+            peer_directory: true,
             keywords: Vec::new(),
             department: None,
             avatar_emoji: None,
             preferred_intake_node_labels: None,
+            memory_group: None,
         }
     }
 

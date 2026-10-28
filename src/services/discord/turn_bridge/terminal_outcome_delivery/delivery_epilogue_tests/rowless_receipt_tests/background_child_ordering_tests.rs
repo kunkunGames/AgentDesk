@@ -102,6 +102,7 @@ async fn bind_turn(
         watcher.output_path = path.display().to_string();
         driver.shared.tmux_watchers.insert(channel, watcher);
     }
+    prove_claude_input(driver._temp.path(), &mut driver.inflight);
     (parent, tmux, path)
 }
 
@@ -171,7 +172,9 @@ async fn start_bridge(
     std::sync::mpsc::Sender<StreamMessage>,
     tokio::sync::oneshot::Receiver<BridgeCompletionSignal>,
 ) {
-    let cancel = Arc::new(CancelToken::new());
+    let cancel = Arc::new(CancelToken::from_persisted_turn_nonce(
+        driver.inflight.turn_nonce.clone(),
+    ));
     let channel = ChannelId::new(DRIVER_CHANNEL_ID);
     let user = MessageId::new(DRIVER_USER_MSG_ID);
     assert!(
@@ -364,7 +367,7 @@ fn bridge_child_completion_before_insert_commit_reconciles_both_cursors_pg() {
                     .bind(sibling).fetch_one(&mut *locked).await.unwrap();
                 sibling_blocker = Some(locked);
             }
-            sqlx::query(&format!("CREATE FUNCTION pause_child_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.parent_session_id IS NOT NULL THEN PERFORM pg_advisory_xact_lock({INSERT_GATE}); END IF; RETURN NEW; END $$"))
+            sqlx::query(sqlx::AssertSqlSafe(format!("CREATE FUNCTION pause_child_insert() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.parent_session_id IS NOT NULL THEN PERFORM pg_advisory_xact_lock({INSERT_GATE}); END IF; RETURN NEW; END $$")))
                 .execute(&pool).await.unwrap();
             sqlx::query("CREATE TRIGGER pause_child_insert BEFORE INSERT ON sessions FOR EACH ROW EXECUTE FUNCTION pause_child_insert()")
                 .execute(&pool).await.unwrap();

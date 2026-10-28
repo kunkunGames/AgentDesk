@@ -8,7 +8,9 @@ use std::sync::Arc;
 use poise::serenity_prelude::{self as serenity, ChannelId};
 use serde_json::{Value, json};
 
-use super::super::super::inject_tests::{InjectPane, queue_texts, register_inject_runtime};
+use super::super::super::inject_tests::{
+    InjectPane, name_rest, queue_texts, register_inject_runtime,
+};
 use super::super::super::{HumanInputDelivery, HumanInputRequest, deliver_human_input};
 use super::super::test_hook;
 use crate::db::dispatched_sessions::hosted_execution::{
@@ -135,7 +137,7 @@ enum Logged {
 
 /// Claude logs each pasted frame as `logged` when its Enter arrives, as it records a queued prompt.
 fn claude_logs(rig: &HerdrRig, pane: &InjectPane, logged: Logged) {
-    let transcript = pane.path("transcript.jsonl");
+    let transcript = pane.path(InjectPane::TRANSCRIPT);
     let mut pasted = String::new();
     rig.on_send(move |params| {
         if let Some(text) = params["text"].as_str() {
@@ -193,11 +195,10 @@ fn herdr_busy_input_reaches_the_bound_pane_once_and_never_tmux_pg() {
         let sends = rig.sends();
         assert_eq!(sends.len(), 2, "{sends:?}");
         let pasted = sends[0]["text"].as_str().unwrap();
-        assert!(
-            pasted.starts_with("\u{1b}[200~[📱 imessage · 200 · "),
-            "{pasted:?}"
+        assert_eq!(
+            pasted,
+            "\u{1b}[200~[User: imessage:200 (ID: 200)] status?\u{1b}[201~"
         );
-        assert!(pasted.ends_with("]\nstatus?\u{1b}[201~"), "{pasted:?}");
         assert_eq!(sends[1]["keys"], json!(["enter"]));
         assert_eq!(pane.tmux_calls(), 0);
         assert!(queue_texts(&shared, herdr).await.is_empty());
@@ -329,7 +330,15 @@ async fn try_busy(shared: &Arc<SharedData>, channel: u64) -> bool {
     let gate = Some(router::queued_head_inject_covers as fn(ChannelId, Option<ChannelId>) -> bool);
     let channel = ChannelId::new(channel);
     let try_busy = crate::services::discord::queue_io::queued_head_inject::try_busy;
-    try_busy(&deps, &ProviderKind::Claude, channel, gate, "herdr_test").await
+    try_busy(
+        &deps,
+        &ProviderKind::Claude,
+        channel,
+        None,
+        gate,
+        "herdr_test",
+    )
+    .await
 }
 
 /// Live intake passes over a Herdr channel, but its queued head reaches the Bound pane once and,
@@ -342,6 +351,7 @@ fn queued_herdr_head_reaches_the_bound_pane_once_and_tmux_types_as_before_pg() {
     let rig = HerdrRig::start();
     let _registry = rig.registry_on_this_thread();
     runtime().block_on(async {
+        let _names = name_rest("ann", 200).await;
         let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         let registry = HealthRegistry::new();
@@ -363,7 +373,10 @@ fn queued_herdr_head_reaches_the_bound_pane_once_and_tmux_types_as_before_pg() {
         let sends = rig.sends();
         assert_eq!(sends.len(), 2, "{sends:?}");
         let pasted = sends[0]["text"].as_str().unwrap();
-        assert!(pasted.ends_with("]\nstatus?\u{1b}[201~"), "{pasted:?}");
+        assert_eq!(
+            pasted,
+            "\u{1b}[200~[User: ann (ID: 200)] status?\u{1b}[201~"
+        );
         assert_eq!(sends[1]["keys"], json!(["enter"]));
         assert_eq!(pane.tmux_calls(), 0);
         assert_eq!(queue_texts(&shared, herdr).await, ["tail B"]);
@@ -385,6 +398,7 @@ fn queued_herdr_head_stays_queued_when_the_execution_changes_before_the_paste_pg
     let rig = HerdrRig::start();
     let _registry = rig.registry_on_this_thread();
     runtime().block_on(async {
+        let _names = name_rest("ann", 200).await;
         let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         let registry = HealthRegistry::new();
@@ -444,6 +458,7 @@ fn queued_herdr_head_without_the_exact_receipt_stays_unknown_and_holds_the_tail_
     let channels = [(unlogged, NODE), (mixed, NODE)];
     let _hosts = crate::config::session_hosts::force_for_test(Some(NODE), &channels);
     runtime().block_on(async {
+        let _names = name_rest("ann", 200).await;
         let pg_db = crate::db::auto_queue::test_support::TestPostgresDb::create().await;
         let pool = pg_db.connect_and_migrate().await;
         let registry = HealthRegistry::new();

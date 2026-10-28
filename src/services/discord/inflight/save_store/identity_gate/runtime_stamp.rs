@@ -129,7 +129,7 @@ fn admit_codex_terminal_range_in_root(
         || local.runtime_kind != Some(RuntimeHandoffKind::CodexTui)
         || !StreamRelayAuthority::from_state(local).bridge_owns_relay()
         || local.response_sent_offset != 0
-        || result.trim().is_empty()
+        || !captured_terminal_admission::body_admissible(result)
         || end <= start
     {
         return Err(GuardedSaveOutcome::AuthorityPinned);
@@ -146,9 +146,8 @@ fn admit_codex_terminal_range_in_root(
     if !expected.matches_state(&fresh)
         || fresh.runtime_kind != Some(RuntimeHandoffKind::CodexTui)
         || fresh.tmux_session_name.as_deref() != Some(tmux)
-        || nonempty(fresh.turn_nonce.as_deref()) != Some(nonce)
-        || fresh.turn_start_offset != Some(start)
-        || fresh.last_offset != start
+        || !captured_terminal_admission::nonce_matches(&fresh, nonce)
+        || !captured_terminal_admission::range_matches(&fresh, start)
         || fresh.response_sent_offset != 0
         || fresh.restart_mode.is_some()
         || fresh.rebind_origin
@@ -157,36 +156,14 @@ fn admit_codex_terminal_range_in_root(
     {
         return Err(GuardedSaveOutcome::from_durable_authority(&fresh));
     }
-    let (canonical, file_len) =
-        canonical_regular_file(rollout).ok_or(GuardedSaveOutcome::AuthorityPinned)?;
-    if file_len < end || !marker_matches(tmux, &canonical, session, start) {
-        return Err(GuardedSaveOutcome::AuthorityPinned);
-    }
-    // A dead prelaunch session deliberately persists no wrapper path. At the
-    // first raw range (`start == 0`), allow that representation only after the
-    // exact row/frame nonce and marker path/session/start checks above; retain
-    // the legacy wrapper-path form for live seeds.
-    let cold = start == 0
-        && fresh
-            .output_path
-            .as_deref()
-            .is_none_or(|path| path == tmux_runtime_paths(tmux).0);
-    let warm = fresh
-        .output_path
-        .as_deref()
-        .and_then(|path| std::fs::canonicalize(path).ok())
-        .as_deref()
-        == Some(canonical.as_path())
-        && binding_matches(tmux, &canonical, session, [start, end]);
-    let generation = tmux_generation_file_mtime_ns(tmux);
-    if (!cold && !warm) || generation == 0 {
-        return Err(GuardedSaveOutcome::AuthorityPinned);
-    }
+    let (canonical, generation) =
+        captured_terminal_admission::legacy_source(&fresh, rollout, tmux, session, (start, end))?;
     persist_terminal_range(
         root,
         &path,
         (local, baseline),
         fresh,
+        can_deliver_directly,
         (result, canonical, session),
         ((start, end), generation, None),
     )
@@ -197,6 +174,7 @@ fn persist_terminal_range(
     path: &Path,
     states: (&mut InflightTurnState, &mut InflightTurnState),
     mut fresh: InflightTurnState,
+    can_deliver_directly: bool,
     frame: (&str, PathBuf, &str),
     source: ((u64, u64), i64, Option<(u64, u64)>),
 ) -> Result<TuiTerminalRange, GuardedSaveOutcome> {
@@ -204,8 +182,72 @@ fn persist_terminal_range(
     let (result, canonical, session) = frame;
     let (range, generation, source_file_identity) = source;
     let canonical = canonical.display().to_string();
+    #[cfg(test)]
+    let crash_after_admission = std::env::var("ADK_7453_CRASH_CHANNEL")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        == Some(fresh.channel_id);
+    #[cfg(test)]
+    if crash_after_admission {
+        assert_eq!(
+            (local.full_response.len(), local.response_sent_offset),
+            (13, 6),
+            "unsaved local precondition"
+        );
+        assert_eq!(
+            (fresh.full_response.len(), fresh.response_sent_offset),
+            (6, 6),
+            "durable precondition"
+        );
+    }
+    let body_ownership = crate::services::discord::turn_bridge::stream_body_ownership_peek(
+        ChannelId::new(fresh.channel_id),
+        &fresh,
+        can_deliver_directly,
+    );
+    #[cfg(test)]
+    crate::services::discord::turn_bridge::record_stream_test_event(
+        fresh.channel_id,
+        format!("admission-peek={body_ownership:?}"),
+    );
+    let preserve_progress = !matches!(body_ownership, Ok(false));
+    if preserve_progress {
+        if !InflightTurnIdentity::from_state(&fresh).matches_state(local)
+            || fresh.turn_nonce != local.turn_nonce
+            || fresh.runtime_kind != local.runtime_kind
+            || (fresh.output_path != local.output_path
+                && local
+                    .output_path
+                    .as_deref()
+                    .and_then(|path| std::fs::canonicalize(path).ok())
+                    .as_deref()
+                    != Some(Path::new(&canonical)))
+            || !fresh.same_coordinate_source(local)
+            || !StreamRelayAuthority::from_state(local).bridge_owns_relay()
+        {
+            return Err(GuardedSaveOutcome::AuthorityPinned);
+        }
+        for state in [&fresh, &*local] {
+            if state.response_sent_offset > state.full_response.len()
+                || !state
+                    .full_response
+                    .is_char_boundary(state.response_sent_offset)
+            {
+                return Err(GuardedSaveOutcome::AuthorityPinned);
+            }
+        }
+        // Preserve stream coordinates and unsaved local text with the source cursor atomically.
+        let (body, frontier) = super::stamp_merge::merge_forward_response_progress(
+            (&fresh.full_response, fresh.response_sent_offset),
+            (&local.full_response, local.response_sent_offset),
+        )
+        .ok_or(GuardedSaveOutcome::AuthorityPinned)?;
+        fresh.full_response = body;
+        fresh.response_sent_offset = frontier;
+    } else {
+        fresh.full_response = result.to_string();
+    }
     fresh.output_path = Some(canonical.clone());
-    fresh.full_response = result.to_string();
     fresh.last_offset = range.1;
     fresh.tui_terminal_source_file_identity = source_file_identity;
     fresh.tui_terminal_generation_mtime_ns = Some(generation);
@@ -218,12 +260,28 @@ fn persist_terminal_range(
     .map_err(|_| GuardedSaveOutcome::IoError)?
     .ok_or(GuardedSaveOutcome::AuthorityPinned)?;
     baseline.clone_from(&persisted);
+    if preserve_progress {
+        local.full_response.clone_from(&persisted.full_response);
+        local.response_sent_offset = persisted.response_sent_offset;
+    }
     local.output_path.clone_from(&persisted.output_path);
     local.session_id.clone_from(&persisted.session_id);
     local.tui_terminal_source_file_identity = persisted.tui_terminal_source_file_identity;
     local.tui_terminal_generation_mtime_ns = persisted.tui_terminal_generation_mtime_ns;
     local.last_offset = persisted.last_offset;
     local.save_generation = persisted.save_generation;
+    #[cfg(test)]
+    crate::services::discord::turn_bridge::record_stream_test_event(
+        persisted.channel_id,
+        format!(
+            "admission-body={:?}/{}",
+            persisted.full_response, persisted.response_sent_offset
+        ),
+    );
+    #[cfg(test)]
+    if crash_after_admission {
+        std::process::exit(73);
+    }
     Ok(TuiTerminalRange {
         retained_codex_terminal: false,
         parked: None,
@@ -513,58 +571,32 @@ pub(in crate::services::discord::inflight) fn stamp_runtime_handoff_if_matches_i
     let Some(provider) = requested.provider_kind() else {
         return GuardedSaveOutcome::IoError;
     };
+    let captured_nonce = requested.turn_nonce.as_deref();
+    if baseline
+        .as_ref()
+        .is_some_and(|row| !row.owned_by_turn_nonce(captured_nonce))
+    {
+        return GuardedSaveOutcome::SuccessorOwned;
+    }
     let path = inflight_state_path(root, &provider, requested.channel_id);
     let Ok(_lock) = lock_inflight_state_path(&path) else {
         return GuardedSaveOutcome::IoError;
     };
-    let mut on_disk = match read_inflight_state_for_guarded_write(
+    let mut on_disk = match read_owned_row_for_guarded_write(
         &path,
         &provider,
         requested.channel_id,
         expected,
+        captured_nonce,
         caller,
     ) {
         Ok(on_disk) => on_disk,
         Err(outcome) => return outcome,
     };
-    let durable = InflightTurnIdentity::from_state(&on_disk);
-    if expected.user_msg_id == 0 && expected.turn_start_offset.is_none() {
-        tracing::info!(
-            provider = %provider.as_str(),
-            channel_id = requested.channel_id,
-            caller,
-            snapshot_identity = ?expected,
-            durable_identity = ?durable,
-            "runtime-handoff stamp skipped because offsetless id-0 snapshot cannot safely match a durable row"
-        );
-        return GuardedSaveOutcome::Unnameable;
-    }
-    if on_disk.restart_mode.is_some() || on_disk.rebind_origin || !expected.matches_state(&on_disk)
+    if let Some(refusal) =
+        stamp_guard::stamp_identity_refusal(&provider, &requested, expected, &on_disk, caller)
     {
-        tracing::info!(
-            provider = %provider.as_str(),
-            channel_id = requested.channel_id,
-            caller,
-            snapshot_identity = ?expected,
-            durable_identity = ?durable,
-            durable_restart_mode = ?on_disk.restart_mode,
-            durable_rebind_origin = on_disk.rebind_origin,
-            "runtime-handoff stamp skipped because durable row authority changed"
-        );
-        return GuardedSaveOutcome::from_durable_authority(&on_disk);
-    }
-    if expected.tmux_session_name.is_some()
-        && requested.tmux_session_name != expected.tmux_session_name
-    {
-        tracing::info!(
-            provider = %provider.as_str(),
-            channel_id = requested.channel_id,
-            caller,
-            snapshot_tmux_session_name = ?expected.tmux_session_name,
-            requested_tmux_session_name = ?requested.tmux_session_name,
-            "runtime-handoff stamp skipped because an established runtime session changed"
-        );
-        return GuardedSaveOutcome::AuthorityPinned;
+        return refusal;
     }
 
     if !hosted_binding_write_admitted(&on_disk, &requested) {
@@ -714,6 +746,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn codex_terminal_range_cold_admission_and_exit_owner_5264() {
+        if !crate::services::tui_o::cutover::test_override::in_empty_list_process(concat!(
+            module_path!(),
+            "::codex_terminal_range_cold_admission_and_exit_owner_5264"
+        )) {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let _env = crate::config::TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", temp.path());
         let root = inflight_runtime_root().unwrap();
@@ -1439,6 +1477,9 @@ impl InflightTurnState {
 #[cfg(all(test, unix))]
 #[path = "runtime_stamp/claude_terminal_tests.rs"]
 mod claude_terminal_tests;
+
+#[path = "runtime_stamp/stamp_guard.rs"]
+mod stamp_guard;
 
 #[path = "runtime_stamp/captured_terminal_admission.rs"]
 mod captured_terminal_admission;

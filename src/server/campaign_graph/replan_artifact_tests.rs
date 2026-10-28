@@ -300,7 +300,7 @@ async fn lost_artifact_replan_refuses_live_owners_success_claims_external_effect
     );
     for table in ["campaign_graph_reconciliations", "campaign_goal_revisions"] {
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
                 .fetch_one(&pool)
                 .await
                 .unwrap(),

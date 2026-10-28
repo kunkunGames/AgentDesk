@@ -1,5 +1,4 @@
 use super::*;
-use crate::services::discord::input_runtime::fence::{BootTarget, boot_skip};
 
 #[path = "lifecycle/activity.rs"]
 mod activity;
@@ -63,6 +62,7 @@ pub(in crate::services::discord) use self::watch_host::{HostSnapshot, WatchHost,
 #[path = "lifecycle/restore_support.rs"]
 mod restore_support;
 pub(super) use self::restore_support::*;
+#[cfg(test)]
 #[path = "lifecycle/tests.rs"]
 mod tests;
 
@@ -94,26 +94,32 @@ pub(in crate::services::discord) use self::claims::{
 };
 
 #[cfg(test)]
-pub(in crate::services::discord) use n4d2_entry_support::InstallFixture;
+pub(in crate::services::discord) use watcher_install_fixture::InstallFixture;
 
 #[cfg(all(test, unix))]
 #[path = "lifecycle/restore_legacy_tests.rs"]
 mod restore_legacy_tests;
 
+#[cfg(all(test, unix))]
+#[path = "lifecycle/resume_companion_restore_tests.rs"]
+mod resume_companion_restore_tests;
+
 #[cfg(test)]
 #[path = "lifecycle/n4d2_boundary_tests.rs"]
 mod n4d2_boundary_tests;
 #[cfg(test)]
-#[path = "lifecycle/n4d2_entry_test.rs"]
-pub(in crate::services::discord) mod n4d2_entry_support;
+#[path = "lifecycle/watcher_install_fixture.rs"]
+pub(in crate::services::discord) mod watcher_install_fixture;
 
 #[path = "lifecycle/restore.rs"]
 mod restore;
-pub(in crate::services::discord) use self::restore::restore_tmux_watchers;
+pub(in crate::services::discord) use self::restore::retry as restore_retry;
+pub(in crate::services::discord) use self::restore_retry::restore_tmux_watchers;
 #[path = "lifecycle/restore_mapping.rs"]
 mod restore_mapping;
 use self::restore_mapping::add_configured_channel_bindings;
 pub(in crate::services::discord) use self::restore_mapping::session_belongs_to_current_runtime;
 
+#[cfg(test)]
 #[path = "lifecycle/restore_tests.rs"]
 mod restore_tests;

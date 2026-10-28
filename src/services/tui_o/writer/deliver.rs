@@ -1,6 +1,5 @@
 //! One channel's delivery. For each piece: take the delivery lease, then under the ownership gate
-//! (a delegated channel's home gate) fsync `Prepared` and start the POST, record the result, and
-//! settle unclear ones.
+//! fsync `Prepared` and start the POST, record the result, and settle unclear ones.
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::{Future, poll_fn};
@@ -16,7 +15,6 @@ use tokio::sync::{oneshot, watch};
 use super::confirm::{self, Verdict};
 use super::pieces::{Derived, PieceWork};
 use super::{AlarmSink, DeliveryLease, DiscordPort, PostOutcome, SeenMessage, WriterAlarm};
-use crate::services::cluster::channel_home;
 use crate::services::tui_o::ownership::OwnershipGate;
 use crate::services::tui_o::repost::admission::OriginalGate;
 use crate::services::tui_o::repost::dispatch::{DispatchPermit, RepostWriter};
@@ -102,7 +100,7 @@ fn note_posted(channel: u64, msg_id: u64) {
 
 type Counts = Mutex<BTreeMap<u64, Arc<AtomicUsize>>>;
 
-/// POSTs started per Herdr-configured channel in this process and not ended yet. A channel's
+/// POSTs started per channel in this process and not ended yet. A channel's
 /// writers share one count, so a POST that outlives its writer still counts. Tests keep one per thread.
 #[cfg(not(test))]
 static IN_FLIGHT: Counts = Mutex::new(BTreeMap::new());
@@ -123,6 +121,10 @@ fn with_in_flight<R>(use_counts: impl FnOnce(&mut BTreeMap<u64, Arc<AtomicUsize>
 /// The POSTs of `channel` started and not ended in this process; `None` until a writer of the
 /// channel counted them.
 pub fn posts_in_flight(channel: u64) -> Option<usize> {
+    #[cfg(test)]
+    if bo_mutant("none_zero") {
+        return Some(0);
+    }
     with_in_flight(|counts| {
         counts
             .get(&channel)
@@ -133,9 +135,10 @@ pub fn posts_in_flight(channel: u64) -> Option<usize> {
 /// Counts one POST from before its request exists until the request is dropped, ended or aborted.
 struct Running(Arc<AtomicUsize>);
 
-type RepostCheck = Arc<dyn Fn() -> bool + Send + Sync>;
-
-fn source_delivery_allowed(channel: u64, sources: impl IntoIterator<Item = SourceId>) -> bool {
+pub(super) fn source_delivery_allowed(
+    channel: u64,
+    sources: impl IntoIterator<Item = SourceId>,
+) -> bool {
     crate::services::tui_prompt_dedupe::codex_verified_channel_delivery_allowed(channel)
         && sources.into_iter().all(|source| {
             crate::services::tui_prompt_dedupe::codex_verified_o_source_allowed(channel, &source)
@@ -144,6 +147,10 @@ fn source_delivery_allowed(channel: u64, sources: impl IntoIterator<Item = Sourc
 
 impl Running {
     fn start(count: Arc<AtomicUsize>) -> Self {
+        #[cfg(test)]
+        if bo_mutant("post_start") {
+            return Self(count);
+        }
         count.fetch_add(1, Ordering::SeqCst);
         Self(count)
     }
@@ -151,19 +158,11 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if bo_mutant("post_start") {
+            return;
+        }
         self.0.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// A delegated channel posts only through its registered home gate, which also ends a lapsed hold;
-/// any other channel through the writer's gate. A channel whose delegation is unavailable posts none.
-fn admit<T>(gate: &OwnershipGate, channel: u64, hand_off: impl FnOnce(u64) -> T) -> Option<T> {
-    if crate::services::cluster::home_availability::refusal(channel).is_some() {
-        return None;
-    }
-    match channel_home::registered_channel(channel) {
-        Some(home) => home.admit_post(hand_off),
-        None => gate.admit(hand_off),
     }
 }
 
@@ -210,6 +209,8 @@ impl<H> Drop for LeaseReturn<H> {
 }
 
 pub struct ChannelWriter<P, L, A> {
+    pub(super) boot: super::boot::Trace,
+    pub(super) suspension: super::suspension::Suspension,
     channel: u64,
     store: ChannelStore,
     gate: Arc<OwnershipGate>,
@@ -218,12 +219,11 @@ pub struct ChannelWriter<P, L, A> {
     alarms: A,
     stopped: Option<StopCause>,
     paused: bool,
-    /// The channel's shared POST count; only a Herdr-configured channel keeps one.
+    /// The channel's shared POST count, retained across writer replacement.
     posts: Option<Arc<AtomicUsize>>,
     /// The channel's re-post turn, run from the same actor turn as its posts.
     repost: Option<Box<dyn RepostHook<Self>>>,
     repost_live: RepostLive,
-    repost_switch: Mutex<Option<RepostCheck>>,
     repost_stops: Vec<watch::Receiver<bool>>,
     /// Shared receipts read at start; a receipted rejection or approval reads as settled.
     receipts: ReceiptOverlay,
@@ -263,12 +263,27 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
     ) -> Self {
         let channel = store.init().channel;
         let (stopped, paused) = (None, false);
-        let herdr = crate::config::session_hosts::herdr_endpoint(channel).is_some();
         let shared = |counts: &mut BTreeMap<_, Arc<AtomicUsize>>| {
             Arc::clone(counts.entry(channel).or_default())
         };
-        let posts = herdr.then(|| with_in_flight(shared));
+        let posts = Some(with_in_flight(shared));
+        #[cfg(test)]
+        let posts = if bo_mutant("counter_herdr_only")
+            && crate::config::session_hosts::herdr_endpoint(channel).is_none()
+        {
+            None
+        } else if bo_mutant("counter_reset") {
+            let fresh = Arc::new(AtomicUsize::new(0));
+            with_in_flight(|counts| {
+                counts.insert(channel, Arc::clone(&fresh));
+            });
+            Some(fresh)
+        } else {
+            posts
+        };
         let mut writer = Self {
+            boot: super::boot::Trace::new(channel, None, 0, 0),
+            suspension: super::suspension::Suspension::default(),
             channel,
             store,
             gate,
@@ -280,10 +295,10 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
             posts,
             repost: None,
             repost_live: RepostLive::default(),
-            repost_switch: Mutex::new(None),
             repost_stops: Vec::new(),
             receipts,
         };
+        writer.exclude_stored_tool_results();
         let ledger = writer.store.ledger();
         seed_last_posted(channel, ledger);
         let refused = writer.receipts.blocked(ledger);
@@ -294,7 +309,7 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
                 channel,
                 serial,
                 status,
-                "[tui_o] latest rejected piece needs operator approval"
+                "[tui_o] output blocked; fix the refusal and use /clear for a fresh session"
             );
             writer.stop(WriterAlarm::Blocked { status });
         }
@@ -328,13 +343,19 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
         self
     }
 
+    pub(super) fn stopping(&self) -> bool {
+        self.repost_stops.iter().any(|stop| *stop.borrow())
+    }
+
     /// Outstanding ordinary pieces pin retired cursors; re-post turns have nothing owed.
     pub(crate) fn delivery_allowed(&self, owing: bool) -> bool {
         source_delivery_allowed(
             self.channel,
             self.store
                 .cursors()
-                .filter(|cursor| !cursor.retired || owing)
+                .filter(|cursor| {
+                    (!cursor.retired || owing) && !self.suspension.contains(&cursor.source)
+                })
                 .map(|cursor| cursor.source.clone()),
         )
     }
@@ -351,6 +372,14 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
 
     /// One re-post turn, after this poll's owed pieces; nothing without a turn or once stopped.
     pub(crate) async fn repost_turn(&mut self) {
+        let allowed = self.suspension.is_empty();
+        #[cfg(test)]
+        let allowed = allowed
+            || crate::services::claude_tui::source_verify::n2b_mutant("b1b-repost")
+            || crate::services::claude_tui::source_verify::n2b_mutant("b1b-live-s");
+        if !allowed {
+            return;
+        }
         if self.is_stopped() {
             return;
         }
@@ -402,6 +431,10 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
         self.alarms.reconcile_reader_count(self.channel, count);
     }
 
+    pub fn reconcile_boundary_pending(&self, count: usize) {
+        self.alarms.reconcile_boundary_pending(self.channel, count);
+    }
+
     /// Stops the channel once; only the first stop raises its alarm.
     pub fn stop(&mut self, alarm: WriterAlarm) -> Step {
         self.stop_with(alarm, None)
@@ -423,11 +456,13 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
     }
 
     /// Appends one ledger entry; a store error or a violation the entry exposed stops the channel.
-    fn record(&mut self, entry: LedgerEntry) -> Result<(), Step> {
+    pub(super) fn record(&mut self, entry: LedgerEntry) -> Result<(), Step> {
         let posted = match entry {
-            LedgerEntry::Posted { msg_id, .. } => Some(msg_id),
+            LedgerEntry::Posted { serial, msg_id } => Some((serial, msg_id)),
             _ => None,
         };
+        #[cfg(test)]
+        self.boot.before_record(&entry);
         if let Err(error) = self.store.append_ledger(entry) {
             return Err(self.stop(WriterAlarm::Halted {
                 detail: format!("{error:?}"),
@@ -436,7 +471,8 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
         match self.store.ledger().violation().map(str::to_string) {
             Some(detail) => Err(self.stop(WriterAlarm::LedgerViolation { detail })),
             None => {
-                if let Some(msg_id) = posted {
+                if let Some((serial, msg_id)) = posted {
+                    self.boot.posted(self.store.ledger(), serial, msg_id);
                     note_posted(self.channel, msg_id);
                 }
                 Ok(())
@@ -458,6 +494,11 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
             return Step::Stopped;
         }
         if let Err(step) = self.settle_open().await {
+            return step;
+        }
+        if let Derived::Piece(piece) = item
+            && let Some(step) = self.exclude_tool_result(&piece.unit_key)
+        {
             return step;
         }
         if self.has_local_retry() {
@@ -492,7 +533,7 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
         let (piece, approved) = match disposition {
             PieceDisposition::Blocked { serial, status } => {
                 tracing::warn!(channel = self.channel, serial, status, unit_key = ?piece.unit_key,
-                    "[tui_o] latest rejected piece needs operator approval");
+                    "[tui_o] output blocked; fix the refusal and use /clear for a fresh session");
                 return self.stop(WriterAlarm::Blocked { status });
             }
             PieceDisposition::Settled => return Step::Done,
@@ -564,6 +605,9 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
         local_retry: Option<LocalRetryMark>,
         approved: Option<u64>,
     ) -> Step {
+        if let Some(step) = self.exclude_tool_result(&piece.unit_key) {
+            return step;
+        }
         let (serial, anchor_id) = (
             self.store.ledger().next_serial(),
             self.store.ledger().anchor(),
@@ -574,11 +618,12 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
         let (gate, port, channel) = (Arc::clone(&self.gate), Arc::clone(&self.port), self.channel);
         let mut posts = self.posts.clone();
         let stops = self.repost_stops.clone();
+        let boot = self.boot.clone();
         let store = &mut self.store;
         // The first poll of the request runs under the gate, so no request starts after a
         // transition; the rest runs outside the lock.
         let admitted = poll_fn(|cx| {
-            Poll::Ready(admit(&gate, channel, |epoch| {
+            Poll::Ready(gate.admit(|epoch| {
                 if stops.iter().any(|stop| *stop.borrow())
                     || !super::local_retry::may_prepare(store.ledger(), piece, local_retry.as_ref())
                 {
@@ -610,6 +655,8 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
                             "[tui_o] operator approval consumed by Prepared");
                     }
                     let running = posts.take().map(Running::start);
+                    #[cfg(test)]
+                    boot.constructing(serial, epoch);
                     let post = port.post(channel, piece.payload.clone());
                     // `map` forwards each poll to the request; the count ends when it is ready or dropped.
                     let mut request: Request = match running {
@@ -619,6 +666,7 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
                         })),
                         None => Box::pin(post),
                     };
+                    boot.first_post(serial, epoch);
                     Ok(match request.as_mut().poll(cx) {
                         Poll::Ready(outcome) => Started::Done(outcome),
                         Poll::Pending => Started::Running(request),
@@ -705,7 +753,7 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> ChannelWriter<P, L, A> {
                 }) {
                     "local retry budget exhausted"
                 } else {
-                    "this serial needs a new operator approval"
+                    "blocked serial; fix the refusal and use /clear for a fresh session"
                 };
                 tracing::warn!(
                     channel = self.channel,
@@ -824,11 +872,6 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> RepostWriter for ChannelWri
 
     fn live(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
         let live = Arc::clone(&self.repost_live.0);
-        let effective = self
-            .repost_switch
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
         let stops = self.repost_stops.clone();
         let channel = self.channel;
         let sources: Arc<[SourceId]> = self
@@ -837,12 +880,18 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> RepostWriter for ChannelWri
             .filter(|cursor| !cursor.retired)
             .map(|cursor| cursor.source.clone())
             .collect();
+        #[cfg(test)]
+        let sources: Arc<[SourceId]> = sources
+            .iter()
+            .filter(|source| {
+                !crate::services::claude_tui::source_verify::n2b_mutant("b1b-live-s")
+                    || !self.suspension.contains(source)
+            })
+            .cloned()
+            .collect();
         Arc::new(move || {
             live.load(Ordering::SeqCst)
-                && effective.as_ref().is_some_and(|allowed| allowed())
                 && stops.iter().all(|stop| !*stop.borrow())
-                && channel_home::registered_channel(channel).is_none()
-                && crate::services::cluster::home_availability::refusal(channel).is_none()
                 && source_delivery_allowed(channel, sources.iter().cloned())
         })
     }
@@ -856,6 +905,9 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> RepostWriter for ChannelWri
     }
 
     fn prepare(&mut self, epoch: u64, permit: &DispatchPermit) -> Result<(), String> {
+        if self.exclude_tool_result(permit.key().unit()).is_some() {
+            return Err(super::pieces::TOOL_RESULT_INTERNAL.into());
+        }
         let ledger = self.store.ledger();
         let (serial, anchor_id) = (ledger.next_serial(), ledger.anchor());
         let prepared = || LedgerEntry::Prepared {
@@ -916,12 +968,6 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> RepostWriter for ChannelWri
 }
 
 impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> TurnWriter for ChannelWriter<P, L, A> {
-    fn bind_switch(&self, effective: RepostCheck) {
-        *self
-            .repost_switch
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(effective);
-    }
     fn channel(&self) -> u64 {
         self.channel
     }
@@ -934,4 +980,16 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink> TurnWriter for ChannelWrite
         let live = live && self.stopped.is_none();
         self.repost_live.0.store(live, Ordering::SeqCst);
     }
+}
+
+#[cfg(test)]
+pub(super) fn bo_mutant(name: &str) -> bool {
+    std::env::var("AGENTDESK_BO_MUTANT").is_ok_and(|value| value == name)
+}
+
+#[cfg(test)]
+pub(super) fn forget_posts_for_test(channel: u64) {
+    with_in_flight(|counts| {
+        counts.remove(&channel);
+    });
 }

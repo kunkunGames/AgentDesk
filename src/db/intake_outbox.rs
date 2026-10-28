@@ -14,7 +14,7 @@
 use super::intake_outbox_open_status::INTAKE_OUTBOX_OPEN_STATUSES_SQL;
 use super::intake_outbox_status::IntakeOutboxStatus;
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 #[cfg(test)]
 pub(crate) mod owner_fence_pg_tests;
@@ -64,8 +64,6 @@ pub(crate) struct IntakeOutboxRow {
     pub owner_generation: Option<i64>,
     pub owner_instance_id: Option<String>,
     pub admission_kind: String,
-    /// The delegated home epoch this row was routed under; `None` is a gateway-rule row.
-    pub home_epoch: Option<i64>,
 }
 
 /// Per-message payload required to INSERT a fresh row. Mirrors the
@@ -98,7 +96,6 @@ pub(crate) struct InsertPendingPayload {
     /// eligibility is scoped on this, not on `agents.provider`, because a
     /// cc/cdx paired agent has one `agents.provider` but two bots.
     pub provider: String,
-    pub home_epoch: Option<i64>,
 }
 
 /// INSERT a fresh `pending` row into `intake_outbox` for the given
@@ -128,7 +125,7 @@ pub(crate) async fn insert_pending(
             merge_consecutive, reply_to_user_message, defer_watcher_resume,
             wait_for_completion, preserve_on_cancel, agent_id, provider,
             status, attempt_no, parent_outbox_id, execution_requirements, attachment_refs,
-            home_epoch, replay_source_message_ids
+            replay_source_message_ids
         ) VALUES (
             $1, $2, $3,
             $4, $5, $6, $7,
@@ -136,7 +133,7 @@ pub(crate) async fn insert_pending(
             $13, $14, $15,
             $16, $17, $18, $19,
             $20, $21, $22, $23, $24,
-            $25, $26
+            $25
         )
         RETURNING id
         "#,
@@ -165,7 +162,6 @@ pub(crate) async fn insert_pending(
     .bind(parent_outbox_id)
     .bind(&payload.execution_requirements)
     .bind(&payload.attachment_refs)
-    .bind(payload.home_epoch)
     .bind(payload.replay_source_message_ids.as_deref())
     .fetch_one(pool)
     .await?;
@@ -248,6 +244,9 @@ pub(crate) enum FailedPreAcceptSweepOutcome {
     },
 }
 
+/// Historical delegated inputs stay terminal; retry never replays their old target.
+const SOURCE_HOME_STAMP_SQL: &str = "parent.home_epoch IS NULL";
+
 pub(crate) async fn sweep_failed_pre_accept_once(
     pool: &PgPool,
     local_leader: &str,
@@ -284,6 +283,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
                    AND open_row.status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})
            )
            AND NOT replay_sources_blocked(parent.provider, parent.channel_id, COALESCE(parent.replay_source_message_ids, ARRAY[parent.user_msg_id]))
+           AND {SOURCE_HOME_STAMP_SQL}
            AND EXISTS (
                 SELECT 1 FROM worker_nodes worker
                  WHERE worker.status = 'online'
@@ -333,7 +333,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
          FOR UPDATE OF parent SKIP LOCKED
         "#
     );
-    let capable_source: Option<IntakeOutboxRow> = sqlx::query_as(&capable_source_sql)
+    let capable_source: Option<IntakeOutboxRow> = sqlx::query_as(AssertSqlSafe(capable_source_sql))
         .bind(stale_after_secs)
         .bind(max_attempts)
         .bind(retry_after_secs)
@@ -361,12 +361,13 @@ pub(crate) async fn sweep_failed_pre_accept_once(
                        AND open_row.status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})
                )
                AND NOT replay_sources_blocked(parent.provider, parent.channel_id, COALESCE(parent.replay_source_message_ids, ARRAY[parent.user_msg_id]))
+               AND {SOURCE_HOME_STAMP_SQL}
              ORDER BY parent.updated_at ASC, parent.id ASC
              LIMIT 1
              FOR UPDATE OF parent SKIP LOCKED
             "#
         );
-        sqlx::query_as(&fallback_source_sql)
+        sqlx::query_as(AssertSqlSafe(fallback_source_sql))
             .bind(retry_after_secs)
             .fetch_optional(&mut *tx)
             .await?
@@ -413,8 +414,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
             .await?;
     }
 
-    // Re-check the capability snapshot after the source lock. A worker may
-    // have heartbeated a new snapshot between candidate selection and here.
+    // Re-check capability after the source lock (a worker may have re-heartbeated).
     let targets: Vec<Value> = sqlx::query_scalar(
         r#"
         SELECT to_jsonb(worker) || jsonb_build_object('api_base_url', worker.capabilities->'agentdesk_api'->>'base_url')
@@ -522,10 +522,10 @@ pub(crate) async fn sweep_failed_pre_accept_once(
             wait_for_completion, preserve_on_cancel, agent_id, provider,
             owner_instance_id, owner_generation, admission_kind,
             status, attempt_no, parent_outbox_id, execution_requirements, attachment_refs,
-            home_epoch, replay_source_message_ids
+            replay_source_message_ids
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                   $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-                  $23, $24, $25, $26, $27, $28, $29)
+                  $23, $24, $25, $26, $27, $28)
         RETURNING id"#,
     )
     .bind(&target)
@@ -555,7 +555,6 @@ pub(crate) async fn sweep_failed_pre_accept_once(
     .bind(source.id)
     .bind(&source.execution_requirements)
     .bind(&source.attachment_refs)
-    .bind(source.home_epoch)
     .bind(source.replay_source_message_ids.as_deref())
     .fetch_one(&mut *tx)
     .await?;
@@ -566,7 +565,7 @@ pub(crate) async fn sweep_failed_pre_accept_once(
         attempt_no: next_attempt,
     })
 }
-
+pub(crate) mod consent_handoff;
 mod worker_status;
 #[cfg(test)]
 use worker_status::confirm_claim;
@@ -609,8 +608,8 @@ pub(crate) async fn list_recent_rows(
         .await
     }
 }
-
 /// Whether the channel still has an intake row in an open status; that row owes Legacy execution.
+#[cfg(test)]
 pub(crate) async fn channel_has_open_row(
     pool: &PgPool,
     channel_id: &str,
@@ -619,7 +618,7 @@ pub(crate) async fn channel_has_open_row(
         "SELECT EXISTS (SELECT 1 FROM intake_outbox
                          WHERE channel_id = $1 AND status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL}))"
     );
-    sqlx::query_scalar(&sql)
+    sqlx::query_scalar(AssertSqlSafe(sql))
         .bind(channel_id)
         .fetch_one(pool)
         .await
@@ -650,17 +649,13 @@ pub(crate) async fn list_accepted_unspawned_sla(
 }
 
 #[cfg(test)]
-#[path = "intake_outbox_home_tests.rs"]
-mod home_tests;
-
-#[cfg(test)]
 mod migration_pg_tests {
     use crate::db::auto_queue::test_support::TestPostgresDb;
     use crate::db::intake_outbox_force_fail::{ForceFailError, force_fail_and_retry_as_new};
     use crate::db::intake_outbox_open_status::INTAKE_OUTBOX_OPEN_STATUSES_SQL;
     use crate::db::intake_outbox_status::{IntakeOutboxStatus, OperatorRetryClass};
     use serde_json::json;
-    use sqlx::Row;
+    use sqlx::{AssertSqlSafe, Row};
 
     /// Migration 0080 verbatim. Every statement is idempotent — the DDL is
     /// `IF [NOT] EXISTS` and each backfill/fail-closed UPDATE is gated on
@@ -827,7 +822,7 @@ mod migration_pg_tests {
             "SELECT COUNT(*)::BIGINT FROM intake_outbox
              WHERE provider = '' AND status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})"
         );
-        let unclaimable: i64 = sqlx::query_scalar(&unclaimable_sql)
+        let unclaimable: i64 = sqlx::query_scalar(AssertSqlSafe(unclaimable_sql))
             .fetch_one(&pool)
             .await
             .expect("count unclaimable open rows"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
@@ -1052,7 +1047,7 @@ mod migration_pg_tests {
              WHERE status IN ({prior_statuses})
              ORDER BY id"
         );
-        let old_ids: Vec<i64> = sqlx::query_scalar(&prior_sql)
+        let old_ids: Vec<i64> = sqlx::query_scalar(AssertSqlSafe(prior_sql))
             .fetch_all(&pool)
             .await
             .expect("select pre-T2-M open rows"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module
@@ -1061,7 +1056,7 @@ mod migration_pg_tests {
              WHERE status IN ({INTAKE_OUTBOX_OPEN_STATUSES_SQL})
              ORDER BY id"
         );
-        let widened_ids: Vec<i64> = sqlx::query_scalar(&widened_sql)
+        let widened_ids: Vec<i64> = sqlx::query_scalar(AssertSqlSafe(widened_sql))
             .fetch_all(&pool)
             .await
             .expect("select T2-M open rows"); // agentdesk-audit: allow-unwrap — test helper/assert in #[cfg(test)] module

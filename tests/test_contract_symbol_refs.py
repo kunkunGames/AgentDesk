@@ -9,7 +9,6 @@ these tests target: doc-anchor extraction, the code-derived Rust-anchor parser
 gate, the set comparison, and the distinct-anchor floor. Each round-2/round-3
 false-pass has a dedicated reproduction.
 """
-# H2 cases also check Python import bindings and the public script's exit status.
 
 from __future__ import annotations
 
@@ -164,7 +163,7 @@ class CfgGateTest(unittest.TestCase):
 
     def test_accepted_block_cfgs(self) -> None:
         # The only two whitelisted gates. `unix` is allowed only because the
-        # required PR compile (check_fast) is ubuntu-latest.
+        # required PR compile (the `lint` clippy) is ubuntu-latest.
         for cfg in ("#[cfg(test)]", "#[cfg(all(test, unix))]"):
             self.assertEqual(self._errors(cfg=cfg), [], cfg)
 
@@ -553,25 +552,27 @@ class WiringTest(unittest.TestCase):
         workflow = (REPO_ROOT / ".github" / "workflows" / "ci-pr.yml").read_text(
             encoding="utf-8"
         )
-        macos_workflow = (
-            REPO_ROOT / ".github" / "workflows" / "ci-macos-trusted.yml"
-        ).read_text(encoding="utf-8")
-        for name, source in (("ci-pr", workflow), ("ci-macos-trusted", macos_workflow)):
-            self.assertFalse(
-                "ci_relax_safe" in source,
-                f"{name} retains the retired CI relaxation output/condition",
-            )
-            self.assertFalse(
-                "tui-relay-stabilization" in source,
-                f"{name} still grants a branch-name CI escape hatch",
-            )
+        self.assertFalse(
+            "ci_relax_safe" in workflow,
+            "ci-pr retains the retired CI relaxation output/condition",
+        )
+        self.assertFalse(
+            "tui-relay-stabilization" in workflow,
+            "ci-pr still grants a branch-name CI escape hatch",
+        )
 
-        # The required-context mirror gates the forced run.
-        self.assertIn("Relay-contract fast check mirror (always, #4268)", workflow)
+        # The CI required judge reads the forced lint run for Lint and Fast check.
+        judge = yaml.safe_load(workflow)["jobs"]["required_contexts"]
+        self.assertIn("lint", judge["needs"])
+        sys.path.insert(0, str(REPO_ROOT / "scripts" / "ci"))
+        import nextest_required
+        sys.path.pop(0)
+        self.assertEqual(judge["name"], nextest_required.GATE)
+        self.assertLessEqual({"Lint", "Fast check (ubuntu-latest)"}, set(nextest_required.CONTEXTS))
 
 
 class RelayContractPathFilterTest(unittest.TestCase):
-    """A doc-only PR reaches `check_fast` only via this output, so the filter
+    """A doc-only PR reaches the `lint` compile only via this output, so the filter
     key it reads must select exactly the checker's binding sources."""
 
     def setUp(self) -> None:
@@ -608,55 +609,6 @@ class RelayContractPathFilterTest(unittest.TestCase):
         self.assertEqual(stale, [], "update REFERENCE_SOURCE_MODULES or drop the entry")
 
 
-class H2ContractCliTest(unittest.TestCase):
-    def run_contract(self, text):
-        with tempfile.TemporaryDirectory() as tmp:
-            doc = Path(tmp, "h2.md")
-            doc.write_text(text, encoding="utf-8")
-            return subprocess.run([sys.executable, str(SCRIPT_PATH), "--h2-doc", str(doc)],
-                                  capture_output=True, text=True)
-
-    def test_matching_h2_document_passes_the_script(self):
-        proc = self.run_contract(CHECKER.H2_DOC.read_text(encoding="utf-8"))
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("H2 contract symbol-ref check passed", proc.stdout)
-
-    def test_document_only_symbol_warns_with_diagnostic(self):
-        text = CHECKER.H2_DOC.read_text(encoding="utf-8") + "\n`sym:missing::entry`\n"
-        proc = self.run_contract(text)
-        self.assertEqual(proc.returncode, 0, proc.stdout)
-        self.assertIn("H2 contract: sym:missing::entry has no imported reference", proc.stdout)
-
-    def test_import_only_symbol_warns_with_diagnostic(self):
-        for symbol in ("h2_cfg_compare::compare_cfgs", "h2_cfg_collect::seal", "h2_cfg_collect::read_manifest",
-                       "h2_env::environment", "h2_env::check_host"):
-            with self.subTest(symbol=symbol):
-                text = CHECKER.H2_DOC.read_text(encoding="utf-8").replace(f"`sym:{symbol}`", "")
-                proc = self.run_contract(text)
-                self.assertEqual(proc.returncode, 0, proc.stdout)
-                self.assertIn(f"H2 contract: imported {symbol} is not documented", proc.stdout)
-
-    def test_main_preserves_import_search_path_on_h2_success_and_error(self):
-        probe = textwrap.dedent("""
-            import runpy
-            import sys
-            checker = runpy.run_path(sys.argv[1])
-            before = sys.path[:]
-            result = checker["main"](["--h2-doc", sys.argv[2]])
-            assert result == int(sys.argv[3]), result
-            assert sys.path == before, (before, sys.path)
-        """)
-        with tempfile.TemporaryDirectory() as tmp:
-            for doc, expected in ((CHECKER.H2_DOC, 0), (Path(tmp, "missing.md"), 1)):
-                with self.subTest(doc=doc):
-                    proc = subprocess.run(
-                        [sys.executable, "-c", probe, str(SCRIPT_PATH), str(doc), str(expected)],
-                        capture_output=True, text=True,
-                    )
-                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-                    self.assertEqual(proc.stderr, "")
-
-
 class CliSeverityTest(unittest.TestCase):
     def test_equality_floor_and_form_drift_warns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -664,15 +616,13 @@ class CliSeverityTest(unittest.TestCase):
             doc.write_text("`sym:module::old`", encoding="utf-8")
             source.write_text(_block("    use super::new as _;", cfg="#[cfg(windows)]"), encoding="utf-8")
             report = CHECKER.build_report(doc=doc, rust_sources={source: ("module",)})
-        with patch.object(CHECKER, "build_report", return_value=report), \
-                patch.object(CHECKER, "check_h2_contract", return_value=[]), patch("sys.stdout") as stdout:
+        with patch.object(CHECKER, "build_report", return_value=report), patch("sys.stdout") as stdout:
             self.assertEqual(CHECKER.main([]), 0)
         self.assertIn("warning", str(stdout.write.call_args_list))
 
     def test_missing_reference_source_still_fails(self) -> None:
         report = CHECKER.build_report(doc_anchors=set(), rust_sources={Path("/missing/source.rs"): ("module",)})
-        with patch.object(CHECKER, "build_report", return_value=report), \
-                patch.object(CHECKER, "check_h2_contract", return_value=[]), patch("sys.stdout"):
+        with patch.object(CHECKER, "build_report", return_value=report), patch("sys.stdout"):
             self.assertEqual(CHECKER.main([]), 1)
 
     def test_scanner_exception_cannot_pass(self) -> None:
@@ -696,6 +646,98 @@ class IntegrationTest(unittest.TestCase):
             )
             self.assertEqual(errors, [], f"{rel}: {errors}")
             self.assertTrue(anchors, f"no anchors parsed from {rel}")
+
+
+class ForwardPromiseTests(unittest.TestCase):
+    def test_rejects_issue_and_same_change_update_promises(self) -> None:
+        for text in (
+            "#6012 updates this bullet in the same PR.",
+            "A lane owns correcting this bullet in the same change.",
+            "This section will be updated by #6012 in the same PR.",
+            "This bullet must be corrected in the same PR.",
+            "A lane will change this bullet in the same PR.",
+            "This bullet will be amended in the same PR.",
+            "The release may be delayed, so #6012 will update this bullet in the same PR.",
+            "The project could slip, therefore #6012 will update this bullet in the same PR.",
+            "The deadline may slip, so this bullet will be updated in the same PR.",
+            "The review could overrun, which means this section will be revised in the same PR.",
+            "#6012 edits this bullet in the same PR.",
+            "This section is scheduled to be revised in the same PR.",
+            "A lane is responsible for updating this bullet in the same change.",
+            "The follow-up PR plans to update this bullet in the same PR.",
+            "This section is planned to be revised in the same PR.",
+            "The lane is committed to correcting this paragraph in the same change.",
+            "#6012 will update the contract and correct this bullet in the same PR.",
+            "#6012 will update the contract and review the test and correct this bullet in the same PR.",
+            "#6012 will update the contract but also correct this bullet in the same PR.",
+            "A lane will avoid editing another section and update this bullet in the same PR.",
+            "Given no lane owns this section, #6012 will update this bullet in the same PR.",
+            "With no lane assigned to this paragraph, #6012 will rewrite this paragraph in the same PR.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(CHECKER.forward_promise_errors(text))
+
+    def test_follow_up_prediction_and_recheck_guidance_are_allowed(self) -> None:
+        text = (
+            "After #6012 lands, recheck this bullet before relying on it. "
+            "A later change may update the contract. The prior PR #6012 updated "
+            "this bullet in the preceding release. This bullet may be updated "
+            "in the same PR. It is possible that this bullet will be updated in the same PR. "
+            "This bullet will likely be updated in the same PR. "
+            "The old paragraph said this section would be revised "
+            "in the same change. No lane will update this bullet in the same PR. "
+            "This section must not be corrected in the same change. The prior PR "
+            "#6012 updated this bullet in the same PR. This paragraph is not "
+            "scheduled to be changed in the same PR. This paragraph is not "
+            "expected to be updated in the same PR. A lane is responsible for "
+            "not changing this bullet in the same PR. A lane is responsible for "
+            "ensuring this section is not changed in the same PR. A lane is "
+            "responsible for ensuring the same PR does not change this bullet. "
+            "A lane is responsible for ensuring this bullet won't be updated "
+            "in the same PR. A lane is responsible for ensuring this bullet "
+            "does not need updating in the same PR. A lane is responsible for "
+            "ensuring it does not have to update this bullet in the same PR."
+            " A lane will avoid updating this bullet in the same PR."
+            " A lane will refrain from changing this bullet in the same PR."
+            " No lane will update this paragraph and change this bullet in the same PR."
+            " No lane will update the document and change this bullet in the same PR."
+            " A lane must not edit anything and change this bullet in the same PR."
+            " No lane is expected to update the document and change this bullet in the same PR."
+            " No lane is scheduled to update the document and change this bullet in the same PR."
+            " A lane is not expected to update the document and change this bullet in the same PR."
+            " No lane is required to update the document and correct this bullet in the same PR."
+            " No lane has to update the document and correct this bullet in the same PR."
+            " No lane is planned to update the document and correct this bullet in the same PR."
+        )
+        self.assertEqual(CHECKER.forward_promise_errors(text), [])
+
+    def test_unrelated_prohibition_does_not_hide_promise_in_next_clause(self) -> None:
+        for text in (
+            "A lane must not cite the old fact; #6012 will update this bullet in the same PR.",
+            "No lane should cite this as fixed, or #6012 will update this bullet in the same PR.",
+            "No lane should cite this as fixed, while #6012 will update this bullet in the same PR.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(CHECKER.forward_promise_errors(text))
+
+    def test_repo_contract_has_no_forward_update_promise(self) -> None:
+        self.assertEqual(CHECKER.check_forward_promises(), [])
+
+    def test_checker_cli_fails_on_forward_promise_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = Path(tmp, "relay-state-contract.md")
+            doc.write_text(
+                CHECKER.DEFAULT_DOC.read_text(encoding="utf-8")
+                + "\n\n#6012 updates this bullet in the same PR.\n",
+                encoding="utf-8",
+            )
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT_PATH), "--doc", str(doc)],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("forward-promise check:", proc.stdout)
 
 
 if __name__ == "__main__":

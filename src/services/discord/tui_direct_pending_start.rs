@@ -50,7 +50,7 @@ pub(super) use state::{
     PENDING_START_MAX_BACKSTOP_CYCLES, PENDING_START_MAX_CLAIM_ATTEMPTS, PENDING_START_POLL,
     PendingStartState, PriorTurnObservation, PriorTurnView, ReclaimOrphanFn,
     ReclaimStaleForeignOutcome, STALE_FOREIGN_INFLIGHT_MIN_AGE_SECS, TuiDirectPendingStart, ViewFn,
-    backstop_claim_is_safe, delete, load_all, mark_present_on_restore,
+    backstop_claim_is_safe, delete, discard_legacy_waiting, load_all, mark_present_on_restore,
     pending_synthetic_start_blocks_idle_kickoff, pending_synthetic_start_present, persist,
     prior_turn_finalized, record_claim_marker_if_watcher_owned, retire_completed,
     save_row_unless_retired, should_defer_synthetic_turn_start,
@@ -193,7 +193,6 @@ pub(super) fn spawn_worker(
     abort_cleanup_fn: AbortCleanupFn,
     reclaim_orphan_fn: ReclaimOrphanFn,
 ) {
-    let effect = restore_gate::input_effect(&record);
     let active_guard = active_worker_guard_for_spawn(&record.provider, record.channel_id);
     let native_turn = WorkerNativeTurn {
         provider: record.provider.clone(),
@@ -201,7 +200,7 @@ pub(super) fn spawn_worker(
         anchor: record.anchor_message_id,
         claimed: false,
     };
-    restore_gate::spawn_admitted(effect, async move {
+    super::task_supervisor::spawn_observed("tui_direct_pending_start_worker", async move {
         let _active_guard = active_guard;
         // Bind the whole guard so the block owns it, not only its `claimed` field.
         let mut native_turn = native_turn;

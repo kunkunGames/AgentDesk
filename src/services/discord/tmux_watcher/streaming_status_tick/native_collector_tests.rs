@@ -186,7 +186,7 @@ fn native_collector_case(test_name: &str, mode: u8) {
             turn_result_relayed: false,
             restored_injected_prompt_message_id: row.injected_prompt_message_id,
             host: Arc::new(HostSnapshot::new(WatchHost::Legacy)),
-            legacy_mode: WatcherLegacyMode::Legacy,
+            watcher_instance_id: 1,
         };
         shared.tmux_watchers.insert(
             fx.channel,
@@ -301,7 +301,6 @@ fn native_collector_case(test_name: &str, mode: u8) {
             &fx.tmux,
             &fx.output_path,
             &ctx.cancel,
-            WatcherLegacyMode::Legacy,
         )
         .await
         .unwrap();
@@ -418,7 +417,6 @@ fn native_collector_case(test_name: &str, mode: u8) {
                     &fx.tmux,
                     &fx.output_path,
                     &ctx.cancel,
-                    WatcherLegacyMode::Legacy,
                 )
                 .await
                 .unwrap();
@@ -606,6 +604,7 @@ fn native_collector_case(test_name: &str, mode: u8) {
         }
         let before_relay = load_inflight_state(&fx.provider, fx.channel.get());
         let context = TerminalRelayPlanContext {
+            evidence_source: None,
             http: &rec.http,
             shared: &shared,
             channel_id: fx.channel,
@@ -715,17 +714,18 @@ fn native_collector_case(test_name: &str, mode: u8) {
             receipt.generation_mtime_ns,
             source_authority.generation_mtime_ns
         );
-        let visible = rec.visible.lock().unwrap();
-        assert!(visible[&receipt.panel_msg_id.unwrap()].contains("ADK5833-final"));
-        assert_eq!(
-            visible
-                .values()
-                .filter(|body| body.contains(TRAILING_BODY))
-                .count(),
-            1,
-            "exact terminal delivery must leave one visible copy of the commentary",
-        );
-        drop(visible);
+        {
+            let visible = rec.visible.lock().unwrap();
+            assert!(visible[&receipt.panel_msg_id.unwrap()].contains("ADK5833-final"));
+            assert_eq!(
+                visible
+                    .values()
+                    .filter(|body| body.contains(TRAILING_BODY))
+                    .count(),
+                1,
+                "exact terminal delivery must leave one visible copy of the commentary",
+            );
+        }
         if rowless {
             assert!(
                 load_inflight_state(&fx.provider, fx.channel.get()).is_none(),

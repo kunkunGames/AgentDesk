@@ -12,7 +12,7 @@ This document is the operator-side index for the three domains. The precedence a
 | **dashboard** (company settings) | The dashboard UI and any caller that owns the merged company-settings JSON document | `kv_meta['settings']` | n/a — this surface IS the override | Full-replace contract. No YAML baseline. Hidden keys (e.g. `roomThemes`) survive only if callers re-merge them. |
 | **bot-settings** | Discord bot bindings, agent roster, channel→agent routing, default per-bot behavior | `agentdesk.yaml` (`discord:`, `agents[].channels`) | None at runtime; defaults are read-only metadata derived from the YAML | Legacy `bot_settings.json` and `role_map.json` are migration inputs only. The dashboard "bot defaults" view is read-only over this YAML. |
 
-A surface that doesn't fit one of the three domains (escalation override, onboarding/secrets) is a separate, dedicated store — see the surface matrix in `adr-settings-precedence.md`.
+A surface that doesn't fit one of the three domains (onboarding/secrets) is a separate, dedicated store — see the surface matrix in `adr-settings-precedence.md`.
 
 ## Domain 1 — `runtime-config`
 
@@ -31,6 +31,7 @@ A surface that doesn't fit one of the three domains (escalation override, onboar
 - Editing the dashboard does NOT update YAML — it sets a live override. To make a value the new restart baseline, also edit YAML.
 - Read-only metadata such as `server_port` is exposed in this surface but is not writable.
 - Per-key restart behavior (`reseed-from-yaml` vs `persist-live-override`) is reported by `/api/settings/config`. Trust that field, not local memory.
+- When a YAML edit takes effect (`live`, `restart`, or `seeded-at-boot`) is listed per field in [`config-reload-classes.md`](config-reload-classes.md), generated from `src/config/reload_classes/table.rs`. Config hot reload logs one WARN line for an edit that needs a restart or a re-seed.
 
 **Reference**: ADR section "Runtime config", `/api/settings/runtime-config` and `/api/settings/config` in `adr-settings-precedence.md`.
 

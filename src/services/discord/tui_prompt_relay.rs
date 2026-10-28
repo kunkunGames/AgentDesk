@@ -18,7 +18,7 @@ use crate::services::claude_tui::hook_server::subscribe_hook_events;
 use crate::services::memory::TokenUsage;
 use crate::services::provider::{CancelToken, ProviderKind, ReadOutputResult};
 use crate::services::tui_prompt_dedupe::{
-    ExternalInputRelayLease, ExternalInputRelayOwner, ObservedTuiPrompt,
+    ExternalInputRelayLease, ExternalInputRelayOwner, ObservedTuiPrompt, hosted_source,
 };
 use tracing::Instrument;
 
@@ -74,7 +74,7 @@ pub(crate) use rehydration::run_codex_rehydrate_pass_for_tests;
 
 mod anchor_completion;
 mod bridge_completion;
-mod bridge_gateway;
+pub(in crate::services::discord) mod bridge_gateway;
 use self::anchor_completion::{
     DeferredAnchorCompletionDrain, decide_deferred_anchor_completion_drain,
 };
@@ -160,7 +160,11 @@ mod claude_idle_bridge;
 mod claude_idle_runtime;
 #[cfg(unix)]
 mod claude_idle_tail;
+#[cfg(unix)]
+mod claude_source;
 mod headless;
+#[cfg(unix)]
+mod source_tick;
 // #5188: session-rotation settle pass (pure planner always compiled + tested).
 mod session_rotation_settle;
 #[cfg(all(unix, test))]
@@ -181,14 +185,8 @@ pub(super) use self::claude_idle_runtime::resolve_rehydrated_claude_tmux_channel
 #[cfg(unix)]
 use self::claude_idle_runtime::{
     DEAD_ORPHANED_PANE_PROBE_DELAY, DEAD_ORPHANED_PANE_PROBE_SAMPLES,
-    advance_claude_tmux_runtime_binding_offset, claude_continuation_binding_supersedes_launch,
-    claude_tui_rehydrate_start_offset, claude_tui_runtime_binding_matches_launch,
-    resolve_idle_relay_transcript, resolve_rehydrated_tmux_channel_id,
-    resolved_claude_idle_relay_transcript_path, spawn_claude_idle_transcript_relay,
-};
-#[cfg(unix)]
-pub(in crate::services::discord) use self::claude_idle_runtime::{
-    claude_tui_launch_context, other_session_claimed_transcripts,
+    advance_claude_tmux_runtime_binding_offset, claude_tui_rehydrate_start_offset,
+    resolve_rehydrated_tmux_channel_id, spawn_claude_idle_transcript_relay,
 };
 #[cfg(all(unix, test))]
 use self::claude_idle_runtime::{
@@ -203,18 +201,21 @@ use self::claude_idle_tail::{
     maybe_spawn_claude_idle_response_tail, spawn_claude_idle_response_tail_once,
 };
 #[cfg(unix)]
+use self::claude_source::{
+    claude_continuation_binding_supersedes_launch, claude_tui_runtime_binding_matches_launch,
+    resolve_idle_relay_transcript, resolved_claude_idle_relay_transcript_path,
+};
+#[cfg(unix)]
+pub(in crate::services::discord) use self::claude_source::{
+    claude_tui_launch_context, other_session_claimed_transcripts,
+};
+#[cfg(unix)]
 use self::session_rotation_settle::settle_claude_session_rotations;
 
-const SSH_DIRECT_PROMPT_PREVIEW_LIMIT: usize = 1500;
 const CODEX_IDLE_ROLLOUT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CLAUDE_IDLE_REHYDRATE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const CLAUDE_IDLE_INFLIGHT_DRAIN_WAIT: Duration = Duration::from_secs(5);
 const CLAUDE_IDLE_INFLIGHT_DRAIN_POLL: Duration = Duration::from_millis(100);
-/// #2843: when the background idle relay loop discovers that a session's
-/// transcript path changed, scan this many bytes back from EOF (not from EOF
-/// itself) so a prompt already written to the freshly-resolved transcript is
-/// still observed and its response relayed.
-const CLAUDE_IDLE_FRESH_TRANSCRIPT_LOOKBACK_BYTES: u64 = 65_536;
 const TUI_DIRECT_SYNTHETIC_CLAIM_WAIT: Duration = Duration::from_secs(2);
 const TUI_DIRECT_SYNTHETIC_CLAIM_POLL: Duration = Duration::from_millis(100);
 pub(in crate::services::discord) const TUI_DIRECT_SYNTHETIC_OWNER_USER_ID: u64 = 1;
@@ -302,12 +303,8 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
     // never needs to repair pre-publish lease/SSH state. A missing or lagged
     // receiver therefore cannot strand a local `/compact` relay lease.
     let relay_prompt_decision = relay_observed_prompt_injected_prompt_decision(&prompt.prompt);
-    let Some(channel_id) = owner_channel_for_prompt(shared, &prompt) else {
-        tracing::debug!(
-            provider = %prompt.provider,
-            tmux_session_name = %prompt.tmux_session_name,
-            "skipping SSH-direct TUI prompt notify; no Discord channel mapping"
-        );
+    let candidate = owner_channel_for_prompt(shared, &prompt);
+    let Some(channel_id) = hosted_source::adoption_channel(shared, &prompt, candidate).await else {
         return;
     };
     if prompt.steer_echo {
@@ -342,7 +339,13 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             );
             return;
         };
-        match channel_id.say(&*notify_http, note).await {
+        match super::http::dispatch_channel_message(
+            &notify_http,
+            channel_id,
+            serenity::CreateMessage::new().content(note),
+        )
+        .await
+        {
             Ok(message) => {
                 crate::services::tui_prompt_dedupe::record_local_only_entry_id_after_note_delivery(
                     &prompt,
@@ -426,7 +429,6 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
     // #3811: TUI-direct is an id-0 synthetic turn — clear any stale interactive 요청 anchor.
     let live_events = &shared.ui.placeholder_live_events;
     live_events.set_turn_request_anchor(channel_id, None, None);
-    let recap_provider = ProviderKind::from_str_or_unsupported(&prompt.provider);
     let mut lease = record_observed_external_turn_lease(shared, &prompt, channel_id);
     // #3041 P1-4 codex: arm an early-return RAII guard the instant the lease is
     // recorded — every failure early-return below would otherwise leave the lease set
@@ -453,34 +455,6 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
     };
     let notify_http = task_gate.notify_http;
     let task_card_anchor = task_gate.card_anchor;
-    // A TUI-direct prompt has now been observed for this channel. Bump idle
-    // recap generation before the pre-claim clear so an in-flight recap POST job
-    // cannot persist a stale card after a deferred/local-only/aborted synthetic
-    // start path (#3296, #3878).
-    if let Some(pool) = shared.pg_pool.as_ref().cloned() {
-        if let Err(e) = super::idle_recap::bump_turn_generation(
-            &pool,
-            channel_id.get(),
-            &recap_provider,
-            lease.session_key.as_deref(),
-        )
-        .await
-        {
-            tracing::warn!(
-                error = %e,
-                channel_id = channel_id.get(),
-                provider = %recap_provider.as_str(),
-                session_key = lease.session_key.as_deref().unwrap_or(""),
-                "idle_recap: failed to bump turn generation on TUI-direct observation"
-            );
-        }
-        super::idle_recap::spawn_clear_captured_idle_recap_for_channel(
-            notify_http.clone(),
-            pool,
-            channel_id.get(),
-        )
-        .await;
-    }
     // #3164 / #750 invariant: the `⏳` MUST be added by the SAME bot identity that
     // later removes it (the shared reaction remove path only removes `@me`; a
     // different bot leaves the hourglass forever). The note BODY may be any bot
@@ -557,7 +531,13 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             synthetic_start_wiring::record_prompt_id_after_post(&prompt, None);
             message_id
         } else {
-            match channel_id.say(&*notify_http, content).await {
+            match super::http::dispatch_channel_message(
+                &notify_http,
+                channel_id,
+                serenity::CreateMessage::new().content(content),
+            )
+            .await
+            {
                 Ok(message) => {
                     synthetic_start_wiring::record_prompt_id_after_post(&prompt, None);
                     message.id
@@ -652,7 +632,6 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
         // neutral note cannot claim the mailbox if this seam is called accidentally.
         deferred_synthetic_start = synthetic_start_wiring::wire_tui_direct_synthetic_turn_start(
             shared,
-            &prompt.provider,
             channel_id,
             &prompt,
             anchor_message_id,
@@ -674,7 +653,6 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
             "SSH-direct TUI prompt notified; runtime relay attached synthetic ownership when possible"
         );
     }
-
     // #3041 P1-4 codex: SUCCESS PATH reached — the card/anchor (or system-continuation
     // note) was posted and the bridge legitimately retains the in-flight turn. DISARM
     // the early-return guard so the lease PERSISTS for this turn (otherwise the
@@ -682,7 +660,6 @@ async fn relay_observed_prompt(shared: &Arc<SharedData>, prompt: ObservedTuiProm
     // bridge-tail block's own `TuiDirectExternalInputLeaseGuard` (bridge-owner leases)
     // or simply left set (Unassigned / session-bound-owned leases the sink delivers).
     observed_lease_early_return_guard.disarm();
-
     #[cfg(unix)]
     {
         // #3154 P1-3: when the synthetic turn-start was deferred, the detached

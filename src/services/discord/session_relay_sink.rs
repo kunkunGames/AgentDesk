@@ -17,18 +17,32 @@ use serenity::model::id::{ChannelId, MessageId};
 pub(in crate::services::discord) use self::tests::sink_fixtures::*;
 use super::delivery_lease_cell::source_epoch_observer;
 use super::formatting::{self, ReplaceLongMessageOutcome};
-use super::health::{self, HealthRegistry};
+use super::health::HealthRegistry;
 use super::inflight::{self, InflightTurnState, RelayOwnerKind, TurnSource};
 use super::outbound::delivery_record as dr;
 use super::outbound::turn_output_controller as toc;
 use super::replace_outcome_policy::edit_fail_fallback_disposition;
-use super::{task_supervisor, tmux};
+use super::{DeliveryLeaseCell, DeliveryLeaseHeartbeat, LeaseHolder, task_supervisor, tmux};
 use crate::services::cluster::stream_relay::{
     RelaySink, RelaySinkError, RelaySinkOutcome, StreamFrame,
 };
 use crate::services::cluster::watcher_supervisor::{SupervisorConfig, run_watcher_supervisor_loop};
 use crate::services::provider::ProviderKind;
 use tracing::Instrument;
+
+mod routing;
+pub(in crate::services::discord) use routing::session_bound_discord_relay_can_own_terminal_delivery;
+use routing::{
+    SessionBoundExternalInputLeaseGuard, SessionBoundTerminalDeliveryRoute,
+    SessionBoundTerminalDeliveryRouteDecision, SessionRelayTraceContext, SinkDeliveryLeaseGuard,
+    SinkPostHeartbeat, session_bound_should_send_new_chunks_for_placeholder,
+    session_bound_terminal_delivery_route_decision_with_lease, session_relay_trace_context,
+    sink_delivery_lease_coordinate,
+};
+#[cfg(test)]
+use routing::{
+    session_bound_terminal_delivery_route, session_bound_terminal_delivery_route_or_skip,
+};
 
 mod delivery_commit;
 mod delivery_frontier;
@@ -46,7 +60,7 @@ use supervision::{LegacySessionRelayConsumer, run_idle_jsonl_relay_loop};
 // #3960: orphaned `SessionBoundRelay` TUI-direct reclaim (producer-liveness TOCTOU).
 mod orphan_reclaim;
 mod relay_format;
-mod task_notification_context;
+pub(in crate::services::discord) mod task_notification_context;
 mod terminal_handoff;
 pub(in crate::services::discord) mod turn_parser;
 use self::idle_jsonl::IdlePending::{Deferred, RetainedForRetry, SentUnconfirmed};
@@ -54,11 +68,11 @@ use self::idle_jsonl::{
     IdleCursor, IdleJsonlSessionInitRearm, IdleJsonlSuppression, IdlePending, IdleRelayRangeAction,
     idle_jsonl_apply_active_inflight_gate,
     idle_jsonl_clear_session_init_on_generation_signature_change, idle_jsonl_consume_offset,
-    idle_jsonl_current_eof, idle_jsonl_payload_contains_init_event,
-    idle_jsonl_payload_contains_schedule_wakeup_setup, idle_jsonl_payload_contains_user_event,
-    idle_jsonl_prepare_dedup_shared, idle_jsonl_relay_source_for_matched,
-    idle_jsonl_session_has_init, idle_jsonl_suppressed_range_action, idle_relay_range_action,
-    prune_idle_jsonl_session_state, read_jsonl_range,
+    idle_jsonl_current_eof, idle_jsonl_payload_contains_schedule_wakeup_setup,
+    idle_jsonl_payload_contains_user_event, idle_jsonl_prepare_dedup_shared,
+    idle_jsonl_relay_source_for_matched, idle_jsonl_session_has_init,
+    idle_jsonl_suppressed_range_action, idle_relay_range_action, prune_idle_jsonl_session_state,
+    read_jsonl_range,
 };
 use self::task_notification_context::ensure_card_and_route;
 use self::terminal_handoff::SessionRelayDeliveryOutcome;
@@ -73,85 +87,6 @@ const IDLE_JSONL_RELAY_MAX_BYTES_PER_TICK: u64 = 1_048_576;
 
 pub(in crate::services::discord) fn session_bound_discord_delivery_enabled() -> bool {
     SESSION_BOUND_DISCORD_DELIVERY_ENABLED.load(Ordering::Acquire)
-}
-
-pub(in crate::services::discord) fn session_bound_discord_relay_can_own_terminal_delivery(
-    inflight: Option<&InflightTurnState>,
-    tmux_session_name: &str,
-) -> bool {
-    if tmux_session_name.trim().is_empty() {
-        return false;
-    }
-    let Some(state) = inflight else {
-        return true;
-    };
-    if state.tmux_session_name.as_deref() != Some(tmux_session_name) {
-        return false;
-    }
-    // A normal Discord-origin inflight already has the watcher as terminal owner;
-    // letting the sink (still attached to the same JSONL) deliver would double-post.
-    // Only rebind/adopted rows are no real foreground turn; scheduled wakeups / idle
-    // background output reach this path with no inflight at all.
-    matches!(
-        state.effective_relay_owner_kind(),
-        RelayOwnerKind::SessionBoundRelay
-    ) || state.rebind_origin
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SessionBoundTerminalDeliveryRoute {
-    NewMessage,
-    PlaceholderEdit(MessageId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SessionBoundTerminalDeliveryRouteDecision {
-    Route(SessionBoundTerminalDeliveryRoute),
-    Skipped,
-}
-
-fn session_bound_terminal_delivery_route(
-    inflight: Option<&InflightTurnState>,
-    tmux_session_name: &str,
-) -> Option<SessionBoundTerminalDeliveryRoute> {
-    if tmux_session_name.trim().is_empty() {
-        return None;
-    }
-    let Some(state) = inflight else {
-        return Some(SessionBoundTerminalDeliveryRoute::NewMessage);
-    };
-    if !session_bound_discord_relay_can_own_terminal_delivery(Some(state), tmux_session_name) {
-        return None;
-    }
-    if matches!(
-        state.effective_relay_owner_kind(),
-        RelayOwnerKind::SessionBoundRelay
-    ) && matches!(state.turn_source, TurnSource::ExternalInput)
-    {
-        return Some(SessionBoundTerminalDeliveryRoute::NewMessage);
-    }
-    if !state.rebind_origin && state.current_msg_id != 0 {
-        return Some(SessionBoundTerminalDeliveryRoute::PlaceholderEdit(
-            MessageId::new(state.current_msg_id),
-        ));
-    }
-    Some(SessionBoundTerminalDeliveryRoute::NewMessage)
-}
-
-fn session_bound_terminal_delivery_route_or_skip(
-    inflight: Option<&InflightTurnState>,
-    tmux_session_name: &str,
-    provider: &ProviderKind,
-    channel_id: u64,
-) -> Result<SessionBoundTerminalDeliveryRoute, String> {
-    session_bound_terminal_delivery_route(inflight, tmux_session_name).ok_or_else(|| {
-        format!(
-            "session-bound terminal delivery route skipped for provider={} channel={} tmux_session={}",
-            provider.as_str(),
-            channel_id,
-            tmux_session_name
-        )
-    })
 }
 
 #[allow(dead_code)] // #3034: #3041 lease-free route-decision pinned by unit tests (prod uses `_with_lease`).
@@ -177,316 +112,6 @@ fn session_bound_terminal_delivery_route_decision(
     )
 }
 
-fn session_bound_terminal_delivery_route_decision_with_lease(
-    inflight: Option<&InflightTurnState>,
-    tmux_session_name: &str,
-    provider: &ProviderKind,
-    channel_id: u64,
-    observed_lease: Option<&crate::services::tui_prompt_dedupe::ExternalInputRelayLease>,
-) -> SessionBoundTerminalDeliveryRouteDecision {
-    if session_bound_external_lease_blocks_delivery(observed_lease) {
-        return SessionBoundTerminalDeliveryRouteDecision::Skipped;
-    }
-    match session_bound_terminal_delivery_route_or_skip(
-        inflight,
-        tmux_session_name,
-        provider,
-        channel_id,
-    ) {
-        Ok(route) => SessionBoundTerminalDeliveryRouteDecision::Route(route),
-        Err(_) => SessionBoundTerminalDeliveryRouteDecision::Skipped,
-    }
-}
-
-fn session_bound_external_lease_blocks_delivery(
-    observed_lease: Option<&crate::services::tui_prompt_dedupe::ExternalInputRelayLease>,
-) -> bool {
-    let Some(lease) = observed_lease else {
-        return false;
-    };
-    // #3041 P1-4 / §4-④: the external_input lease is now "input dedup only". A
-    // FOREIGN-owner lease (BridgeAdapter/TuiPromptRelay/TmuxWatcher) names the
-    // OTHER subsystem owning this terminal delivery → still defer (routing, not the
-    // self-block behind the ~10min stall). An `Unassigned`/`SessionBoundRelay` lease
-    // is THIS sink's own marker → must NOT block our delivery (serialization now
-    // belongs to the `DeliveryLeaseCell` B2 gate + per-sequence ACK + reconciliation).
-    !matches!(
-        lease.relay_owner,
-        crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::Unassigned
-            | crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::SessionBoundRelay
-    )
-}
-
-/// RAII guard releasing the session-bound `external_input_relay_lease` on EVERY exit of
-/// `deliver_response` (Ok/Err/`?`/503/panic). #3041 P1-4 (§4-④, fixes the #2955 leak:
-/// pre-P1-4 only Ok branches cleared, so an Err/`?`/503 stranded the lease for the 600s
-/// TTL → blocked the next delivery ~10min). NO-CLOBBER: captures the UNIQUE `generation`
-/// of the route-observed lease and clears via the generation-matched helper, so a newer
-/// turn re-taking the key (even a value-identical `Unassigned`) survives (mirrors
-/// `TuiDirectExternalInputLeaseGuard`).
-struct SessionBoundExternalInputLeaseGuard {
-    provider: ProviderKind,
-    tmux_session_name: String,
-    channel_id: u64,
-    /// `generation` of the recorded lease this guard armed with. Drop clears ONLY
-    /// this exact generation.
-    generation: u64,
-}
-
-impl SessionBoundExternalInputLeaseGuard {
-    /// Arm a guard IFF the route-observed lease (`observed_lease`, a SINGLE shared
-    /// read) is an `Unassigned`/`SessionBoundRelay` input lease for this target.
-    /// Foreign-owner leases (not ours) and no-lease deliveries return `None` (inert).
-    /// Capturing the generation from the SAME read closes the arm-time TOCTOU.
-    fn arm_with_observed_lease(
-        provider: &ProviderKind,
-        channel_id: u64,
-        tmux_session_name: &str,
-        observed_lease: Option<&crate::services::tui_prompt_dedupe::ExternalInputRelayLease>,
-    ) -> Option<Self> {
-        let lease = observed_lease?;
-        if !matches!(
-            lease.relay_owner,
-            crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::Unassigned
-                | crate::services::tui_prompt_dedupe::ExternalInputRelayOwner::SessionBoundRelay
-        ) {
-            return None;
-        }
-        Some(Self {
-            provider: provider.clone(),
-            tmux_session_name: tmux_session_name.to_string(),
-            channel_id,
-            generation: lease.generation,
-        })
-    }
-}
-
-impl Drop for SessionBoundExternalInputLeaseGuard {
-    fn drop(&mut self) {
-        // Compare-and-clear by generation: release only if the CURRENT lease for this
-        // key is STILL the one we armed with. A newer turn's lease that re-took this key
-        // — even a value-identical `Unassigned` — has a different generation → survives.
-        crate::services::tui_prompt_dedupe::clear_external_input_relay_lease_if_generation_matches(
-            self.provider.as_str(),
-            &self.tmux_session_name,
-            self.channel_id,
-            self.generation,
-        );
-    }
-}
-
-/// #3151: RAII in-flight sink-delivery marker on the per-channel
-/// [`super::DeliveryLeaseCell`], acquired as [`super::LeaseHolder::Sink`] for the SAME
-/// `(channel, turn, [start,end))` the watcher's §3.2 reconciliation computes, BEFORE the
-/// POST; a [`super::DeliveryLeaseHeartbeat`] renews the deadline so the watcher reads
-/// `Leased{Sink, fresh}` and WAITS instead of re-sending (slow-sink dup). RECLAIMABLE: a
-/// crashed sink stops renewing → the watcher reclaims within ~one deadline (no black-hole).
-/// CLEAR ordering (SUCCESS): advance committed FIRST (`advance_after_confirmed_post`) THEN
-/// [`Self::commit`] → watcher reads `committed >= end` → Skip. EVERY exit Drop RELEASES
-/// (full-identity → stale no-ops); a never-committed failure leaves `Unleased`, committed
-/// NOT advanced → watcher SendFull.
-struct SinkDeliveryLeaseGuard {
-    cell: Arc<super::DeliveryLeaseCell>,
-    key: super::DeliveryLeaseKey,
-    start: u64,
-    end: u64,
-    /// The in-flight heartbeat; aborted on Drop (mirrors the watcher's RAII).
-    _heartbeat: super::DeliveryLeaseHeartbeat,
-}
-
-impl SinkDeliveryLeaseGuard {
-    /// Self-heal a dead PRIOR holder, then CAS-acquire as `LeaseHolder::Sink` for
-    /// `(turn, [start,end))`. `Some` (spawning the heartbeat) only when the acquire wins;
-    /// `None` means another holder owns the range and the caller must return NotDelivered
-    /// without reaching transport.
-    fn acquire(
-        cell: &Arc<super::DeliveryLeaseCell>,
-        key: super::DeliveryLeaseKey,
-        start: u64,
-        end: u64,
-    ) -> Option<Self> {
-        // Mirror the watcher's self-healing acquire (tmux_watcher.rs:8594): reclaim an
-        // EXPIRED prior holder so a stale dead lease can't lose this acquire.
-        cell.reclaim_if_expired(super::lease_now_ms());
-        let acquired = cell.try_acquire(
-            key.clone(),
-            super::LeaseHolder::Sink,
-            start,
-            end,
-            super::lease_now_ms().saturating_add(super::DELIVERY_LEASE_DEADLINE_MS),
-        );
-        if !acquired {
-            return None;
-        }
-        let heartbeat = super::DeliveryLeaseHeartbeat::spawn(
-            cell.clone(),
-            super::LeaseHolder::Sink,
-            key.clone(),
-        );
-        Some(Self {
-            cell: cell.clone(),
-            key,
-            start,
-            end,
-            _heartbeat: heartbeat,
-        })
-    }
-
-    /// Terminal-decision commit, AFTER the advance was attempted: `outcome` reflects
-    /// whether it ACTUALLY happened — `Delivered` only when the offset advanced (so the
-    /// watcher reads `committed >= end` → Skip), else `NotDelivered` (offset `< end` →
-    /// the watcher re-sends → SendFull, no black-hole). Full-identity compare-and-X →
-    /// a stale older-turn clear no-ops. Drop still releases.
-    fn commit(&self, outcome: super::LeaseOutcome) {
-        self.cell.commit(
-            super::LeaseHolder::Sink,
-            self.key.clone(),
-            self.start,
-            self.end,
-            outcome,
-        );
-    }
-}
-
-impl Drop for SinkDeliveryLeaseGuard {
-    fn drop(&mut self) {
-        // Release on EVERY exit. `release` is valid from `Leased` (failure) and `Committed`
-        // (success) and full-identity-gated, so it clears ONLY our marker — a newer turn
-        // that re-leased this cell survives. (`_heartbeat` Drop aborts the renew task.)
-        self.cell.release(
-            super::LeaseHolder::Sink,
-            self.key.clone(),
-            self.start,
-            self.end,
-        );
-    }
-}
-
-/// #3089 A2b: adapts the sink's `DeliveryLeaseHeartbeat` to [`toc::PostHeartbeat`]. Holds the
-/// `Arc` (the controller drives the lease behind a borrowed `&cell`) and spawns the SAME
-/// `DeliveryLeaseHeartbeat::spawn` the legacy guard used (#3151 — identical renew); the guard
-/// Drop aborts the renew task BEFORE the inline commit.
-struct SinkPostHeartbeat {
-    cell: Arc<super::DeliveryLeaseCell>,
-}
-
-impl toc::PostHeartbeat for SinkPostHeartbeat {
-    fn start(
-        &self,
-        holder: super::LeaseHolder,
-        key: super::DeliveryLeaseKey,
-    ) -> Box<dyn toc::PostHeartbeatGuard> {
-        Box::new(SinkPostHeartbeatGuard {
-            _heartbeat: super::DeliveryLeaseHeartbeat::spawn(self.cell.clone(), holder, key),
-        })
-    }
-}
-
-struct SinkPostHeartbeatGuard {
-    _heartbeat: super::DeliveryLeaseHeartbeat,
-}
-
-impl toc::PostHeartbeatGuard for SinkPostHeartbeatGuard {}
-
-fn session_bound_should_send_new_chunks_for_placeholder(response_text: &str) -> bool {
-    super::formatting::needs_multiple_messages(response_text)
-}
-
-/// Pick the one ordered coordinate used by every terminal sink path. Strict
-/// commit-fenced frames take precedence; inflight-less idle/catch-up frames use
-/// their carried range; legacy no-range frames still return a degenerate
-/// zero-width coordinate so no terminal POST can bypass the shared lease.
-fn sink_delivery_lease_coordinate(delivery: &SessionRelayDelivery) -> ((u64, u64), Option<u64>) {
-    if let (Some(start), Some(end)) = (
-        delivery.frame_turn_start_offset,
-        delivery.terminal_consumed_end,
-    ) && end > start
-    {
-        return ((start, end), Some(start));
-    }
-    if let Some((start, end)) = delivery.relay_range
-        && end > start
-    {
-        return ((start, end), Some(start));
-    }
-
-    // A terminal delivery without an ordered byte range must still serialize on
-    // the channel cell. The zero-width coordinate and absent fallback retain the
-    // legacy degenerate id-0 key instead of allowing a lease-free POST.
-    ((0, 0), None)
-}
-
-#[derive(Clone, Debug, Default)]
-struct SessionRelayTraceContext {
-    turn_id: Option<String>,
-    dispatch_id: Option<String>,
-    session_key: Option<String>,
-    relay_owner: Option<String>,
-    runtime_kind: Option<String>,
-}
-
-impl SessionRelayTraceContext {
-    fn turn_id(&self) -> Option<&str> {
-        self.turn_id.as_deref()
-    }
-
-    fn dispatch_id(&self) -> Option<&str> {
-        self.dispatch_id.as_deref()
-    }
-
-    fn session_key(&self) -> Option<&str> {
-        self.session_key.as_deref()
-    }
-
-    fn relay_owner(&self) -> &str {
-        self.relay_owner.as_deref().unwrap_or("none")
-    }
-
-    fn runtime_kind(&self) -> &str {
-        self.runtime_kind.as_deref().unwrap_or("unknown")
-    }
-}
-
-fn session_relay_trace_context(
-    provider: &ProviderKind,
-    channel_id: u64,
-    tmux_session_name: &str,
-    inflight: Option<&InflightTurnState>,
-) -> SessionRelayTraceContext {
-    let lease = crate::services::tui_prompt_dedupe::external_input_relay_lease(
-        provider.as_str(),
-        tmux_session_name,
-        channel_id,
-    );
-    SessionRelayTraceContext {
-        turn_id: inflight
-            .and_then(inflight_turn_id)
-            .or_else(|| lease.as_ref().and_then(|lease| lease.turn_id.clone())),
-        dispatch_id: inflight.and_then(|state| state.dispatch_id.clone()),
-        session_key: inflight
-            .and_then(|state| state.session_key.clone())
-            .or_else(|| lease.as_ref().and_then(|lease| lease.session_key.clone())),
-        relay_owner: inflight
-            .map(|state| state.effective_relay_owner_kind().as_str().to_string())
-            .or_else(|| {
-                lease
-                    .as_ref()
-                    .map(|lease| lease.relay_owner.as_str().to_string())
-            }),
-        runtime_kind: inflight
-            .and_then(|state| state.runtime_kind.map(|kind| kind.as_str().to_string()))
-            .or_else(|| {
-                lease
-                    .as_ref()
-                    .and_then(|lease| lease.runtime_kind.map(|kind| kind.as_str().to_string()))
-            }),
-    }
-}
-
-fn inflight_turn_id(state: &InflightTurnState) -> Option<String> {
-    (state.user_msg_id != 0).then(|| format!("discord:{}:{}", state.channel_id, state.user_msg_id))
-}
-
 pub(in crate::services::discord) struct SessionBoundDiscordRelaySink {
     health_registry: Arc<HealthRegistry>,
     frames_total: AtomicU64,
@@ -494,7 +119,6 @@ pub(in crate::services::discord) struct SessionBoundDiscordRelaySink {
     by_session: Mutex<HashMap<String, SessionRelayParser>>,
     // #5071 T1 S3a: borrowed from the process-wide observer rather than owned, so
     // the sink direct family and the watcher family serialise onto one actor.
-    journal: &'static journal::JournalObserver,
     #[cfg(test)]
     lease_test_probe: Option<Arc<SinkLeaseTestProbe>>,
     #[cfg(test)]
@@ -514,7 +138,6 @@ impl SessionBoundDiscordRelaySink {
             frames_total: AtomicU64::new(0),
             delivered_total: AtomicU64::new(0),
             by_session: Mutex::new(HashMap::new()),
-            journal: journal::process_observer(),
             #[cfg(test)]
             lease_test_probe: None,
             #[cfg(test)]
@@ -924,8 +547,9 @@ impl SessionBoundDiscordRelaySink {
                     provider.clone(),
                     None,
                 );
+                let controller_gateway = short_controller::choose_gateway(gateway, &live_gateway);
                 return short_controller::deliver_short_replace_via_controller(
-                    gateway.unwrap_or(&live_gateway),
+                    controller_gateway,
                     short_controller::SinkShortReplaceCtx {
                         shared: &shared,
                         provider: &provider,
@@ -945,12 +569,6 @@ impl SessionBoundDiscordRelaySink {
                 )
                 .await;
             }
-            let mut direct_journal_attempt =
-                if journal::journals_sink_direct(&route, cutover_short_replace) {
-                    self.journal.begin_fresh(&shared, &delivery)
-                } else {
-                    None
-                };
             if session_bound_should_send_new_chunks_for_placeholder(&relay_text) {
                 let send = || {
                     journal::send_long_chunks_with_anchor_receipt(
@@ -962,7 +580,7 @@ impl SessionBoundDiscordRelaySink {
                         &shared,
                     )
                 };
-                let (message_ids, chunk_anchor_receipt) =
+                let (message_ids, _chunk_anchor_receipt) =
                     claimed_body_send(claim_then_send(Some(body_claim), send).await)??;
                 if let Some(gateway) = gateway {
                     let _ = gateway.delete_message(channel, msg_id).await;
@@ -1004,29 +622,22 @@ impl SessionBoundDiscordRelaySink {
                     sink_lease_guard.as_ref(),
                     "src/services/discord/session_relay_sink.rs:sink_long_chunks_advance",
                 );
-                journal::settle(
-                    self.journal,
-                    &mut direct_journal_attempt,
-                    chunk_anchor_receipt,
-                    proof,
-                );
                 return Ok(SessionRelayDeliveryOutcome::from_proof(proof));
             }
             #[cfg(test)]
             let mut last_chunk_anchor = self.test_replace_anchor.clone();
             #[cfg(not(test))]
             let mut last_chunk_anchor = None;
-            let mut edit_anchor_receipt = None;
             let (http_ref, shared_ref, text) = (&http, &shared, relay_text.as_str());
-            let (anchor, receipt) = (&mut last_chunk_anchor, &mut edit_anchor_receipt);
+            let anchor = &mut last_chunk_anchor;
             let replace = move || async move {
                 if let Some(gateway) = gateway {
                     gateway
                         .replace_message_with_outcome(channel, msg_id, text)
                         .await
                 } else {
-                    formatting::replace_long_message_raw_with_outcome_returning_receipt(
-                        http_ref, channel, msg_id, text, shared_ref, anchor, receipt,
+                    formatting::replace_long_message_raw_with_outcome(
+                        http_ref, channel, msg_id, text, shared_ref, anchor,
                     )
                     .await
                     .map_err(|error| error.to_string())
@@ -1077,12 +688,6 @@ impl SessionBoundDiscordRelaySink {
                         sink_lease_guard.as_ref(),
                         "src/services/discord/session_relay_sink.rs:sink_legacy_short_edit_advance",
                     );
-                    journal::settle(
-                        self.journal,
-                        &mut direct_journal_attempt,
-                        edit_anchor_receipt.take(),
-                        proof,
-                    );
                     Ok(SessionRelayDeliveryOutcome::from_proof(proof))
                 }
                 Ok(ReplaceLongMessageOutcome::SentFallbackAfterEditFailure {
@@ -1129,12 +734,6 @@ impl SessionBoundDiscordRelaySink {
                         &raw_response_text,
                         sink_lease_guard.as_ref(),
                         "src/services/discord/session_relay_sink.rs:sink_legacy_short_fallback_advance",
-                    );
-                    journal::settle(
-                        self.journal,
-                        &mut direct_journal_attempt,
-                        edit_anchor_receipt.take(),
-                        proof,
                     );
                     Ok(SessionRelayDeliveryOutcome::from_proof(proof))
                 }

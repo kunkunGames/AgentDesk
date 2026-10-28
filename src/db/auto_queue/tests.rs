@@ -106,15 +106,15 @@ mod dispatch_terminal_sync_pg_tests {
     use super::{
         ENTRY_STATUS_DONE, ENTRY_STATUS_FAILED, ENTRY_STATUS_SKIPPED, ENTRY_STATUS_USER_CANCELLED,
         EntryStatusUpdateOptions, PhaseGateStateWrite, SlotAllocation,
-        allocate_slot_for_group_agent_pg, clear_phase_gate_state_on_pg, complete_run_on_pg,
-        finalize_completed_dispatch_terminal_entry_on_pg_tx, pause_run_on_pg,
-        record_consultation_dispatch_on_pg, record_entry_dispatch_failure_on_pg, resume_run_on_pg,
-        save_phase_gate_state_on_pg, slot_has_active_dispatch_pg,
+        allocate_slot_for_group_agent_pg, clear_phase_gate_state_on_pg,
+        finalize_completed_dispatch_terminal_entry_on_pg_tx, finalize_run_if_ready_pg,
+        pause_run_on_pg, record_consultation_dispatch_on_pg, record_entry_dispatch_failure_on_pg,
+        resume_run_on_pg, save_phase_gate_state_on_pg, slot_has_active_dispatch_pg,
         slot_has_recent_terminal_auto_queue_dispatch_pg, sync_dispatch_terminal_entries_on_pg_tx,
         update_entry_status_on_pg, update_entry_status_on_pg_tx,
     };
     use crate::db::auto_queue::runs::acquire_run_advisory_xact_lock_on_pg_tx;
-    use crate::db::auto_queue::runs::complete_run_after_activate_on_pg;
+    use crate::db::auto_queue::runs::{RunCompletionBlockedReason, RunCompletionOutcome};
     use crate::db::auto_queue::test_support::TestPostgresDb;
     use chrono::{DateTime, Utc};
     use sqlx::{Connection, PgConnection, PgPool, Row};
@@ -361,9 +361,9 @@ mod dispatch_terminal_sync_pg_tests {
 
     async fn install_active_dispatch_after_slot_update_trigger(
         pool: &PgPool,
-        function_name: &str,
-        trigger_name: &str,
-        dispatch_id: &str,
+        function_name: &'static str,
+        trigger_name: &'static str,
+        dispatch_id: &'static str,
     ) {
         let function_sql = format!(
             "CREATE OR REPLACE FUNCTION {function_name}()
@@ -386,7 +386,7 @@ mod dispatch_terminal_sync_pg_tests {
              END;
              $$ LANGUAGE plpgsql"
         );
-        sqlx::query(&function_sql)
+        sqlx::query(sqlx::AssertSqlSafe(function_sql))
             .execute(pool)
             .await
             .expect("create active dispatch trigger function");
@@ -396,7 +396,7 @@ mod dispatch_terminal_sync_pg_tests {
              AFTER UPDATE ON auto_queue_slots
              FOR EACH ROW EXECUTE FUNCTION {function_name}()"
         );
-        sqlx::query(&trigger_sql)
+        sqlx::query(sqlx::AssertSqlSafe(trigger_sql))
             .execute(pool)
             .await
             .expect("create active dispatch trigger");
@@ -470,9 +470,8 @@ mod dispatch_terminal_sync_pg_tests {
         pg_db.drop().await;
     }
 
-    /// Manual completion now intentionally rejects runnable entries. This
-    /// terminal fixture preserves the resource-cleanup/card-preservation
-    /// purpose of the older test while recording that strengthened contract.
+    /// Derived completion refuses a pending gate instead of deleting it; once
+    /// the gate is gone it completes, cleans resources and preserves the card.
     #[tokio::test]
     async fn postgres_auto_queue_policy_complete_preserves_card_and_cleans_resources_pg() {
         let pg_db = TestPostgresDb::create().await;
@@ -503,20 +502,31 @@ mod dispatch_terminal_sync_pg_tests {
         .await
         .expect("seed policy completion entry");
 
-        assert!(
-            complete_run_on_pg(&pool, "run-1")
+        assert_eq!(
+            finalize_run_if_ready_pg(&pool, "run-1")
                 .await
-                .expect("complete run")
+                .expect("gated completion"),
+            RunCompletionOutcome::Blocked(RunCompletionBlockedReason::BlockingPhaseGate)
+        );
+        assert_eq!(run_status(&pool, "run-1").await, "active");
+        assert_eq!(
+            slot_run(&pool, "agent-1", 0).await.as_deref(),
+            Some("run-1")
+        );
+        assert_eq!(count_message_outbox(&pool).await, 0);
+
+        sqlx::query("DELETE FROM auto_queue_phase_gates WHERE run_id = 'run-1'")
+            .execute(&pool)
+            .await
+            .expect("pass the gate");
+        assert_eq!(
+            finalize_run_if_ready_pg(&pool, "run-1")
+                .await
+                .expect("complete run"),
+            RunCompletionOutcome::Completed
         );
         assert_eq!(run_status(&pool, "run-1").await, "completed");
         assert_eq!(slot_run(&pool, "agent-1", 0).await, None);
-        let gate_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::BIGINT FROM auto_queue_phase_gates WHERE run_id = 'run-1'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count phase gates");
-        assert_eq!(gate_count, 0);
         assert_eq!(count_message_outbox(&pool).await, 1);
         let card = sqlx::query_as::<_, (String, Option<String>, i64)>(
             "SELECT status, review_notes, review_round::BIGINT
@@ -540,7 +550,7 @@ mod dispatch_terminal_sync_pg_tests {
     }
 
     #[tokio::test]
-    async fn postgres_activate_completion_uses_protocol_without_notification_pg() {
+    async fn postgres_activate_tail_completion_queues_notification_once_pg() {
         let pg_db = TestPostgresDb::create().await;
         let pool = setup_pool(&pg_db).await;
         seed_entry(
@@ -551,14 +561,47 @@ mod dispatch_terminal_sync_pg_tests {
         )
         .await;
 
-        assert!(
-            complete_run_after_activate_on_pg(&pool, "run-1")
+        assert_eq!(
+            finalize_run_if_ready_pg(&pool, "run-1")
                 .await
-                .expect("complete drained activate run")
+                .expect("complete drained activate run"),
+            RunCompletionOutcome::Completed
         );
         assert_eq!(run_status(&pool, "run-1").await, "completed");
         assert_eq!(slot_run(&pool, "agent-1", 0).await, None);
-        assert_eq!(count_message_outbox(&pool).await, 0);
+        assert_eq!(count_message_outbox(&pool).await, 1);
+        assert_eq!(
+            finalize_run_if_ready_pg(&pool, "run-1")
+                .await
+                .expect("repeat completion"),
+            RunCompletionOutcome::AlreadyTerminal
+        );
+        assert_eq!(count_message_outbox(&pool).await, 1);
+        let (bot, source, original, display): (String, String, String, Option<serde_json::Value>) =
+            sqlx::query_as("SELECT bot,source,content,session_notice FROM message_outbox")
+                .fetch_one(&pool)
+                .await
+                .expect("load actual run-completion outbox row");
+        assert_eq!(
+            bot, "notify",
+            "autoqueue row identity must remain unchanged"
+        );
+        assert_eq!(
+            source, "system",
+            "autoqueue dedup source must remain unchanged"
+        );
+        assert!(original.starts_with("자동큐 완료:"));
+        let display =
+            display.expect("the actual run completion entrypoint must freeze its provider display");
+        assert_eq!(display["version"], 1);
+        assert_eq!(display["provider_hint"], "claude");
+        let content = display["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("-# ✅ "),
+            "actual autoqueue completion must use one provider success subtext line: {content:?}"
+        );
+        assert!(crate::services::discord::session_notice::is_inline(content));
+        assert!(content.encode_utf16().count() <= 2_000);
 
         pool.close().await;
         pg_db.drop().await;
@@ -609,9 +652,10 @@ mod dispatch_terminal_sync_pg_tests {
             .await
             .expect("release run token");
         assert!(
-            complete_run_on_pg(&pool, "run-1")
+            finalize_run_if_ready_pg(&pool, "run-1")
                 .await
                 .expect("recovery completion")
+                .is_completed()
         );
         assert_eq!(run_status(&pool, "run-1").await, "completed");
         assert_eq!(slot_run(&pool, "agent-1", 0).await, None);
@@ -675,7 +719,7 @@ mod dispatch_terminal_sync_pg_tests {
 
         let complete_pool = pool.clone();
         let completion =
-            tokio::spawn(async move { complete_run_on_pg(&complete_pool, "run-1").await });
+            tokio::spawn(async move { finalize_run_if_ready_pg(&complete_pool, "run-1").await });
         wait_for_run_advisory_waiter(&mut attach_conn).await;
 
         sqlx::query("COMMIT")
@@ -687,7 +731,10 @@ mod dispatch_terminal_sync_pg_tests {
             .expect("completion should finish after attach commit")
             .expect("join completion task")
             .expect("completion result");
-        assert!(!changed);
+        assert_eq!(
+            changed,
+            RunCompletionOutcome::Blocked(RunCompletionBlockedReason::RunnableEntry)
+        );
         assert_eq!(run_status(&pool, "run-1").await, "active");
         assert_eq!(
             slot_run(&pool, "agent-1", 0).await.as_deref(),
@@ -756,9 +803,10 @@ mod dispatch_terminal_sync_pg_tests {
         let pool = setup_pool(&pg_db).await;
 
         assert!(
-            complete_run_on_pg(&pool, "run-1")
+            finalize_run_if_ready_pg(&pool, "run-1")
                 .await
                 .expect("complete run before stale allocation")
+                .is_completed()
         );
         let allocation = allocate_slot_for_group_agent_pg(&pool, "run-1", 0, "agent-1")
             .await
@@ -2236,6 +2284,210 @@ mod dispatch_terminal_sync_pg_tests {
             ENTRY_STATUS_SKIPPED
         );
         assert_eq!(run_status(&pool, "run-1").await, "paused");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+}
+
+#[cfg(test)]
+mod card_soft_delete_pg_tests {
+    use super::{GenerateCardFilter, list_backlog_cards_pg, list_generate_candidates_pg};
+    use crate::db::auto_queue::test_support::TestPostgresDb;
+    use crate::db::kanban_cards::{
+        CardDeleteOutcome, IssueCardUpsert, ListCardsFilter, card_status_pg, list_cards_pg,
+        load_card_json_pg, soft_delete_card_pg, upsert_card_from_issue_pg,
+    };
+    use sqlx::PgPool;
+
+    async fn setup(pg_db: &TestPostgresDb) -> PgPool {
+        let pool = pg_db.connect_and_migrate().await;
+        sqlx::query(
+            "INSERT INTO agents (id, name, provider, discord_channel_id)
+             VALUES ('agent-1', 'Agent 1', 'claude', '123')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed agent");
+        pool
+    }
+
+    async fn seed_card(pool: &PgPool, id: &str, status: &str, issue: Option<i64>) {
+        sqlx::query(
+            "INSERT INTO kanban_cards (id, title, status, repo_id, github_issue_number, assigned_agent_id)
+             VALUES ($1, $1, $2, 'owner/repo', $3, 'agent-1')",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(issue)
+        .execute(pool)
+        .await
+        .expect("seed card");
+    }
+
+    async fn seed_dispatch(pool: &PgPool, id: &str, card_id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO task_dispatches (id, kanban_card_id, to_agent_id, dispatch_type, status, title)
+             VALUES ($1, $2, 'agent-1', 'implementation', $3, $1)",
+        )
+        .bind(id)
+        .bind(card_id)
+        .bind(status)
+        .execute(pool)
+        .await
+        .expect("seed dispatch");
+    }
+
+    fn issue(number: i64) -> IssueCardUpsert {
+        IssueCardUpsert {
+            repo_id: "owner/repo".to_string(),
+            issue_number: number,
+            issue_url: None,
+            title: "again".to_string(),
+            description: None,
+            priority: None,
+            assigned_agent_id: None,
+            metadata_json: None,
+            status_on_create: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_card_with_dispatch_history_is_hidden_instead_of_deleted_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup(&pg_db).await;
+        seed_card(&pool, "card-hist", "ready", Some(7)).await;
+        seed_dispatch(&pool, "d-done", "card-hist", "completed").await;
+
+        let outcome = soft_delete_card_pg(&pool, "card-hist").await;
+        assert_eq!(outcome, Ok(CardDeleteOutcome::Deleted));
+
+        let (stamped, issue_freed, dispatches): (bool, bool, i64) = sqlx::query_as(
+            "SELECT kc.deleted_at IS NOT NULL, kc.github_issue_number IS NULL,
+                    (SELECT COUNT(*) FROM task_dispatches WHERE kanban_card_id = kc.id)
+             FROM kanban_cards kc WHERE kc.id = 'card-hist'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("card row is kept");
+        assert_eq!((stamped, issue_freed, dispatches), (true, true, 1));
+        assert_eq!(card_status_pg(&pool, "card-hist").await, Ok(None));
+        assert_eq!(load_card_json_pg(&pool, "card-hist").await, Ok(None));
+        let listed = list_cards_pg(&pool, &ListCardsFilter::default(), &[])
+            .await
+            .expect("list cards");
+        assert!(listed.iter().all(|card| card.id != "card-hist"));
+        assert_eq!(
+            soft_delete_card_pg(&pool, "card-hist").await,
+            Ok(CardDeleteOutcome::NotFound)
+        );
+
+        let again = upsert_card_from_issue_pg(&pool, issue(7))
+            .await
+            .expect("register the issue again");
+        assert!(again.created, "a deleted card's issue gets a fresh card");
+        assert_ne!(again.card_id, "card-hist");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn a_card_is_not_deleted_while_a_dispatch_works_on_it_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup(&pg_db).await;
+        seed_card(&pool, "card-live", "in_progress", None).await;
+        seed_dispatch(&pool, "d-live", "card-live", "dispatched").await;
+
+        assert_eq!(
+            soft_delete_card_pg(&pool, "card-live").await,
+            Ok(CardDeleteOutcome::LiveDispatch("d-live".to_string()))
+        );
+        assert_eq!(
+            card_status_pg(&pool, "card-live").await,
+            Ok(Some("in_progress".to_string()))
+        );
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_card_skips_its_pending_auto_queue_entry_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup(&pg_db).await;
+        sqlx::query(
+            "INSERT INTO auto_queue_runs (id, repo, agent_id, status)
+             VALUES ('run-1', 'owner/repo', 'agent-1', 'active')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed run");
+        seed_card(&pool, "card-queued", "ready", None).await;
+        sqlx::query(
+            "INSERT INTO auto_queue_entries (id, run_id, kanban_card_id, agent_id, status)
+             VALUES ('entry-1', 'run-1', 'card-queued', 'agent-1', 'pending')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed entry");
+
+        assert_eq!(
+            soft_delete_card_pg(&pool, "card-queued").await,
+            Ok(CardDeleteOutcome::Deleted)
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM auto_queue_entries WHERE id = 'entry-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("entry status");
+        assert_eq!(status, "skipped");
+
+        pool.close().await;
+        pg_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn deleted_cards_get_no_queue_slot_and_no_new_dispatch_pg() {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = setup(&pg_db).await;
+        seed_card(&pool, "gone-ready", "ready", None).await;
+        seed_card(&pool, "gone-backlog", "backlog", None).await;
+        seed_card(&pool, "kept-ready", "ready", None).await;
+        sqlx::query("UPDATE kanban_cards SET deleted_at = NOW() WHERE id LIKE 'gone-%'")
+            .execute(&pool)
+            .await
+            .expect("delete two cards");
+
+        let filter = GenerateCardFilter::default();
+        let candidates = list_generate_candidates_pg(&pool, &filter, &["ready".to_string()])
+            .await
+            .expect("generate candidates");
+        let ids: Vec<_> = candidates.iter().map(|c| c.card_id.as_str()).collect();
+        assert_eq!(ids, ["kept-ready"]);
+        let backlog = list_backlog_cards_pg(&pool, &filter)
+            .await
+            .expect("backlog cards");
+        assert!(backlog.is_empty(), "{backlog:?}");
+
+        let created = crate::dispatch::create_dispatch_core(
+            &pool,
+            "gone-ready",
+            "agent-1",
+            "implementation",
+            "work",
+            &serde_json::json!({}),
+        )
+        .await;
+        let error = created
+            .expect_err("a deleted card gets no dispatch")
+            .to_string();
+        assert!(error.contains("Card not found"), "{error}");
+        let dispatches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_dispatches")
+            .fetch_one(&pool)
+            .await
+            .expect("count dispatches");
+        assert_eq!(dispatches, 0);
 
         pool.close().await;
         pg_db.drop().await;

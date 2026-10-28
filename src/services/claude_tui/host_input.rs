@@ -2,96 +2,6 @@
 //! pane mutation, and typed outcomes. A confirmed tmux session takes keys; a recorded
 //! Herdr pane takes them only through its own gate.
 
-use std::process::Output;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum NativeClearSubmission {
-    NotSent,
-    Confirmed,
-    Indeterminate,
-}
-
-pub(crate) fn submit_native_clear_tmux(
-    target: &InputTarget,
-    gate: &dyn MutationGate,
-    deadline: tokio::time::Instant,
-) -> NativeClearSubmission {
-    #[cfg(not(unix))]
-    {
-        let _ = (target, gate, deadline);
-        return NativeClearSubmission::NotSent;
-    }
-    // The caller supplies the resolved target; only a confirmed tmux session takes keys.
-    let InputTarget::Tmux(session) = target else {
-        return NativeClearSubmission::NotSent;
-    };
-    super::composer_lock::try_with_composer_mutation_lock(&session, || {
-        native_clear_once(
-            &session,
-            gate,
-            deadline,
-            |remaining| tmux::capture_pane_timeout(&session, -80, remaining),
-            |remaining| capture_draft_with("tmux", &session, remaining),
-            |keys, remaining| {
-                tmux::send_keys_timeout(&session, keys, remaining).is_ok_and(|o| o.status.success())
-            },
-        )
-    })
-    .unwrap_or(NativeClearSubmission::NotSent)
-}
-
-pub(super) fn native_clear_once(
-    session: &str,
-    gate: &dyn MutationGate,
-    deadline: tokio::time::Instant,
-    mut capture: impl FnMut(std::time::Duration) -> Option<String>,
-    draft: impl FnOnce(std::time::Duration) -> Option<String>,
-    mut send: impl FnMut(&[&str], std::time::Duration) -> bool,
-) -> NativeClearSubmission {
-    // The shared subprocess owner may spend 200ms killing and 2s reaping a timed-out child.
-    let remaining = || {
-        deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-            .saturating_sub(std::time::Duration::from_millis(2300))
-    };
-    let budget = remaining();
-    if budget.is_zero() {
-        return NativeClearSubmission::NotSent;
-    }
-    let Some(before) = capture(budget) else {
-        return NativeClearSubmission::NotSent;
-    };
-    if !native_clear_composer_empty(&before)
-        || remaining().is_zero()
-        || super::composer_lock::admit_composer_write(session, || draft(remaining())).is_err()
-        || gate.admit(session).is_err()
-    {
-        return NativeClearSubmission::NotSent;
-    }
-    crate::services::tui_prompt_dedupe::record_discord_originated_prompt(
-        "claude", session, "/clear",
-    );
-    // One command submits only slash-command characters and Enter; no retry follows.
-    let sent = send(&["/clear", "Enter"], remaining());
-    if !sent {
-        return NativeClearSubmission::Indeterminate;
-    }
-    if !remaining().is_zero()
-        && capture(remaining()).is_some_and(|c| native_clear_composer_empty(&c))
-    {
-        NativeClearSubmission::Confirmed
-    } else {
-        NativeClearSubmission::Indeterminate
-    }
-}
-
-pub(crate) fn native_clear_composer_empty(capture: &str) -> bool {
-    use crate::services::tmux_common as tc;
-    tc::tmux_capture_indicates_claude_tui_exact_empty_composer(capture)
-        && !tc::tmux_capture_indicates_claude_tui_busy(capture)
-        && !tc::tmux_capture_indicates_claude_tui_interactive_modal(capture)
-}
-
 use super::input::{
     POST_LITERAL_SETTLE, POST_PASTE_BUFFER_SETTLE, PROMPT_READY_CANCELLED_ERROR,
     PromptReadinessKind, TuiInputAction, ensure_tmux_success, literal_action_needs_post_settle,
@@ -107,6 +17,7 @@ use crate::services::session_host::{
     ResolvedSessionTarget, TargetHost, TmuxHost, herdr_endpoints,
 };
 use crate::services::tmux_common::tmux_capture_indicates_claude_tui_interactive_modal;
+use std::process::Output;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InputTarget {
@@ -263,7 +174,7 @@ struct TmuxInput;
 
 impl InputTransport for TmuxInput {
     fn send_literal(&mut self, session: &str, text: &str) -> Result<Output, String> {
-        tmux::send_literal(session, text)
+        TmuxHost.send_literal(session, text)
     }
 
     fn load_buffer(&mut self, buffer: &str, text: &str) -> Result<Output, String> {
@@ -276,7 +187,7 @@ impl InputTransport for TmuxInput {
         buffer: &str,
         delete: bool,
     ) -> Result<Output, String> {
-        tmux::paste_buffer(session, buffer, delete)
+        TmuxHost.paste_buffer(session, buffer, delete)
     }
 
     fn send_keys(&mut self, session: &str, keys: &[HostKey]) -> Result<Output, String> {
@@ -1087,276 +998,25 @@ mod spy {
     }
 }
 
-// A queued UI is confirmed only by a new exact enqueue in the same transcript.
-pub(super) struct SteeringReceipt {
-    binding: crate::services::tui_prompt_dedupe::TuiRuntimeBinding,
-    file: std::fs::File,
-    offset: u64,
-}
-
-impl SteeringReceipt {
-    pub(super) fn before(session: &str) -> Option<Self> {
-        use crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session_under_source_authority;
-        use std::io::{Seek, SeekFrom};
-        crate::services::tmux_common::with_tmux_source_authority(session, |authority| {
-            let binding = runtime_binding_for_tmux_session_under_source_authority(authority)?;
-            if binding.runtime_kind
-                != crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui
-                || binding
-                    .session_id
-                    .as_deref()
-                    .is_none_or(|id| id.trim().is_empty())
-                || !std::fs::symlink_metadata(&binding.output_path)
-                    .ok()?
-                    .is_file()
-            {
-                return None;
-            }
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            }
-            let mut file = options.open(&binding.output_path).ok()?;
-            if !file.metadata().ok()?.is_file() {
-                return None;
-            }
-            let offset = file.seek(SeekFrom::End(0)).ok()?;
-            Some(Self {
-                binding,
-                file,
-                offset,
-            })
-        })
-    }
-
-    pub(super) fn confirmed(mut self, session: &str, frame: &str) -> bool {
-        use crate::services::tui_prompt_dedupe::runtime_binding_for_tmux_session_under_source_authority;
-        use std::io::Read;
-        crate::services::tmux_common::with_tmux_source_authority(session, |authority| {
-            let Some(current) = runtime_binding_for_tmux_session_under_source_authority(authority)
-            else {
-                return false;
-            };
-            if current.runtime_kind != self.binding.runtime_kind
-                || current.output_path != self.binding.output_path
-                || current.session_id != self.binding.session_id
-                || !same_transcript(&self.file, &current.output_path)
-                || !self.file.metadata().is_ok_and(|m| m.len() >= self.offset)
-            {
-                return false;
-            }
-            let limit = crate::services::tui_input::actor::pane::MAX_PROMPT_BYTES * 8;
-            let mut appended = String::new();
-            if self
-                .file
-                .by_ref()
-                .take(limit as u64 + 1)
-                .read_to_string(&mut appended)
-                .is_err()
-                || appended.len() > limit
-                || !appended.ends_with('\n')
-                || !same_transcript(&self.file, &current.output_path)
-            {
-                return false;
-            }
-            let mut enqueues = 0;
-            let mut removed = false;
-            let mut attached = false;
-            for line in appended
-                .split_inclusive('\n')
-                .filter(|line| line.ends_with('\n'))
-            {
-                let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-                    return false;
-                };
-                if record["sessionId"].as_str() != current.session_id.as_deref() {
-                    continue;
-                }
-                if record["type"] == "queue-operation" && record["content"].as_str() == Some(frame)
-                {
-                    if record["operation"] == "enqueue" {
-                        enqueues += 1;
-                    }
-                    if record["operation"] == "remove" {
-                        removed = true;
-                    }
-                }
-                let attachment = &record["attachment"];
-                attached |= record["type"] == "attachment"
-                    && attachment["type"] == "queued_command"
-                    && attachment["commandMode"] == "prompt"
-                    && attachment["prompt"].as_str() == Some(frame);
-            }
-            enqueues == 1 && (!removed || attached)
-        })
-    }
-}
-
-fn same_transcript(file: &std::fs::File, path: &str) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match (file.metadata(), std::fs::symlink_metadata(path)) {
-            (Ok(a), Ok(b)) => b.is_file() && a.dev() == b.dev() && a.ino() == b.ino(),
-            _ => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (file, path);
-        false
-    }
-}
-
-pub(crate) mod guarded_submission;
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    use super::guarded_submission::confirm_prompt_submission_passively;
     use super::spy::{Spy, SpyGuard, SpyState, exit};
     use super::*;
-    use crate::services::claude_tui::input::{
-        CompactSubmitOutcome, claude_prompt_draft_backspace_budget_from_tail,
-        inject_steering_prompt, send_compact_while_busy,
-    };
+    use crate::services::claude_tui::input::{CompactSubmitOutcome, send_compact_while_busy};
     use crate::services::session_host::{SessionTargetInput, TargetSource, UnknownHost};
 
     const EMPTY_COMPOSER: &str = "Claude Code v2.1.141\n\n\u{276f} \nstatus";
     const BUSY: &str = "\u{2733} Architecting\u{2026}";
     const DRAFT: &str = "\u{276f} 남은 초안 한글";
 
-    #[test]
-    fn native_clear_indeterminate_never_retries_and_keeps_discord_provenance() {
-        let _state = crate::services::tui_prompt_dedupe::TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let session = format!("native-clear-input-{}", uuid::Uuid::new_v4());
-        let mut sends = 0;
-        let outcome = native_clear_once(
-            &session,
-            &LegacyTmuxGate,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(20),
-            |_| Some(EMPTY_COMPOSER.into()),
-            |_| None,
-            |keys, _| {
-                assert_eq!(keys, &["/clear", "Enter"]);
-                sends += 1;
-                false
-            },
-        );
-        assert_eq!(outcome, NativeClearSubmission::Indeterminate);
-        assert_eq!(sends, 1, "Indeterminate must not resend");
-        assert_eq!(
-            crate::services::tui_prompt_dedupe::observe_prompt_by_tmux(
-                "claude", &session, "/clear"
-            ),
-            crate::services::tui_prompt_dedupe::PromptObservation::SuppressedDiscordDuplicate
-        );
-    }
-
-    #[test]
-    fn native_clear_refuses_drafts_deadlines_and_changed_execution_before_send() {
-        let _state = crate::services::tui_prompt_dedupe::TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let session = format!("native-clear-refuse-{}", uuid::Uuid::new_v4());
-        for capture in [None, Some(DRAFT), Some(BUSY)] {
-            assert_eq!(
-                native_clear_once(
-                    &session,
-                    &LegacyTmuxGate,
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(20),
-                    |_| capture.map(str::to_owned),
-                    |_| None,
-                    |_, _| panic!("unready pane sent keys")
-                ),
-                NativeClearSubmission::NotSent
-            );
-        }
-        assert_eq!(
-            native_clear_once(
-                &session,
-                &LegacyTmuxGate,
-                tokio::time::Instant::now(),
-                |_| panic!("expired deadline captured pane"),
-                |_| None,
-                |_, _| panic!("expired deadline sent")
-            ),
-            NativeClearSubmission::NotSent
-        );
-        let refused = RefuseAfter(std::cell::Cell::new(0), InputRefusal::IdentityMismatch);
-        assert_eq!(
-            native_clear_once(
-                &session,
-                &refused,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(20),
-                |_| Some(EMPTY_COMPOSER.into()),
-                |_| None,
-                |_, _| panic!("changed execution sent")
-            ),
-            NativeClearSubmission::NotSent
-        );
-        for last in [EMPTY_COMPOSER, DRAFT] {
-            let mut captures = [EMPTY_COMPOSER, last].into_iter();
-            let result = native_clear_once(
-                &session,
-                &LegacyTmuxGate,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(20),
-                |_| captures.next().map(str::to_owned),
-                |_| None,
-                |_, _| true,
-            );
-            assert_eq!(
-                result,
-                if last == EMPTY_COMPOSER {
-                    NativeClearSubmission::Confirmed
-                } else {
-                    NativeClearSubmission::Indeterminate
-                }
-            );
-            crate::services::tui_prompt_dedupe::remove_discord_originated_prompt(
-                "claude", &session, "/clear",
-            );
-        }
-    }
-
-    #[test]
-    fn native_clear_unsupported_hosts_do_no_tmux_io() {
-        for host in [
-            known(HostKind::Herdr),
-            TargetHost::Unknown(UnknownHost::NoHostEvidence),
-        ] {
-            let target = ResolvedSessionTarget {
-                input: SessionTargetInput::RawName("native-clear-refused".into()),
-                session_key: None,
-                host,
-            };
-            assert_eq!(
-                super::super::input::submit_native_clear(
-                    &InputTarget::from_session_target(&target),
-                    &LegacyTmuxGate,
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(20)
-                ),
-                NativeClearSubmission::NotSent
-            );
-        }
-    }
-
     fn state(captures: &[Option<&str>]) -> SpyState {
         SpyState {
             captures: captures.iter().map(|c| c.map(str::to_string)).collect(),
             ..SpyState::default()
         }
-    }
-
-    fn keys(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| format!("keys:{name}")).collect()
     }
 
     fn run(spy: &mut Spy, gate: &dyn MutationGate, actions: &[TuiInputAction]) -> InputRun {
@@ -1393,56 +1053,6 @@ mod tests {
             source: TargetSource::SessionRecord,
             name: "AgentDesk-claude-p6a1".to_string(),
         }
-    }
-
-    #[test]
-    fn steering_submit_keeps_the_legacy_tmux_key_order() {
-        let name = "p6a1-spy-steering";
-        let prompt = format!("첫 줄 한글\n{}", "둘째 줄 긴 붙여넣기 ".repeat(800));
-        let guard = SpyGuard::install(state(&[Some(EMPTY_COMPOSER), Some(BUSY)]));
-        assert_eq!(inject_steering_prompt(name, &prompt), Ok(()));
-        let submitted = [
-            "capture".to_string(),
-            "alive".to_string(),
-            format!("load:{prompt}"),
-            "paste:delete=true".to_string(),
-            "keys:Enter".to_string(),
-            "capture".to_string(),
-            "alive".to_string(),
-        ];
-        assert_eq!(guard.calls(), submitted);
-        drop(guard);
-
-        // A failed paste keeps the legacy draft cleanup and never sends Enter.
-        let budget = claude_prompt_draft_backspace_budget_from_tail(DRAFT).unwrap();
-        let mut failing = state(&[Some(EMPTY_COMPOSER), Some(DRAFT)]);
-        failing.fail_send = Some((1, Ok(exit(1, "no buffer\n"))));
-        let guard = SpyGuard::install(failing);
-        assert_eq!(
-            inject_steering_prompt(name, &prompt),
-            Err("tmux send paste-buffer failed: no buffer".to_string())
-        );
-        let mut expected = vec![
-            "capture".to_string(),
-            "alive".to_string(),
-            format!("load:{prompt}"),
-            "paste:delete=true".to_string(),
-            "capture".to_string(),
-            "alive".to_string(),
-        ];
-        expected.extend(keys(&["C-u", "Escape", "C-u"]));
-        expected.extend(keys(&[&vec!["BSpace"; budget].join("+")]));
-        assert_eq!(guard.calls(), expected);
-        drop(guard);
-
-        // A long single line goes as 1800-char literal chunks, then Enter.
-        let line = "가".repeat(2000);
-        let guard = SpyGuard::install(state(&[Some(EMPTY_COMPOSER), Some(BUSY)]));
-        assert_eq!(inject_steering_prompt(name, &line), Ok(()));
-        let calls = guard.calls();
-        assert_eq!(calls[2], format!("literal:{}", "가".repeat(1800)));
-        assert_eq!(calls[3], format!("literal:{}", "가".repeat(200)));
-        assert_eq!(calls[4], "keys:Enter");
     }
 
     #[test]
@@ -1749,96 +1359,6 @@ mod tests {
         ] {
             for run in [send_failure.clone(), InputRun::Cancelled { confirmed: 1 }] {
                 assert!(!target.keys_may_follow(&run), "{target:?} {run:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn passive_claude_confirmation_never_retries_or_clears_a_draft() {
-        let idle = include_str!("../../../tests/fixtures/tui_input/claude-2.1.293-idle.txt");
-        for (capture, confirmed) in [
-            (Some("unknown screen"), false),
-            (Some("❯ foreign draft"), false),
-            (None, false),
-            (Some(idle), true),
-            (Some("✳ Architecting…"), true),
-            (
-                Some(
-                    "✳ Architecting…\n────────────────────\n❯ [User: A (ID:1)] stranded\n────────────────────\n",
-                ),
-                false,
-            ),
-            (
-                Some(
-                    "Do you want to proceed?\n  1. Yes\n  2. No\nEnter to confirm · esc to cancel\n✳ Architecting…",
-                ),
-                false,
-            ),
-            (Some("✳ Architecting…\n❯ \n"), false),
-            (
-                Some(
-                    "✳ Architecting…\n────────────────────\n❯ foreign\n  ❯ \n────────────────────\n",
-                ),
-                false,
-            ),
-            (
-                Some("✳ Architecting…\n❯ \nunindented continuation\n────────────────────\n"),
-                false,
-            ),
-            (
-                Some("✳ Architecting…\n────────────────────\n❯ \n────────────────────\n"),
-                true,
-            ),
-            (
-                Some(
-                    "❯ [User: A (ID:1)] previous prompt\n✳ Architecting…\n────────────────────\n❯ \n────────────────────\n",
-                ),
-                true,
-            ),
-        ] {
-            let spy = SpyGuard::install(SpyState {
-                captures: [capture.map(str::to_string)].into(),
-                ..SpyState::default()
-            });
-            assert_eq!(
-                confirm_prompt_submission_passively("passive-confirmation", None).is_ok(),
-                confirmed
-            );
-            assert!(
-                !spy.calls()
-                    .iter()
-                    .any(|c| c.starts_with("keys:") || c.starts_with("retire:"))
-            );
-        }
-    }
-
-    #[test]
-    fn passive_confirmation_checks_cancellation_before_and_after_its_only_capture() {
-        for cancel_after_capture in [false, true] {
-            let token = Arc::new(CancelToken::new());
-            let mut setup = state(&[Some(BUSY)]);
-            if cancel_after_capture {
-                setup.cancel_on = Some(("capture:draft", 1, token.clone()));
-            } else {
-                token.cancelled.store(true, Ordering::Relaxed);
-            }
-            let spy = SpyGuard::install(setup);
-            assert_eq!(
-                confirm_prompt_submission_passively("passive-cancel", Some(token.as_ref())),
-                Err(PROMPT_READY_CANCELLED_ERROR.to_string())
-            );
-            let calls = spy.calls();
-            assert_eq!(
-                calls.iter().filter(|c| c.starts_with("capture")).count(),
-                usize::from(cancel_after_capture)
-            );
-            assert!(
-                !calls
-                    .iter()
-                    .any(|c| c.starts_with("keys:") || c.starts_with("retire:"))
-            );
-            if !cancel_after_capture {
-                assert!(calls.is_empty());
             }
         }
     }

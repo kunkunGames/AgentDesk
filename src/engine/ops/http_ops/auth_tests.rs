@@ -78,32 +78,15 @@ async fn protected_api() -> (u16, Arc<Mutex<Vec<bool>>>, tokio::task::JoinHandle
 
 fn run_idle_recap(port: u16, server_port: u16, token: Option<&str>, tick_engine: bool) -> Value {
     let policies = tempfile::tempdir().unwrap();
-    // Use the actual policy module. Only its DB candidate and scheduling fixture
-    // are supplied here; HTTP registration and transport remain the real ones.
-    let idle_recap = include_str!("../../../../policies/timeouts/idle-recap.js");
     let script = format!(
         r#"
         var fixture = {{ name: "policy-http-auth-fixture", priority: 1 }};
         var observedResult = null;
         var continuedAfterRecap = false;
-        var nativePost = agentdesk.http.post;
-        agentdesk.http.post = function(url, body) {{
-            observedResult = nativePost(url, body);
-            return observedResult;
-        }};
-        agentdesk.db.query = function(sql) {{
-            return [{{ session_key: "codex/auth-fixture", provider: "codex", thread_channel_id: null }}];
-        }};
         agentdesk.config.get = function(key) {{ return key === "server_port" ? {port} : null; }};
-        agentdesk.log.error = function() {{}};
-        agentdesk.log.info = function() {{}};
-        (function() {{
-            var module = {{ exports: {{}} }};
-            {idle_recap}
-            module.exports(fixture, {{ parseSessionThreadId: function() {{ return null; }} }});
-        }})();
         fixture.onTick5min = function() {{
-            fixture._section_R_idle_recap();
+            var url = "http://127.0.0.1:" + agentdesk.config.get("server_port") + "/api/sessions/codex%2Fauth-fixture/idle-recap";
+            observedResult = agentdesk.http.post(url, {{ retry: false }});
             continuedAfterRecap = true;
         }};
         agentdesk.registerPolicy(fixture);

@@ -91,7 +91,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/sessions/{session_key}/force-kill",
             "sessions",
-            "Force-kill session and optionally retry",
+            "Force-kill session and optionally retry. With the P11 terminate switch on, a Claude/Codex Herdr execution the session row owns is retired through the terminate service instead of the tmux kill; only then are the session disconnected and the dispatch failed or retried, and the reply adds `termination` with `lifecycle_path: herdr-terminate`.",
         )
         .with_example(
             json!({"path": {"session_key": "claude/hash123/mac-mini:AgentDesk-claude-adk-cc"}, "body": {"retry": true, "reason": "stalled turn"}}),
@@ -712,7 +712,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/routines/{id}/session/reset",
             "routines",
-            "Reset the provider session for a persistent agent-backed routine. `session.queue_preserved` is nullable: null means unmeasured, including Reset and remote-owned teardown; it does not assert preservation. Claude sends /clear; managed tmux providers reset the process session; providers without managed tmux clear runtime mailbox state only.",
+            "Reset the provider session for a persistent agent-backed routine. Fresh routines return 409 Conflict because session control requires execution_strategy=persistent. `session.queue_preserved` is nullable: null means unmeasured, including Reset and remote-owned teardown; it does not assert preservation. Claude sends /clear; managed tmux providers reset the process session; providers without managed tmux clear runtime mailbox state only.",
         )
         .with_params([("id", path_param("Routine id"))])
         .with_example(
@@ -723,7 +723,7 @@ pub(super) fn endpoints() -> Vec<EndpointDoc> {
             "POST",
             "/api/routines/{id}/session/kill",
             "routines",
-            "Force-kill the provider session for a persistent agent-backed routine (`session.queue_preserved` is true/false only when measured, otherwise null), disconnect matching session rows, and interrupt the routine's in-flight run when the session actually changes.",
+            "Force-kill the provider session for a persistent agent-backed routine. Fresh routines return 409 Conflict because session control requires execution_strategy=persistent. `session.queue_preserved` is true/false only when measured, otherwise null. Disconnect matching session rows and interrupt the routine's in-flight run when the session actually changes.",
         )
         .with_params([("id", path_param("Routine id"))])
         .with_example(

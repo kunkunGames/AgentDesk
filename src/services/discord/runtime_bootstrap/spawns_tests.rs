@@ -7,8 +7,7 @@
 use super::*;
 
 #[tokio::test]
-async fn c2_deferred_marking_skips_old_format_held_rows_before_backfill() {
-    use crate::services::discord::input_runtime::{self, fence};
+async fn deferred_marking_backfills_old_rows_and_marks_siblings() {
     let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
@@ -40,22 +39,17 @@ async fn c2_deferred_marking_skips_old_format_held_rows_before_backfill() {
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     old.as_object_mut().unwrap().remove("finalizer_turn_id");
     std::fs::write(&path, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
-    let before = std::fs::read(&path).unwrap();
-    let gate = fence::Gate::protect(provider.clone(), held).unwrap();
-    let _health = fence::test_health::Clear::new(&gate);
-    let _closing = gate.close().unwrap();
     assert!(deferred_restart_marked(&provider).await);
     let legacy_row = inflight::load_inflight_state(&provider, legacy).unwrap();
     assert_eq!(
         legacy_row.restart_mode,
         Some(crate::services::discord::InflightRestartMode::DrainRestart)
     );
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-    assert!(
-        !input_runtime::health_reasons()
-            .iter()
-            .any(|reason| reason.contains(&format!("channel={held}"))),
-        "deferred marking must not attempt a compatibility writer"
+    let marked: InflightTurnState = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(marked.finalizer_turn_id, held + 1);
+    assert_eq!(
+        marked.restart_mode,
+        Some(crate::services::discord::InflightRestartMode::DrainRestart)
     );
 }
 
@@ -103,11 +97,10 @@ async fn wait_for_deferred(mut done: impl FnMut() -> bool) {
     panic!("deferred restart poller never reached the expected state");
 }
 
-/// The actual poller marks a protected open row from async code and still consumes its slot
+/// The actual poller marks an open row from async code and still consumes its slot
 /// when the scan could not read every row, as a short scan always did.
 #[tokio::test(start_paused = true)]
 async fn c2b_deferred_poller_marks_rows_and_proceeds_past_an_incomplete_scan() {
-    use crate::services::discord::input_runtime::{self, fence};
     let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let temp = tempfile::tempdir().unwrap();
     let _env = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
@@ -127,8 +120,6 @@ async fn c2b_deferred_poller_marks_rows_and_proceeds_past_an_incomplete_scan() {
         [0xff, 0xfe],
     )
     .unwrap();
-    let gate = fence::Gate::protect(provider.clone(), open).unwrap();
-    let _health = fence::test_health::Clear::new(&gate);
     std::fs::write(
         temp.path().join("restart_pending"),
         "nonce=c2b-incomplete\n",
@@ -151,16 +142,7 @@ async fn c2b_deferred_poller_marks_rows_and_proceeds_past_an_incomplete_scan() {
     assert_eq!(event["incomplete"], true);
     assert_eq!(event["failed"], serde_json::json!([]));
     assert!(deferred_row_marked(&plain_path));
-    assert!(
-        deferred_row_marked(&open_path),
-        "protected open row left unmarked"
-    );
-    assert!(
-        !input_runtime::health_reasons()
-            .iter()
-            .any(|reason| reason.contains(&format!("channel={open}"))),
-        "the protected open row saw a refused writer"
-    );
+    assert!(deferred_row_marked(&open_path), "open row left unmarked");
 }
 
 /// With no protected channel, the actual poller marks the readable row and consumes its slot past
@@ -494,7 +476,7 @@ fn cancellation_before_durable_commit_rolls_back_but_after_commit_stays_committe
     )
     .expect("restart request");
 
-    let permit = begin_deferred_restart(&shared).expect("restart permit");
+    let _permit = begin_deferred_restart(&shared).expect("restart permit");
     let guard = DeferredRestartCancellationGuard::new(
         shared.clone(),
         root.path().to_path_buf(),
@@ -512,7 +494,6 @@ fn cancellation_before_durable_commit_rolls_back_but_after_commit_stays_committe
     drop(guard);
     assert_eq!(shared.restart.shutdown_remaining.load(Ordering::Acquire), 1);
     assert!(!shared.restart.intake_worker_lifecycle.admission_is_fenced());
-    drop(permit);
 
     std::fs::remove_file(root.path().join("restart_cancelled")).expect("clear cancellation");
     let permit = begin_deferred_restart(&shared).expect("new restart permit");

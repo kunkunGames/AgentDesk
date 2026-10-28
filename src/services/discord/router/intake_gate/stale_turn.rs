@@ -11,7 +11,15 @@ enum StaleActiveTurnProofClassification {
 struct StaleActiveTurnProof {
     classification: StaleActiveTurnProofClassification,
     snapshot: crate::services::discord::health::WatcherStateSnapshot,
+    /// The row the verdict was computed from.
+    inflight: crate::services::discord::inflight::InflightTurnState,
+    /// Taken before every evidence read.
+    observed_before: std::time::Instant,
 }
+
+#[path = "thread_guard_release.rs"]
+mod thread_guard_release;
+use thread_guard_release::{ThreadGuardStaleWitness, thread_guard_force_clean_stale_thread};
 
 /// Non-unix builds have no tmux reachability evidence source: every warrant
 /// operand is absent, so the warrant abstains and the structural
@@ -90,10 +98,13 @@ fn bind_stale_active_turn_proof(
     inflight: &crate::services::discord::inflight::InflightTurnState,
     snapshot: crate::services::discord::health::WatcherStateSnapshot,
     now_unix_secs: i64,
+    observed_before: std::time::Instant,
 ) -> StaleActiveTurnProof {
     StaleActiveTurnProof {
         classification: classify_stale_active_turn_proof(inflight, &snapshot, now_unix_secs),
         snapshot,
+        inflight: inflight.clone(),
+        observed_before,
     }
 }
 
@@ -103,6 +114,7 @@ async fn classify_channel_stale_active_turn_proof(
     channel_id: serenity::ChannelId,
     now_unix_secs: i64,
 ) -> Option<StaleActiveTurnProof> {
+    let observed_before = std::time::Instant::now();
     let inflight =
         crate::services::discord::inflight::load_inflight_state(provider, channel_id.get())?;
     let registry = shared.health_registry.upgrade()?;
@@ -113,6 +125,7 @@ async fn classify_channel_stale_active_turn_proof(
         &inflight,
         snapshot,
         now_unix_secs,
+        observed_before,
     ))
 }
 
@@ -133,21 +146,39 @@ async fn classify_channel_stale_active_turn_proof(
 /// during startup before the stall-watchdog would also be running, so
 /// deferring cleanup costs nothing. A session whose host is not a confirmed
 /// legacy tmux one is never force-cleaned either.
+/// The verdict is the witness of the one episode the clean may release.
 pub(super) async fn thread_guard_should_force_clean_stale_thread(
     shared: &std::sync::Arc<SharedData>,
     provider: &ProviderKind,
     thread_id: serenity::ChannelId,
     now_unix_secs: i64,
-) -> bool {
+) -> Option<ThreadGuardStaleWitness> {
     if !stale_turn_release_admitted(shared, provider, thread_id).await {
-        return false;
+        return None;
     }
-    let Some(proof) =
-        classify_channel_stale_active_turn_proof(shared, provider, thread_id, now_unix_secs).await
-    else {
-        return false;
-    };
-    stale_turn_axis_b_warrants(provider, &proof)
+    let proof =
+        classify_channel_stale_active_turn_proof(shared, provider, thread_id, now_unix_secs)
+            .await?;
+    if !stale_turn_axis_b_warrants(provider, &proof) {
+        return None;
+    }
+    ThreadGuardStaleWitness::bind(shared, thread_id, &proof)
+}
+
+/// The THREAD-GUARD's stale-thread release: `true` when the witnessed episode was released and
+/// intake proceeds, `false` when the bot message queues behind the thread.
+pub(super) async fn thread_guard_release_stale_thread(
+    shared: &std::sync::Arc<SharedData>,
+    provider: &ProviderKind,
+    thread_id: serenity::ChannelId,
+    now_unix_secs: i64,
+) -> bool {
+    let witness =
+        thread_guard_should_force_clean_stale_thread(shared, provider, thread_id, now_unix_secs);
+    match witness.await {
+        Some(witness) => thread_guard_force_clean_stale_thread(shared, provider, witness).await,
+        None => false,
+    }
 }
 
 /// Whether the turn's session is confirmed legacy, judged before the classification whose
@@ -163,68 +194,6 @@ async fn stale_turn_release_admitted(
     };
     tracing::warn!(channel_id = channel_id.get(), %reason, "stale turn release refused");
     false
-}
-
-/// #1446 Layer 2 — perform the THREAD-GUARD's stale-thread cleanup:
-///   1. drop the parent → thread mapping so subsequent intakes do not re-
-///      trigger the guard,
-///   2. delete the thread's inflight state file (releases the durable lock
-///      whose presence convinced `mailbox_has_active_turn` the dispatch is
-///      still live),
-///   3. **clear** the thread's mailbox (cancel token + active turn anchor +
-///      pending interventions). `cancel_active_turn` alone is insufficient
-///      here — for a dead-dispatch case there is no live turn task to
-///      observe the cancel signal and call `finish_turn`, so
-///      `has_active_turn()` would stay `true` forever and the next bot
-///      message would re-enter the THREAD-GUARD's queueing branch.
-///      `mailbox_clear_channel` synchronously drops `active_request_owner`
-///      / `active_user_message_id` and reports `has_active_turn() == false`
-///      immediately on completion (see `ChannelMailboxMsg::Clear` handler
-///      in `turn_orchestrator.rs`).
-///   4. complete the bookkeeping that the missing `finish_turn` would
-///      otherwise have done: cancel the orphaned token (kill any leftover
-///      child / tmux session) and decrement `global_active`. Mirrors the
-///      `placeholder_sweeper::finalize_abandoned_mailbox` cleanup
-///      pattern so health and deferred-restart counters do not leak.
-///
-/// We never touch the parent channel's own mailbox — only the thread's.
-/// This preserves the `watcher_owns_live_relay` invariant by leaving
-/// parent-side relay state untouched.
-pub(super) async fn thread_guard_force_clean_stale_thread(
-    shared: &std::sync::Arc<SharedData>,
-    provider: &ProviderKind,
-    _parent_channel_id: serenity::ChannelId,
-    thread_id: serenity::ChannelId,
-) {
-    if crate::services::discord::inflight::delete_inflight_state_file_checked(
-        provider,
-        thread_id.get(),
-    ) == crate::services::discord::inflight::InflightDeleteOutcome::ProtectedReceipt
-        && !crate::services::discord::inflight::receipt_mutant("stale-a")
-    {
-        return;
-    }
-    let ts = chrono::Local::now().format("%H:%M:%S");
-    tracing::info!(
-        "  [{ts}] 🔓 THREAD-GUARD: stale inflight detected for thread {}, cleaning up and proceeding",
-        thread_id
-    );
-    let thread_parent_kickoffs =
-        crate::services::discord::turn_finalizer::cleanup::collect_and_clear_thread_parents(
-            shared, thread_id,
-        );
-    crate::services::discord::turn_finalizer::cleanup::kickoff_thread_parents_after_finalize(
-        shared,
-        provider,
-        thread_parent_kickoffs,
-    );
-    let cleared = mailbox_clear_channel(shared, provider, thread_id).await;
-    crate::services::discord::stall_recovery::finalize_orphaned_clear(
-        shared,
-        thread_id,
-        cleared.removed_token,
-        "1446_thread_guard_stale_inflight",
-    );
 }
 
 /// #2044 F7 (P3 — documentation): invariant note.
@@ -321,7 +290,7 @@ pub(super) async fn mailbox_has_live_active_turn_or_cleanup_stale_proof(
     channel_id: serenity::ChannelId,
 ) -> bool {
     if !mailbox_has_active_turn(shared, channel_id).await {
-        return false;
+        return restarted_row_holds(shared, provider, channel_id);
     }
     if release_queue_blocked_stale_active_turn(
         shared,
@@ -331,14 +300,83 @@ pub(super) async fn mailbox_has_live_active_turn_or_cleanup_stale_proof(
     )
     .await
     {
-        return mailbox_has_active_turn(shared, channel_id).await;
+        return mailbox_has_active_turn(shared, channel_id).await
+            || restarted_row_holds(shared, provider, channel_id);
     }
     true
+}
+
+/// A prior process's Herdr row would refuse a start, so intake queues behind it as behind a turn.
+fn restarted_row_holds(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: serenity::ChannelId,
+) -> bool {
+    #[cfg(unix)]
+    let held =
+        crate::services::discord::recovery_engine::herdr_row_end::owner::restarted_herdr_hold(
+            provider,
+            channel_id.get(),
+            shared.restart.current_generation,
+        )
+        .is_some();
+    #[cfg(not(unix))]
+    let held = {
+        let _ = (shared, provider, channel_id);
+        false
+    };
+    held
 }
 
 #[cfg(all(test, unix))]
 #[path = "stale_turn_host_tests.rs"]
 mod host_tests;
+
+#[cfg(test)]
+#[path = "stale_turn_witness_tests.rs"]
+mod witness_tests;
+
+/// The THREAD-GUARD verdict and clean, and the QUEUE-GUARD, as intake runs them, for tests
+/// outside intake.
+#[cfg(test)]
+pub(in crate::services::discord) mod thread_guard_test_api {
+    use super::*;
+
+    pub(in crate::services::discord) use super::thread_guard_release::pause;
+
+    /// What the verdict hands the clean.
+    pub(in crate::services::discord) type Witness = ThreadGuardStaleWitness;
+
+    /// Whether the QUEUE-GUARD reads the channel's turn as active, after releasing a stale one.
+    pub(in crate::services::discord) async fn queue_guard_active(
+        shared: &std::sync::Arc<SharedData>,
+        provider: &ProviderKind,
+        channel: serenity::ChannelId,
+    ) -> bool {
+        mailbox_has_live_active_turn_or_cleanup_stale_proof(shared, provider, channel).await
+    }
+
+    pub(in crate::services::discord) async fn witness(
+        shared: &std::sync::Arc<SharedData>,
+        provider: &ProviderKind,
+        thread: serenity::ChannelId,
+    ) -> Option<Witness> {
+        let now = chrono::Utc::now().timestamp();
+        thread_guard_should_force_clean_stale_thread(shared, provider, thread, now).await
+    }
+
+    /// Whether the clean released the thread's turn.
+    pub(in crate::services::discord) async fn clean(
+        shared: &std::sync::Arc<SharedData>,
+        provider: &ProviderKind,
+        parent: serenity::ChannelId,
+        thread: serenity::ChannelId,
+        witness: Witness,
+    ) -> bool {
+        let _ = (parent, thread);
+        thread_guard_force_clean_stale_thread(shared, provider, witness).await
+    }
+}
 
 /// #1446 Layer 2 — these cases read inflight files via the runtime root
 /// override, so we keep the always-on slice that needs no `SharedData`
@@ -401,7 +439,7 @@ mod thread_guard_stale_pure_tests {
         std::fs::write(&path, json).expect("write seeded inflight");
     }
 
-    fn inflight_with_updated_at(
+    pub(super) fn inflight_with_updated_at(
         provider: &ProviderKind,
         channel_id: u64,
         updated_at: &str,
@@ -425,7 +463,7 @@ mod thread_guard_stale_pure_tests {
         state
     }
 
-    fn watcher_snapshot(
+    pub(super) fn watcher_snapshot(
         provider: &ProviderKind,
         channel_id: u64,
         user_msg_id: u64,
@@ -579,7 +617,9 @@ mod thread_guard_stale_pure_tests {
         {
             snapshot.reachability_observation = Some(observation.clone());
         }
-        let proof = super::bind_stale_active_turn_proof(&inflight, snapshot, now_unix);
+        let observed_before = std::time::Instant::now();
+        let proof =
+            super::bind_stale_active_turn_proof(&inflight, snapshot, now_unix, observed_before);
 
         assert_eq!(
             proof.classification,

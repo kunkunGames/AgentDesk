@@ -164,7 +164,7 @@ pub(super) async fn load(
         COALESCE(octet_length(d.result::text)>65536,false) AS oversized
         FROM task_dispatches d WHERE d.kanban_card_id=ANY($1) ORDER BY d.id LIMIT 513"
         .replace("__CONTROL_RECONCILIATION__", control_history::PROOF_SQL);
-    let dispatches = sqlx::query_as::<_, Dispatch>(&dispatch_sql)
+    let dispatches = sqlx::query_as::<_, Dispatch>(sqlx::AssertSqlSafe(dispatch_sql))
         .bind(&cards)
         .fetch_all(&mut **tx)
         .await?;

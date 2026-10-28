@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "pre_emit_guard/replay.rs"]
+mod replay;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -167,10 +170,10 @@ pub(super) async fn run_pre_emit_guard(
             provider: watcher_provider,
             placeholder_msg_id,
             response_sent_offset,
-            last_edit_text: last_edit_text,
+            last_edit_text,
             inflight_state: None,
             has_active_turn: false,
-            tmux_session_name: tmux_session_name,
+            tmux_session_name,
             task_notification_kind: None,
             reattach_offset_match: matched_reattach.is_some(),
         };
@@ -293,6 +296,9 @@ pub(super) async fn run_pre_emit_guard(
     // Detect stale session resume failure in watcher output
     let is_stale_resume = stale_resume_detected;
     if is_stale_resume {
+        if replay::blocked(context).await {
+            return PreEmitGuardOutcome::ContinueWatcherLoop;
+        }
         clear_provider_overload_retry_state(channel_id);
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::warn!(

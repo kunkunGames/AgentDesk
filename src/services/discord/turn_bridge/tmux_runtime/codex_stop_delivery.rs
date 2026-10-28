@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::claude_stop_delivery::{
     ClaudeStopDeliveryReservation, ClaudeStopTurnIdentity, ClaudeTuiInterruptPhase,
-    classify_tui_interrupt_phase,
+    classify_tui_interrupt_phase, claude_tui_stop_pane_evidence,
 };
 
 use crate::db::dispatched_sessions::hosted_execution::{HostedLookup, HostedRecord, HostedState};
@@ -182,6 +182,9 @@ impl Drop for TestBindingRoot {
 #[path = "codex_stop_delivery_tests.rs"]
 mod tests;
 
+#[path = "codex_stop_idle_evidence.rs"]
+mod idle_evidence;
+
 enum TurnIdentity {
     Claude(ClaudeStopTurnIdentity),
     Codex(CodexStopTurnIdentity),
@@ -256,8 +259,7 @@ pub(in crate::services::discord) enum HerdrDelivery {
 }
 
 fn holder(channel: u64) -> bool {
-    use crate::services::cluster::channel_home::{HomeRefusal, refusal};
-    channel != 0 && refusal(channel) != Some(HomeRefusal::NotHeld)
+    channel != 0
 }
 
 /// Whether `token`'s Herdr turn may take this user stop. It writes nothing: the mailbox records
@@ -662,7 +664,6 @@ pub(super) async fn interrupt_herdr(
         return HerdrDelivery::NotSent(Holder);
     }
     let (token, provider) = (token.clone(), provider.clone());
-    let home = crate::services::cluster::channel_home::registered_channel(channel);
     #[cfg(test)]
     let binding_root = crate::services::tui_prompt_dedupe::binding_events::test_root();
     let enabled = herdr_cancel_enabled();
@@ -671,7 +672,12 @@ pub(super) async fn interrupt_herdr(
     }
     let attempted = Arc::new(AtomicBool::new(false));
     let writer_attempted = attempted.clone();
+    // Tests capture the writer's events on the caller's thread-local subscriber.
+    #[cfg(test)]
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _trace = tracing::dispatcher::set_default(&dispatch);
         #[cfg(test)]
         let _root = TestBindingRoot::enter(binding_root.as_deref());
         #[cfg(test)]
@@ -682,7 +688,6 @@ pub(super) async fn interrupt_herdr(
             &provider,
             &target,
             channel,
-            home.as_deref(),
             &record.execution_nonce,
             &writer_attempted,
         );
@@ -721,19 +726,14 @@ fn deliver(
     provider: &ProviderKind,
     target: &HerdrTarget,
     channel: u64,
-    home: Option<&crate::services::cluster::channel_home::HomeGate>,
     nonce: &str,
     attempted: &AtomicBool,
 ) -> HerdrDelivery {
     use HerdrNotSent::*;
+    // A Claude idle refusal's evidence, logged only once the composer lock is released.
+    let idle = std::cell::Cell::new(None);
     let attempt = || -> Result<HerdrDelivery, HerdrNotSent> {
-        let held = || {
-            holder(channel)
-                && home.is_none_or(|home| {
-                    home.refusal()
-                        != Some(crate::services::cluster::channel_home::HomeRefusal::NotHeld)
-                })
-        };
+        let held = || holder(channel);
         let state = token.herdr_interrupt_state().ok_or(Pending)?;
         // The reservation belongs to the blocking writer, even if its async waiter disappears.
         let _claim = ClaudeStopDeliveryReservation::claim(token).ok_or(Duplicate)?;
@@ -787,23 +787,25 @@ fn deliver(
             {
                 return Err(Identity);
             }
-            let screen = target.capture(-160).ok_or_else(unobserved)?;
+            // One read decides: Codex's dim placeholder survives only in the styled read.
+            let screen = match provider {
+                ProviderKind::Codex => target.capture_ansi(-160),
+                _ => target.capture(-160),
+            }
+            .ok_or_else(unobserved)?;
+            let mut judged = None;
             let running = match provider {
                 ProviderKind::Claude => {
                     use crate::services::tmux_common as screen_state;
                     let structured = crate::services::tui_turn_state::runtime_binding_turn_state(
                         provider, &current,
                     );
-                    let ready =
-                        screen_state::tmux_capture_indicates_claude_tui_ready_for_input(&screen)
-                            || screen_state::tmux_capture_indicates_claude_tui_prompt_draft(
-                                &screen,
-                            );
-                    let active =
-                        screen_state::tmux_capture_indicates_claude_tui_actively_streaming(&screen);
+                    // The tmux stop's pane evidence and phase, plus modal and draft vetoes.
+                    let (ready, active, draft) = claude_tui_stop_pane_evidence(&screen);
+                    judged = Some((structured, ready, active, draft));
                     !screen_state::tmux_capture_indicates_claude_tui_interactive_modal(&screen)
-                        && !ready
-                        && classify_tui_interrupt_phase(structured, ready, active)
+                        && !draft
+                        && classify_tui_interrupt_phase(structured, ready || draft, active)
                             == ClaudeTuiInterruptPhase::ActiveGeneration
                 }
                 ProviderKind::Codex => {
@@ -812,6 +814,13 @@ fn deliver(
                 _ => false,
             };
             if !running && !mutant("running") {
+                if let Some(judged) = judged {
+                    let at = (channel, logical.as_str(), nonce);
+                    let sources = (&binding, &current);
+                    idle.set(Some(idle_evidence::IdleEvidence::new(
+                        token, provider, at, sources, judged, &screen,
+                    )));
+                }
                 return Err(Idle);
             }
             target.pin(HerdrMutation::Cancel).map_err(|_| Gate)?;
@@ -871,5 +880,11 @@ fn deliver(
             _ => Err(NotAdmitted),
         }
     };
-    attempt().unwrap_or_else(HerdrDelivery::NotSent)
+    let result = attempt();
+    if result == Err(Idle)
+        && let Some(evidence) = idle.take()
+    {
+        evidence.emit();
+    }
+    result.unwrap_or_else(HerdrDelivery::NotSent)
 }

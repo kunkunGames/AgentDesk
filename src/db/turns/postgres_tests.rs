@@ -21,8 +21,8 @@ async fn turn_timestamp_instants_are_independent_of_postgres_timezone_pg() {
         provider: Some("codex".into()),
         session_id: None,
         dispatch_id: None,
-        started_at: Some(started_at),
-        finished_at: Some(finished_at),
+        started_at: Some(started_at.to_rfc3339()),
+        finished_at: Some(finished_at.to_rfc3339()),
         duration_ms: Some(306_632),
         token_usage: TurnTokenUsage::default(),
     };

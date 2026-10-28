@@ -25,6 +25,9 @@ gated funnels. This gate keeps that cut honest on every intermediate head:
       raw claim (a claiming gate fn, or under tui_o any `.claim(` call or
       `::claim` path) may appear only in the RAW_CLAIM_SITES functions, each
       listed with its reason.
+  (e) TURN_MARK_SITES pins the fresh-turn admission helper and its Candidate
+      mark call. TURN_ADMISSION_ORDER keeps that hook ahead of provider
+      submission and bridge spawn along the production intake path.
 
 Census PASS is not flip readiness. `flip_ready` is reported on its own line and
 is true only when no census row is deferred and every FLIP_READY_TESTS funnel
@@ -52,6 +55,7 @@ from pathlib import Path
 PRIMITIVE_ROOT = "src/services/discord/"
 PRIMITIVES: dict[str, str] = {
     "send_channel_message*": r"\bsend_channel_message\w*\s*\(",
+    "dispatch_channel_message": r"\bdispatch_channel_message\s*\(",
     "edit_channel_message*": r"\bedit_channel_message\w*\s*\(",
     "replace_long_message*": r"\breplace_long_message\w*\s*\(",
     "send_long_message*": r"\bsend_long_message\w*\s*\(",
@@ -59,6 +63,10 @@ PRIMITIVES: dict[str, str] = {
     ".send_message": r"\.\s*send_message\s*\(",
     ".edit_message": r"\.\s*edit_message\s*\(",
     "TurnGateway::send_message": r"\bTurnGateway\s*::\s*send_message\s*\(",
+    ".send_notice_once": r"\.\s*send_notice_once\s*\(",
+    "TurnGateway::send_notice_once": r"\bTurnGateway\s*::\s*send_notice_once\s*\(",
+    "send_terminal_notice": r"\bsend_terminal_notice\s*\(",
+    "send_terminal_notice_http_once": r"\bsend_terminal_notice_http_once\s*\(",
     "TurnGateway::edit_message": r"\bTurnGateway\s*::\s*edit_message\s*\(",
     "deliver_turn_output*": r"\bdeliver_turn_output\w*\s*\(",
     "relay_recovered_terminal_text_to_placeholder": (
@@ -73,17 +81,22 @@ PRIMITIVES: dict[str, str] = {
     "edit_outbound_message": r"\bedit_outbound_message\s*\(",
 }
 _OWNS = r"o_owns_tui_output(?:_for_channel_tmux|_for_channel|_for_tmux_session|_with)?(?:_reserving)?"
-_RAW_CLAIM = rf"\b{_OWNS}\b|\bcandidate\s*\.\s*claim(?:_body)?\s*\("
+_CLAIM_METHOD = r"claim(?:_body(?:_from)?)?"
+_RAW_CLAIM = rf"\b{_OWNS}\b|\bcandidate\s*\.\s*{_CLAIM_METHOD}\s*\("
 RAW_CLAIM_RE = re.compile(_RAW_CLAIM)
 # `Candidate::claim` and `claim_body` are visible only under tui_o, so there every such call
 # and path counts, whatever the receiver or chain, and whether called or taken as a value.
 TUI_O_ROOT = "src/services/tui_o/"
-TUI_O_RAW_CLAIM_RE = re.compile(rf"{_RAW_CLAIM}|\.\s*claim(?:_body)?\s*\(|::\s*claim(?:_body)?\b")
+TUI_O_RAW_CLAIM_RE = re.compile(rf"{_RAW_CLAIM}|\.\s*{_CLAIM_METHOD}\s*\(|::\s*{_CLAIM_METHOD}\b")
 GATE_RES = {
     "claim": re.compile(rf"{_RAW_CLAIM}|\bclaim_then_(?:direct_)?send(?:_held)?\b|\bclaim_at_post\b"),
-    "peek": re.compile(rf"\b(?:peek_{_OWNS}|bridge_o_body_peek_decision)\b"),
+    "peek": re.compile(rf"\b(?:peek_{_OWNS}(?:_quiet)?|bridge_o_body_peek_decision)\b"),
 }
 FLAG_RE = re.compile(r"\bO_TUI_WRITER\b")
+TURN_MARK_RES = {
+    "admit": re.compile(r"\bmark_codex_turn_admitted\b"),
+    "mark": re.compile(r"\.\s*mark_turn_admitted\s*\(|::\s*mark_turn_admitted\b"),
+}
 DEFN_RE = re.compile(r"\bfn\s+$")
 FN_RE = re.compile(r"\bfn\s+(\w+)")
 # The switch is defined in topology.rs; the intake gate and its health probe read it there.
@@ -106,6 +119,7 @@ TARGETS = {
 DEFER_RE = re.compile(r"DEFER_[A-Z0-9_]+")
 R_EVID = (
     "src/services/discord/outbound/delivery_record.rs",
+    "src/services/discord/outbound/delivery_record/",
     "src/services/discord/outbound/completed_turn_ledger.rs",
     "src/services/discord/catch_up.rs",
     "src/services/discord/catch_up/",
@@ -120,42 +134,40 @@ R_EVID = (
 EXPECTED_PRIMITIVES: dict[str, dict[str, int]] = {
     "abandon_request_store.rs": {"edit_outbound_message": 1},
     "admin_host_guard.rs": {".say": 1},
-    "commands/config.rs": {".say": 12, "send_long_message*": 1},
-    "commands/control.rs": {".say": 14, "send_long_message*": 1},
-    "commands/control/home_fence.rs": {".say": 1},
-    "commands/diagnostics/mod.rs": {".say": 9, "send_long_message*": 7},
+    "commands/config.rs": {".say": 2},
+    "commands/control.rs": {".say": 11},
+    "commands/diagnostics/mod.rs": {"send_long_message*": 4},
     "commands/fast_mode.rs": {".say": 2},
     "commands/goals.rs": {".say": 2},
     "commands/help.rs": {".say": 2},
     "commands/inspect/mod.rs": {"send_long_message*": 2},
-    "commands/meeting_cmd.rs": {".say": 4},
     "commands/mod.rs": {".say": 1},
     "commands/model_picker.rs": {".say": 1, ".send_message": 1},
     "commands/node.rs": {".say": 3},
-    "commands/receipt.rs": {".say": 2, "send_long_message*": 1},
-    "commands/recovery_ops.rs": {".say": 3, "send_long_message*": 1},
-    "commands/restart.rs": {".say": 4},
-    "commands/session.rs": {".say": 8, "send_long_message*": 2},
-    "commands/skill.rs": {".say": 10, "send_long_message*": 3},
-    "commands/text_commands.rs": {".send_message": 2, "send_long_message*": 10},
+    "commands/receipt.rs": {"send_long_message*": 1},
+    "commands/restart.rs": {".say": 1, "send_channel_message*": 1},
+    "commands/session.rs": {".say": 5, "send_long_message*": 1},
+    "commands/skill.rs": {".say": 7, "send_long_message*": 3},
+    "commands/system_prompt.rs": {".say": 3},
     "commands/tui_passthrough.rs": {".say": 8},
+    "commands/tool_call.rs": {".say": 1},
     "commands/voice.rs": {".say": 6},
-    "discord_io.rs": {".send_message": 1},
+    "discord_io.rs": {"dispatch_channel_message": 1},
     "footer_view_reconciler/mod.rs": {"edit_channel_message*": 6},
-    "formatting/delivery.rs": {".say": 3, "send_channel_message*": 6, "send_long_message*": 2},
-    "formatting/long_send_rollback.rs": {"send_channel_message*": 6, "send_long_message*": 5},
+    "formatting/delivery.rs": {".say": 2, "dispatch_channel_message": 1, "send_channel_message*": 6, "send_long_message*": 2},
+    "formatting/long_send_rollback.rs": {"send_channel_message*": 6, "send_long_message*": 3},
     "formatting/replace_long_message.rs": {"edit_channel_message*": 1, "replace_long_message*": 5, "send_channel_message*": 1, "send_long_message*": 1},
-    "gateway.rs": {".edit_message": 1, ".send_message": 2, "TurnGateway::send_message": 1, "replace_long_message*": 2, "replace_message_with_outcome": 1, "send_long_message*": 1, "send_outbound_message": 1},
+    "gateway.rs": {".edit_message": 1, ".send_message": 2, "TurnGateway::send_message": 2, "send_terminal_notice_http_once": 1, "replace_long_message*": 2, "replace_message_with_outcome": 1, "send_long_message*": 1, "send_outbound_message": 1},
+    "gateway/headless_exact.rs": {"TurnGateway::send_message": 1, "TurnGateway::edit_message": 1, "replace_message_with_outcome": 1, "send_long_message*": 1},
     "health/recovery.rs": {"edit_channel_message*": 1, "send_channel_message*": 1},
-    "http.rs": {".edit_message": 2, ".send_message": 5, "send_channel_message*": 2},
-    "idle_recap/card.rs": {"edit_channel_message*": 1, "send_channel_message*": 1},
-    "input_runtime/intake/skills.rs": {".say": 1},
+    "http.rs": {".edit_message": 1, ".send_message": 5, "send_channel_message*": 2, "dispatch_channel_message": 2},
     "meeting_orchestrator/records.rs": {"send_long_message*": 3},
     "meeting_orchestrator/rounds.rs": {"send_long_message*": 1},
-    "meeting_orchestrator/selection_runtime.rs": {".edit_message": 1, ".send_message": 1},
-    "monitoring_status.rs": {".edit_message": 1, ".send_message": 1},
+    "meeting_orchestrator/selection_runtime.rs": {".edit_message": 1, "dispatch_channel_message": 1},
+    "monitoring_status.rs": {".edit_message": 1, "dispatch_channel_message": 1},
+    "outbound/confirmation.rs": {".send_notice_once": 1, "send_channel_message*": 1},
     "outbound/delivery.rs": {".edit_message": 1},
-    "outbound/manual_delivery.rs": {".send_message": 3},
+    "outbound/manual_delivery.rs": {"dispatch_channel_message": 3},
     "outbound/o_writer_io.rs": {".send_message": 1},
     "outbound/serenity_reference.rs": {".send_message": 2},
     "outbound/transport.rs": {".send_message": 1},
@@ -168,16 +180,19 @@ EXPECTED_PRIMITIVES: dict[str, dict[str, int]] = {
     "queue_io/turn_admission.rs": {"send_channel_message*": 1},
     "recovery_engine/completion_delivery.rs": {"relay_recovered_body_to_placeholder": 3},
     "recovery_engine/herdr_before_start_restart.rs": {"replace_message_with_outcome": 1},
+    "recovery_engine/herdr_row_end.rs": {"relay_recovered_terminal_text_to_placeholder": 2},
     "recovery_engine/restore_inflight.rs": {"relay_recovered_terminal_text_to_placeholder": 2},
     "recovery_engine/terminal_text_idempotency.rs": {"replace_long_message*": 2, "send_long_message*": 2},
     "recovery_engine/two_message_panel.rs": {"send_channel_message*": 1},
     "recovery_paths/controller_cutover.rs": {"deliver_turn_output*": 1},
     "recovery_paths/restart.rs": {"relay_recovered_body_to_placeholder": 1},
+    "router/herdr_consent.rs": {"send_channel_message*": 1},
+    "router/herdr_consent/return_input.rs": {"send_channel_message*": 1},
+    "router/herdr_consent/transport.rs": {"edit_channel_message*": 2, "send_channel_message*": 1},
     "router/intake_dispatch/notice.rs": {"send_channel_message*": 1},
     "router/intake_gate.rs": {".say": 3},
     "router/intake_gate/busy_inject.rs": {".say": 1},
-    "router/message_handler/attachments.rs": {".say": 4},
-    "router/message_handler/control.rs": {".say": 1},
+    "router/message_handler/attachments.rs": {"dispatch_channel_message": 4},
     "router/message_handler/goal_lifecycle.rs": {".say": 1},
     "router/message_handler/intake_turn.rs": {".say": 2},
     "router/message_handler/intake_turn/host_refusal.rs": {".say": 1},
@@ -206,11 +221,13 @@ EXPECTED_PRIMITIVES: dict[str, dict[str, int]] = {
     "tmux_watcher/terminal_long_chunks.rs": {"deliver_turn_output*": 1, "send_long_message*": 1},
     "tmux_watcher/terminal_send.rs": {"deliver_turn_output*": 1},
     "tmux_watcher/two_message_panel.rs": {"send_channel_message*": 1},
-    "tui_prompt_relay.rs": {".say": 2},
-    "tui_prompt_relay/bridge_gateway.rs": {"edit_outbound_message": 1, "replace_long_message*": 1, "send_long_message*": 1, "send_outbound_message": 1},
-    "tui_prompt_relay/synthetic_start_wiring.rs": {".say": 3},
+    "tui_prompt_relay.rs": {"dispatch_channel_message": 2},
+    "tui_prompt_relay/bridge_gateway.rs": {"send_terminal_notice_http_once": 1, "edit_outbound_message": 1, "replace_long_message*": 1, "send_long_message*": 1, "send_outbound_message": 1},
+    "tui_prompt_relay/synthetic_start_wiring.rs": {"dispatch_channel_message": 3},
     "turn_bridge/before_start_stop.rs": {"replace_message_with_outcome": 1},
     "turn_bridge/bridge_entry_persist.rs": {"TurnGateway::send_message": 1},
+    "turn_bridge/tmux_runtime/native_stop.rs": {"send_terminal_notice_http_once": 1},
+    "turn_end_summary.rs": {"send_terminal_notice": 1},
     "turn_bridge/current_message_anchor.rs": {"TurnGateway::edit_message": 1, "TurnGateway::send_message": 1},
     "turn_bridge/headless_delivery.rs": {"edit_channel_message*": 1, "send_long_message*": 1},
     "turn_bridge/mod.rs": {"TurnGateway::edit_message": 1},
@@ -218,8 +235,8 @@ EXPECTED_PRIMITIVES: dict[str, dict[str, int]] = {
     "turn_bridge/status_panel.rs": {".edit_message": 1, "TurnGateway::edit_message": 1, "edit_channel_message*": 2},
     "turn_bridge/status_panel/fallback.rs": {".send_message": 1, "send_channel_message*": 2},
     "turn_bridge/stream_loop/types.rs": {"replace_message_with_outcome": 1},
-    "turn_bridge/stream_tick.rs": {"TurnGateway::edit_message": 3, "TurnGateway::send_message": 1},
     "turn_bridge/stream_tick/o_panel.rs": {"TurnGateway::edit_message": 1},
+    "turn_bridge/stream_tick/output.rs": {"TurnGateway::edit_message": 3, "TurnGateway::send_message": 1},
     "turn_bridge/stream_tick/rollover_guard.rs": {"TurnGateway::edit_message": 2},
     "turn_bridge/terminal_controller_cutover.rs": {"deliver_turn_output*": 2},
     "turn_bridge/terminal_delivery.rs": {"send_long_message*": 1},
@@ -240,22 +257,20 @@ CENSUS: dict[str, tuple[str, ...]] = {
     "admin_host_guard.rs": ("CMD", "KEEP_NONBODY"),
     "commands/config.rs": ("CMD", "KEEP_NONBODY"),
     "commands/control.rs": ("CMD", "KEEP_NONBODY"),
-    "commands/control/home_fence.rs": ("CMD", "KEEP_NONBODY"),
     "commands/diagnostics/mod.rs": ("CMD", "KEEP_NONBODY"),
     "commands/fast_mode.rs": ("CMD", "KEEP_NONBODY"),
+    "commands/tool_call.rs": ("CMD", "KEEP_NONBODY"),
     "commands/goals.rs": ("CMD", "KEEP_NONBODY"),
     "commands/help.rs": ("CMD", "KEEP_NONBODY"),
     "commands/inspect/mod.rs": ("CMD", "KEEP_NONBODY"),
-    "commands/meeting_cmd.rs": ("CMD", "KEEP_NONBODY"),
     "commands/mod.rs": ("CMD", "KEEP_NONBODY"),
     "commands/model_picker.rs": ("CMD", "KEEP_NONBODY"),
     "commands/node.rs": ("CMD", "KEEP_NONBODY"),
     "commands/receipt.rs": ("CMD", "KEEP_NONBODY"),
-    "commands/recovery_ops.rs": ("CMD", "KEEP_NONBODY"),
     "commands/restart.rs": ("CMD", "KEEP_NONBODY"),
     "commands/session.rs": ("CMD", "KEEP_NONBODY"),
     "commands/skill.rs": ("CMD", "KEEP_NONBODY"),
-    "commands/text_commands.rs": ("CMD", "KEEP_NONBODY"),
+    "commands/system_prompt.rs": ("CMD", "KEEP_NONBODY"),
     "commands/tui_passthrough.rs": ("CMD", "KEEP_NONBODY"),
     "commands/voice.rs": ("CMD", "KEEP_NONBODY"),
     "discord_io.rs": ("W19", "KEEP_TRANSPORT"),
@@ -264,15 +279,14 @@ CENSUS: dict[str, tuple[str, ...]] = {
     "formatting/long_send_rollback.rs": ("W19", "KEEP_TRANSPORT"),
     "formatting/replace_long_message.rs": ("W19", "KEEP_TRANSPORT"),
     "gateway.rs": ("W19", "KEEP_TRANSPORT"),
+    "gateway/headless_exact.rs": ("W19", "KEEP_TRANSPORT"),
     "health/recovery.rs": ("W33", "CUT_D"),
     "http.rs": ("W19", "KEEP_TRANSPORT"),
-    "idle_recap/card.rs": ("W25", "KEEP_NONBODY"),
-    # The fixed custody ACK follows a durable receipt and carries no TUI body.
-    "input_runtime/intake/skills.rs": ("CMD", "KEEP_NONBODY"),
     "meeting_orchestrator/records.rs": ("MEETING", "KEEP_NONBODY"),
     "meeting_orchestrator/rounds.rs": ("MEETING", "KEEP_NONBODY"),
     "meeting_orchestrator/selection_runtime.rs": ("MEETING", "KEEP_NONBODY"),
     "monitoring_status.rs": ("OPS", "KEEP_NONBODY"),
+    "outbound/confirmation.rs": ("TURN-END-TRANSPORT", "KEEP_TRANSPORT"),
     "outbound/delivery.rs": ("W19", "KEEP_TRANSPORT"),
     "outbound/manual_delivery.rs": ("W19", "KEEP_TRANSPORT"),
     "outbound/o_writer_io.rs": ("O", "KEEP_TRANSPORT"),
@@ -289,17 +303,21 @@ CENSUS: dict[str, tuple[str, ...]] = {
     "recovery_engine/completion_delivery.rs": ("W30,W31", "CUT_D"),
     # Dormant restart stop notice on the turn's own message, sent only when O peek is Ok(false).
     "recovery_engine/herdr_before_start_restart.rs": ("1-D-notice", "KEEP_NONBODY"),
+    # Neutral restart notice on the turn's own card or a new message: no body, claim or context.
+    "recovery_engine/herdr_row_end.rs": ("1-D-notice", "KEEP_NONBODY"),
     "recovery_engine/restore_inflight.rs": ("1-D-notice", "KEEP_NONBODY"),
     "recovery_engine/terminal_text_idempotency.rs": ("W32", "COV:W32"),
     "recovery_engine/two_message_panel.rs": ("1-D-panel", "KEEP_NONBODY"),
     "recovery_paths/controller_cutover.rs": ("W30a", "COV:W30"),
     "recovery_paths/restart.rs": ("W35", "CUT_D", "recovery_engine/terminal_text_idempotency.rs"),
+    "router/herdr_consent.rs": ("HERDR-CONSENT", "KEEP_NONBODY"),
+    "router/herdr_consent/return_input.rs": ("HERDR-CONSENT", "KEEP_NONBODY"),
+    "router/herdr_consent/transport.rs": ("HERDR-CONSENT", "KEEP_NONBODY"),
     "router/intake_dispatch/notice.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/intake_gate.rs": ("INTAKE", "KEEP_NONBODY"),
     # Injection notices (unconfirmed paste, unknown handback); no body text.
     "router/intake_gate/busy_inject.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/message_handler/attachments.rs": ("INTAKE", "KEEP_NONBODY"),
-    "router/message_handler/control.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/message_handler/goal_lifecycle.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/message_handler/intake_turn.rs": ("INTAKE", "KEEP_NONBODY"),
     "router/message_handler/intake_turn/host_refusal.rs": ("INTAKE", "KEEP_NONBODY"),
@@ -333,15 +351,17 @@ CENSUS: dict[str, tuple[str, ...]] = {
     "tui_prompt_relay/synthetic_start_wiring.rs": ("W24", "KEEP_NONBODY"),
     "turn_bridge/before_start_stop.rs": ("1-D-notice", "KEEP_NONBODY"),
     "turn_bridge/bridge_entry_persist.rs": ("1-D-notice", "KEEP_NONBODY"),
+    "turn_bridge/tmux_runtime/native_stop.rs": ("native-stop-notice", "KEEP_NONBODY"),
     "turn_bridge/current_message_anchor.rs": ("W15", "KEEP_NONBODY"),
     "turn_bridge/headless_delivery.rs": ("W17", "KEEP_36"),
     "turn_bridge/mod.rs": ("W18", "KEEP_NONBODY"),
+    "turn_end_summary.rs": ("TURN-END", "KEEP_NONBODY"),
     "turn_bridge/single_message_footer.rs": ("W16", "KEEP_NONBODY"),
     "turn_bridge/status_panel.rs": ("1-B-panel", "KEEP_NONBODY"),
     "turn_bridge/status_panel/fallback.rs": ("1-B-panel", "KEEP_NONBODY"),
     "turn_bridge/stream_loop/types.rs": ("W10e", "COV:W10"),
-    "turn_bridge/stream_tick.rs": ("W14", "CUT_D"),
     "turn_bridge/stream_tick/o_panel.rs": ("1-B-panel", "KEEP_NONBODY"),
+    "turn_bridge/stream_tick/output.rs": ("W14", "CUT_D"),
     "turn_bridge/stream_tick/rollover_guard.rs": ("W14a", "COV:W14"),
     "turn_bridge/terminal_controller_cutover.rs": ("W10b-c", "COV:W10"),
     "turn_bridge/terminal_delivery.rs": ("W10d", "COV:W10"),
@@ -363,7 +383,9 @@ CENSUS: dict[str, tuple[str, ...]] = {
 # Each file's cutover gates as `enclosing fn:kind`, in source order.
 # claim: a body is sent here (`claim_then_send`, or a RAW_CLAIM_SITES claim). peek: only read.
 EXPECTED_GATES: dict[str, tuple[str, ...]] = {
-    "src/services/discord/commands/control/native.rs": ("select:peek",),
+    "src/services/discord/tmux_watcher/terminal_relay_plan.rs": ("run_terminal_relay_plan:peek",),
+    "src/services/discord/inflight/clear_store/herdr_row_end.rs": ("o_still_owns:peek",),
+    "src/services/discord/turn_end_summary.rs": ("post_live:peek",),
     "src/services/discord/footer_view_reconciler/mod.rs": (
         "edit_body_message:claim",
     ),
@@ -371,9 +393,7 @@ EXPECTED_GATES: dict[str, tuple[str, ...]] = {
         "maybe_recover_completed_stale_leak:peek",
         "maybe_recover_completed_stale_leak:claim",
     ),
-    "src/services/discord/idle_recap.rs": (
-        "probe_relay_integrity:peek",
-    ),
+    "src/services/discord/outbound/completed_turn_ledger/o_pending.rs": ("capture:peek",),
     "src/services/discord/outbound/turn_output_controller.rs": (
         "deliver_turn_output_with_fallback_revalidation:claim",
     ),
@@ -384,8 +404,11 @@ EXPECTED_GATES: dict[str, tuple[str, ...]] = {
         "o_owns_recovery_body:peek",
         "relay_recovered_body_to_placeholder:claim",
     ),
-    "src/services/discord/recovery_engine/herdr_admitted_restart.rs": ("o_owns:peek",),
-    "src/services/discord/recovery_engine/herdr_before_start_restart.rs": ("o_owns:peek",),
+    "src/services/discord/recovery_engine/herdr_row_end.rs": ("o_owns_output:peek",),
+    "src/services/discord/recovery_engine/producer_resume.rs": (
+        "authority:peek",
+        "prepare:peek",
+    ),
     "src/services/discord/recovery_engine/terminal_text_idempotency.rs": (
         "relay_no_anchor_terminal_text:claim",
         "relay_no_anchor_terminal_text:claim",
@@ -422,8 +445,6 @@ EXPECTED_GATES: dict[str, tuple[str, ...]] = {
     ),
     "src/services/discord/tmux_watcher/o_delegated_arm.rs": (
         "o_took_channel:peek",
-        # After card await, consumption requires an explicit Ok(true) ownership peek.
-        "under_current_authority:peek",
     ),
     "src/services/discord/tmux_watcher/streaming_status_tick.rs": (
         "update_streaming_status_tick:peek",
@@ -443,20 +464,23 @@ EXPECTED_GATES: dict[str, tuple[str, ...]] = {
         "apply_watcher_long_chunks_legacy:claim",
     ),
     "src/services/discord/tui_prompt_relay/claude_idle_bridge.rs": ("idle_tail_tool_opens:peek",),
-    "src/services/discord/turn_bridge/before_start_stop.rs": ("consume:peek",),
+    "src/services/discord/turn_bridge/before_start_stop.rs": ("o_owns_body:peek",),
     "src/services/discord/turn_bridge/headless_delivery.rs": (
         "enqueue_claimed_headless_delivery:claim",
     ),
     "src/services/discord/turn_bridge/runtime_handoff_loop/watcher_handoff.rs": (
         "handle_watcher_runtime_handoff:peek",
     ),
+    "src/services/discord/turn_bridge/response_delivery.rs": ("stream_body_ownership_peek:peek",),
     "src/services/discord/turn_bridge/stream_loop/types.rs": (
         "deliver:claim",
         "deliver:claim",
     ),
     "src/services/discord/turn_bridge/stream_tick.rs": (
         "run_bridge_stream_tick:peek",
-        "run_bridge_stream_tick:claim",
+    ),
+    "src/services/discord/turn_bridge/stream_tick/output.rs": (
+        "refresh_streaming_response:claim",
     ),
     "src/services/discord/turn_bridge/stream_tick/rollover_guard.rs": (
         "guarded_bridge_rollover_edit:claim",
@@ -487,22 +511,39 @@ EXPECTED_GATES: dict[str, tuple[str, ...]] = {
         "claim_for_placement:claim",
     ),
     "src/services/tui_o/cutover/channel_gate.rs": (
-        "claim:claim",
-        "claim:claim",
         "claim_then_send:claim",
+        "decide_with_snapshot:claim",
         "decide_with_snapshot:claim",
     ),
 }
 # Functions where a raw claim may stand outside `claim_then_send`, keyed by file.
 RAW_CLAIM_SITES: dict[str, tuple[str, ...]] = {
     # The helper's own claim, and the adoption transition it reaches.
-    "src/services/tui_o/cutover/channel_gate.rs": ("claim", "claim_then_send_held", "decide_with_snapshot"),
+    "src/services/tui_o/cutover/channel_gate.rs": ("claim_then_send_held", "decide_with_snapshot"),
+    # The caller-location wrapper forwards to the same locked body claim and origin log.
+    "src/services/tui_o/channel_policy/adoption.rs": ("claim_body",),
     # Re-exports; a placement releases a pending adoption by design, with no body.
     "src/services/tui_o/cutover.rs": ("<module>", "claim_for_placement"),
     # The writer host's once-per-channel actor slot, not an adoption.
     "src/services/tui_o/writer/host.rs": ("start_managed",),
     # Claimed right before the first unconfirmed chunk's edit or post, across a resumable loop.
     "src/services/discord/health/recovery.rs": ("maybe_recover_completed_stale_leak",),
+}
+# The Candidate's send/seq capture is reachable only through local fresh-turn admission.
+TURN_MARK_SITES: dict[str, tuple[str, ...]] = {
+    "src/services/discord/router/turn_start.rs": ("log_session_strategy_diagnostic:admit",),
+    "src/services/tui_o/cutover.rs": ("mark_codex_turn_admitted:mark",),
+}
+# Every token must occur once, in this order, inside its named production function.
+TURN_ADMISSION_ORDER: dict[str, dict[str, tuple[str, ...]]] = {
+    "src/services/discord/router/message_handler/intake_turn.rs": {
+        "handle_text_message": (
+            "log_session_strategy_diagnostic", "provider_dispatch::execute", "spawn_turn_bridge",
+        ),
+    },
+    "src/services/discord/router/turn_start.rs": {
+        "log_session_strategy_diagnostic": ("mark_codex_turn_admitted", "spawn_blocking"),
+    },
 }
 # Funnel -> tests that drive it with O owning the channel. Each must exist as a
 # non-ignored test-attributed `fn` in src/; empty funnels or missing tests block the flip.
@@ -525,7 +566,6 @@ FLIP_READY_TESTS: dict[str, tuple[str, ...]] = {
     "W34": ("o_delegated_restart_handoff_keeps_only_the_marker",),
     "W35": ("o_delegated_anchor_repost_is_skipped",),
     "backstop": ("o_delegated_done_turn_needs_no_legacy_delivery_confirmation",),
-    "idle_recap": ("o_delegated_idle_recap_probe_reports_unknown",),
 }
 
 
@@ -570,7 +610,7 @@ def _fn_bodies(text: str) -> list[tuple[str, int, int]]:
     return bodies
 
 
-USE_RE = re.compile(r"(?:^|[;{}])\s*(?:pub(?:\s*\([^)]*\))?\s+)?use\s[^;]*$")
+USE_RE = re.compile(r"(?:^|[;{}])\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\s*\([^)]*\))?\s+)?use\s[^;]*$")
 
 
 def _gate_sites(text: str, patterns=None) -> list[str]:
@@ -590,6 +630,33 @@ def _gate_sites(text: str, patterns=None) -> list[str]:
     return [site for _, site in sorted(found)]
 
 
+def _admission_order_problems(rel: str, text: str) -> list[str]:
+    problems = []
+    bodies = _fn_bodies(text)
+    for owner, tokens in TURN_ADMISSION_ORDER.get(rel, {}).items():
+        spans = [(start, end) for name, start, end in bodies if name == owner]
+        if len(spans) != 1:
+            problems.append(f"turn admission: {rel} needs one production fn {owner}")
+            continue
+        start, end = spans[0]
+        body = text[start + 1:end]
+        positions = []
+        for token in tokens:
+            pattern = r"\b" + r"\s*::\s*".join(map(re.escape, token.split("::"))) + r"\b"
+            matches = list(re.finditer(pattern, body))
+            if len(matches) != 1:
+                problems.append(
+                    f"turn admission: {rel} {owner} has {len(matches)}x {token}, expected 1x"
+                )
+            else:
+                positions.append(matches[0].start())
+        if len(positions) == len(tokens) and positions != sorted(positions):
+            problems.append(
+                f"turn admission: {rel} {owner} must order {' -> '.join(tokens)}"
+            )
+    return problems
+
+
 def measure(root: Path, pinned_test_only_files=None):
     classifier = _load_classifier()
     if pinned_test_only_files is None:
@@ -600,11 +667,18 @@ def measure(root: Path, pinned_test_only_files=None):
     gates: dict[str, list[str]] = {}
     raw: dict[str, list[str]] = {}
     flags: dict[str, int] = {}
+    marks: dict[str, list[str]] = {}
+    admission_problems: list[str] = []
+    seen: set[str] = set()
     for path in files:
         if path in skips:
             continue
         rel = path.relative_to(root).as_posix()
         text = classifier._production_text(path)
+        seen.add(rel)
+        admission_problems.extend(_admission_order_problems(rel, text))
+        if sites := _gate_sites(text, TURN_MARK_RES):
+            marks[rel] = sites
         if rel.startswith(PRIMITIVE_ROOT):
             for name, pattern in compiled.items():
                 if n := _count(pattern, text):
@@ -616,11 +690,18 @@ def measure(root: Path, pinned_test_only_files=None):
             raw[rel] = [site.removesuffix(":raw") for site in sites]
         if n := len(FLAG_RE.findall(text)):
             flags[rel] = n
-    return primitives, gates, flags, raw
+    for rel in sorted(set(TURN_ADMISSION_ORDER) - seen):
+        admission_problems.append(f"turn admission: missing production file {rel}")
+    return primitives, gates, flags, raw, marks, admission_problems
 
 
-def problems_for(primitives, gates, flags, raw) -> list[str]:
+def problems_for(primitives, gates, flags, raw, marks, admission_problems) -> list[str]:
     problems: list[str] = []
+    problems.extend(admission_problems)
+    for rel in sorted(set(TURN_MARK_SITES) | set(marks)):
+        want, have = list(TURN_MARK_SITES.get(rel, ())), marks.get(rel, [])
+        if want != have:
+            problems.append(f"turn mark sites: {rel} has {have}, expected {want}")
     for rel, owners in sorted(raw.items()):
         for owner in sorted(set(owners) - set(RAW_CLAIM_SITES.get(rel, ()))):
             problems.append(
@@ -714,10 +795,10 @@ def flip_readiness(root: Path) -> tuple[bool, str]:
 
 def check(root: Path, pinned_test_only_files=None) -> tuple[bool, str]:
     try:
-        primitives, gates, flags, raw = measure(root, pinned_test_only_files)
+        primitives, gates, flags, raw, marks, admission_problems = measure(root, pinned_test_only_files)
     except RuntimeError as exc:
         return False, str(exc)
-    problems = problems_for(primitives, gates, flags, raw)
+    problems = problems_for(primitives, gates, flags, raw, marks, admission_problems)
     sites = sum(sum(m.values()) for m in primitives.values())
     deferred = sorted(rel for rel, row in CENSUS.items() if DEFER_RE.fullmatch(row[1]))
     if problems:

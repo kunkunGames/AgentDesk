@@ -38,46 +38,41 @@ fn spawn_retry(
     exact: Option<crate::services::discord::replay_policy::ExactRetry>,
 ) {
     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
-    let permit = super::super::input_runtime::fence::effect::current();
-    super::super::task_supervisor::spawn_observed(
-        "retry_with_history_dispatch",
-        super::super::input_runtime::fence::effect::detached(permit.clone(), async move {
-            match exact {
-                None => {
-                    gateway
-                        .schedule_retry_with_history_with_completion(
-                            channel_id,
-                            user_msg_id,
-                            &retry_text,
-                            completion_tx,
-                        )
-                        .await
-                }
-                Some(retry) => {
-                    let receipt = retry.permit.receipt_id();
-                    let handoff = gateway
-                        .schedule_exact_retry_with_history(channel_id, retry)
-                        .await;
-                    if handoff == crate::services::discord::replay_policy::ExactHandoff::Refused {
-                        tracing::warn!(
-                            channel_id = channel_id.get(),
-                            receipt,
-                            "exact retry was not started; the request stays held"
-                        );
-                    }
-                    let _ = completion_tx.send(());
-                }
+    super::super::task_supervisor::spawn_observed("retry_with_history_dispatch", async move {
+        match exact {
+            None => {
+                gateway
+                    .schedule_retry_with_history_with_completion(
+                        channel_id,
+                        user_msg_id,
+                        &retry_text,
+                        completion_tx,
+                    )
+                    .await
             }
-        }),
-    );
-    super::super::task_supervisor::spawn_observed(
-        "retry_with_history_release",
-        super::super::input_runtime::fence::effect::detached(permit, async move {
-            // Completion or the safety timeout releases the existing retry reservation.
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(120), completion_rx).await;
-            release_retry_pending(channel_id);
-        }),
-    );
+            Some(retry) => {
+                let receipt = retry.permit.receipt_id();
+                let unstarted = retry.permit.abandonment();
+                let handoff = gateway
+                    .schedule_exact_retry_with_history(channel_id, retry)
+                    .await;
+                if handoff == crate::services::discord::replay_policy::ExactHandoff::Refused {
+                    unstarted.abandon("exact retry handoff refused").await;
+                    tracing::warn!(
+                        channel_id = channel_id.get(),
+                        receipt,
+                        "exact retry was not started; the request stays held"
+                    );
+                }
+                let _ = completion_tx.send(());
+            }
+        }
+    });
+    super::super::task_supervisor::spawn_observed("retry_with_history_release", async move {
+        // Completion or the safety timeout releases the existing retry reservation.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(120), completion_rx).await;
+        release_retry_pending(channel_id);
+    });
 }
 
 /// One stale-resume retry point of a turn and the request it would rerun.
@@ -103,61 +98,9 @@ pub(super) struct StaleRetryState<'a> {
 
 /// Runs the legacy reset and history retry, or a protected request's decision: an exact retry
 /// defers every reset to its next start, and a held request keeps its body and session.
-pub(super) async fn retry_stale_resume(point: StaleRetry<'_>, state: StaleRetryState<'_>) {
-    use crate::services::discord::replay_policy::{self, StaleResume};
-    let pool = point.shared.pg_pool.as_ref();
-    match replay_policy::stale_resume(pool, point.cancel_token, state.inflight_state).await {
-        StaleResume::Legacy => {
-            let reset = reset_session_for_auto_retry(
-                point.shared,
-                point.channel_id,
-                point.cancel_token,
-                point.adk_session_key,
-                state.new_session_id,
-                state.new_raw_provider_session_id,
-                state.inflight_state,
-                point.reason,
-            )
-            .await;
-            // Retry with history only for an anchored user message whose session was cleared.
-            if let Some(user_msg_id) = state.auto_retry.queue(reset, point.user_msg_id) {
-                spawn_retry_with_history_with_release(
-                    point.gateway.clone(),
-                    point.channel_id,
-                    user_msg_id,
-                    point.user_text.to_string(),
-                );
-            }
-            state.full_response.clear();
-        }
-        StaleResume::Exact(permit) => {
-            if let Some(user_msg_id) = point.user_msg_id {
-                let inflight = &state.inflight_state;
-                let retry = crate::services::discord::replay_policy::ExactRetry {
-                    user_message_id: user_msg_id,
-                    sources: inflight
-                        .source_message_ids
-                        .iter()
-                        .map(|&id| MessageId::new(id))
-                        .collect(),
-                    request_owner: UserId::new(inflight.request_owner_user_id),
-                    text: point.user_text.to_string(),
-                    reply_context: inflight.followup_reply_context.clone(),
-                    permit,
-                };
-                spawn_retry(
-                    point.gateway.clone(),
-                    point.channel_id,
-                    user_msg_id,
-                    String::new(),
-                    Some(retry),
-                );
-            }
-            state.full_response.clear();
-        }
-        StaleResume::Hold => {}
-    }
-}
+#[path = "retry_state/replay.rs"]
+mod replay;
+pub(super) use replay::retry_stale_resume;
 
 pub(super) fn clear_local_session_state(
     new_session_id: &mut Option<String>,
@@ -181,213 +124,21 @@ pub(super) fn should_reset_gemini_retry_attempt_state(
         || has_post_tool_text
 }
 
-fn normalized_response_sent_offset(full_response: &str, response_sent_offset: usize) -> usize {
-    let mut offset = response_sent_offset.min(full_response.len());
-    while offset > 0 && !full_response.is_char_boundary(offset) {
-        offset -= 1;
-    }
-    offset
-}
-
-pub(super) fn sync_response_delivery_state(
-    full_response: &str,
-    response_sent_offset: &mut usize,
-    inflight_state: &mut InflightTurnState,
-) {
-    *response_sent_offset = normalized_response_sent_offset(full_response, *response_sent_offset);
-    inflight_state.full_response = full_response.to_string();
-    inflight_state.response_sent_offset = *response_sent_offset;
-}
-
-pub(super) fn sync_terminal_error_delivery_state(
-    full_response: &str,
-    response_sent_offset: &mut usize,
-    inflight_state: &mut InflightTurnState,
-) {
-    *response_sent_offset = 0;
-    sync_response_delivery_state(full_response, response_sent_offset, inflight_state);
-}
-
-pub(super) fn bridge_confirmed_response_sent_offset_seed(
-    owner: super::super::inflight::RelayOwnerKind,
-    response_sent_offset: usize,
-) -> usize {
-    match owner {
-        super::super::inflight::RelayOwnerKind::None => response_sent_offset,
-        super::super::inflight::RelayOwnerKind::Watcher
-        | super::super::inflight::RelayOwnerKind::StandbyRelay
-        | super::super::inflight::RelayOwnerKind::SessionBoundRelay
-        | super::super::inflight::RelayOwnerKind::Unknown => 0,
-    }
-}
-
-pub(super) fn bridge_should_reclaim_relay_from_missing_watcher(
-    watcher_owns_assistant_relay: bool,
-    standby_relay_owns_output: bool,
-    live_watcher_registered: bool,
-) -> bool {
-    watcher_owns_assistant_relay && !standby_relay_owns_output && !live_watcher_registered
-}
-
-fn refresh_delivery_rewind_state(inflight_state: &mut InflightTurnState) -> bool {
-    let Some(provider) = inflight_state.provider_kind() else {
-        return false;
-    };
-    let expected_identity =
-        super::super::inflight::InflightTurnIdentity::from_state(inflight_state);
-    let Some(mut reloaded) =
-        super::super::inflight::load_inflight_state(&provider, inflight_state.channel_id)
-    else {
-        return false;
-    };
-    if !expected_identity.matches_state(&reloaded) {
-        return false;
-    }
-    reloaded.preserve_intake_settlement_authority_from(inflight_state);
-    *inflight_state = reloaded;
-    true
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DeliveryRewindPersistOutcome {
-    Saved,
-    Rejected,
-    PersistError,
-}
-
-impl DeliveryRewindPersistOutcome {
-    fn saved(self) -> bool {
-        matches!(self, Self::Saved)
-    }
-}
-
-fn persist_delivery_rewind(
-    inflight_state: &mut InflightTurnState,
-    reason: super::super::inflight::InflightDeliveryRewindReason,
-    channel_id: ChannelId,
-) -> DeliveryRewindPersistOutcome {
-    match super::super::inflight::save_inflight_delivery_rewind_if_matches_identity(
-        inflight_state,
-        reason,
-    ) {
-        Ok(saved) => {
-            if saved {
-                refresh_delivery_rewind_state(inflight_state);
-                DeliveryRewindPersistOutcome::Saved
-            } else {
-                DeliveryRewindPersistOutcome::Rejected
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                channel_id = channel_id.get(),
-                reason = reason.as_str(),
-                error = %error,
-                "turn_bridge failed to persist legitimate delivery rewind; preserving local rewind state"
-            );
-            DeliveryRewindPersistOutcome::PersistError
-        }
-    }
-}
-
-pub(super) fn persist_terminal_error_delivery_rewind(
-    inflight_state: &mut InflightTurnState,
-    channel_id: ChannelId,
-) -> DeliveryRewindPersistOutcome {
-    persist_delivery_rewind(
-        inflight_state,
-        super::super::inflight::InflightDeliveryRewindReason::TerminalErrorReset,
-        channel_id,
-    )
-}
-
-pub(super) fn persist_reclaim_delivery_rewind(
-    inflight_state: &mut InflightTurnState,
-    channel_id: ChannelId,
-) -> DeliveryRewindPersistOutcome {
-    persist_delivery_rewind(
-        inflight_state,
-        super::super::inflight::InflightDeliveryRewindReason::MissingWatcherReclaim,
-        channel_id,
-    )
-}
-
-pub(super) fn sync_terminal_error_delivery_state_for_bridge_owner(
-    full_response: &str,
-    response_sent_offset: &mut usize,
-    bridge_confirmed_response_sent_offset: &mut usize,
-    inflight_state: &mut InflightTurnState,
-    channel_id: ChannelId,
-    watcher_relay_owns_output: bool,
-) -> bool {
-    if watcher_relay_owns_output {
-        inflight_state.set_relay_owner_kind(super::super::inflight::RelayOwnerKind::None);
-    }
-    sync_terminal_error_delivery_state(full_response, response_sent_offset, inflight_state);
-    let persisted = persist_terminal_error_delivery_rewind(inflight_state, channel_id);
-    if matches!(persisted, DeliveryRewindPersistOutcome::Rejected) {
-        refresh_delivery_rewind_state(inflight_state);
-    }
-    *response_sent_offset = inflight_state.response_sent_offset;
-    *bridge_confirmed_response_sent_offset = *response_sent_offset;
-    persisted.saved()
-}
-
-pub(super) fn rewind_delivery_on_reclaim(
-    full_response: &str,
-    bridge_confirmed_response_sent_offset: usize,
-    response_sent_offset: &mut usize,
-    inflight_state: &mut InflightTurnState,
-    channel_id: ChannelId,
-) -> bool {
-    if *response_sent_offset <= bridge_confirmed_response_sent_offset {
-        return false;
-    }
-    *response_sent_offset = bridge_confirmed_response_sent_offset;
-    sync_response_delivery_state(full_response, response_sent_offset, inflight_state);
-    tracing::warn!(
-        channel_id = channel_id.get(),
-        response_sent_offset,
-        "turn_bridge rewound response_sent_offset after reclaiming missing watcher"
-    );
-    true
-}
-
-pub(super) fn rewind_and_persist_delivery_on_reclaim(
-    full_response: &str,
-    bridge_confirmed_response_sent_offset: usize,
-    response_sent_offset: &mut usize,
-    inflight_state: &mut InflightTurnState,
-    channel_id: ChannelId,
-) -> bool {
-    let pre_reclaim_state = inflight_state.clone();
-    let pre_reclaim_response_sent_offset = *response_sent_offset;
-    if !rewind_delivery_on_reclaim(
-        full_response,
-        bridge_confirmed_response_sent_offset,
-        response_sent_offset,
-        inflight_state,
-        channel_id,
-    ) {
-        return false;
-    }
-    match persist_reclaim_delivery_rewind(inflight_state, channel_id) {
-        DeliveryRewindPersistOutcome::Saved => {
-            *response_sent_offset = inflight_state.response_sent_offset;
-            return true;
-        }
-        DeliveryRewindPersistOutcome::Rejected => {
-            if refresh_delivery_rewind_state(inflight_state) {
-                *response_sent_offset = inflight_state.response_sent_offset;
-            } else {
-                *inflight_state = pre_reclaim_state;
-                *response_sent_offset = pre_reclaim_response_sent_offset;
-            }
-        }
-        DeliveryRewindPersistOutcome::PersistError => {}
-    }
-    false
-}
+#[path = "retry_state/delivery_rewind.rs"]
+mod delivery_rewind;
+#[cfg(test)]
+pub(super) use delivery_rewind::sync_terminal_error_delivery_state;
+#[cfg(test)]
+use delivery_rewind::{
+    DeliveryRewindPersistOutcome, persist_reclaim_delivery_rewind,
+    persist_terminal_error_delivery_rewind, refresh_delivery_rewind_state,
+    rewind_delivery_on_reclaim,
+};
+pub(super) use delivery_rewind::{
+    ReclaimDeliveryOutcome, bridge_confirmed_response_sent_offset_seed,
+    bridge_should_reclaim_relay_from_missing_watcher, rewind_and_persist_delivery_on_reclaim,
+    sync_response_delivery_state, sync_terminal_error_delivery_state_for_bridge_owner,
+};
 
 /// #5938: this is a body mutation like any other — it blanks the bridge-local
 /// body AND the durable row body in the same breath — so it has to appear in the
@@ -739,13 +490,16 @@ mod tests {
             super::super::super::inflight::RelayOwnerKind::Watcher,
             response_sent_offset,
         );
-        assert!(rewind_and_persist_delivery_on_reclaim(
-            full_response,
-            bridge_confirmed,
-            &mut response_sent_offset,
-            &mut state,
-            channel,
-        ));
+        assert_eq!(
+            rewind_and_persist_delivery_on_reclaim(
+                full_response,
+                bridge_confirmed,
+                &mut response_sent_offset,
+                &mut state,
+                channel,
+            ),
+            ReclaimDeliveryOutcome::Saved
+        );
         assert_eq!(
             state.status_message_id,
             Some(41_100_091),
@@ -791,7 +545,11 @@ mod tests {
         stale_reclaim.set_relay_owner_kind(super::super::super::inflight::RelayOwnerKind::None);
 
         assert_eq!(
-            persist_reclaim_delivery_rewind(&mut stale_reclaim, channel),
+            persist_reclaim_delivery_rewind(
+                &mut stale_reclaim,
+                super::super::inflight::StreamRelayAuthority::from_state(&committed),
+                channel,
+            ),
             DeliveryRewindPersistOutcome::Rejected,
             "reclaim RMW must not reopen an already committed watcher row"
         );
@@ -845,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn same_turn_refresh_preserves_transient_intake_settlement_authority() {
+    fn same_turn_refresh_preserves_intake_outbox_identity() {
         let _env_lock = crate::config::shared_test_env_lock()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -856,21 +614,11 @@ mod tests {
         let mut original = inflight("terminal body", 0);
         original.channel_id = channel.get();
         original.adopt_intake_outbox(Some(7331));
-        original.bind_intake_delivery_capabilities(
-            crate::services::discord::runtime_bootstrap::intake_delivery_capability::SettlementCapabilities {
-                stamp_dispatched: true,
-                settle_and_sweep: true,
-            },
-        );
         super::super::super::inflight::save_inflight_state(&original)
             .expect("persist same-turn state");
 
         assert!(refresh_delivery_rewind_state(&mut original));
         assert_eq!(original.intake_outbox_id(), Some(7331));
-        assert!(
-            original.intake_delivery_capabilities().settle_and_sweep,
-            "serde reload must not downgrade the bridge's immutable settlement snapshot"
-        );
     }
 
     #[test]
@@ -893,8 +641,9 @@ mod tests {
         let mut response_sent_offset = state.response_sent_offset;
         sync_terminal_error_delivery_state(error_response, &mut response_sent_offset, &mut state);
 
+        let expected_owner = super::super::inflight::StreamRelayAuthority::from_state(&state);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            persist_terminal_error_delivery_rewind(&mut state, channel)
+            persist_terminal_error_delivery_rewind(&mut state, expected_owner, channel)
         }));
         assert_eq!(
             result.expect("reasoned rewind must not trip debug assert"),

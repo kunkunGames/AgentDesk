@@ -4,7 +4,10 @@ use crate::services::discord::{
     health::mailbox::{ResidualOccupancy, mailbox_agent_turn_status},
 };
 
-fn seed_context(seed: &str, row: InflightTurnState) -> TurnBridgeContext {
+pub(in crate::services::discord::turn_bridge) fn seed_context(
+    seed: &str,
+    row: InflightTurnState,
+) -> TurnBridgeContext {
     let gateway: std::sync::Arc<dyn TurnGateway> =
         std::sync::Arc::new(crate::services::discord::gateway::HeadlessGateway);
     TurnBridgeContext {
@@ -405,66 +408,6 @@ async fn a_pending_or_failing_refusal_notice_never_holds_the_unwind() {
     }
 }
 
-#[cfg(unix)]
-#[tokio::test(flavor = "current_thread")]
-async fn c1_actual_spawn_bridge_retains_effect_until_future_disposal() {
-    use super::super::input_runtime::fence::{self, Gate, effect};
-    use futures::FutureExt;
-    let root = tempfile::tempdir().unwrap();
-    let _env = crate::config::set_agentdesk_root_for_test(root.path());
-    let shared = super::super::make_shared_data_for_tests();
-    let channel = ChannelId::new(6_325_460);
-    let gate = Gate::protect(ProviderKind::Codex, channel.get()).unwrap();
-    let _health = fence::test_health::Clear::new(&gate);
-    let row = InflightTurnState::new(
-        ProviderKind::Codex,
-        channel.get(),
-        None,
-        1,
-        2,
-        0,
-        String::new(),
-        None,
-        None,
-        None,
-        None,
-        0,
-    );
-    let bridge = seed_context("", row);
-    let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
-    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
-    *super::resume_pin_tests::BRIDGE_CAPTURE_PROBE
-        .lock()
-        .unwrap() = Some((channel, captured_tx, resume_rx));
-    let cancel = Arc::new(CancelToken::new());
-    let (_tx, rx) = mpsc::channel();
-    effect::scope(Some(gate.admit().unwrap()), async {
-        spawn_turn_bridge_with_pin(shared, cancel.clone(), rx, bridge, None);
-    })
-    .await;
-    let closing = gate.close().unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), captured_rx)
-        .await
-        .unwrap()
-        .unwrap();
-    let held = closing.drain().now_or_never().is_none();
-    resume_tx.send(()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while Arc::strong_count(&cancel) > 1 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(
-        held,
-        "actual spawned bridge retains original effect while capture is pending"
-    );
-    tokio::time::timeout(std::time::Duration::from_secs(10), closing.drain())
-        .await
-        .unwrap();
-}
-
 /// A Herdr turn that took a user stop and ends without its provider's terminal keeps its mailbox
 /// slot, token and row; the same turn without the stop finalizes and releases the slot.
 #[cfg(unix)]
@@ -775,7 +718,7 @@ async fn herdr_cold_case(
         }
         Cold::StopWithoutEvidence => intent.user_stop.store(true, Ordering::Release),
         Cold::StopAfterSeal => {
-            crate::services::provider::herdr_before_start::finish_execution(Some(&cancel));
+            crate::services::provider::herdr_before_start::finish_execution(Some(&cancel), false);
             crate::services::provider::herdr_before_start::EXIT_OBSERVED
                 .set(Some(|state| state.user_stop.store(true, Ordering::Release)));
         }
@@ -830,7 +773,7 @@ async fn herdr_cold_case(
 
 #[cfg(unix)]
 #[path = "entry_abort_cold_error_tests.rs"]
-mod cold_error;
+pub(in crate::services::discord::turn_bridge) mod cold_error;
 
 /// A Herdr Codex turn from the real rollout reader through admission, the bridge and the finalizer.
 #[cfg(unix)]

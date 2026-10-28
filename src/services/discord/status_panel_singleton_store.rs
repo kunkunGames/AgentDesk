@@ -165,6 +165,7 @@ fn current_durable_singleton(
         .ok_or_else(|| "completed status panel is not the current singleton".to_string())
 }
 
+#[cfg(test)]
 fn clear_if_current_in_root(
     root: &Path,
     provider: &ProviderKind,
@@ -300,24 +301,6 @@ pub(in crate::services::discord) fn load(
 ) -> Option<StatusPanelSingletonBinding> {
     let root = runtime_store::discord_status_panel_singletons_root()?;
     load_in_root(&root, provider, token_hash, channel_id)
-}
-
-pub(in crate::services::discord) fn clear_if_current(
-    provider: &ProviderKind,
-    token_hash: &str,
-    channel_id: u64,
-    panel_message_id: u64,
-) -> bool {
-    let Some(root) = runtime_store::discord_status_panel_singletons_root() else {
-        return false;
-    };
-    clear_if_current_in_root(
-        root.as_path(),
-        provider,
-        token_hash,
-        channel_id,
-        panel_message_id,
-    )
 }
 
 #[cfg(test)]
@@ -669,19 +652,35 @@ mod tests {
             .expect("orphan root")
             .join(provider.as_str())
             .join(token_hash);
-        let original = fs::metadata(&store_dir)
-            .expect("orphan store")
-            .permissions();
-        let mut read_only = original.clone();
-        read_only.set_readonly(true);
-        fs::set_permissions(&store_dir, read_only).expect("read-only orphan store");
-        let probe = fs::File::create(store_dir.join(".fault-probe"));
+        #[cfg(unix)]
+        let restore: Box<dyn FnOnce()> = {
+            let original = fs::metadata(&store_dir)
+                .expect("orphan store")
+                .permissions();
+            let mut read_only = original.clone();
+            read_only.set_readonly(true);
+            fs::set_permissions(&store_dir, read_only).expect("read-only orphan store");
+            assert!(
+                fs::File::create(store_dir.join(".fault-probe")).is_err(),
+                "the read-only fault did not take effect (running as root?)"
+            );
+            Box::new(move || {
+                fs::set_permissions(store_dir, original).expect("writable orphan store");
+            })
+        };
+        #[cfg(windows)]
+        let restore: Box<dyn FnOnce()> = {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_SHARE_READ permits reads while blocking the pending-bind delete/replace.
+            let held = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(store_dir.join(format!("{channel_id}.json")))
+                .expect("hold orphan file without write/delete sharing");
+            Box::new(move || drop(held))
+        };
         let failed = release();
-        fs::set_permissions(&store_dir, original).expect("writable orphan store");
-        assert!(
-            probe.is_err(),
-            "the read-only fault did not take effect (running as root?)"
-        );
+        restore();
         assert_eq!(
             failed,
             SuppressedPanelRelease::Unverified(PendingBindCheckError::Write)

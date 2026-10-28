@@ -3,6 +3,25 @@ use crate::config::TestRuntimeRootGuard;
 use crate::services::discord::make_shared_data_for_tests;
 use std::time::Duration;
 
+pub(in crate::services::discord::turn_presence::activity) async fn verdict_for_tests(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel: ChannelId,
+) -> Result<String, String> {
+    let ports = Arc::new(LivePorts {
+        root: crate::services::tui_prompt_dedupe::binding_events::test_root(),
+    });
+    let (snapshot, namespace, next) =
+        Snapshot::collect_pair(shared, provider, channel, ports).await?;
+    if !snapshot.same_inputs(&next) {
+        return Err("superseded".into());
+    }
+    Ok(format!(
+        "{:?}",
+        snapshot.verdict(shared, &namespace.inventory)
+    ))
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn s1_unbound_invalidates_before_waiting_for_core() {
     let _root = TestRuntimeRootGuard::new();
@@ -105,7 +124,7 @@ fn s1_unbound_registration_reads_preserve_precedence_and_permissions() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    let bindings = registrations(&config).unwrap();
+    let bindings = registrations().unwrap();
     assert_eq!(bindings.len(), 2);
     assert_eq!(bindings[0].channel_id, 69_181_602);
     assert_eq!(bindings[0].owner_provider, ProviderKind::Codex);
@@ -115,7 +134,60 @@ fn s1_unbound_registration_reads_preserve_precedence_and_permissions() {
     );
     std::fs::write(&org, "corrupt: [").unwrap();
     assert!(
-        registrations(&config).is_err(),
+        registrations().is_err(),
         "a corrupt registration must not become empty absence"
     );
+}
+
+#[test]
+fn unbound_registrations_read_only_the_resolved_config_file() {
+    let _root = TestRuntimeRootGuard::new();
+    let root = crate::config::runtime_root().unwrap();
+    let canonical = crate::runtime_layout::config_file_path(&root);
+    let legacy = crate::runtime_layout::legacy_config_file_path(&root);
+    let explicit = root.join("explicit.yaml");
+    let write = |path: &std::path::Path, channel: u64| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let yaml = format!(
+            "server: {{}}\nagents:\n  - id: a\n    name: a\n    provider: codex\n    channels:\n      codex: {{id: '{channel}', name: c}}\n"
+        );
+        std::fs::write(path, yaml).unwrap();
+    };
+    let channels = || -> Vec<u64> {
+        registrations()
+            .unwrap()
+            .iter()
+            .map(|binding| binding.channel_id)
+            .collect()
+    };
+    let env =
+        crate::config::TestEnvVarGuard::capture_after_shared_test_env_lock("AGENTDESK_CONFIG");
+    unsafe { std::env::remove_var("AGENTDESK_CONFIG") };
+
+    write(&legacy, 69_181_701);
+    assert_eq!(
+        channels(),
+        vec![69_181_701],
+        "legacy-only root keeps its file"
+    );
+    write(&canonical, 69_181_702);
+    assert_eq!(channels(), vec![69_181_702]);
+
+    unsafe { std::env::set_var("AGENTDESK_CONFIG", &explicit) };
+    write(&explicit, 69_181_703);
+    std::fs::write(&canonical, "agents: [\n").unwrap();
+    assert_eq!(channels(), vec![69_181_703], "only the env file counts");
+
+    write(&canonical, 69_181_702);
+    std::fs::write(&explicit, "agents: [\n").unwrap();
+    let others = [&canonical, &legacy].map(|path| std::fs::read(path).unwrap());
+    assert!(
+        registrations().is_err(),
+        "a broken env file must not fall back to another file"
+    );
+    assert_eq!(
+        [&canonical, &legacy].map(|path| std::fs::read(path).unwrap()),
+        others
+    );
+    drop(env);
 }

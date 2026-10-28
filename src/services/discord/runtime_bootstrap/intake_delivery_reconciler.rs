@@ -1,17 +1,9 @@
-//! Dormant reducer for journal-proven intake delivery settlement.
-//!
-//! B3 owns scheduling and boot wiring. This module only exposes a per-row
-//! transaction boundary and cannot run until that later slice calls it.
+//! Restores stale intake rows from already persisted delivery evidence.
 
-#![allow(dead_code)]
-
-use crate::config::DeliveryJournalMode;
 use crate::db::intake_outbox_delivery_proof::{
     mark_done_from_delivery_proof, settle_dispatched_unknown, try_lock_dispatched_for_proof,
 };
-use crate::services::discord::session_relay_sink::journal::{
-    judge_obligation_window, read_authority_obligation_window, select_reconcile_judgment,
-};
+use crate::services::discord::session_relay_sink::journal::judge_obligation_window;
 use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
@@ -41,10 +33,6 @@ async fn reconcile_in_tx(
     cutoff: DateTime<Utc>,
     heartbeat_fresh: DateTime<Utc>,
 ) -> Result<ReconcileOutcome, sqlx::Error> {
-    // Capture the mode once so a YAML reload cannot mix readers in this transaction.
-    let journal_mode = crate::config_live_reload::current()
-        .map(|config| config.runtime.delivery_journal_mode)
-        .unwrap_or(DeliveryJournalMode::Legacy);
     let obligations: Vec<Uuid> = sqlx::query_scalar(
         "SELECT DISTINCT obligation_id
            FROM public.delivery_journal_events
@@ -58,24 +46,7 @@ async fn reconcile_in_tx(
 
     let mut delivered = false;
     for obligation_id in obligations {
-        // Authority selects the journal read path; Legacy and Shadow retain the
-        // reducer's pre-handoff facade until a later writer cutover.
-        let authority_judgment =
-            read_authority_obligation_window(&mut *connection, obligation_id, journal_mode).await?;
-        let fallback_judgment = if authority_judgment.is_none() {
-            Some(judge_obligation_window(&mut *connection, obligation_id).await?)
-        } else {
-            None
-        };
-        let judgment =
-            select_reconcile_judgment(journal_mode, authority_judgment, fallback_judgment)
-                .unwrap_or_else(|| {
-                    // The caller's `authority.is_none()` guard makes the fallback present exactly when
-                    // the authority result is absent. That invariant is non-local to this selector and
-                    // must remain true while this code runs inside the open PG transaction; violating
-                    // the caller contract is unreachable rather than a recoverable judgment.
-                    unreachable!("one journal reader must produce a judgment")
-                });
+        let judgment = judge_obligation_window(&mut *connection, obligation_id).await?;
         if judgment.delivered_outbox_id() == Some(outbox_id) {
             delivered = true;
             break;
@@ -122,6 +93,7 @@ mod postgres_tests {
     use crate::db::auto_queue::test_support::TestPostgresDb;
     use crate::db::intake_outbox_delivery_proof::list_stale_dispatched;
     use chrono::Duration;
+    use sqlx::AssertSqlSafe;
     use tokio::time::{Duration as TokioDuration, timeout};
 
     type Audit = (String, Option<DateTime<Utc>>, String, DateTime<Utc>);
@@ -349,43 +321,45 @@ mod postgres_tests {
         let hostile = seed_outbox(&pool, "proof-hostile", old).await;
         seed_delivered(&pool, hostile, Uuid::from_u128(6)).await;
         let hostile_schema = format!("proof_attacker_{}", Uuid::new_v4().simple());
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(AssertSqlSafe(format!(
             "CREATE SCHEMA {hostile_schema};
              CREATE TABLE {hostile_schema}.intake_outbox
                (LIKE public.intake_outbox INCLUDING ALL);
              CREATE TABLE {hostile_schema}.delivery_journal_events
                (LIKE public.delivery_journal_events INCLUDING ALL)"
-        ))
+        )))
         .execute(&pool)
         .await
         .expect("create hostile decoys");
-        sqlx::query(&format!(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO {hostile_schema}.intake_outbox(
                id,target_instance_id,forwarded_by_instance_id,channel_id,user_msg_id,
                request_owner_id,user_text,turn_kind,agent_id,status,claim_owner,dispatched_at)
              VALUES($1,'worker','leader','decoy','decoy','user','hello','standard','agent',
                     'done','dispatch-worker',$2)"
-        ))
+        )))
         .bind(hostile)
         .bind(old)
         .execute(&pool)
         .await
         .expect("seed hostile decoy");
         let mut transaction = pool.begin().await.expect("begin hostile transaction");
-        sqlx::query(&format!("SET LOCAL search_path={hostile_schema},public"))
-            .execute(&mut *transaction)
-            .await
-            .expect("set hostile search path");
+        sqlx::query(AssertSqlSafe(format!(
+            "SET LOCAL search_path={hostile_schema},public"
+        )))
+        .execute(&mut *transaction)
+        .await
+        .expect("set hostile search path");
         assert_eq!(
             reconcile_in_tx(&mut transaction, hostile, cutoff, cutoff)
                 .await
                 .unwrap(),
             ReconcileOutcome::Done
         );
-        let statuses: (String, String) = sqlx::query_as(&format!(
+        let statuses: (String, String) = sqlx::query_as(AssertSqlSafe(format!(
             "SELECT (SELECT status FROM public.intake_outbox WHERE id=$1),
                     (SELECT status FROM {hostile_schema}.intake_outbox WHERE id=$1)"
-        ))
+        )))
         .bind(hostile)
         .fetch_one(&mut *transaction)
         .await
@@ -395,10 +369,12 @@ mod postgres_tests {
             .rollback()
             .await
             .expect("rollback hostile transaction");
-        sqlx::query(&format!("DROP SCHEMA {hostile_schema} CASCADE"))
-            .execute(&pool)
-            .await
-            .expect("remove hostile decoys");
+        sqlx::query(AssertSqlSafe(format!(
+            "DROP SCHEMA {hostile_schema} CASCADE"
+        )))
+        .execute(&pool)
+        .await
+        .expect("remove hostile decoys");
 
         pool.close().await;
         database.drop().await;

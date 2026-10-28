@@ -17,8 +17,7 @@ pub(crate) fn execute_streaming_local_process(
     sender: Sender<StreamMessage>,
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     session_name: &str,
-    compact_percent: Option<u64>,
-    compact_lower_bound_tokens: u64,
+    (compact_percent, compact_lower_bound_tokens): (Option<u64>, u64),
 ) -> Result<(), String> {
     use crate::services::session_backend::{
         ProcessBackend, SessionConfig, with_process_session_launch_authority,
@@ -113,6 +112,10 @@ pub(crate) fn execute_streaming_local_process(
 
                 let exe = std::env::current_exe()
                     .map_err(|e| format!("Failed to get executable path: {}", e))?;
+                #[cfg(test)]
+                let exe = std::env::var_os("ADK_TEST_PROCESS_WRAPPER_EXE")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or(exe);
 
                 let env_vars = crate::services::provider_auth_profile::merge_overlay_env(
                     resolution
@@ -152,6 +155,7 @@ pub(crate) fn execute_streaming_local_process(
                     handle,
                 )?;
 
+                session_prompt::claude_args(args);
                 // Store child PID in cancel token
                 register_child_pid(cancel_token.as_deref(), handle.pid());
 
