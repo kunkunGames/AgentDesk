@@ -2544,13 +2544,26 @@ mod tests {
     #[tokio::test]
     async fn postgres_json_extract_0058_up_and_down_preserve_array_path_behavior() {
         let test_db = TestDatabase::create().await;
-        let config = postgres_test_config(&test_db);
 
-        let pool =
-            connect_test_pool_and_migrate_config(&config, "db::postgres json_extract test pool")
-                .await
-                .expect("connect and migrate postgres")
-                .expect("postgres pool");
+        let pool = super::connect_test_pool_with_max_connections(
+            &test_db.database_url,
+            "db::postgres json_extract test pool",
+            4,
+        )
+        .await
+        .expect("postgres pool");
+
+        let fixture = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                POSTGRES_MIGRATOR
+                    .iter()
+                    .filter(|m| m.version <= 58)
+                    .cloned()
+                    .collect(),
+            ),
+            ..sqlx::migrate::Migrator::DEFAULT
+        };
+        fixture.run(&pool).await.expect("migrate to 0058");
 
         let (array_value, strict_mismatch, malformed_path, volatility): (
             Option<String>,
@@ -2574,7 +2587,7 @@ mod tests {
         assert_eq!(malformed_path, None);
         assert_eq!(volatility, "s");
 
-        POSTGRES_MIGRATOR
+        fixture
             .undo(&pool, 57)
             .await
             .expect("undo 0058 json_extract migration");

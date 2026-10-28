@@ -1320,9 +1320,7 @@ agents:
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_busy_reaper_refreshes_same_nonce_recovery_after_second_probe() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
         for keep_old_admission_map in [true, false] {
@@ -1405,9 +1403,7 @@ agents:
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_busy_finalize_cannot_adopt_same_nonce_recovery_after_observation() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -1466,9 +1462,7 @@ agents:
 
     #[tokio::test(flavor = "current_thread")]
     async fn periodic_reaper_preserves_pending_start_then_recovers_abandoned_start() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -1530,9 +1524,7 @@ agents:
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_busy_reaper_preserves_admission_published_during_either_absence_probe() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
         for refresh_on_probe in [1, 2] {
@@ -1581,9 +1573,7 @@ agents:
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_busy_reaper_recovers_old_disappeared_session_without_monotonic_map() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -1617,9 +1607,7 @@ agents:
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_busy_reaper_cannot_use_a_predecessor_episode_row() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
@@ -1666,9 +1654,7 @@ agents:
 
     #[tokio::test(flavor = "current_thread")]
     async fn stale_busy_reaper_preserves_respawn_name_watcher_and_episode_races() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let root = tempfile::tempdir().expect("runtime root");
         let _root = RuntimeRootGuard::set(root.path());
         for (index, race) in ["respawn", "name", "watcher", "episode"]

@@ -164,9 +164,7 @@ async fn dispatch_process_handoff(
 
 #[tokio::test]
 async fn late_terminal_session_identity_uses_persisted_baseline_and_fences_competing_handoffs() {
-    let _lock = crate::config::shared_test_env_lock()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let root = tempfile::tempdir().expect("runtime root");
     let _env_reset = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
         "AGENTDESK_ROOT_DIR",
