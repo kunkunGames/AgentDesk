@@ -52,7 +52,6 @@ fn result_kind(result: &RebindResult) -> &'static str {
         Err(RebindError::RuntimeBindingUnavailable { .. }) => "RuntimeBindingUnavailable",
         Err(RebindError::ChannelNameMissing) => "ChannelNameMissing",
         Err(RebindError::WatcherWithheld { .. }) => "WatcherWithheld",
-        Err(RebindError::InputFenced(_)) => "InputFenced",
         Err(RebindError::Internal(_)) => "Internal",
     }
 }

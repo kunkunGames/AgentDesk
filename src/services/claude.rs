@@ -1666,10 +1666,8 @@ fn execute_streaming_local_tui_tmux(
     system_prompt: Option<&str>,
     hook_endpoint: String,
 ) -> Result<(), String> {
-    host_gate::tmux_turn_admitted(tmux_session_name)
-        .map_err(crate::services::claude_tui::submit_canary::hold_error)?;
-    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)
-        .map_err(crate::services::claude_tui::submit_canary::hold_error)?;
+    host_gate::tmux_turn_admitted(tmux_session_name)?;
+    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)?;
     debug_log(&format!(
         "=== execute_streaming_local_tui_tmux START: {} ===",
         tmux_session_name

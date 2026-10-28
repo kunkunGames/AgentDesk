@@ -233,7 +233,7 @@ async fn restored_draft_hold(held_record: HeldRecord) {
     } else {
         restore_queued_and_inflight_work(&http, &shared, &provider).await;
     }
-    let (held_before, bytes_before) = if matches!(
+    let (mut held_before, mut bytes_before) = if matches!(
         held_record,
         HeldRecord::LegacyBound | HeldRecord::LegacyLateBound
     ) {
