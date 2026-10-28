@@ -61,7 +61,7 @@ jobs:
         id: filter
         uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad
         with:
-          token: ${{ startsWith(github.head_ref, 'sync/upstream') && '' || github.token }}
+          token: ${{ !startsWith(github.head_ref, 'sync/upstream') && github.token || '' }}
           base: ${{ startsWith(github.head_ref, 'sync/upstream') && '5ca98f454' || '' }}
           list-files: json
           filters: |
