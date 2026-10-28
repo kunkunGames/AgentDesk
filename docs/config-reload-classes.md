@@ -186,6 +186,8 @@ valid edit in the live snapshot, but only `live` fields act on it. A change to a
 | `runtime.herdr_codex_turn_enabled` | live | `src/services/turn_host.rs` herdr_turn_switched_on_for (current()) |
 | `runtime.herdr_cancel_enabled` | live | `src/services/provider/cancel_token_claude_interrupt.rs` herdr_cancel_enabled (current()) |
 | `runtime.herdr_terminate_enabled` | live | `src/services/session_host/herdr_gate.rs` send_close_pinned (current()) |
+| `runtime.campaign_superior_agent_id` | seeded-at-boot | `src/services/settings.rs` seed_runtime_config_defaults_pg (kv runtime-config blob; via startup_reseed) -> campaignSuperiorAgentId |
+| `runtime.campaign_dag_template_min_samples` | seeded-at-boot | `src/services/settings.rs` seed_runtime_config_defaults_pg (kv runtime-config blob; via startup_reseed) -> campaignDagTemplateMinSamples |
 | `runtime.reset_overrides_on_restart` | restart | `src/services/settings.rs` config_default_seed_actions / seeded_runtime_config_map (consumed only by startup_reseed) |
 | `routines.enabled` | restart | `src/server/worker_registry/registry.rs` start_worker (RoutineRuntime gate) |
 | `routines.dir` | restart | `src/server/mod.rs` routine_runtime_loop (script_dirs captured; hot-reload pass reuses boot dirs) |

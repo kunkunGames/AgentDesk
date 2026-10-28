@@ -435,10 +435,14 @@ impl SessionEnrichment {
                 relay_backlog::BacklogUnknownReason::ObservationSuperseded,
             );
         }
+        let raw_lagged = last_capture_offset
+            .map(|capture| capture != last_relay_offset && relay_stale)
+            .unwrap_or(false);
         let capture_lagged = eligible_capture_lagged(
             relay_state_matches_inflight,
             inflight_state_present,
             &relay_backlog,
+            raw_lagged,
         );
 
         let enrichment = Self {
@@ -592,8 +596,16 @@ fn eligible_capture_lagged(
     binding_matches: bool,
     inflight_present: bool,
     evidence: &RelayBacklogEvidence,
+    raw_lagged: bool,
 ) -> bool {
-    binding_matches && inflight_present && evidence.overdue(WATCHER_STATE_DESYNC_STALE_MS)
+    if !binding_matches || !inflight_present {
+        return false;
+    }
+    match evidence {
+        RelayBacklogEvidence::KnownClear { .. } => false,
+        RelayBacklogEvidence::Pending { .. } => evidence.overdue(WATCHER_STATE_DESYNC_STALE_MS),
+        RelayBacklogEvidence::Unknown { .. } => raw_lagged,
+    }
 }
 
 fn capture_sample_for_path(

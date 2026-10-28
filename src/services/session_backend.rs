@@ -1039,7 +1039,7 @@ fn read_output_file_until_result_using(
             let _ = offset_sender.send(StreamMessage::OutputOffset { offset });
         },
         move |line, state| process_line(line, &line_sender, state),
-        |state| state.final_result.is_some(),
+        StreamLineState::has_terminal_result,
         move |state| {
             synthetic_sender
                 .send(StreamMessage::Done {
@@ -1068,7 +1068,7 @@ fn read_output_file_until_result_using(
     let stats = ReadHarvestStats {
         forwarded_messages: state.forwarded_message_count,
         assistant_text_bytes: state.forwarded_assistant_text_bytes,
-        decoded_terminal: state.final_result.is_some(),
+        decoded_terminal: state.has_terminal_result(),
         source_file,
     };
     result.map(|result| (result, stats))

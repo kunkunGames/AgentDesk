@@ -45,6 +45,19 @@ pub async fn soft_delete_card_pg(
         return Ok(CardDeleteOutcome::LiveDispatch(dispatch_id));
     }
 
+    let graph_task = sqlx::query_scalar::<_, String>(
+        "SELECT task_key FROM campaign_graph_tasks WHERE card_id = $1 LIMIT 1",
+    )
+    .bind(card_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| format!("load campaign graph task of card {card_id}: {error}"))?;
+    if let Some(task_key) = graph_task {
+        return Err(format!(
+            "foreign key constraint \"campaign_graph_tasks_card_id_fkey\": card {card_id} is referenced by campaign graph task {task_key}"
+        ));
+    }
+
     let pending_entries = sqlx::query_scalar::<_, String>(
         "SELECT id FROM auto_queue_entries
          WHERE kanban_card_id = $1 AND status = 'pending'

@@ -62,7 +62,6 @@ async fn an_o_owned_channel_gets_no_reattach_from_a_watcher_frontier_left_at_zer
         )
     };
 
-    let _empty = crate::services::tui_o::cutover::test_override::force_channels(&[]);
     let legacy = read().await.expect("watcher-state snapshot");
     let relay = &legacy.relay_health;
     assert!(
@@ -88,7 +87,6 @@ async fn an_o_owned_channel_gets_no_reattach_from_a_watcher_frontier_left_at_zer
         detail_relay_stall_state(&seed).await,
         "tmux_alive_relay_dead"
     );
-    drop(_empty);
 
     let _owned = crate::services::tui_o::cutover::test_override::force_channels(&[(
         channel.get(),

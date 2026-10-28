@@ -69,9 +69,12 @@ async fn heal_stale_busy_mailbox_with_probe(
     // a name reconstructed from `channel_name`. When the row recorded no name (or
     // was already removed) SKIP — falling back to the reconstructed name is what
     // false-finalizes a live routine turn ("routine tmux 오염").
-    let Some(observed_tmux_session_name) =
-        recorded_inflight_tmux_session_name(provider, channel_id)
-    else {
+    let Some(observed_tmux_session_name) = recorded_inflight_tmux_session_name(
+        provider,
+        channel_id,
+        observed_user_msg_id,
+        observed.active_turn_nonce.as_deref(),
+    ) else {
         return false;
     };
     if !host_gate(shared, provider, channel_id, &observed_tmux_session_name).await {
@@ -101,7 +104,12 @@ async fn heal_stale_busy_mailbox_with_probe(
     // same-nonce RecoveryKickoff can publish its new recovery_started_at while
     // the channel admission map and durable row remain unchanged.
     let current = mailbox_snapshot(shared, channel_id).await;
-    let current_tmux_session_name = recorded_inflight_tmux_session_name(provider, channel_id);
+    let current_tmux_session_name = recorded_inflight_tmux_session_name(
+        provider,
+        channel_id,
+        observed_user_msg_id,
+        observed.active_turn_nonce.as_deref(),
+    );
     if !stale_busy_turn_is_still_reapable(
         observed_user_msg_id,
         current.active_user_message_id,
