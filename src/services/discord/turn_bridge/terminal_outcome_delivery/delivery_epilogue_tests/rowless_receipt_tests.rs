@@ -1,8 +1,11 @@
 //! Drive the production terminal boundary with a real source file and receipt.
 
+use super::recovery_retry_guard_tests as summary_assertions;
 use super::*;
 
 mod o_after_done_chain_tests;
+#[cfg(unix)]
+mod o_stream_regression_tests;
 #[cfg(test)]
 mod pg_tests;
 mod preloop_cleanup_tests;
@@ -40,18 +43,16 @@ fn receipt_parts(
         Some(0),
     )
     .unwrap();
-    tui_prompt_dedupe::register_tmux_runtime_binding(
-        tmux,
-        TuiRuntimeBinding {
-            runtime_kind,
-            output_path: rollout.display().to_string(),
-            relay_output_path: None,
-            input_fifo_path: None,
-            session_id: Some("receipt-session".into()),
-            last_offset: 64,
-            relay_last_offset: None,
-        },
-    );
+    let binding = TuiRuntimeBinding {
+        runtime_kind,
+        output_path: rollout.display().to_string(),
+        relay_output_path: None,
+        input_fifo_path: None,
+        session_id: Some("receipt-session".into()),
+        last_offset: 64,
+        relay_last_offset: None,
+    };
+    tui_prompt_dedupe::register_tmux_runtime_binding(tmux, binding.clone());
     let generation = crate::services::tmux_common::session_temp_path(tmux, "generation");
     std::fs::write(&generation, "g").unwrap();
     filetime::set_file_mtime(
@@ -67,16 +68,27 @@ fn receipt_parts(
     local.turn_nonce = Some("receipt-nonce".into());
     local.session_id = Some("receipt-session".into());
     local.output_path = Some(rollout.display().to_string());
+    if provider == ProviderKind::Claude {
+        prove_claude_input(driver._temp.path(), local);
+    }
+    let handoff_end = std::fs::metadata(&rollout).unwrap().len();
+    local.last_offset = handoff_end;
+    if provider == ProviderKind::Claude {
+        // The rowless source contract observes the later relay rehydration; input proof was sealed first.
+        let mut rehydrated = binding;
+        rehydrated.last_offset = handoff_end;
+        tui_prompt_dedupe::register_tmux_runtime_binding(tmux, rehydrated);
+    }
     let source = dr::ExactJsonlSourceIdentity {
         provider: provider.as_str().into(),
         tmux_session_name: tmux.into(),
         turn_nonce: local.turn_nonce.clone().unwrap(),
-        range: (0, 64),
+        range: (0, handoff_end),
         generation_mtime_ns: dr::current_generation_mtime_ns(tmux),
         offset_authority_channel_id: DRIVER_CHANNEL_ID,
         delivery_channel_id: DRIVER_CHANNEL_ID,
     };
-    ctx.tmux_last_offset = Some(64);
+    ctx.tmux_last_offset = Some(handoff_end);
     if provider == ProviderKind::Codex {
         ctx.codex_tui_terminal_range = Some(CodexRange::new(
             InflightTurnIdentity::from_state(local),
@@ -520,7 +532,8 @@ async fn run_postlude_for_owner(
         accumulated_output_tokens: 0,
         accumulated_memory_input_tokens: 0,
         accumulated_memory_output_tokens: 0,
-        transport_error: false,
+        transport_error: output.provider_failure,
+        provider_failure: output.provider_failure,
         api_friction_reports: Vec::new(),
         cancelled,
         restart_followup_pending: None,
@@ -1184,8 +1197,76 @@ async fn exact_receipt_short_fallback_settles_original_actor_and_preserves_succe
                 .await
             );
         }
-        assert_eq!(driver.completed_publications(), 1);
+        summary_assertions::assert_terminal_publications(&driver, !replace_actor);
     }
+}
+#[tokio::test]
+#[cfg(unix)]
+async fn o_capture_probe_is_quiet_but_body_identity_errors_still_alarm() {
+    use crate::services::agent_protocol::RuntimeHandoffKind::{ClaudeTui, CodexTui};
+    use crate::services::tui_o::cutover::{self, BodyClaim, IdentityError};
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(CapturingWriter(buffer.clone()))
+        .finish();
+    crate::logging::test_capture::pin_callsite_interest();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let channel = DRIVER_CHANNEL_ID;
+    assert_eq!(
+        cutover::peek_o_owns_tui_output_for_channel_quiet(channel, Some(CodexTui)),
+        Err(IdentityError::MissingSnapshot)
+    );
+    assert!(buffer.lock().unwrap().is_empty());
+    let sent = std::cell::Cell::new(false);
+    let result =
+        cutover::claim_then_send(Some(BodyClaim::new(channel, Some(CodexTui))), || async {
+            sent.set(true);
+        })
+        .await;
+    assert_eq!(result, Err(IdentityError::MissingSnapshot));
+    assert!(!sent.get());
+    assert!(
+        String::from_utf8(buffer.lock().unwrap().clone())
+            .unwrap()
+            .contains("tui_o output identity held")
+    );
+    buffer.lock().unwrap().clear();
+    {
+        let _owned = cutover::test_override::force_channels(&[(channel, CodexTui)]);
+        let cases = [
+            (channel, Some(CodexTui), Ok(true)),
+            (channel + 1, None, Ok(false)),
+            (channel, None, Err(IdentityError::UnknownKind)),
+            (
+                channel,
+                Some(ClaudeTui),
+                Err(IdentityError::KindMismatch {
+                    expected: Some(CodexTui),
+                    actual: ClaudeTui,
+                }),
+            ),
+        ];
+        for (destination, kind, expected) in cases {
+            assert_eq!(
+                cutover::peek_o_owns_tui_output_for_channel_quiet(destination, kind),
+                expected
+            );
+            assert!(buffer.lock().unwrap().is_empty());
+        }
+    }
+    let _pending = cutover::test_override::force_candidates(&[(channel, CodexTui)]);
+    assert_eq!(
+        cutover::peek_o_owns_tui_output_for_channel_quiet(channel, Some(CodexTui)),
+        Ok(false)
+    );
+    assert_eq!(
+        cutover::peek_o_owns_tui_output_for_channel(channel, Some(CodexTui)),
+        Ok(false)
+    );
+    assert!(buffer.lock().unwrap().is_empty());
 }
 
 /// Custody parked before O owned the channel follows its real destination on resume: an
@@ -1371,6 +1452,7 @@ async fn complete_then_late_o_body(o_channel: bool) -> (Option<u64>, Vec<DriverC
         driver.inflight.runtime_kind,
         driver.inflight.status_message_id,
     ) = (Some(ClaudeTui), Some(KEPT_PANEL));
+    prove_claude_input(driver._temp.path(), &mut driver.inflight);
     inflight::save_inflight_state(&driver.inflight).expect("seed the two-message row");
     let token = driver.shared.token_hash.clone();
     let channel = DRIVER_CHANNEL_ID;
@@ -1378,8 +1460,7 @@ async fn complete_then_late_o_body(o_channel: bool) -> (Option<u64>, Vec<DriverC
     let _mailbox = driver.shared.mailbox(ChannelId::new(channel));
     let owned = [(channel, ClaudeTui)];
     let _o = test_override::force_channels(&owned[..usize::from(o_channel)]);
-    let _posted = deliver::forget_posted_for_tests(channel);
-
+    driver.posted_restart_serialization = Some(deliver::forget_posted_for_tests(channel));
     let (ctx, state) = driver.parts();
     let output = run(ctx, state).await;
     assert!(output.terminal_delivery_committed);
@@ -1399,6 +1480,7 @@ async fn complete_then_late_o_body(o_channel: bool) -> (Option<u64>, Vec<DriverC
         .map(|o| o.call)
         .collect();
     let panel = singleton::load(&ProviderKind::Claude, &token, channel).map(|b| b.panel_message_id);
+    summary_assertions::assert_panel_completion_publications(&driver, o_channel);
     (panel, calls)
 }
 
@@ -1416,5 +1498,5 @@ async fn the_postlude_completes_an_o_panel_in_place_below_which_o_posts_later() 
 async fn the_postlude_completes_a_legacy_panel_in_place_whatever_o_posts_later() {
     let (panel, calls) = complete_then_late_o_body(false).await;
     assert_eq!(panel, Some(KEPT_PANEL));
-    assert_eq!(calls, [DriverCall::Edit]);
+    assert_eq!(calls, [DriverCall::Edit, DriverCall::Send]);
 }

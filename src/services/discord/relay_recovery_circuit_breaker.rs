@@ -167,7 +167,7 @@ fn load_record(path: &Path) -> Result<Option<CircuitRecord>, String> {
 
 fn persist_record(path: &Path, record: &CircuitRecord) -> Result<(), String> {
     let json = serde_json::to_string_pretty(record).map_err(|error| error.to_string())?;
-    super::super::runtime_store::atomic_write(path, &json)
+    super::super::runtime_store::durable_publish::publish_store_row(path, &json)
 }
 
 fn effective_frontier(
@@ -533,48 +533,6 @@ impl CircuitAlertEnqueue for PgCircuitAlertEnqueue {
     }
 }
 
-pub(super) async fn queue_open_alert_once(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    episode: &RelayReattachEpisode,
-    open: &CircuitOpenPin,
-    max_attempts: u32,
-) {
-    queue_open_alert_once_with_enqueue(
-        shared,
-        provider,
-        channel_id,
-        episode,
-        open,
-        max_attempts,
-        &PgCircuitAlertEnqueue,
-    )
-    .await;
-}
-
-pub(super) async fn queue_open_alert_once_with_enqueue(
-    shared: &SharedData,
-    provider: &ProviderKind,
-    channel_id: ChannelId,
-    episode: &RelayReattachEpisode,
-    open: &CircuitOpenPin,
-    max_attempts: u32,
-    enqueue: &dyn CircuitAlertEnqueue,
-) {
-    queue_or_resume_open_alert_with_enqueue(
-        shared,
-        provider,
-        channel_id,
-        episode,
-        open,
-        max_attempts,
-        None,
-        enqueue,
-    )
-    .await;
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn queue_or_resume_open_alert_with_enqueue(
     shared: &SharedData,
@@ -704,6 +662,48 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    async fn queue_open_alert_once(
+        shared: &SharedData,
+        provider: &ProviderKind,
+        channel_id: ChannelId,
+        episode: &RelayReattachEpisode,
+        open: &CircuitOpenPin,
+        max_attempts: u32,
+    ) {
+        queue_open_alert_once_with_enqueue(
+            shared,
+            provider,
+            channel_id,
+            episode,
+            open,
+            max_attempts,
+            &PgCircuitAlertEnqueue,
+        )
+        .await;
+    }
+
+    async fn queue_open_alert_once_with_enqueue(
+        shared: &SharedData,
+        provider: &ProviderKind,
+        channel_id: ChannelId,
+        episode: &RelayReattachEpisode,
+        open: &CircuitOpenPin,
+        max_attempts: u32,
+        enqueue: &dyn CircuitAlertEnqueue,
+    ) {
+        queue_or_resume_open_alert_with_enqueue(
+            shared,
+            provider,
+            channel_id,
+            episode,
+            open,
+            max_attempts,
+            None,
+            enqueue,
+        )
+        .await;
+    }
 
     struct FailThenSucceedEnqueue {
         calls: AtomicUsize,

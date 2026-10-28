@@ -21,6 +21,10 @@ impl<B: BindingEvents> Sources<B> {
         owed: &mut impl Owe,
         wall_now: SystemTime,
     ) -> Result<(), WriterAlarm> {
+        let started = std::time::Instant::now();
+        let mut records = 0;
+        #[cfg(test)]
+        let raw_skip = super::super::replay::mutant("raw_skip");
         if self.reader_config.is_some() {
             self.observe_clock(wall_now)?;
             writer
@@ -28,7 +32,16 @@ impl<B: BindingEvents> Sources<B> {
                 .prepare_cleanup_witnesses()
                 .map_err(halted("witness directory"))?;
         }
-        let resolved = writer.store().apply_resolved_boundaries();
+        self.check_scoped_metadata(writer.store())?;
+        self.refined.clear();
+        let suspension = self.suspension.clone();
+        let resolved = if suspension.is_empty() {
+            writer.store().apply_resolved_boundaries()
+        } else {
+            writer
+                .store()
+                .apply_resolved_boundaries_filtered(|source| !suspension.contains(source))
+        };
         resolved.map_err(halted("resolved boundary"))?;
         renumbered::unique(writer.store().cursors()).map_err(halt)?;
         self.rotation = writer.store().rotation().map_err(halted("rotation"))?;
@@ -40,18 +53,29 @@ impl<B: BindingEvents> Sources<B> {
                 self.restore_hops(writer, &logged.1, checkpoint)?;
             }
         }
-        let mut cursors: Vec<_> = writer.store().cursors().cloned().collect();
+        let mut cursors: Vec<_> = writer
+            .store()
+            .cursors()
+            .filter(|cursor| self.resume_selected(&cursor.source))
+            .cloned()
+            .collect();
         cursors.sort_by_key(|cursor| {
             let seq = self.rotation.link(&cursor.source).map_or(0, |l| l.seq);
             (predecessors(&self.rotation, &cursor.source), seq)
         });
         let now = Instant::now();
-        let consumed: HashMap<String, u64> = (cursors.iter())
-            .map(|cursor| (source_key(&cursor.source), cursor.captured_through))
+        let consumed: HashMap<String, (u64, String)> = (cursors.iter())
+            .map(|cursor| {
+                (
+                    source_key(&cursor.source),
+                    (cursor.captured_through, cursor.prefix_hash.clone()),
+                )
+            })
             .collect();
+        self.reevaluate_boundaries(writer, deriver, owed, false)?;
         for cursor in cursors {
             let (key, mut captured_any) = (source_key(&cursor.source), false);
-            self.sync_parent(&key, |parent| consumed.get(&source_key(parent)).copied());
+            self.sync_parent(&key, |parent| consumed.get(&source_key(parent)).cloned());
             if let Some(SourceLink {
                 boundary: Boundary::Pending { .. },
                 ..
@@ -60,12 +84,20 @@ impl<B: BindingEvents> Sources<B> {
                 let source = cursor.source.clone();
                 self.raised.push(WriterAlarm::BoundaryPending { source });
             }
-            let replay = writer.store().for_each_frame(&cursor.source, |frame| {
-                if let SpoolFrame::Record(record) = frame {
-                    captured_any = true;
-                    self.owe(deriver, owed, &cursor.source, &record);
-                }
-            });
+            let replay =
+                writer
+                    .store()
+                    .for_each_frame(&cursor.source, |frame, identity_version| {
+                        if let SpoolFrame::Record(record) = frame {
+                            records += 1;
+                            #[cfg(test)]
+                            if raw_skip {
+                                return;
+                            }
+                            captured_any = true;
+                            self.owe(deriver, owed, &cursor.source, &record, identity_version);
+                        }
+                    });
             replay.map_err(halted("spool replay"))?;
             let missing = self.reader_config.is_some()
                 && matches!(
@@ -170,6 +202,18 @@ impl<B: BindingEvents> Sources<B> {
                 }
             }
         }
+        // Clear ends published while the actor was down, and proofs boot put to sleep, apply now.
+        self.clear_due = !crate::services::tui_o::store::clear_end::mutant("resume_settle_off");
+        self.settle_cleared(writer)?;
+        self.wake_resumed_proofs(writer)?;
+        self.reconcile_boundary_pending(writer);
+        self.replayed = owed.finish_replay(writer.store().ledger());
+        writer.boot.replay(
+            "resume_replay",
+            records,
+            self.replayed,
+            started.elapsed().as_millis() as u64,
+        );
         Ok(())
     }
 
@@ -565,7 +609,8 @@ impl<B: BindingEvents> Sources<B> {
                 continue;
             };
             let successor_captured = captured.contains(&source_key(&successor.source));
-            // Only a provider record shows the old source stopped; a drained quiet one stays read.
+            // Only a provider record or a confirmed clear end shows the old source stopped; a
+            // drained quiet one stays read.
             let proven = successor.proof.is_some();
             let drained = through == len && reader.pending.is_none();
             let grew = reader.quiet.is_some_and(|(held, _)| held != len);

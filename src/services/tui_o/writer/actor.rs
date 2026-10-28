@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use super::binding::BindingEvents;
 use super::deliver::{ChannelWriter, Step, StopCause};
 use super::pieces::{Derived, UnitDeriver};
-use super::rotation::Sources;
+use super::rotation::{Owe, Sources};
 use super::transition_port;
 use super::{AlarmSink, DeliveryLease, DiscordPort, ReaderConfig, WriterAlarm, WriterConfig};
 use crate::services::tui_o::shadow::{ShadowProvider, UnitKey};
@@ -166,6 +166,7 @@ where
 }
 
 struct Actor<P, L, A, B> {
+    replay_deferred: bool,
     writer: ChannelWriter<P, L, A>,
     deriver: UnitDeriver,
     owed: VecDeque<Derived>,
@@ -178,6 +179,8 @@ struct Actor<P, L, A, B> {
     notice: Option<watch::Receiver<u64>>,
     waiting: Waiting,
     clock: (tokio::time::Instant, chrono::DateTime<chrono::Utc>),
+    scope_hold: Option<&'static str>,
+    boot_previous_nonce: Option<String>,
 }
 
 #[derive(Default)]
@@ -186,8 +189,7 @@ struct Waiting {
     incident: Option<String>,
 }
 
-/// Returns when the channel stops, with why, or when `stop` turns true or closes. `resumed` turns
-/// true once the spool and sources are recovered, and closes when the actor returns.
+/// Runs until stopped; `resumed` means every non-suspended source was restored.
 pub async fn run_channel<P, L, A, B>(
     writer: ChannelWriter<P, L, A>,
     provider: ShadowProvider,
@@ -252,9 +254,11 @@ where
     A: AlarmSink,
     B: BindingEvents,
 {
-    let writer = writer.with_repost_stop(stop.clone());
-    let deriver = UnitDeriver::new(writer.channel(), provider);
-    let mut sources = Sources::new(writer.channel(), provider, Arc::clone(&bindings));
+    let mut writer = writer.with_repost_stop(stop.clone());
+    let deriver =
+        fresh_resume::configured_deriver(writer.channel(), provider, writer.store().ledger());
+    let mut sources = Sources::new(writer.channel(), provider, Arc::clone(&bindings))
+        .with_suspension(writer.suspension.clone());
     if let Some(readers) = readers {
         sources = sources.with_readers(readers);
     }
@@ -262,6 +266,7 @@ where
     let ready = admission::owed_delivery_ready(writer.channel());
     let verified = ready.then(|| super::owed::OwedLog::new(writer.channel(), provider));
     let mut actor = Actor {
+        replay_deferred: false,
         writer,
         deriver,
         owed,
@@ -271,14 +276,55 @@ where
         transitions: transition::Transitions::new(transitions, stop.clone()),
         notice: None,
         waiting: Waiting::default(),
+        scope_hold: None,
+        boot_previous_nonce: None,
         clock: (
             tokio::time::Instant::now(),
             utc.unwrap_or_else(chrono::Utc::now),
         ),
     };
+    let selection = actor.writer.suspension.clone();
+    let restore = provider == ShadowProvider::Codex;
+    #[cfg(test)]
+    let restore =
+        restore && !crate::services::claude_tui::source_verify::n2b_mutant("b1b-selection-restore");
+    if restore {
+        match selection.restore_current(actor.writer.store()) {
+            Ok(restored) => {
+                if !restored
+                    && crate::services::tui_prompt_dedupe::clear_relaunch::fresh_scope_eligible(
+                        actor.writer.channel(),
+                    )
+                {
+                    actor.boot_previous_nonce = actor
+                        .writer
+                        .store()
+                        .fresh_selection()
+                        .ok()
+                        .flatten()
+                        .map(|record| record.nonce);
+                }
+            }
+            Err(error) => {
+                actor.writer.stop(WriterAlarm::Halted {
+                    detail: format!("fresh selection restore: {error:?}"),
+                });
+                return actor.writer.stop_cause().cloned();
+            }
+        }
+    }
+    let progress = super::progress::Publisher::new(actor.writer.channel());
     let mut sources_resumed = false;
     while !actor.writer.is_stopped() && !*stop.borrow() {
+        if actor.rescope() {
+            sources_resumed = false;
+            resumed.send_replace(false);
+        }
+        if actor.writer.is_stopped() {
+            break;
+        }
         if !sources_resumed && actor.sources_allowed() {
+            let phase = actor.writer.boot.phase("resume");
             let (writer, deriver) = (&mut actor.writer, &mut actor.deriver);
             let restored = match &mut actor.verified {
                 Some(log) => actor.sources.resume(writer, deriver, log),
@@ -287,19 +333,51 @@ where
             if let Err(alarm) = restored {
                 actor.writer.stop(alarm);
             }
+            actor.replay_deferred = actor.verified.is_none() && actor.sources.replayed.deferred;
+            phase.finish(if actor.writer.is_stopped() {
+                "stopped"
+            } else {
+                "ok"
+            });
             sources_resumed = true;
             if !actor.writer.is_stopped() {
+                actor.boot_previous_nonce = None;
                 actor.project_operator_resumes();
                 resumed.send_replace(true);
             }
         }
         actor.observe_waiting(false);
+        let drain = actor.writer.boot.first_drain();
+        let serial_before = drain
+            .as_ref()
+            .map(|_| actor.writer.store().ledger().next_serial());
         let now = actor.utc_now();
         if actor.delivery_allowed() {
             actor.writer.retry_local(now).await;
+            actor.refilter_after_open();
         }
         if !actor.writer.has_local_retry() {
-            actor.deliver_owed().await;
+            actor.deliver_owed(&progress).await;
+        }
+        if let Some(drain) = drain {
+            let prepared = actor
+                .writer
+                .store()
+                .ledger()
+                .next_serial()
+                .saturating_sub(serial_before.unwrap_or(0));
+            drain.finish_with(
+                if actor.writer.is_stopped() {
+                    "stopped"
+                } else {
+                    "ok"
+                },
+                super::boot::Details {
+                    done: actor.writer.boot.done(),
+                    prepared,
+                    ..super::boot::Details::default()
+                },
+            );
         }
         // Re-post runs in this same turn and only once nothing is owed, so it never sends beside
         // a piece of this channel. It holds no exact permit, so a verified channel never runs it.
@@ -312,8 +390,11 @@ where
         }
         actor.collect_settled();
         actor.read_sources();
-        actor.poll_transition(sources_resumed, &unsettled);
+        actor.poll_transition(sources_resumed, &unsettled).await;
         actor.observe_waiting(sources_resumed);
+        progress.publish(actor.progress());
+        #[cfg(test)]
+        fresh_resume::note_work(actor.owed.len(), actor.deriver.has_unsealed());
         // A writer that stopped in this poll ends now, so its readiness drops before the next poll.
         if actor.writer.is_stopped() {
             break;
@@ -375,6 +456,13 @@ where
     .await
 }
 
+mod fresh_resume;
+#[cfg(test)]
+pub(crate) use fresh_resume::work_for_tests;
+mod automatic;
+mod automatic_age;
+mod codex_age;
+pub(crate) mod codex_retention;
 mod transition;
 mod transition_snapshot;
 
@@ -431,7 +519,11 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
     }
 
     fn observe_waiting(&mut self, restored: bool) {
-        if self.writer.is_stopped() {
+        let scope_waiting = self.scope_hold == Some("new_root_waiting");
+        #[cfg(test)]
+        let scope_waiting = scope_waiting
+            && !crate::services::claude_tui::source_verify::n2b_mutant("b1b-scope-hold");
+        if self.writer.is_stopped() || scope_waiting {
             return;
         }
         let now = tokio::time::Instant::now();
@@ -479,8 +571,16 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
         });
         if ready == 0 && prepared.is_none() {
             // A fresh actor's empty queue is evidence only after its durable sources were restored.
-            if self.waiting.incident.take().is_some()
-                || (restored && self.waiting.ready.is_empty() && open.is_none())
+            let incident = self.waiting.incident.take().is_some();
+            #[cfg(test)]
+            let incident = incident
+                && (self.writer.suspension.is_empty()
+                    || !crate::services::claude_tui::source_verify::n2b_mutant("b1b-own-clear"));
+            if incident
+                || (restored
+                    && self.waiting.ready.is_empty()
+                    && open.is_none()
+                    && self.writer.suspension.is_empty())
             {
                 self.writer.waiting_cleared();
             }
@@ -506,16 +606,33 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
         self.writer.delivery_allowed(owing)
     }
 
+    fn refilter_after_open(&mut self) -> bool {
+        let summary = if let Some(log) = &mut self.verified {
+            log.refilter_after_open(self.writer.store().ledger())
+        } else if super::replay::after_open(&mut self.replay_deferred, self.writer.store().ledger())
+        {
+            Some(self.owed.finish_replay(self.writer.store().ledger()))
+        } else {
+            None
+        };
+        if let Some(summary) = summary {
+            self.writer.boot.replay("refilter", 0, summary, 0);
+            return true;
+        }
+        false
+    }
+
     /// Verified sources are restored apart from delivery permission, which each piece proves.
     fn sources_allowed(&mut self) -> bool {
         if self.verified.is_none() {
             return self.delivery_allowed();
         }
         let channel = self.writer.channel();
+        let suspension = self.writer.suspension.clone();
         self.writer
             .store()
             .cursors()
-            .filter(|cursor| !cursor.retired)
+            .filter(|cursor| !cursor.retired && !suspension.contains(&cursor.source))
             .all(|cursor| {
                 crate::services::tui_prompt_dedupe::codex_verified_o_source_allowed(
                     channel,
@@ -524,13 +641,22 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
             })
     }
 
-    async fn deliver_owed(&mut self) {
+    /// Delivers in order and publishes the position after each piece, so a long drain shows its
+    /// progress to health while it runs.
+    async fn deliver_owed(&mut self, progress: &super::progress::Publisher) {
         if let Some(log) = &mut self.verified {
+            let (legacy, unsealed) = (self.owed.len(), self.deriver.has_unsealed());
+            let delivered = |writer: &mut ChannelWriter<P, L, A>, log: &super::owed::OwedLog| {
+                let (retry, owed) = (writer.has_local_retry(), legacy + log.work.len());
+                let ledger = writer.store().ledger();
+                progress.publish(super::progress::position(owed, retry, ledger, unsealed));
+            };
             // Legacy retries in `owed` have no provenance, so they stay Unknown here.
-            return super::owed::deliver_owed(&mut self.writer, log).await;
+            return super::owed::deliver_owed(&mut self.writer, log, delivered).await;
         }
+        let mut budget = super::replay::Budget::new();
         while !self.owed.is_empty() {
-            if !self.delivery_allowed() {
+            if self.writer.stopping() || !self.delivery_allowed() {
                 return;
             }
             let Some(item) = self.owed.front() else {
@@ -538,10 +664,15 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
             };
             match self.writer.deliver(item).await {
                 Step::Done => {
-                    self.owed.pop_front();
+                    self.writer.boot.drained();
+                    if !self.refilter_after_open() {
+                        self.owed.pop_front();
+                    }
+                    progress.publish(self.progress());
                     if self.writer.has_local_retry() {
                         return;
                     }
+                    budget.yield_if_due().await;
                 }
                 Step::LeaseBusy | Step::NoGateway | Step::Stopped | Step::Withheld => return,
             }
@@ -551,6 +682,12 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
     /// With nothing owed, unsealed or open, every retained segment of a source with a decided start
     /// is settled. The open segment stays unless the spool is full, so segment files do not churn.
     fn collect_settled(&mut self) {
+        #[cfg(test)]
+        if crate::services::claude_tui::source_verify::n2b_mutant("b1b-gc")
+            && !self.writer.suspension.is_empty()
+        {
+            return;
+        }
         if !self.delivery_allowed() {
             return;
         }
@@ -600,6 +737,14 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
         let retired: HashSet<String> = retired.map(|cursor| source_key(&cursor.source)).collect();
         let old = rotation.successors.keys();
         Some(old.filter(|key| !retired.contains(*key)).count())
+    }
+
+    /// What this poll left owed, whether a unit waits on its seal, and the ledger position.
+    fn progress(&mut self) -> super::progress::ChannelProgress {
+        let verified = self.verified.as_ref().map_or(0, |log| log.work.len());
+        let (retry, unsealed) = (self.writer.has_local_retry(), self.deriver.has_unsealed());
+        let ledger = self.writer.store().ledger();
+        super::progress::position(self.owed.len() + verified, retry, ledger, unsealed)
     }
 
     /// Pieces, an open `Prepared`, unsealed units, sources read short of their end and binds not
@@ -668,6 +813,10 @@ pub(crate) fn undelivered_reads_for_test() -> usize {
 
 #[cfg(test)]
 pub(crate) use test_support::exercise_held_actor_for_tests;
+#[cfg(all(test, unix))]
+pub(crate) use transition::scoped_tests::{
+    exercise_local_retry_retention_for_tests, exercise_scope_waiting_job_for_tests,
+};
 #[cfg(test)]
 pub(crate) use transition::test_hooks as transition_hooks;
 #[cfg(test)]
@@ -692,6 +841,7 @@ mod test_support {
     {
         let channel = writer.channel();
         let mut actor = Actor {
+            replay_deferred: false,
             writer,
             deriver: UnitDeriver::new(channel, provider),
             owed: VecDeque::new(),
@@ -702,6 +852,8 @@ mod test_support {
             notice: None,
             waiting: Waiting::default(),
             clock: (tokio::time::Instant::now(), chrono::Utc::now()),
+            scope_hold: None,
+            boot_previous_nonce: None,
         };
         actor
             .sources
@@ -731,7 +883,8 @@ mod test_support {
             actor.writer.retry_local(now).await;
         }
         if !actor.writer.has_local_retry() {
-            actor.deliver_owed().await;
+            let progress = super::super::progress::Publisher::new(channel);
+            actor.deliver_owed(&progress).await;
         }
         assert_eq!(
             cursor(&mut actor),

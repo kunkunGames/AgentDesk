@@ -1,5 +1,5 @@
 use crate::voice::{VoiceConfig, barge_in::BargeInSensitivity};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -10,6 +10,8 @@ mod runtime_settings;
 mod runtime_validation;
 pub use runtime_settings::RuntimeSettingsConfig;
 
+mod agent_memory;
+pub use agent_memory::AgentDef;
 mod agent_channels;
 pub use agent_channels::AgentChannels;
 pub(crate) mod runtime_profile;
@@ -18,11 +20,18 @@ mod cluster_role;
 pub use cluster_role::ClusterRole;
 pub(crate) mod session_hosts;
 pub use session_hosts::SessionHostsConfig;
+pub mod config_path;
 pub(crate) mod disk_write;
 mod peer_filter;
+pub mod reload_classes;
+mod server_surface;
+mod tool_activity_display;
+pub use config_path::resolved_config_path;
 pub(crate) use disk_write::render_config_for_path;
 pub use disk_write::save_to_path;
 pub use peer_filter::PeerFilterMode;
+pub use server_surface::BrowserGuardMode;
+pub use tool_activity_display::ToolActivityDisplay;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Config {
@@ -63,8 +72,6 @@ pub struct Config {
     pub runtime: RuntimeSettingsConfig,
     #[serde(default, skip_serializing_if = "RoutinesConfig::is_default")]
     pub routines: RoutinesConfig,
-    #[serde(default, skip_serializing_if = "EscalationConfig::is_empty")]
-    pub escalation: EscalationConfig,
     #[serde(default, skip_serializing_if = "OnboardingConfig::is_empty")]
     pub onboarding: OnboardingConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,17 +88,8 @@ pub struct Config {
     /// Channels run on a Herdr endpoint; restart-required, empty by default.
     #[serde(default, skip_serializing_if = "SessionHostsConfig::is_empty")]
     pub session_hosts: SessionHostsConfig,
-    /// When true (default), the server watches the on-disk config file and
-    /// hot-reloads the hot-swappable settings (routine tunables, thresholds)
-    /// without a restart, mirroring the policies watcher: the candidate file is
-    /// pre-validated (parsed + runtime defaults applied) and only then atomically
-    /// swapped in; a parse/validation failure keeps the running config. Infra
-    /// fields (`server` bind/port/auth, `database`, `data.dir`, `cluster`,
-    /// Discord/provider/agent launch and voice runtimes, MCP child processes and
-    /// credential watcher, `memory`, GitHub sync cadence, prompt retention, and
-    /// the config watcher flag itself) are NOT hot-swapped — a change to those is
-    /// applied to the shared snapshot but logged as restart-required, since live
-    /// subsystems bound them at boot.
+    /// When true (default), a validated edit to the config file replaces the live snapshot;
+    /// an invalid edit keeps it. `reload_classes::FIELDS` lists which fields act on the swap.
     #[serde(default = "default_true")]
     pub config_hot_reload: bool,
 }
@@ -153,24 +151,9 @@ pub struct ServerConfig {
     /// Socket-peer source filter for every HTTP route (see `web_surface::peer_filter`).
     #[serde(default, skip_serializing_if = "PeerFilterMode::is_default")]
     pub peer_filter: PeerFilterMode,
-}
-
-impl std::fmt::Debug for ServerConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServerConfig")
-            .field("port", &self.port)
-            .field("host", &self.host)
-            .field(
-                "auth_token",
-                &self.auth_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field(
-                "allow_insecure_nonloopback_bind",
-                &self.allow_insecure_nonloopback_bind,
-            )
-            .field("peer_filter", &self.peer_filter)
-            .finish()
-    }
+    /// Host/Origin/body-type guard for browser-borne requests (see `web_surface::browser_guard`).
+    #[serde(default, skip_serializing_if = "BrowserGuardMode::is_default")]
+    pub browser_guard: BrowserGuardMode,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -362,42 +345,6 @@ where
     )
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-pub struct AgentDef {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub name_ko: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aliases: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wake_word: Option<String>,
-    #[serde(default = "default_true", skip_serializing_if = "is_true")]
-    pub voice_enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sensitivity_mode: Option<BargeInSensitivity>,
-    #[serde(default, skip_serializing_if = "AgentVoiceConfig::is_default")]
-    pub voice: AgentVoiceConfig,
-    #[serde(default = "default_provider")]
-    pub provider: String,
-    #[serde(default, skip_serializing_if = "AgentChannels::is_empty")]
-    pub channels: AgentChannels,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub keywords: Vec<String>,
-    #[serde(default)]
-    pub department: Option<String>,
-    #[serde(default)]
-    pub avatar_emoji: Option<String>,
-    /// Cluster intake node-affinity labels (#3667). When set and non-empty,
-    /// intake for this agent's channels is routed to an online worker node whose
-    /// labels satisfy this list; `Some([])` means no preference (intake stays on
-    /// the leader). `None` (key absent from yaml) leaves any existing DB value
-    /// untouched on sync, so an out-of-band label is never wiped. Maps to the
-    /// `agents.preferred_intake_node_labels` JSONB column.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preferred_intake_node_labels: Option<Vec<String>>,
-}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct AgentVoiceConfig {
@@ -574,13 +521,6 @@ impl AgentChannel {
         }
     }
 
-    pub fn quality_feedback_injection(&self) -> Option<bool> {
-        match self {
-            Self::Legacy(_) => None,
-            Self::Detailed(config) => config.quality_feedback_injection,
-        }
-    }
-
     pub fn dispatch_profile(&self) -> Option<String> {
         match self {
             Self::Legacy(_) => None,
@@ -598,8 +538,7 @@ impl AgentChannel {
     /// Returns the configured prompt-cache TTL selector in minutes, but only
     /// for the retained 5/60 buckets. Subscription Claude automatically
     /// requests the 1h TTL without an env override, so this value is currently
-    /// inert for native sessions; forwarding it to claude-e remains an
-    /// unimplemented gap documented in `docs/claude-e-rollout/`.
+    /// inert for native sessions.
     pub fn cache_ttl_minutes(&self) -> Option<u32> {
         match self {
             Self::Legacy(_) => None,
@@ -623,9 +562,8 @@ pub fn normalize_cache_ttl_minutes(value: Option<u32>) -> Option<u32> {
 /// `AGENTDESK_PROMPT_CACHE_DEFAULT_MINUTES` accepts `5` or `60`; anything
 /// else (including the variable being unset) returns `None`. The Discord
 /// resolver still carries this value through the existing config chain, but
-/// native subscription Claude already auto-requests the 1h TTL (no env is
-/// needed), and claude-e forwarding is not implemented yet; see
-/// `docs/claude-e-rollout/`.
+/// native subscription Claude already auto-requests the 1h TTL without an env
+/// override.
 pub fn default_cache_ttl_minutes_from_env() -> Option<u32> {
     let raw = std::env::var("AGENTDESK_PROMPT_CACHE_DEFAULT_MINUTES").ok()?;
     let parsed = raw.trim().parse::<u32>().ok()?;
@@ -697,8 +635,7 @@ pub struct AgentChannelConfig {
     /// Retained Anthropic prompt-cache TTL selector (#1088). Only `5` or `60`
     /// minutes are valid. Subscription Claude automatically requests the 1h
     /// TTL without an env override, so this field is currently inert for
-    /// native sessions. Forwarding it to claude-e is an unimplemented gap;
-    /// see `docs/claude-e-rollout/`.
+    /// native sessions.
     #[serde(
         default,
         alias = "cacheTtlMinutes",
@@ -1266,8 +1203,6 @@ pub struct KanbanConfig {
     pub manager_channel_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadlock_manager_channel_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pm_decision_gate_enabled: Option<bool>,
     /// #3561 — operator override for the relay-signal alert threshold. When
     /// set, every per-hour relay invariant signal (terminal-ack timeout,
     /// uncommitted-inflight-cleared, owner-unknown, offset invariant
@@ -1283,7 +1218,6 @@ impl KanbanConfig {
     pub fn is_empty(&self) -> bool {
         self.manager_channel_id.is_none()
             && self.deadlock_manager_channel_id.is_none()
-            && self.pm_decision_gate_enabled.is_none()
             && self.relay_alert_threshold.is_none()
     }
 }
@@ -1310,13 +1244,8 @@ pub struct PlaceholderConfig {
     pub live_events_enabled: bool,
     #[serde(default = "default_true")]
     pub status_panel_v2_enabled: bool,
-    /// #3805 P2: rollout gate for the two-message panel model (answer chunks
-    /// first, the live status panel re-anchored beneath the latest chunk).
-    /// Default OFF and restart-required — the whole `placeholder` section is
-    /// boot-bound, copied into shared UI state once at startup (see
-    /// `config_live_reload::restart_required_changes`). PR-A is pure
-    /// scaffolding: no branch reads this flag yet (later PR-B~ gates the
-    /// two-message create/re-anchor path behind it).
+    pub tool_activity_display: ToolActivityDisplay,
+    /// Restart-required rollout gate for the two-message panel model (default OFF).
     #[serde(default)]
     pub two_message_panel_enabled: bool,
 }
@@ -1326,6 +1255,7 @@ impl Default for PlaceholderConfig {
         Self {
             live_events_enabled: true,
             status_panel_v2_enabled: true,
+            tool_activity_display: ToolActivityDisplay::default(),
             two_message_panel_enabled: false,
         }
     }
@@ -1414,79 +1344,6 @@ fn default_prompt_max_bytes_adk_provided() -> u64 {
 
 fn default_prompt_max_bytes_user_derived() -> u64 {
     16 * 1024
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DeliveryJournalMode {
-    /// Keep the legacy delivery writer and do not emit delivery-journal rows.
-    #[default]
-    Legacy,
-    /// Emit delivery-journal observations while the legacy writer remains authoritative.
-    Shadow,
-    /// Keep emitting observations, and let explicitly wired readers treat the journal as
-    /// authoritative. Existing delivery writers remain in place until the hot-file handoff.
-    /// This mode is selected by the YAML `runtime.delivery_journal_mode` field only:
-    /// `kv_meta['runtime-config']` and `SettingsService::put_runtime_config` do not read this
-    /// key. A value placed there through the runtime-config API is stored and echoed by that API,
-    /// but the journal consumers ignore it.
-    ///
-    /// Activation is not safe by itself. The fence risk belongs to any transition that exits
-    /// `Legacy`, not to `Authority` alone: a direct `Legacy` to `Authority` transition, or a
-    /// `Legacy` to `Shadow` transition before its admission scope is warmed, can leave an
-    /// in-flight delivery permanently absent. Legacy admits with no observation, then a later
-    /// Authority settle sees `None` and is a no-op. `JournalObserver::submit` also uses bounded
-    /// `try_send`, so a full mailbox drops an observation. Cutover therefore requires Shadow
-    /// warm-up and an in-flight drain/fence; this dormant slice does not provide either one.
-    ///
-    /// `Shadow` to `Authority` prevents that same half-recorded delivery only for deliveries
-    /// actually admitted under `Shadow`. Admission is additionally gated by the cohort and
-    /// internal-channel settings (`cohort_bucket(id) < delivery_journal_cohort_percent.min(100)` unless
-    /// the channel is internal). The shipped defaults are cohort `0` and an empty internal
-    /// channel list, so the admitted scope is empty: no observation is captured, and this
-    /// transition is equivalent to `Legacy` to `Authority` (the reconciler reaches
-    /// `settle_dispatched_unknown`). Cutover requires **the entire target scope to be admitted;
-    /// cohort warm-up complete**, in addition to the drain/fence above.
-    Authority,
-}
-
-impl DeliveryJournalMode {
-    /// Both rollout modes need observations in the journal. `Authority` does not revoke an
-    /// existing writer; that handoff belongs to a later slice.
-    pub const fn records_shadow_observations(self) -> bool {
-        matches!(self, Self::Shadow | Self::Authority)
-    }
-
-    /// Only the explicit authority mode changes a reader's source of truth.
-    pub const fn reads_as_authority(self) -> bool {
-        matches!(self, Self::Authority)
-    }
-}
-
-fn is_legacy_delivery_journal_mode(mode: &DeliveryJournalMode) -> bool {
-    *mode == DeliveryJournalMode::Legacy
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum IntakeDeliverySettlementStage {
-    /// Disable fresh-turn dispatched stamping and bridge-exit settlement, and skip the schema
-    /// probe. The turn path performs no intake-delivery database work.
-    #[default]
-    Off,
-    /// Reserve the observation stage while leaving fresh turns database-neutral: no probe,
-    /// dispatched stamp, or bridge-exit settlement runs on the turn path.
-    Observe,
-    /// Probe the schema and, when ready, enable bridge-exit settlement and stale-debt sweep.
-    /// Dispatched stamping remains disabled.
-    Settle,
-    /// Probe the schema and, when ready, enable dispatched handoff stamping, bridge-exit
-    /// settlement, and stale-debt sweep.
-    Enforce,
-}
-
-fn is_off_intake_delivery_settlement(stage: &IntakeDeliverySettlementStage) -> bool {
-    *stage == IntakeDeliverySettlementStage::Off
 }
 
 /// Rollout stage for the #5071 T3 execution-identity fence.
@@ -1647,10 +1504,6 @@ pub(crate) const INTAKE_DELIVERY_SWEEP_INITIAL_DELAY_SECS: u64 = 120;
 /// Bounds each intake-delivery settlement transaction's PostgreSQL lock wait.
 pub(crate) const INTAKE_DELIVERY_SWEEP_LOCK_TIMEOUT_SECS: u64 = 3;
 
-fn is_zero_u8(value: &u8) -> bool {
-    *value == 0
-}
-
 #[cfg(test)]
 mod runtime_hook_registry_config_tests {
     use super::*;
@@ -1673,37 +1526,7 @@ mod runtime_hook_registry_config_tests {
         // direction catches it — the negative assertions below never can.
         // This assertion preserves coverage of the serde-deserialization path.
         let absent: RuntimeSettingsConfig = serde_yaml::from_str("{}").unwrap();
-        assert_eq!(absent.delivery_journal_mode, DeliveryJournalMode::Legacy);
-        assert_eq!(absent.delivery_journal_cohort_percent, 0);
-        assert_eq!(
-            absent.intake_delivery_settlement,
-            IntakeDeliverySettlementStage::Off
-        );
-        assert!(!absent.delivery_journal_mode.records_shadow_observations());
-        assert!(!absent.delivery_journal_mode.reads_as_authority());
         assert!(absent.is_empty());
-
-        let authority: RuntimeSettingsConfig =
-            serde_yaml::from_str("delivery_journal_mode: authority\n").unwrap();
-        assert_eq!(
-            authority.delivery_journal_mode,
-            DeliveryJournalMode::Authority
-        );
-        assert_eq!(authority.delivery_journal_cohort_percent, 0);
-        assert!(
-            authority
-                .delivery_journal_mode
-                .records_shadow_observations()
-        );
-        assert!(authority.delivery_journal_mode.reads_as_authority());
-        assert!(!authority.is_empty());
-        assert_eq!(
-            serde_yaml::from_str::<RuntimeSettingsConfig>(
-                &serde_yaml::to_string(&authority).unwrap()
-            )
-            .unwrap(),
-            authority
-        );
 
         let ttl_only = RuntimeSettingsConfig {
             tui_hook_buffer_ttl_secs: Some(45),
@@ -1747,45 +1570,6 @@ mod runtime_hook_registry_config_tests {
         assert_eq!(empty.tui_hook_buffer_ttl_secs, None);
         assert_eq!(empty.tui_unclaimed_stop_delay_ms, None);
         assert_eq!(empty.tui_hook_registry_enabled, None);
-    }
-
-    #[test]
-    fn intake_delivery_settlement_defaults_off_and_round_trips() {
-        let default = RuntimeSettingsConfig::default();
-        assert_eq!(
-            default.intake_delivery_settlement,
-            IntakeDeliverySettlementStage::Off
-        );
-        assert!(
-            !serde_yaml::to_string(&default)
-                .expect("serialize default runtime")
-                .contains("intake_delivery_settlement")
-        );
-
-        for stage in [
-            IntakeDeliverySettlementStage::Off,
-            IntakeDeliverySettlementStage::Observe,
-            IntakeDeliverySettlementStage::Settle,
-            IntakeDeliverySettlementStage::Enforce,
-        ] {
-            let yaml = format!(
-                "intake_delivery_settlement: {}\n",
-                serde_yaml::to_value(stage)
-                    .expect("serialize stage")
-                    .as_str()
-                    .expect("stage serializes as a string")
-            );
-            let parsed: RuntimeSettingsConfig =
-                serde_yaml::from_str(&yaml).expect("parse settlement stage");
-            assert_eq!(parsed.intake_delivery_settlement, stage);
-            assert_eq!(
-                serde_yaml::from_str::<RuntimeSettingsConfig>(
-                    &serde_yaml::to_string(&parsed).expect("serialize runtime")
-                )
-                .expect("reparse runtime"),
-                parsed
-            );
-        }
     }
 
     // #5071 T3-A0: an operator who never writes the key must land on `Legacy`,
@@ -1962,120 +1746,6 @@ mod runtime_hook_registry_config_tests {
     fn intake_delivery_sweep_lock_timeout_stays_within_short_retry_contract() {
         assert!((1..=5).contains(&INTAKE_DELIVERY_SWEEP_LOCK_TIMEOUT_SECS));
     }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum EscalationMode {
-    Pm,
-    User,
-    Scheduled,
-}
-
-impl Default for EscalationMode {
-    fn default() -> Self {
-        Self::Pm
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct EscalationScheduleConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pm_hours: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timezone: Option<String>,
-}
-
-impl EscalationScheduleConfig {
-    pub fn is_empty(&self) -> bool {
-        self.pm_hours.is_none() && self.timezone.is_none()
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct EscalationConfig {
-    #[serde(default)]
-    pub mode: EscalationMode,
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_u64",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub owner_user_id: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pm_channel_id: Option<String>,
-    #[serde(default, skip_serializing_if = "EscalationScheduleConfig::is_empty")]
-    pub schedule: EscalationScheduleConfig,
-}
-
-impl EscalationConfig {
-    pub fn is_empty(&self) -> bool {
-        self.mode == EscalationMode::Pm
-            && self.owner_user_id.is_none()
-            && self.pm_channel_id.is_none()
-            && self.schedule.is_empty()
-    }
-}
-
-/// Default PM-hours window applied when escalation settings leave it unset.
-pub const DEFAULT_ESCALATION_PM_HOURS: &str = "00:00-08:00";
-/// Default timezone applied when escalation settings leave it unset.
-pub const DEFAULT_ESCALATION_TIMEZONE: &str = "Asia/Seoul";
-
-/// Resolved (non-optional) escalation schedule used by the settings API and
-/// Discord text commands. Distinct from [`EscalationScheduleConfig`], which is
-/// the optional on-disk config representation; this is the materialized
-/// wire/runtime shape with defaults applied.
-///
-/// Lives in the config (domain) layer so service-layer callers can depend on it
-/// without reaching back into the server route module that owns the HTTP
-/// handlers (#3037 service→server backflow).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct EscalationScheduleSettings {
-    pub pm_hours: String,
-    pub timezone: String,
-}
-
-impl Default for EscalationScheduleSettings {
-    fn default() -> Self {
-        Self {
-            pm_hours: DEFAULT_ESCALATION_PM_HOURS.to_string(),
-            timezone: DEFAULT_ESCALATION_TIMEZONE.to_string(),
-        }
-    }
-}
-
-/// Resolved escalation settings (materialized wire/runtime shape with defaults
-/// applied). See [`EscalationScheduleSettings`] for the layering rationale.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct EscalationSettings {
-    pub mode: EscalationMode,
-    pub owner_user_id: Option<u64>,
-    pub pm_channel_id: Option<String>,
-    pub schedule: EscalationScheduleSettings,
-}
-
-impl Default for EscalationSettings {
-    fn default() -> Self {
-        Self {
-            mode: EscalationMode::Pm,
-            owner_user_id: None,
-            pm_channel_id: None,
-            schedule: EscalationScheduleSettings::default(),
-        }
-    }
-}
-
-/// API response body for the escalation settings endpoint: the current
-/// effective settings plus the computed defaults.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct EscalationSettingsResponse {
-    pub current: EscalationSettings,
-    pub defaults: EscalationSettings,
 }
 
 /// Onboarding wizard / agent-factory rules. Externalizes the values that used
@@ -2421,6 +2091,7 @@ impl Default for ServerConfig {
             auth_token: None,
             allow_insecure_nonloopback_bind: false,
             peer_filter: PeerFilterMode::default(),
+            browser_guard: BrowserGuardMode::default(),
         }
     }
 }
@@ -2449,18 +2120,17 @@ pub fn loopback() -> String {
     ServerConfig::loopback()
 }
 
-/// Canonical runtime root: $AGENTDESK_ROOT_DIR → ~/.adk/release
+mod runtime_root_guard;
+
+/// Canonical runtime root; tests default to a process-local temporary directory.
 /// All code that needs the AgentDesk root directory MUST call this function
 /// instead of reimplementing the resolution logic.
 pub fn runtime_root() -> Option<std::path::PathBuf> {
-    if let Ok(override_root) = std::env::var("AGENTDESK_ROOT_DIR") {
-        let trimmed = override_root.trim();
-        if !trimmed.is_empty() {
-            return Some(std::path::PathBuf::from(trimmed));
-        }
-    }
-    dirs::home_dir().map(|h| h.join(".adk").join("release"))
+    runtime_root_guard::resolve(dirs::home_dir)
 }
+
+#[cfg(test)]
+mod runtime_root_tests;
 
 impl Default for PoliciesConfig {
     fn default() -> Self {
@@ -2475,17 +2145,14 @@ impl Default for PoliciesConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct RoutinesConfig {
-    /// Master on/off switch. Defaults to false; requires PostgreSQL and is
-    /// unavailable without the PG control plane.
+    /// Master on/off switch. Defaults to false; requires the PostgreSQL control plane.
     #[serde(default)]
     pub enabled: bool,
-    /// Release-managed directory containing bundled *.js routine scripts.
-    /// Defaults to `./routines`.
+    /// Release-managed bundled *.js routine directory. Defaults to `./routines`.
     #[serde(default = "default_routines_dir")]
     pub dir: PathBuf,
-    /// Additional operator-managed routine script directories. These are loaded
-    /// after `dir`, so a script with the same relative path overrides the
-    /// bundled script without being copied into the release directory.
+    /// Operator-managed directories loaded after `dir`; matching relative paths
+    /// override bundled scripts without copying them into the release directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_dirs: Vec<PathBuf>,
     /// How often the due-scan tick runs, in seconds. Defaults to 30.
@@ -2503,6 +2170,9 @@ pub struct RoutinesConfig {
     /// Default maximum wait for agent-backed routine completion, in seconds.
     #[serde(default = "default_routines_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
+    /// Opt in to headless fresh agent runs. Defaults to false; requires restart.
+    #[serde(default)]
+    pub headless_fresh_agents: bool,
     /// Maximum serialized checkpoint payload accepted from a routine run.
     #[serde(default = "default_routines_max_checkpoint_bytes")]
     pub max_checkpoint_bytes: usize,
@@ -2528,7 +2198,6 @@ pub struct RoutinesConfig {
     /// `'migration_invalid'`, or `NULL` (pre-existing rows) are NEVER touched.
     /// The `ResumeRequiresNextDueAt` guard also applies: schedule-less routines
     /// with no `next_due_at` are skipped.
-    ///
     /// Defaults to 0 (disabled). Set to e.g. 3600 (1 hour) to enable.
     #[serde(default)]
     pub failure_pause_auto_resume_secs: u64,
@@ -2553,6 +2222,7 @@ impl Default for RoutinesConfig {
             max_agent_polls_per_tick: default_routines_max_agent_polls_per_tick(),
             default_timezone: default_routines_timezone(),
             agent_timeout_secs: default_routines_agent_timeout_secs(),
+            headless_fresh_agents: false,
             max_checkpoint_bytes: default_routines_max_checkpoint_bytes(),
             hot_reload: true,
             stale_paused_alert_secs: 0,
@@ -2623,6 +2293,20 @@ fn default_routines_max_consecutive_failures() -> u32 {
 #[cfg(test)]
 mod routine_config_unit_tests {
     use super::*;
+
+    #[test]
+    fn headless_fresh_agents_defaults_to_disabled() {
+        let config: RoutinesConfig = serde_json::from_str("{}").expect("empty routines config");
+        assert!(!config.headless_fresh_agents);
+        assert_eq!(config, RoutinesConfig::default());
+    }
+
+    #[test]
+    fn headless_fresh_agents_deserializes_opt_in() {
+        let config: RoutinesConfig =
+            serde_json::from_str(r#"{"headless_fresh_agents":true}"#).expect("headless opt-in");
+        assert!(config.headless_fresh_agents);
+    }
 
     #[test]
     fn routine_script_dirs_preserve_default_then_operator_order() {
@@ -2807,7 +2491,6 @@ impl Default for Config {
             placeholder: PlaceholderConfig::default(),
             runtime: RuntimeSettingsConfig::default(),
             routines: RoutinesConfig::default(),
-            escalation: EscalationConfig::default(),
             onboarding: OnboardingConfig::default(),
             memory: None,
             mcp: McpConfig::default(),
@@ -2822,14 +2505,7 @@ impl Default for Config {
 
 pub fn load() -> Result<Config> {
     crate::utils::redact::register_common_env_secrets();
-    let path = resolve_graceful_config_path(
-        std::env::var("AGENTDESK_CONFIG")
-            .ok()
-            .map(std::path::PathBuf::from),
-        runtime_root(),
-        std::env::current_dir().ok(),
-        dirs::home_dir(),
-    );
+    let path = resolved_config_path();
     let path_display = path.display().to_string();
 
     let contents = std::fs::read_to_string(&path)
@@ -2849,22 +2525,6 @@ pub fn load() -> Result<Config> {
     std::fs::create_dir_all(&config.data.dir)?;
 
     Ok(config)
-}
-
-/// The on-disk config path the running server loaded from, resolved with the
-/// same precedence as [`load`] (`$AGENTDESK_CONFIG` → runtime root → cwd → home).
-/// Used by the config file watcher so it reloads from the exact same file the
-/// boot path read. The returned path is the resolved canonical candidate even if
-/// it does not currently exist (matching the graceful resolver).
-pub fn resolved_config_path() -> PathBuf {
-    resolve_graceful_config_path(
-        std::env::var("AGENTDESK_CONFIG")
-            .ok()
-            .map(std::path::PathBuf::from),
-        runtime_root(),
-        std::env::current_dir().ok(),
-        dirs::home_dir(),
-    )
 }
 
 pub fn load_from_path(path: &Path) -> Result<Config> {
@@ -2889,7 +2549,6 @@ pub(crate) fn validate_config(config: &Config) -> Result<()> {
     config.cluster.runtime_profile.validate(&config.cluster)?;
     session_hosts::validate(config)?;
     config.onboarding.warn_invalid_rules();
-    validate_escalation_schedule(&config.escalation.schedule)?;
     validate_scheduled_message_required_mentions(
         &config.discord.scheduled_message_required_mention_user_ids,
     )
@@ -2937,27 +2596,6 @@ mod scheduled_message_required_mention_config_tests {
     }
 }
 
-fn validate_escalation_schedule(schedule: &EscalationScheduleConfig) -> Result<()> {
-    if let Some(timezone) = schedule.timezone.as_deref()
-        && timezone.parse::<chrono_tz::Tz>().is_err()
-    {
-        bail!("schedule.timezone must be a valid IANA timezone");
-    }
-    if let Some(pm_hours) = schedule.pm_hours.as_deref()
-        && parse_escalation_time_window(pm_hours).is_none()
-    {
-        bail!("schedule.pm_hours must be HH:MM-HH:MM");
-    }
-    Ok(())
-}
-
-fn parse_escalation_time_window(raw: &str) -> Option<(chrono::NaiveTime, chrono::NaiveTime)> {
-    let (start, end) = raw.trim().split_once('-')?;
-    let start = chrono::NaiveTime::parse_from_str(start.trim(), "%H:%M").ok()?;
-    let end = chrono::NaiveTime::parse_from_str(end.trim(), "%H:%M").ok()?;
-    Some((start, end))
-}
-
 fn register_config_secrets(config: &Config) {
     if let Some(token) = config.server.auth_token.as_deref() {
         crate::utils::redact::register_known_secret(token);
@@ -3000,49 +2638,45 @@ fn audit_config_file_permissions_if_secret_bearing(path: &Path, config: &Config)
 mod secret_bearing_config_file_tests {
     use super::*;
 
+    /// Retired `tui_o` keys still load, while writer and turn settings are kept.
     fn assert_retired_shadow_settings_load(enabled: bool) {
         let _env = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("retired-shadow-config.yaml");
-        let settings = format!(
-            "shadow: {{enabled: {enabled}, channel_allowlist: [41, 42]}}\n\
-             writer: {{channels: [41, 42], late_adopt: true, dormant_channels: [42]}}\n\
-             turn: {{channels: [41], all_owned: true}}\n\
-             repost: {{enabled: true, channels: [41]}}\n\
-             alert_channel_id: 42\n\
-             codex_history_adoption: false\n"
-        );
+        let live = "writer: {channels: [41, 42], late_adopt: true, dormant_channels: [42]}\n\
+             turn: {channels: [41], all_owned: true}\n\
+             alert_channel_id: 42\n";
         let expected: crate::services::tui_o::shadow::tap::TuiOConfig =
-            serde_yaml::from_str(&settings).unwrap();
-        let indented = settings
-            .lines()
-            .map(|line| format!("  {line}\n"))
-            .collect::<String>();
-        let data_dir = serde_json::to_string(&dir.path().join("data")).unwrap();
-        let yaml = format!(
-            concat!(
-                "server: {{}}\ndata: {{dir: {}}}\n",
-                "agents:\n  - id: retired-shadow\n    name: Retired shadow\n",
-                "    channels:\n",
-                "      claude: {{id: '41', runtime: tui}}\n",
-                "      codex: {{id: '42', runtime: tui}}\n",
-                "tui_o:\n{}"
-            ),
-            data_dir, indented
-        );
-        std::fs::write(&path, &yaml).unwrap();
-
-        let loaded = load_from_path(&path).unwrap();
-        let output = loaded.tui_o.as_ref().unwrap();
-
-        assert_eq!(output, &expected);
-        assert_eq!(output.shadow.enabled, enabled);
-        assert_eq!(output.shadow.channel_allowlist, [41, 42]);
-        assert_eq!(
-            serde_yaml::to_string(output).unwrap(),
-            serde_yaml::to_string(&expected).unwrap()
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+            serde_yaml::from_str(live).unwrap();
+        for repost in [
+            "{enabled: true, channels: [41]}",
+            "{enabled: false, channels: []}",
+            "{enabled: obsolete, channels: malformed, enabeld: true}",
+        ] {
+            let yaml = format!(
+                concat!(
+                    "server: {{}}\ndata: {{dir: {}}}\n",
+                    "agents:\n  - id: retired-shadow\n    name: Retired shadow\n",
+                    "    channels:\n",
+                    "      claude: {{id: '41', runtime: tui}}\n",
+                    "      codex: {{id: '42', runtime: tui}}\n",
+                    "tui_o:\n  shadow: {{enabled: {enabled}, channel_allowlist: [41, 42]}}\n",
+                    "  codex_history_adoption: {enabled}\n  repost: {repost}\n  {}"
+                ),
+                serde_json::to_string(&dir.path().join("data")).unwrap(),
+                live.replace('\n', "\n  "),
+                enabled = enabled,
+                repost = repost,
+            );
+            std::fs::write(&path, &yaml).unwrap();
+            let loaded = load_from_path(&path).unwrap();
+            let output = loaded.tui_o.as_ref().unwrap();
+            assert_eq!(output, &expected);
+            assert!(output.writer.late_adopt);
+            let rendered = serde_yaml::to_string(output).unwrap();
+            assert!(!rendered.contains("repost"), "{rendered}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), yaml);
+        }
     }
 
     #[test]
@@ -3056,29 +2690,20 @@ mod secret_bearing_config_file_tests {
     }
 
     #[test]
-    fn load_from_path_rejects_invalid_escalation_schedule_timezone() {
+    fn load_from_path_ignores_retired_escalation_section() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agentdesk.yaml");
-        let mut config = Config::default();
-        config.escalation.schedule.timezone = Some("Mars/Olympus".to_string());
-        save_to_path(&path, &config).unwrap();
-
-        let error = format!("{:#}", load_from_path(&path).unwrap_err());
-
-        assert!(error.contains("schedule.timezone must be a valid IANA timezone"));
-    }
-
-    #[test]
-    fn load_from_path_rejects_invalid_escalation_schedule_pm_hours() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agentdesk.yaml");
-        let mut config = Config::default();
-        config.escalation.schedule.pm_hours = Some("soon".to_string());
-        save_to_path(&path, &config).unwrap();
-
-        let error = format!("{:#}", load_from_path(&path).unwrap_err());
-
-        assert!(error.contains("schedule.pm_hours must be HH:MM-HH:MM"));
+        save_to_path(&path, &Config::default()).unwrap();
+        let mut legacy_yaml = std::fs::read_to_string(&path).unwrap();
+        legacy_yaml.push_str("\nescalation:\n  mode: scheduled\n  owner_user_id: \"9\"\n  schedule:\n    timezone: Mars/Olympus\n");
+        std::fs::write(&path, legacy_yaml).unwrap();
+        let loaded = load_from_path(&path).unwrap();
+        assert!(
+            serde_yaml::to_value(&loaded)
+                .unwrap()
+                .get("escalation")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3141,7 +2766,8 @@ mod secret_bearing_config_file_tests {
         let path = dir.path().join("agentdesk.yaml");
         let mut config = Config::default();
         config.database.password = Some("database-secret".to_string());
-        config.escalation.schedule.timezone = Some("Mars/Olympus".to_string());
+        config.discord.scheduled_message_required_mention_user_ids =
+            vec!["not-a-user-id".to_string()];
         save_to_path(&path, &config).unwrap();
 
         let mut loose_permissions = std::fs::metadata(&path).unwrap().permissions();
@@ -3150,113 +2776,16 @@ mod secret_bearing_config_file_tests {
 
         let error = format!("{:#}", load_from_path(&path).unwrap_err());
 
-        assert!(error.contains("schedule.timezone must be a valid IANA timezone"));
+        assert!(error.contains("scheduled_message_required_mention_user_ids must contain"));
         let hardened_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(hardened_mode, 0o600);
     }
 }
 
-fn resolve_graceful_config_path(
-    explicit: Option<std::path::PathBuf>,
-    runtime_root: Option<std::path::PathBuf>,
-    cwd: Option<std::path::PathBuf>,
-    home_dir: Option<std::path::PathBuf>,
-) -> std::path::PathBuf {
-    if let Some(path) = explicit {
-        if path.exists() {
-            return path;
-        }
-
-        let mut candidates = Vec::new();
-        if let Some(root) = runtime_root.as_ref() {
-            let canonical = crate::runtime_layout::config_file_path(root);
-            let legacy = crate::runtime_layout::legacy_config_file_path(root);
-            if path == legacy {
-                candidates.push(canonical);
-            } else if path == canonical {
-                candidates.push(legacy);
-            }
-        }
-
-        if path.file_name() == Some(OsStr::new("agentdesk.yaml")) {
-            if let Some(parent) = path.parent() {
-                if parent.file_name() == Some(OsStr::new("config")) {
-                    if let Some(root) = parent.parent() {
-                        let legacy = root.join("agentdesk.yaml");
-                        if legacy != path {
-                            candidates.push(legacy);
-                        }
-                    }
-                } else {
-                    let canonical = parent.join("config").join("agentdesk.yaml");
-                    if canonical != path {
-                        candidates.push(canonical);
-                    }
-                }
-            }
-        }
-
-        if let Some(candidate) = candidates.into_iter().find(|candidate| candidate.exists()) {
-            return candidate;
-        }
-        return path;
-    }
-    if let Some(root) = runtime_root.as_ref() {
-        for path in [
-            crate::runtime_layout::config_file_path(root),
-            crate::runtime_layout::legacy_config_file_path(root),
-        ] {
-            if path.exists() {
-                return path;
-            }
-        }
-    }
-    if let Some(dir) = cwd {
-        for path in [
-            dir.join("config").join("agentdesk.yaml"),
-            dir.join("agentdesk.yaml"),
-        ] {
-            if path.exists() {
-                return path;
-            }
-        }
-    }
-    if let Some(home) = home_dir {
-        let release_root = home.join(".adk").join("release");
-        for path in [
-            crate::runtime_layout::config_file_path(&release_root),
-            crate::runtime_layout::legacy_config_file_path(&release_root),
-        ] {
-            if path.exists() {
-                return path;
-            }
-        }
-    }
-    runtime_root
-        .map(|root| crate::runtime_layout::config_file_path(&root))
-        .unwrap_or_else(|| std::path::PathBuf::from("config").join("agentdesk.yaml"))
-}
-
-/// Load config gracefully; invalid or missing files use the live snapshot or defaults.
-/// Searches:
-/// $AGENTDESK_CONFIG →
-/// $AGENTDESK_ROOT_DIR/config/agentdesk.yaml →
-/// $AGENTDESK_ROOT_DIR/agentdesk.yaml →
-/// CWD/config/agentdesk.yaml →
-/// CWD/agentdesk.yaml →
-/// ~/.adk/release/config/agentdesk.yaml →
-/// ~/.adk/release/agentdesk.yaml
+/// Load config gracefully from [`resolved_config_path`]; invalid or missing files use the
+/// live snapshot or defaults.
 pub fn load_graceful() -> Config {
-    let path = resolve_graceful_config_path(
-        std::env::var("AGENTDESK_CONFIG")
-            .ok()
-            .map(std::path::PathBuf::from),
-        std::env::var("AGENTDESK_ROOT_DIR")
-            .ok()
-            .map(|root| std::path::PathBuf::from(root.trim())),
-        std::env::current_dir().ok(),
-        dirs::home_dir(),
-    );
+    let path = resolved_config_path();
     let path_display = path.display().to_string();
 
     let config = match std::fs::read_to_string(&path) {
@@ -3325,11 +2854,9 @@ pub fn load_graceful() -> Config {
 /// the number of independent cascades that are possible.
 ///
 /// The convention here is that every acquisition site recovers the guard
-/// rather than propagating the `PoisonError`. Of the 290 direct
-/// `shared_test_env_lock().lock()` sites, 288 spell it
-/// `unwrap_or_else(|poison| poison.into_inner())` literally; the remaining two
-/// recover identically in a different syntax -- `placeholder_live_events`
-/// matches on `Err(poisoned) => poisoned.into_inner()`, and
+/// rather than propagating the `PoisonError`; direct `shared_test_env_lock().lock()`
+/// sites pass an `into_inner` recovery to `unwrap_or_else`, except that
+/// `placeholder_live_events` matches on `Err(poisoned) => poisoned.into_inner()`, and
 /// `turn_orchestrator::SharedEnvLock::lock` is a forwarding shim whose single
 /// caller `lock_test_env()` applies the `unwrap_or_else`. The canonical
 /// `test_env_lock::acquire_shared_test_env_lock` path recovers too.
@@ -3549,3 +3076,7 @@ mod shared_test_env_lock_tests {
 
 #[cfg(test)]
 mod writer_channels_tests;
+
+#[cfg(test)]
+#[path = "config/retired_relay_tests.rs"]
+mod retired_relay_tests;

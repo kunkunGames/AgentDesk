@@ -53,9 +53,9 @@ pub(crate) async fn disposition(pool: &PgPool, card: &str) -> Result<String, Str
 const WORK_SCOPE: &str = "FROM kanban_cards k JOIN LATERAL (SELECT id,result,status FROM task_dispatches WHERE kanban_card_id=k.id AND dispatch_type IN ('implementation','rework') ORDER BY created_at DESC,id DESC LIMIT 1) d ON d.status='completed' WHERE k.status='review' AND k.verification_contract IS NOT NULL AND NOT EXISTS(SELECT 1 FROM task_dispatches a WHERE a.kanban_card_id=k.id AND a.dispatch_type IN ('implementation','rework') AND a.status IN ('pending','dispatched'))";
 
 pub(super) async fn pending_cards(pool: &PgPool) -> anyhow::Result<Vec<String>> {
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT k.id {WORK_SCOPE} ORDER BY k.updated_at,k.id LIMIT 16"
-    ))
+    )))
     .fetch_all(pool)
     .await?)
 }
@@ -64,7 +64,10 @@ pub(super) async fn load(pool: &PgPool, card: &str) -> anyhow::Result<Option<Wor
     let query = format!(
         "SELECT k.verification_contract,k.verification_state,k.assigned_agent_id,k.repo_id,k.pipeline_stage_id,d.id AS dispatch_id,d.result {WORK_SCOPE} AND k.id=$1"
     );
-    let row = sqlx::query(&query).bind(card).fetch_optional(pool).await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(query))
+        .bind(card)
+        .fetch_optional(pool)
+        .await?;
     row.map(|r| {
         Ok(Work {
             card: card.into(),

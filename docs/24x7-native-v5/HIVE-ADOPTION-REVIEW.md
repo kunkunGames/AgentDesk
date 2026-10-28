@@ -1,5 +1,7 @@
 # Hive patterns adapted to native Campaign execution
 
+<!-- doc-path-refs: external host/ agent_loop/ worker_definition.py -->
+
 Initial source basis: the user-supplied `D:\P4\hive` tree, inspected on
 2026-09-29 KST. On 2026-10-03 KST, the supplied
 `C:\Users\12336\Desktop\hive-main.zip` was checked directly. Its SHA-256 is

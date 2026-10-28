@@ -1,12 +1,13 @@
 //! `agentdesk herdr`: this node's Herdr-hosted executions: a read-only status, a retire that only
-//! reads the pane before its nonce compare-and-set, and a terminate the local server performs.
+//! reads the pane before its nonce compare-and-set, a terminate the local server performs, and a
+//! read-only probe of the execution user's own server.
 
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 
 #[derive(Args)]
 #[command(
-    about = "Herdr-hosted executions on this node: status, retire of an ended one, and terminate"
+    about = "Herdr-hosted executions on this node: status, retire of an ended one, terminate, and a user-default probe"
 )]
 pub(crate) struct HerdrArgs {
     #[command(subcommand)]
@@ -35,6 +36,12 @@ pub(crate) enum HerdrCommand {
         #[arg(long)]
         reason: String,
     },
+    /// Check the execution user's own herdr server once; reads no AgentDesk config or database
+    ProbeUserDefault {
+        /// Absolute socket path; defaults to $HOME/.config/herdr/herdr.sock
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
 }
 
 pub(crate) fn run(args: HerdrArgs) -> Result<(), String> {
@@ -46,6 +53,10 @@ pub(crate) fn run(args: HerdrArgs) -> Result<(), String> {
         } => {
             let body = json!({"session_key": session_key, "execution_nonce": execution_nonce, "reason": reason});
             return terminate(&super::client::api_base(), &body);
+        }
+        #[cfg(unix)]
+        HerdrCommand::ProbeUserDefault { socket } => {
+            return user_probe::run(socket, std::env::var_os("HOME"), &mut std::io::stdout());
         }
         command => command,
     };
@@ -75,22 +86,23 @@ fn terminate(base: &str, body: &Value) -> Result<(), String> {
     ))
 }
 
-pub(crate) fn confirmed_ended(
-    record: &crate::db::dispatched_sessions::hosted_execution::HostedExecution,
-    reading: &crate::services::session_host::PaneReading,
-) -> bool {
-    use crate::services::session_host::{PaneProvider, PaneReading};
-    match reading {
-        PaneReading::Missing => true,
-        PaneReading::Present {
-            root,
-            provider: PaneProvider::Exited,
-        } => record
-            .expected
-            .as_ref()
-            .is_some_and(|expected| expected.root == *root),
-        PaneReading::Present { .. } | PaneReading::Unreadable(_) => false,
-    }
+#[cfg(unix)]
+pub(crate) async fn install_observation_hosts(
+    config: &crate::config::Config,
+    pool: &sqlx::PgPool,
+) -> Result<(), String> {
+    let candidate = crate::config::session_hosts::BootSessionHosts::from_config(config)
+        .map_err(|error| format!("{error}"))?;
+    let selection = crate::config::session_hosts::migration::select(
+        candidate,
+        &crate::config::session_hosts::approval_store::FileApprovalStore::runtime(),
+        &crate::config::session_hosts::migration::PgRows(Some(pool)),
+        &crate::config::session_hosts::migration::NoHoldStore,
+        true,
+    )
+    .await;
+    crate::config::session_hosts::install_selected(selection);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -113,7 +125,7 @@ mod node {
         /// No live Herdr row of this channel on this node, or more than one.
         NoRow(&'static str),
         ProviderRunning,
-        /// The pane was not read as gone or as its own shell alone; it may still run something.
+        /// The pane was not read as one its execution has left; it may still run something.
         Unproven(&'static str),
         /// The row changed after it was read, or the transition was refused.
         Changed(String),
@@ -130,11 +142,11 @@ mod node {
 
     pub(super) fn run(command: HerdrCommand) -> Result<(), String> {
         let config = crate::config::load().map_err(|error| format!("load config: {error}"))?;
-        crate::config::session_hosts::install(&config).map_err(|error| format!("{error}"))?;
         super::super::direct::run_async(async move {
             let pool = crate::db::postgres::connect(&config)
                 .await?
                 .ok_or("postgres pool unavailable for herdr")?;
+            super::install_observation_hosts(&config, &pool).await?;
             let result = match command {
                 HerdrCommand::Status => status(&pool).await.map(|status| pretty(&status)),
                 HerdrCommand::Retire { channel } => match retire(&pool, channel).await {
@@ -142,6 +154,9 @@ mod node {
                     Err(refusal) => Err(format!("herdr retire {channel} refused: {refusal:?}")),
                 },
                 HerdrCommand::Terminate { .. } => Err("herdr terminate goes to the server".into()),
+                HerdrCommand::ProbeUserDefault { .. } => {
+                    Err("herdr probe-user-default reads no database".into())
+                }
             };
             pool.close().await;
             println!("{}", result?);
@@ -191,6 +206,21 @@ mod node {
         Some(read.unwrap_or_else(|error| PaneReading::Unreadable(error.to_string())))
     }
 
+    /// As `read_pane`, with whether that reading shows `record`'s execution ended.
+    async fn read_end(record: &HostedExecution) -> Option<(PaneReading, bool)> {
+        let view = herdr_endpoints().view(record)?;
+        let record = record.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            let reading = view.read_execution();
+            let ended = view.ended(&record, &reading);
+            (reading, ended)
+        });
+        Some(
+            read.await
+                .unwrap_or_else(|error| (PaneReading::Unreadable(error.to_string()), false)),
+        )
+    }
+
     fn known(row: &HostedObservation) -> Option<&HostedExecution> {
         match &row.record {
             HostedRecord::Known(record) => Some(record),
@@ -198,8 +228,8 @@ mod node {
         }
     }
 
-    /// Retires `channel`'s execution only when its pane reads as gone, or as the recorded root shell
-    /// with no provider; then that execution's hold, and only that one, is released.
+    /// Retires `channel`'s execution only when its pane reads as gone, or as a lone shell that is
+    /// its recorded root or outlived both recorded processes; then only that execution's hold goes.
     pub(crate) async fn retire(pool: &PgPool, channel: u64) -> Result<Retired, RetireRefusal> {
         let node = local_node()?;
         let rows = list_local_herdr_rows_pg(pool, &node, LIVE)
@@ -219,13 +249,13 @@ mod node {
             }
         };
         let record = known(row).ok_or(RetireRefusal::NoRow("unreadable record"))?;
-        let Some(reading) = read_pane(record).await else {
+        let Some((reading, ended)) = read_end(record).await else {
             return Err(match record.location {
                 None => RetireRefusal::Unproven("no recorded pane"),
                 Some(_) => RetireRefusal::NoLocalEndpoint,
             });
         };
-        retire_on_reading(pool, row, record, &reading).await
+        retire_on_reading(pool, row, record, &reading, ended).await
     }
 
     /// The channel's execution an earlier retire already wrote Retired, whose hold that retire
@@ -257,14 +287,15 @@ mod node {
         })
     }
 
-    /// The retire decision on one reading; the hold goes only after the row's CAS wrote Retired.
+    /// The retire decision on one reading and whether it shows the execution ended; the hold goes
+    /// only after the row's CAS wrote Retired.
     pub(crate) async fn retire_on_reading(
         pool: &PgPool,
         row: &HostedObservation,
         record: &HostedExecution,
         reading: &PaneReading,
+        ended: bool,
     ) -> Result<Retired, RetireRefusal> {
-        let ended = super::confirmed_ended(record, reading);
         if !ended {
             return Err(match reading {
                 PaneReading::Present {
@@ -361,7 +392,11 @@ mod node {
 }
 
 #[cfg(all(test, unix))]
-use node::{RetireRefusal, Retired, retire, retire_on_reading, status};
+pub(crate) use node::{RetireRefusal, Retired, retire, retire_on_reading, status};
+
+#[cfg(unix)]
+#[path = "herdr_probe.rs"]
+mod user_probe;
 
 #[cfg(test)]
 #[path = "herdr_tests.rs"]

@@ -75,29 +75,8 @@ pub(super) fn spawn_channel_mailbox(
             remint_fence: fence,
             ..Default::default()
         };
-        while let Some((msg, input_permit)) = rx.recv().await {
-            if crate::services::discord::input_runtime::fence::channel_gate(channel_id.get())
-                .is_some()
-            {
-                let signal = own_recovery_done.clone();
-                state = tokio::task::spawn_blocking(move || {
-                    crate::services::discord::input_runtime::fence::effect::synchronous(
-                        input_permit,
-                        || {
-                            crate::services::discord::input_runtime::fence::blocking(|| {
-                                input_mailbox_step(state, channel_id, msg, &signal)
-                            })
-                        },
-                    )
-                })
-                .await
-                .expect("input mailbox step panicked");
-            } else {
-                state = crate::services::discord::input_runtime::fence::effect::synchronous(
-                    input_permit,
-                    || input_mailbox_step(state, channel_id, msg, &own_recovery_done),
-                );
-            }
+        while let Some(msg) = rx.recv().await {
+            state = input_mailbox_step(state, channel_id, msg, &own_recovery_done);
         }
     });
     ChannelMailboxHandle {

@@ -17,18 +17,16 @@ class SkipPromotionTests(unittest.TestCase):
         (self.root / 'src').mkdir()
         (self.root / 'scripts').mkdir()
         (self.root / 'src/lib.rs').write_text(
-            'mod promoted;\n#[cfg(test)] mod still_test;\n')
-        for name in ('promoted.rs', 'still_test.rs', 'fixture_tests.rs'):
+            'mod promoted;\n#[cfg(test)] mod still_test;\n#[cfg(test)] mod deleted;\n')
+        for name in ('promoted.rs', 'still_test.rs', 'deleted.rs', 'fixture_tests.rs'):
             (self.root / 'src' / name).write_text('fn fixture() {}\n')
         self.path = self.root / 'scripts/test_only_module_skip_pin.py'
         self.original = (
-            'PINNED_BASENAME_TEST_FILES = frozenset(\n    {\n'
-            '        "src/fixture_tests.rs",\n    }\n)\n'
             'PINNED_RESOLVER_TEST_ONLY_FILES = frozenset(\n    {\n'
-            '        "src/promoted.rs",\n        "src/still_test.rs",\n    }\n)\n')
+            '        "src/promoted.rs",\n        "src/still_test.rs",\n        "src/deleted.rs",\n    }\n)\n')
         self.path.write_text(self.original)
-        pinned = frozenset(('src/fixture_tests.rs', 'src/promoted.rs', 'src/still_test.rs'))
-        patched = patch.object(guard.classifier._SKIP_PIN, 'PINNED_TEST_ONLY_MODULE_FILES', pinned)
+        pinned = frozenset(('src/deleted.rs', 'src/promoted.rs', 'src/still_test.rs'))
+        patched = patch.object(guard.classifier._SKIP_PIN, 'PINNED_RESOLVER_TEST_ONLY_FILES', pinned)
         patched.start()
         self.addCleanup(patched.stop)
 
@@ -39,19 +37,54 @@ class SkipPromotionTests(unittest.TestCase):
             return str(error)
         return None
 
-    def test_explicit_promotion_removes_only_its_pin(self):
-        self.assertIsNone(self.outcome(('src/promoted.rs',)))
-        self.assertNotIn('"src/promoted.rs"', self.path.read_text())
-        self.assertIn('"src/still_test.rs"', self.path.read_text())
-        self.assertIn('"src/fixture_tests.rs"', self.path.read_text())
+    def manual_step(self, relative, source=None):
+        source = source or self.path
+        label = source.relative_to(self.root).as_posix()
+        line = source.read_text().splitlines().index('        "' + relative + '",') + 1
+        return (f'{label}:{line}: delete the legacy pin `{relative}` by hand; '
+                f'--sync-skips never rewrites {label}')
 
-    def test_explicit_deletion_removes_only_missing_pin(self):
-        (self.root / 'src/fixture_tests.rs').unlink()
-        with patch.object(guard.classifier._SKIP_PIN, 'PINNED_TEST_ONLY_MODULE_FILES',
-                          frozenset(('src/fixture_tests.rs', 'src/still_test.rs'))):
-            guard.sync_skips(self.root, deleted_paths=('src/fixture_tests.rs',))
-        self.assertNotIn('"src/fixture_tests.rs"', self.path.read_text())
-        self.assertIn('"src/still_test.rs"', self.path.read_text())
+    def test_explicit_legacy_promotion_returns_a_manual_step_without_writing(self):
+        self.assertEqual(guard.sync_skips(self.root, ('src/promoted.rs',)),
+                         ([self.manual_step('src/promoted.rs')], []))
+        self.assertEqual(self.path.read_text(), self.original)
+        self.assertFalse((self.root / guard.registry.FRAGMENTS_REL).exists())
+
+    def test_split_pin_preserves_delegate_and_child_until_manual_promotion(self):
+        child = self.root / 'scripts/test_only_module_skip_pin_paths.py'
+        child.write_text(self.original)
+        delegate = 'from test_only_module_skip_pin_paths import *\n'
+        self.path.write_text(delegate)
+        (self.root / 'src/new_tests.rs').write_text('fn fixture() {}\n')
+        (self.root / 'src/new_helper.rs').write_text('fn fixture() {}\n')
+        owner = self.root / 'src/lib.rs'
+        owner.write_text(owner.read_text() + '#[cfg(test)] mod new_helper;\n')
+        self.assertEqual(guard.sync_skips(self.root, ('src/promoted.rs',)),
+                         ([self.manual_step('src/promoted.rs', child)], []))
+        self.assertEqual(self.path.read_text(), delegate)
+        self.assertEqual(child.read_text(), self.original)
+        self.assertFalse((self.root / guard.registry.FRAGMENTS_REL).exists())
+        manual = self.original.replace('        "src/promoted.rs",\n', '')
+        child.write_text(manual)
+        fragment = guard.registry.FRAGMENTS_REL / guard.registry.auto_fragment('src/new_helper.rs')
+        self.assertEqual(guard.sync_skips(self.root), ([], [fragment.as_posix()]))
+        self.assertEqual(self.path.read_text(), delegate)
+        self.assertEqual(child.read_text(), manual)
+        self.assertEqual((self.root / fragment).read_text(), 'resolver | src/new_helper.rs\n')
+        rows = guard.registry.load(self.root).rows
+        self.assertNotIn('src/new_tests.rs', rows)
+        self.assertIn('src/still_test.rs', rows)
+
+    def test_explicit_legacy_deletion_returns_manual_step_without_writing(self):
+        manual = self.original.replace('        "src/promoted.rs",\n', '')
+        self.path.write_text(manual)
+        (self.root / 'src/deleted.rs').unlink()
+        with patch.object(guard.classifier._SKIP_PIN, 'PINNED_RESOLVER_TEST_ONLY_FILES',
+                          frozenset(('src/deleted.rs', 'src/still_test.rs'))):
+            self.assertEqual(guard.sync_skips(self.root, deleted_paths=('src/deleted.rs',)),
+                             ([self.manual_step('src/deleted.rs')], []))
+        self.assertEqual(self.path.read_text(), manual)
+        self.assertFalse((self.root / guard.registry.FRAGMENTS_REL).exists())
 
     def test_existing_deletion_path_refuses_without_writing(self):
         with self.assertRaisesRegex(RuntimeError, 'deletion path still exists: src/still_test.rs'):
@@ -72,8 +105,8 @@ class SkipPromotionTests(unittest.TestCase):
                                          '"src/promoted.rs",\n        "src/missing.rs",')
         self.path.write_text(original)
         pin = guard.classifier._SKIP_PIN
-        with patch.object(pin, 'PINNED_TEST_ONLY_MODULE_FILES',
-                          pin.PINNED_TEST_ONLY_MODULE_FILES | {'src/missing.rs'}):
+        with patch.object(pin, 'PINNED_RESOLVER_TEST_ONLY_FILES',
+                          pin.PINNED_RESOLVER_TEST_ONLY_FILES | {'src/missing.rs'}):
             self.assertEqual(self.outcome(('src/promoted.rs', 'src/missing.rs')),
                              'promotion path missing: src/missing.rs')
         self.assertEqual(self.path.read_text(), original)
@@ -83,30 +116,83 @@ class SkipPromotionTests(unittest.TestCase):
                          'promotion remains test-only: src/still_test.rs')
         self.assertEqual(self.path.read_text(), self.original)
 
-    def test_addition_stays_next_to_its_directory_without_removing_existing_pins(self):
+    def test_basename_addition_needs_no_pin_without_removing_existing_resolver_pins(self):
         (self.root / 'src/new_tests.rs').write_text('fn fixture() {}\n')
-        self.assertIsNone(self.outcome(('src/promoted.rs',)))
-        source = self.path.read_text()
-        self.assertLess(source.index('"src/new_tests.rs"'), source.index('"src/fixture_tests.rs"'))
-        self.assertIn('"src/still_test.rs"', source)
+        self.assertEqual(guard.sync_skips(self.root, ('src/promoted.rs',)),
+                         ([self.manual_step('src/promoted.rs')], []))
+        self.assertEqual(self.path.read_text(), self.original)
+        manual = self.original.replace('        "src/promoted.rs",\n', '')
+        self.path.write_text(manual)
+        self.assertEqual(guard.sync_skips(self.root), ([], []))
+        self.assertEqual(self.path.read_text(), manual)
+        self.assertNotIn('new_tests.rs', manual)
+        self.assertNotIn('fixture_tests.rs', manual)
+        self.assertIn('"src/still_test.rs"', manual)
+        self.assertFalse((self.root / guard.registry.FRAGMENTS_REL).exists())
 
-    def test_explicit_deleted_pin_removes_only_missing_path(self):
-        missing = 'src/fixture_tests.rs'
-        (self.root / missing).unlink()
-        guard.sync_skips(self.root, ('src/promoted.rs',), (missing,))
-        self.assertNotIn('"src/fixture_tests.rs"', self.path.read_text())
-        self.assertIn('"src/still_test.rs"', self.path.read_text())
+    def test_basename_addition_and_deletion_leave_pin_bytes_unchanged(self):
+        self.path.write_text(self.original.replace('        "src/promoted.rs",\n', ''))
+        before = self.path.read_bytes()
+        added = self.root / 'src/new_tests.rs'
+        added.write_text('fn fixture() {}\n')
+        pin = guard.classifier._SKIP_PIN
+        with patch.object(pin, 'PINNED_RESOLVER_TEST_ONLY_FILES',
+                          pin.PINNED_RESOLVER_TEST_ONLY_FILES - {'src/promoted.rs'}):
+            self.assertEqual(guard.sync_skips(self.root), ([], []))
+            self.assertEqual(self.path.read_bytes(), before)
+            added.unlink()
+            self.assertEqual(guard.sync_skips(self.root), ([], []))
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertFalse((self.root / guard.registry.FRAGMENTS_REL).exists())
+
+    def test_sync_refuses_production_basename_mount_without_writing(self):
+        (self.root / 'src/lib.rs').write_text('mod fixture_tests;\n')
+        with self.assertRaisesRegex(RuntimeError, 'production module mounts basename test file'):
+            guard.sync_skips(self.root)
+        self.assertEqual(self.path.read_text(), self.original)
+
+    def deletion_fragment(self):
+        legacy = self.original
+        for relative in ('src/promoted.rs', 'src/still_test.rs', 'src/deleted.rs'):
+            legacy = legacy.replace('        "' + relative + '",\n', '')
+        self.path.write_text(legacy)
+        fragment = self.root / guard.registry.FRAGMENTS_REL / 'mac-mini-1-delete.txt'
+        fragment.parent.mkdir()
+        fragment.write_text('resolver | src/deleted.rs\nresolver | src/still_test.rs\n')
+        (self.root / 'src/deleted.rs').unlink()
+        return fragment, legacy
+
+    def test_explicit_deleted_fragment_removes_only_missing_path(self):
+        fragment, legacy = self.deletion_fragment()
+        self.assertEqual(guard.sync_skips(self.root, (), ('src/deleted.rs',)),
+                         ([], [fragment.relative_to(self.root).as_posix()]))
+        self.assertEqual(fragment.read_text(), 'resolver | src/still_test.rs\n')
+        self.assertEqual(self.path.read_text(), legacy)
+        self.assertEqual(set(guard.registry.load(self.root).rows), {'src/still_test.rs'})
+
+    def test_delete_pin_cli_alias_removes_only_missing_fragment_path(self):
+        fragment, legacy = self.deletion_fragment()
+        result = subprocess.run(
+            [sys.executable, str(Path(guard.__file__).resolve()), '--sync-skips',
+             '--delete-pin', 'src/deleted.rs'], cwd=self.root,
+            capture_output=True, text=True, check=False, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, 'skip pin fragment written: '
+                         + fragment.relative_to(self.root).as_posix() + '\n')
+        self.assertEqual(result.stderr, '')
+        self.assertEqual(fragment.read_text(), 'resolver | src/still_test.rs\n')
+        self.assertEqual(self.path.read_text(), legacy)
 
     def test_deleted_pin_refuses_existing_unpinned_or_implicit_removal(self):
         for path, expected in (
-            ('src/fixture_tests.rs', 'deletion path still exists: src/fixture_tests.rs'),
+            ('src/deleted.rs', 'deletion path still exists: src/deleted.rs'),
             ('src/missing.rs', 'deletion is not pinned: src/missing.rs'),
         ):
             with self.subTest(path=path):
                 with self.assertRaisesRegex(RuntimeError, expected):
                     guard.sync_skips(self.root, ('src/promoted.rs',), (path,))
                 self.assertEqual(self.path.read_text(), self.original)
-        (self.root / 'src/fixture_tests.rs').unlink()
+        (self.root / 'src/deleted.rs').unlink()
         self.assertEqual(self.outcome(('src/promoted.rs',)), 'refusing pin removal')
         self.assertEqual(self.path.read_text(), self.original)
 
@@ -144,7 +230,7 @@ class RemovedRetiredPathTests(unittest.TestCase):
             self.assertFalse(path.exists(), relative)
             self.assertNotIn(path, files)
             self.assertNotIn(path, skips)
-        self.assertIn(root / 'src/services/discord/watchers/lifecycle/n4d2_entry_test.rs', skips)
+        self.assertIn(root / 'src/services/discord/watchers/lifecycle/watcher_install_fixture.rs', skips)
         source = (root / 'src/services/discord/watchers/lifecycle/n4d2_boundary_tests.rs').read_text()
         census = re.findall(
             r'fn n4d2_dormant_census_counts_actual_production_callers\(\)\s*\{\s*let script = r#"(.*?)"#;',
@@ -247,7 +333,7 @@ class DormantCensusTests(unittest.TestCase):
         self.assertEqual(self.inspect('fn unrelated() { RETIRED.insert(key); }'), [])
         errors = self.inspect('fn writer() { legacy_supervision::RETIRED.get_or_init(make); }')
         self.assertEqual(len(errors), 1)
-        self.assertIn(':writer: external RETIRED', errors[0])
+        self.assertIn(':writer: external legacy_supervision', errors[0])
 
     def test_protected_body_and_helper_manifest_drift_fail(self):
         errors = guard.audit({'primitive.rs': 'fn extra() {}', 'canonical.rs': 'changed'},
@@ -258,7 +344,6 @@ class DormantCensusTests(unittest.TestCase):
 
     # Narrowed pins run on the real main sources: what each function pin catches and what it lets pass.
     TURN = 'src/services/discord/tui_direct_pending_start/turn_retirement.rs'
-    LEGACY = 'src/services/discord/health/legacy_supervision.rs'
 
     def protected_audit(self, path, edit=lambda code: code):
         code = edit(guard.classifier._production_text(Path(path)))
@@ -312,12 +397,17 @@ class DormantCensusTests(unittest.TestCase):
             code = guard.classifier._production_text(path)
         self.assertTrue(guard.function_text(code, 'start').endswith('run(); }'))
 
-    def test_new_pub_fn_in_legacy_supervision_fails(self):
-        errors = self.protected_audit(self.LEGACY, lambda code: code + (
-            '\npub(in crate::services::discord) fn mark(p: &str, c: u64) '
-            '{ RETIRED.get_or_init(Default::default); }\n'))
-        self.assertEqual(len(errors), 1)
-        self.assertIn(self.LEGACY + '::*: protected boot/RETIRED body changed', errors[0])
+    def test_restored_retired_gate_fails(self):
+        legacy = 'src/services/discord/health/legacy_supervision.rs'
+        errors = guard.audit({legacy: 'static RETIRED: Set = Set::new();'}, entries={}, protected={})
+        self.assertEqual(errors, [legacy + ': deleted RETIRED owner restored'])
+        for reader in ('legacy_retired(p, c, "site")', 'retired_in(&cell, p, c)',
+                       'RetiredForTest::new(p, c)'):
+            with self.subTest(reader=reader):
+                errors = self.inspect('fn backstop() { ' + reader + '; }')
+                self.assertEqual(len(errors), 1)
+                self.assertIn(':backstop: external ' + reader.split('(')[0].split('::')[0], errors[0])
+        self.assertEqual(self.inspect('fn count() { counters.retired_incarnation += 1; }'), [])
 
     def test_new_primitive_macro_or_hidden_file_fails(self):
         entries = {guard.R + '.rs': ''}

@@ -62,23 +62,7 @@ pub async fn stop_agent_turn(
         );
     }
 
-    let admission = match session.runtime_channel_id.as_deref() {
-        Some(channel) => crate::services::cluster::channel_home::admit_command(
-            channel,
-            session.provider.as_deref().unwrap_or("agent_stop"),
-        ),
-        None => crate::services::cluster::channel_home::admit_unattributed(),
-    };
-    let permit = match admission {
-        Ok(permit) => permit,
-        Err(reason) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": reason.to_string()})),
-            );
-        }
-    };
-    crate::services::cluster::channel_home::command_scope(permit, async {
+    {
         let session_key = session.session_key.clone();
         let tmux_name = extract_tmux_name(&session_key).unwrap_or_else(|| session_key.clone());
         let lifecycle = stop_turn_preserving_queue(
@@ -97,6 +81,15 @@ pub async fn stop_agent_turn(
         .await;
         // A turn the host guard kept is running on: its session is not marked disconnected.
         if lifecycle.host_guard_kept() {
+            let reason = lifecycle.refusal_reason();
+            if reason.starts_with("native_stop_") {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": reason, "stop_disposition": reason, "session_key": session_key,
+                    })),
+                );
+            }
             let (error, unsupported) = ("session host is not legacy tmux", "session_host_not_tmux");
             let body =
                 json!({"error": error, "unsupported": unsupported, "session_key": session_key});
@@ -123,6 +116,5 @@ pub async fn stop_agent_turn(
             "error"
         });
         (status, Json(body))
-    })
-    .await
+    }
 }

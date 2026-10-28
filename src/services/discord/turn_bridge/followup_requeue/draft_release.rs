@@ -13,8 +13,7 @@ static OBSERVED_HINTS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<(u64, String), String>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// Only an active watch's unseen idle observation holds back later inputs. A repeated
-/// unsupported draft or an expired watch keeps the ordinary cap behavior.
+/// An unseen idle observation holds the queue until the existing watch releases its source.
 #[cfg(unix)]
 pub(in crate::services::discord) fn idle_release_pending(
     channel: u64,
@@ -24,10 +23,7 @@ pub(in crate::services::discord) fn idle_release_pending(
     if !draft_release_watches().contains(&key) {
         return None;
     }
-    let observed =
-        crate::services::claude_tui::host_input::guarded_submission::idle_stash::wake_hint_observed(
-            session,
-        );
+    let observed = crate::services::claude_tui::input::submission::wake_hint_observed(session);
     let watches = draft_release_watches();
     if !watches.contains(&key) {
         return None;
@@ -73,20 +69,37 @@ pub(super) fn watch_draft_release(
             .remove(&key);
     }
     tokio::spawn(async move {
+        let binding_key = crate::services::claude_tui::input::PaneIdentity::capture;
+        let mut binding = binding_key(&session);
         let started = tokio::time::Instant::now();
         let mut any_released = false;
         let mut last_hint = None;
         while started.elapsed() < DRAFT_RELEASE_WATCH {
             tokio::time::sleep(DRAFT_RELEASE_POLL).await;
+            if binding.is_none() {
+                binding = binding_key(&session);
+            }
+            if binding.is_none() || binding_key(&session) != binding {
+                continue;
+            }
+            if shared
+                .tmux_watchers
+                .channel_binding(&channel_id)
+                .is_some_and(|current| current.tmux_session_name != session)
+            {
+                continue;
+            }
             let released = draft_lifted(&session).await;
             #[cfg(unix)]
             let hint = if !released
                 && crate::services::claude_tui::busy_inject::stash_enabled(Some(channel_id.get()))
             {
                 let session = session.clone();
-                tokio::task::spawn_blocking(move ||
-                    crate::services::claude_tui::host_input::guarded_submission::idle_stash::wake_hint(&session)
-                ).await.unwrap_or(None)
+                tokio::task::spawn_blocking(move || {
+                    crate::services::claude_tui::input::submission::wake_hint(&session)
+                })
+                .await
+                .unwrap_or(None)
             } else {
                 None
             };
@@ -95,10 +108,23 @@ pub(super) fn watch_draft_release(
             if !released && (hint.is_none() || hint == last_hint) {
                 continue;
             }
+            let snapshot = super::super::super::mailbox_snapshot(&shared, channel_id).await;
+            let live_ids = snapshot
+                .intervention_queue
+                .iter()
+                .flat_map(|input| {
+                    std::iter::once(input.message_id.get())
+                        .chain(input.source_message_ids.iter().map(|id| id.get()))
+                })
+                .collect();
+            if binding_key(&session) != binding {
+                continue;
+            }
             let pass = super::super::super::busy_followup_retry_store::release_draft_holds(
                 &provider,
                 channel_id.get(),
                 &session,
+                &live_ids,
             );
             any_released |= pass.released > 0;
             tracing::info!(

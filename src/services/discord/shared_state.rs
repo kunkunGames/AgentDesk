@@ -240,24 +240,7 @@ impl SharedData {
         user_msg_id: MessageId,
         placeholder_msg_id: MessageId,
     ) {
-        if super::input_runtime::fence::lookup(&self.provider, channel_id.get()).is_none() {
-            return self.insert_queued_placeholder_locked(
-                channel_id,
-                user_msg_id,
-                placeholder_msg_id,
-            );
-        }
-        self.queued
-            .queued_placeholders
-            .insert((channel_id, user_msg_id), placeholder_msg_id);
-        super::queued_placeholders_store::persist_map_on_worker(
-            &self.queued.queued_placeholders,
-            &self.provider,
-            &self.token_hash,
-            channel_id,
-            false,
-        )
-        .await;
+        self.insert_queued_placeholder_locked(channel_id, user_msg_id, placeholder_msg_id);
     }
 
     /// Write-through remove for the `queued_placeholders` mapping. Returns
@@ -279,23 +262,7 @@ impl SharedData {
         channel_id: ChannelId,
         user_msg_id: MessageId,
     ) -> Option<MessageId> {
-        if super::input_runtime::fence::lookup(&self.provider, channel_id.get()).is_none() {
-            return self.remove_queued_placeholder_locked(channel_id, user_msg_id);
-        }
-        let removed = self
-            .queued
-            .queued_placeholders
-            .remove(&(channel_id, user_msg_id))
-            .map(|(_, msg_id)| msg_id);
-        super::queued_placeholders_store::persist_map_on_worker(
-            &self.queued.queued_placeholders,
-            &self.provider,
-            &self.token_hash,
-            channel_id,
-            false,
-        )
-        .await;
-        removed
+        self.remove_queued_placeholder_locked(channel_id, user_msg_id)
     }
 
     /// Remove variant that assumes the caller already holds the per-channel
@@ -653,9 +620,8 @@ pub(in crate::services::discord) fn clear_codex_goals_reset_pending_for_channel(
 /// plain atomic would silently fork the process-global counter per provider
 /// and break the deferred-restart / shutdown barrier arithmetic.
 pub(in crate::services) struct RestartLifecycle {
-    /// Keeps delegation judgement alive for background runtimes after their boot future returns.
-    pub(in crate::services) _home_availability:
-        Option<crate::services::cluster::home_availability::Registration>,
+    pub(in crate::services) replay_restart:
+        std::sync::OnceLock<crate::cli::dcserver::replay_recovery::OwnedRuntimeRoot>,
     /// Per-channel restart-resume marker: Instant when recovery started, for
     /// stale-recovery timeout.
     pub(in crate::services) recovering_channels: dashmap::DashMap<ChannelId, std::time::Instant>,
@@ -850,13 +816,58 @@ pub(in crate::services::discord) mod restart_lifecycle_tests {
 
         // Both stores of a pair land before the adapter returns, so the matrix
         // cannot see their order. Pin it at the source instead.
-        let source = include_str!("shared_state.rs");
-        for name in "legacy_deferred_rollback legacy_lease_lost legacy_sigterm".split(' ') {
-            let start = source.find(&format!("fn {name}(&self) {{")).expect("fn");
-            let body = &source[start..start + source[start..].find("\n    }\n").expect("end")];
-            let shutdown_at = body.find("self.shutting_down.store").expect("shutdown");
-            let pending_at = body.find("self.restart_pending.store").expect("pending");
-            assert!(shutdown_at < pending_at, "{name} stores shutdown first");
+        assert_eq!(shutdown_first_gaps(SHARED_STATE), Vec::<String>::new());
+    }
+
+    const SHARED_STATE: &str = include_str!("shared_state.rs");
+    const PAIRED_ADAPTERS: [&str; 3] = [
+        "legacy_deferred_rollback",
+        "legacy_lease_lost",
+        "legacy_sigterm",
+    ];
+    const SHUTDOWN: &str = "self.shutting_down.store";
+    const PENDING: &str = "self.restart_pending.store";
+
+    /// Classification 2: inside each paired adapter item, comments excluded, the shutdown
+    /// store precedes the pending store. A lexical tripwire over statement order only.
+    fn shutdown_first_gaps(source: &str) -> Vec<String> {
+        use crate::services::discord::router::source_guard_support::Lexed;
+        let lexed = Lexed::new(source);
+        PAIRED_ADAPTERS
+            .into_iter()
+            .filter(|name| {
+                let body = lexed.block(&format!("fn {name}(&self) {{"));
+                let order = body
+                    .as_ref()
+                    .map(|body| (body.find(SHUTDOWN), body.find(PENDING)));
+                !matches!(order, Some((Some(shutdown), Some(pending))) if shutdown < pending)
+            })
+            .map(|name| format!("{name} must store shutdown before pending"))
+            .collect()
+    }
+
+    #[test]
+    fn shutdown_first_guard_rejects_commented_and_reordered_stores() {
+        use crate::services::discord::router::source_guard_support::{forge, swap};
+        use crate::test_support::CommentForgery;
+        let heads = PAIRED_ADAPTERS.map(|name| format!("fn {name}(&self) {{"));
+        for needle in heads.iter().map(String::as_str).chain([SHUTDOWN, PENDING]) {
+            for forgery in CommentForgery::ALL {
+                let forged = forge(SHARED_STATE, needle, forgery);
+                assert!(
+                    !shutdown_first_gaps(&forged).is_empty(),
+                    "{forgery:?} commented `{needle}` still passes"
+                );
+            }
+        }
+        for adapter in &heads {
+            let at = SHARED_STATE.find(adapter.as_str()).expect("adapter");
+            let swapped = format!(
+                "{}{}",
+                &SHARED_STATE[..at],
+                swap(&SHARED_STATE[at..], SHUTDOWN, PENDING)
+            );
+            assert_eq!(shutdown_first_gaps(&swapped).len(), 1, "{adapter}");
         }
     }
 

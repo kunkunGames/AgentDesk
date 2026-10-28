@@ -24,8 +24,11 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts" / "e2e"))
 
 import run_tui_relay as driver  # noqa: E402
-from tui_relay import assertions  # noqa: E402
-from tui_relay import normal_intake_evidence as e36  # noqa: E402
+from tui_relay import assertions, normal_intake_evidence as e36  # noqa: E402
+from tui_relay.tests.restart_guard_cases import RestartObservationGuard  # noqa: E402, F401
+
+PROVIDER = assertions.provider_bot_id("claude")
+NOTIFY = "1481522187197218816"
 
 
 class E36DriverContract(unittest.TestCase):
@@ -117,17 +120,17 @@ class E36DriverContract(unittest.TestCase):
                     trace.append(("body", key))
                 if not (fault == "deleted" and state["qb_done"] and key == "S01"):
                     rows.append({"id": str(mid + 1), "content": f"{hold}\n{marker}" if hold else marker,
-                                 "author": {"id": "999", "bot": True}})
+                                 "author": {"id": NOTIFY if fault == "notify_author" else PROVIDER, "bot": True}})
                 if fault == "page_duplicate" and key == "S01":
                     seen = state.get("page_dup_fetches", 0)
                     state["page_dup_fetches"] = seen + 1
                     rows.append({"id": str(mid + 9), "content": marker if seen == 0 else "edited away",
-                                 "author": {"id": "999", "bot": True}})
+                                 "author": {"id": PROVIDER, "bot": True}})
                 if clock[0] >= first[key] + 6:
-                    rows.append({"id": str(mid + 2), "content": "✅ 응답 완료", "author": {"id": "999", "bot": True}})
+                    rows.append({"id": str(mid + 2), "content": "✅ 응답 완료", "author": {"id": PROVIDER, "bot": True}})
             if fault == "idle_publication_replay" and state.get("idle_returned"):
                 marker = scenario["steps"][0]["body_marker"].replace("{run_id}", "offline")
-                rows.append({"id": "9999", "content": "late header\n" + marker, "author": {"id": "999", "bot": True}})
+                rows.append({"id": "9999", "content": "late header\n" + marker, "author": {"id": PROVIDER, "bot": True}})
             if client.body_observations is not None:
                 for row in rows:
                     if (body := assertions.relay_body(row)) is not None:
@@ -211,6 +214,15 @@ class E36DriverContract(unittest.TestCase):
                 self.assertEqual(result["failure_attribution"]["source"], "assertion")
                 self.assertIn(reason, result["reason"])
                 self.assertNotEqual(result["e36_acceptance"]["queued_followup"], "pass")
+
+    def test_notify_bot_body_never_completes_an_e36_request(self):
+        with patch.object(driver, "_raise_if_tui_prompt_stuck_while_idle"):
+            result, trace, sent, _ = self.run_e36(fault="notify_author")
+        self.assertEqual(result["status"], "fail", result)
+        self.assertEqual(result["failure_attribution"]["source"], "assertion")
+        self.assertIn("E36 response missing", result["reason"])
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn(("join", "S01"), trace)
 
     def test_swapped_join_order_is_real_driver_zero_refetch_red(self):
         result, _, sent, _ = self.run_e36(fault="join_before_completion")
@@ -1108,7 +1120,7 @@ class PostScenarioIdle(unittest.TestCase):
         window.add(
             {
                 "id": "2",
-                "content": "터미널에 직접 주입된 입력 (tmux : `s`):\n```text\nfinal prompt\n```",
+                "content": "-# ⌨️ final prompt",
                 "author": {"id": "agentdesk", "bot": True},
                 "type": 0,
             }
@@ -1229,6 +1241,140 @@ class PostScenarioIdle(unittest.TestCase):
                         poll_interval_s=0.01,
                     )
         self.assertIn("queued_placeholders", str(ctx.exception))
+
+
+E51_TIMEOUT = json.loads(
+    (ROOT / "scripts/e2e/tui_relay/tests/fixtures/e51_codex_tui_20261024_wait_timeout.json")
+    .read_text(encoding="utf-8")
+)
+
+
+def _e51_message(row: dict, **overrides) -> dict:
+    """Rebuild a Discord message from the report's message summary."""
+    message = {
+        "id": row["id"],
+        "type": row["type"],
+        "content": row["content"],
+        "author": {"id": row["author_id"], "bot": row["author_bot"]},
+    }
+    return {**message, **overrides}
+
+
+def _e51_mailbox(**overrides) -> dict:
+    """The 10-24 E-51 target mailbox as /api/health/detail reported it."""
+    (summary,) = E51_TIMEOUT["target_mailboxes"]
+    mailbox = {**_idle_mailbox(summary["channel_id"], provider=summary["provider"]), **{
+        key: summary[key]
+        for key in ("agent_turn_status", "queue_depth", "relay_stall_state")
+    }}
+    mailbox["relay_health"] = {**mailbox["relay_health"], **summary["relay_health"]}
+    return {**mailbox, **overrides}
+
+
+class WaitTimeoutClassification(unittest.TestCase):
+    NEEDLE = E51_TIMEOUT["needle"]
+    PROMPT, WATCHER_UNBOUND = E51_TIMEOUT["recent_raw"]
+
+    def classify(self, *messages: dict, health) -> str:
+        window = assertions.Window(setup_marker_id="1")
+        for message in messages:
+            window.add(message)
+        payloads = {"/api/health/detail": [health]}
+        with (
+            patch("run_tui_relay.urllib.request.urlopen", _fake_urlopen_for(payloads)),
+            patch("run_tui_relay.tmux.capture_pane", return_value="›"),
+        ):
+            diagnostic = driver._collect_wait_timeout_diagnostics(  # noqa: SLF001
+                base_url="http://agentdesk.test",
+                channel_id=E51_TIMEOUT["channel_id"],
+                cell=E51_TIMEOUT["cell"],
+                scenario={"id": "E-51"},
+                thread_channel_id=None,
+                after_id=E51_TIMEOUT["after_id"],
+                wait_kind="relay",
+                needle=self.NEEDLE,
+                prompt=None,
+                window=window,
+            )
+        return diagnostic["classification"]
+
+    def idle_health(self):
+        return (200, _health_detail(_idle_mailbox(E51_TIMEOUT["channel_id"])))
+
+    def test_marker_only_in_our_prompt_or_its_echo_is_not_filter_miss(self):
+        prompt = _e51_message(self.PROMPT)
+        echo = _e51_message(
+            self.PROMPT, id="1563443349741117460", content=f"-# ⌨️ {self.PROMPT['content']}",
+            author={"id": assertions.provider_bot_id("codex"), "bot": True},
+        )
+        self.assertEqual(
+            self.classify(prompt, health=self.idle_health()), "no_direct_input_or_relay_evidence"
+        )
+        self.assertEqual(
+            self.classify(prompt, echo, health=self.idle_health()),
+            "direct_input_notified_no_tail_observed",
+        )
+
+    def test_filtered_provider_output_stays_filter_miss_while_queue_is_blocked(self):
+        filtered = _e51_message(
+            self.WATCHER_UNBOUND, id="1563443355663212700", content=f"✅ {self.NEEDLE}"
+        )
+        self.assertIsNone(assertions.relay_body(filtered))
+        self.assertEqual(
+            self.classify(
+                _e51_message(self.PROMPT),
+                _e51_message(self.WATCHER_UNBOUND),
+                filtered,
+                health=(200, _health_detail(_e51_mailbox(), status="degraded")),
+            ),
+            "relay_surface_filter_miss_raw_contains_needle",
+        )
+
+    def test_e51_report_events_classify_as_queue_blocked_not_started(self):
+        self.assertEqual(E51_TIMEOUT["reported_classification"], "relay_surface_filter_miss_raw_contains_needle")
+        messages = [_e51_message(row) for row in E51_TIMEOUT["recent_raw"]]
+        self.assertEqual(
+            self.classify(*messages, health=(200, _health_detail(_e51_mailbox(), status="degraded"))),
+            "turn_not_started_queue_blocked",
+        )
+        # The watcher_unbound notice and the health snapshot each suffice without the other.
+        self.assertEqual(
+            self.classify(messages[0], health=(200, _health_detail(_e51_mailbox(), status="degraded"))),
+            "turn_not_started_queue_blocked",
+        )
+        self.assertEqual(
+            self.classify(*messages, health=self.idle_health()), "turn_not_started_queue_blocked"
+        )
+
+    def test_stall_state_alone_marks_queue_blocked(self):
+        mailbox = _e51_mailbox(queue_depth=0)
+        self.assertEqual(
+            self.classify(_e51_message(self.PROMPT), health=(200, _health_detail(mailbox))),
+            "turn_not_started_queue_blocked",
+        )
+
+    def test_idle_queue_depth_alone_marks_queue_blocked(self):
+        mailbox = _e51_mailbox(relay_stall_state="healthy")
+        self.assertEqual(
+            self.classify(_e51_message(self.PROMPT), health=(200, _health_detail(mailbox))),
+            "turn_not_started_queue_blocked",
+        )
+
+    def test_unreadable_health_is_not_reported_as_no_queue_hold(self):
+        prompt = _e51_message(self.PROMPT)
+        unreadable = urllib.error.URLError("connection refused")
+        self.assertEqual(
+            self.classify(prompt, health=unreadable), "no_relay_evidence_queue_state_unknown"
+        )
+        self.assertEqual(
+            self.classify(prompt, _e51_message(self.WATCHER_UNBOUND), health=unreadable),
+            "turn_not_started_queue_blocked",
+        )
+        stale_notice = _e51_message(self.WATCHER_UNBOUND, id=str(int(E51_TIMEOUT["after_id"]) - 1))
+        self.assertEqual(
+            self.classify(prompt, stale_notice, health=self.idle_health()),
+            "no_direct_input_or_relay_evidence",
+        )
 
 
 class ScenarioHealthProbe(unittest.TestCase):
@@ -3429,6 +3575,14 @@ class FeatureOutcomeContract(_OutcomeFixture, unittest.TestCase):
         path = next((ROOT / "tests/e2e/tui_relay/scenarios").glob(f"{scenario_id}-*.yaml"))
         return driver.yaml.safe_load(path.read_text())
 
+    def feature_fixture(self, name="E-FEATURE", *, scenario_gate=True):
+        scenario = self.scenario(name)
+        if scenario_gate:
+            scenario["requires_features"] = ["two_message_panel", "e2e_discord_control"]
+        else:
+            scenario["assertions"] = [{"requires_feature": "two_message_panel", "single_status_panel": True}]
+        return scenario
+
     def test_phase_entry_lease_error_counts_unevaluable(self):
         self.args.phase_deadline_s = 1
         with patch.object(driver.lease, "acquire", side_effect=OSError("offline lease unavailable")), patch.object(
@@ -3452,41 +3606,52 @@ class FeatureOutcomeContract(_OutcomeFixture, unittest.TestCase):
         self.assertIsNone(outcome["passed"])
         self.assertEqual(outcome["required_feature"], "two_message_panel")
 
-    def test_e9_e15_off_on_and_broken_panel_use_real_oracles(self):
-        self.stub(driver, "restart_dcserver_for_e2e")
+    def e15_turns(self, terminal):
+        # Each turn's posts are stamped at its own send, so completion_per_turn attributes them per prompt.
+        rows, sent = [], []
+        line = "E15U-LINE-{:03} 🧪🌏🎯🪐🧪🌏🎯🪐 가나다라마바사".format
+        turns = [["[E2E:E15:BEGIN]\nE15-LINE-010\n[E2E:E15:MID]\nE15-LINE-150\n[E2E:E15:END]"],
+                 ["[E2E:E15U:BEGIN]\n" + "\n".join(map(line, range(1, 41))),
+                  "\n".join(map(line, range(41, 61))) + "\n[E2E:E15U:MID]\n" + "\n".join(map(line, range(61, 91))),
+                  "\n".join(map(line, range(91, 121))) + "\n[E2E:E15U:END]"]]
+
+        def send_prompt(*_args, **_kwargs):
+            sent_at = driver.dt.datetime.now(driver.dt.timezone.utc).isoformat()
+            for body in turns[len(sent)] + ([terminal] if terminal != "absent" else []):
+                rows.append({"id": str(120 + len(rows)), "content": body, "timestamp": sent_at,
+                             "author": {"id": "provider", "bot": True}})
+            sent.append(sent_at)
+            return {"id": "111"}
+
+        self.client.send_prompt.side_effect = send_prompt
+        return rows
+
+    def test_e9_e15_require_summary_and_reject_retired_panels_without_feature_gates(self):
+        self.stub(driver, "restart_dcserver_for_e2e", return_value={"before": "a", "after": "b"})
         self.stub(driver, "assert_health", return_value={"status": "healthy"})
         for scenario_id in ("E-9", "E-15"):
-            for enabled, panel in ((False, "absent"), (True, "valid"), (True, "absent"), (True, "duplicate")):
-                with self.subTest(scenario=scenario_id, enabled=enabled, panel=panel):
+            for terminal in ("-# ⏱️ 1분", "absent", "✅ 응답 완료"):
+                with self.subTest(scenario=scenario_id, terminal=terminal):
                     self.client.send_prompt.reset_mock()
                     markers = (["[E2E:E9:STREAM_OK]", "[E2E:E9:END]"] if scenario_id == "E-9" else
                                ["[E2E:E15:BEGIN]", "E15-LINE-010", "[E2E:E15:MID]", "E15-LINE-150", "[E2E:E15:END]"])
-                    rows = [{"id": "120", "content": "\n".join(markers), "author": {"id": "provider", "bot": True}}]
-                    if panel != "absent":
-                        rows.append({"id": "130", "content": "✅ 응답 완료", "author": {"id": "provider", "bot": True}})
-                    if panel == "duplicate":
-                        rows.append({**rows[-1], "id": "140"})
+                    stamp = driver.dt.datetime.now(driver.dt.timezone.utc)
+                    rows = [{"id": "120", "content": "\n".join(markers), "timestamp": (stamp + driver.dt.timedelta(seconds=1)).isoformat(),
+                             "author": {"id": "provider", "bot": True}}]
+                    if terminal != "absent":
+                        rows.append({**rows[0], "id": "130", "content": terminal, "timestamp": (stamp + driver.dt.timedelta(seconds=2)).isoformat()})
+                    if scenario_id == "E-15":
+                        rows = self.e15_turns(terminal)
                     self.client.fetch_messages.side_effect = lambda *a, **k: [
-                        r for r in rows if self.client.send_prompt.called and int(r["id"]) > int(k.get("after_id") or 0)]
-                    with patch.dict(driver.os.environ, {"AGENTDESK_E2E_FEATURES": "two_message_panel" if enabled else ""}):
-                        rc, report, _ = self.main_result(self.load(scenario_id))
+                        row for row in rows if self.client.send_prompt.called and int(row["id"]) > int(k.get("after_id") or 0)]
+                    rc, report, _ = self.main_result(self.load(scenario_id))
                     result = report["scenarios"][0]
-                    gated = [r for r in result["assertions"] if r.get("spec", {}).get("requires_feature")]
-                    expected_pass = not enabled or panel == "valid"
-                    self.assertEqual((rc, result["status"]), (0, "pass") if expected_pass else (1, "fail"))
-                    if expected_pass:
-                        self.assertEqual(sum(r.get("passed") is True for r in gated), 2 if enabled else 0)
-                        self.assertEqual(sum(r.get("status") == "skipped" for r in gated), 0 if enabled else 2)
-                        self.assertEqual(result["assertion_coverage"], "complete" if enabled else "partial")
-                    else:
-                        self.assertEqual(sum(r.get("status") == "fail" for r in gated), 1)
-                        self.assertEqual(result["assertion_totals"]["fail"], 1)
-                        self.assertEqual(result["assertion_coverage"], "partial")
-                    self.assertEqual(report["totals"]["executed"], 1)
-                    self.assertEqual(report["totals"]["skipped_assertions"], 0 if enabled else 2)
+                    self.assertEqual((rc, result["status"]), (0, "pass") if terminal == "-# ⏱️ 1분" else (1, "fail"), result)
+                    self.assertEqual(report["totals"]["skipped_assertions"], 0)
+                    self.assertFalse(any(row.get("spec", {}).get("requires_feature") for row in result["assertions"]))
 
-    def test_e32_e34_dormant_and_unknown_are_disjoint(self):
-        scenarios = [self.load(f"E-{i}") for i in (32, 33, 34)]
+    def test_generic_feature_dormancy_and_unknown_are_disjoint(self):
+        scenarios = [self.feature_fixture(f"E-FEATURE-{i}") for i in (1, 2, 3)]
         with patch.dict(driver.os.environ, {"AGENTDESK_E2E_FEATURES": ""}):
             rc, report, _ = self.main_result(*scenarios)
         self.assertEqual(rc, 0)
@@ -3502,8 +3667,8 @@ class FeatureOutcomeContract(_OutcomeFixture, unittest.TestCase):
     def test_missing_malformed_unreadable_features_stop_without_dormancy(self):
         real_get = driver.os.environ.get
         for value in (None, "two_message_panel,,bad", OSError("feature evidence unreadable")):
-            for scenario_id in ("E-15", "E-32"):
-                with self.subTest(value=value, scenario=scenario_id):
+            for scenario_gate in (False, True):
+                with self.subTest(value=value, scenario_gate=scenario_gate):
                     def get(key, default=None):
                         if key == "AGENTDESK_E2E_FEATURES":
                             if isinstance(value, Exception):
@@ -3513,7 +3678,7 @@ class FeatureOutcomeContract(_OutcomeFixture, unittest.TestCase):
                     with patch.object(driver.os.environ, "get", side_effect=get), patch.object(
                         driver, "run_one_cell", side_effect=AssertionError("feature preflight must refuse execution")
                     ):
-                        rc, report, _ = self.main_result(self.load(scenario_id), self.scenario("E-NEXT"))
+                        rc, report, _ = self.main_result(self.feature_fixture(scenario_gate=scenario_gate), self.scenario("E-NEXT"))
                     self.assertEqual((rc, len(report["scenarios"])), (1, 1))
                     self.assert_unevaluable(report["scenarios"][0])
                     self.assertEqual(report["totals"]["dormant"], 0)
@@ -3523,7 +3688,7 @@ class FeatureOutcomeContract(_OutcomeFixture, unittest.TestCase):
     def test_dormant_cannot_satisfy_required_observed_coverage(self):
         for field, required in (("required_agent_mode", "real_live"), ("required_coverage_class", "live")):
             with self.subTest(field=field), patch.object(self.args, field, required), patch.dict(driver.os.environ, {"AGENTDESK_E2E_FEATURES": ""}):
-                rc, report, _ = self.main_result(self.load("E-32"))
+                rc, report, _ = self.main_result(self.feature_fixture())
             self.assertEqual((rc, report["scenarios"][0]["status"]), (1, "fail"))
             self.assertEqual(report["totals"]["executed"], 0)
             self.assertEqual(report["totals"]["dormant"], 1)
@@ -3671,12 +3836,15 @@ class HarnessOutcomeContract(_OutcomeFixture, unittest.TestCase):
         return {**self.HEALTHY, "status": "degraded", "ok": False, "degraded": True,
                 "degraded_reasons": reasons, "fully_recovered": recovered}
 
-    def health_steps_result(self, name, steps, after, *, kickstart_rc=0):
+    def health_steps_result(self, name, steps, after, *, kickstart_rc=0, incarnations=("boot-before", "boot-after")):
         # /api/health stays healthy until launchctl ran, then serves `after` in order; the clock advances on sleep.
         kicked, reads, clock = [], [], [0.0]
         has_restart = any("restart_dcserver" in step for step in steps)
 
         def health(base, path, **k):
+            if path == "/api/health/detail":
+                incarnation = incarnations[1] if kicked else incarnations[0]
+                return 200, {} if incarnation is None else {"boot_incarnation": incarnation}
             if path != "/api/health":
                 return 200, {"sessions": []}
             if has_restart and not kicked:
@@ -3693,8 +3861,31 @@ class HarnessOutcomeContract(_OutcomeFixture, unittest.TestCase):
         with patch.object(driver.time, "monotonic", side_effect=lambda: clock[0]), \
                 patch.object(driver.subprocess, "run", side_effect=kickstart):
             _, report, _ = self.main_result(self.scenario(name, steps + [{"send_prompt": "after health"}]))
-        self.assertEqual(kicked, [["launchctl", "kickstart", "-k"]] if has_restart else [])
+        self.assertEqual(kicked, [["launchctl", "kickstart", "-k"]] if has_restart and incarnations[0] else [])
         return report["scenarios"][0]
+
+    def test_restart_records_changed_boot_incarnation(self):
+        row = self.health_steps_result("E-X", [{"restart_dcserver": {"target": "release"}}], [self.HEALTHY])
+        self.assertEqual(row["status"], "pass", row.get("reason"))
+        self.assertEqual(row["restart_incarnations"], [{"target": "release", "before": "boot-before", "after": "boot-after"}])
+
+    def test_restart_fails_when_boot_incarnation_does_not_change(self):
+        # kickstart rc=0 and healthy health are not proof: the same process may still be answering.
+        row = self.health_steps_result("E-X", [{"restart_dcserver": {"target": "release"}}], [self.HEALTHY],
+                                       incarnations=("boot-same", "boot-same"))
+        self.assertEqual(row["status"], "fail")
+        self.assertEqual(row["failure_attribution"]["source"], "assertion")
+        self.assertIn("boot_incarnation stayed boot-same", row["reason"])
+        self.assertIn("restart not observed", row["reason"])
+        self.client.send_prompt.assert_not_called()
+
+    def test_restart_without_boot_incarnation_is_unevaluable_and_never_kicks(self):
+        for incarnations in ((None, None), ("boot-before", None)):
+            with self.subTest(incarnations=incarnations):
+                row = self.health_steps_result("E-X", [{"restart_dcserver": {"target": "release"}}], [self.HEALTHY],
+                                               incarnations=incarnations)
+                self.assert_unevaluable(row)
+                self.assertIn("has no boot_incarnation", row["reason"])
 
     def test_restart_health_wait_takes_assert_health_allowlist(self):
         # A fully recovered restart can keep only the bulk baseline degraded reasons.
@@ -3877,6 +4068,30 @@ class PhasePartialEvidenceContract(_OutcomeFixture, unittest.TestCase):
                 self.assertEqual(len(row["assertions"]), len({json.dumps(x, sort_keys=True) for x in row["assertions"]}))
                 if failure == "step": self.assertEqual(len(row["assertions"]), 1)
 
+    def test_nested_handler_deadline_keeps_plain_send_id_and_contact(self):
+        # Not E-35: a plain prompt whose deadline lands in the assertion handler's teardown.
+        for step in ("send_prompt", "send_discord_prompt"):
+            with self.subTest(step=step):
+                self.args.phase_deadline_s = 1
+                self.client.send_control.side_effect = lambda channel, text: {"id": "100"} if "SETUP" in text else (_ for _ in ()).throw(driver.PhaseDeadlineExpired("phase"))
+                self.client.fetch_messages.side_effect = [[], assertions.AssertionError("valid assertion")]
+                rc, report, _ = self.main_result(self.scenario(steps=[{step: "probe"}]))
+                row = report["scenarios"][0]
+                self.assertEqual(rc, 1)
+                self.assert_unevaluable(row)
+                self.assertIn("prior: assertion: valid assertion", row["reason"])
+                self.assertEqual(row["prompt_sends"], [{"step": step, "send_state": "acknowledged", "message_id": "111"}])
+                self.assertTrue(row["real_provider_contacted"])
+                self.assertEqual(row["agent_mode_actual"], "real_live")
+
+    def test_deadline_before_plain_ack_reports_attempt_without_contact(self):
+        self.client.send_prompt.side_effect = driver.PhaseDeadlineExpired("pre-ack")
+        rc, report, _ = self.main_result(self.scenario())
+        row = report["scenarios"][0]
+        self.assertEqual(rc, 1)
+        self.assertEqual(row["prompt_sends"], [{"step": "send_prompt", "send_state": "attempted"}])
+        self.assertFalse(row["real_provider_contacted"])
+
     def test_deadline_inside_handler_refresh_preserves_ack(self):
         self.client.fetch_messages.side_effect = [[], assertions.AssertionError("already failed")]
         original = driver._refresh_agent_mode_record
@@ -3939,6 +4154,55 @@ class PhasePartialEvidenceContract(_OutcomeFixture, unittest.TestCase):
                 self.client.fetch_messages.side_effect = error
                 with self.assertRaises(type(error)): self.main_result(self.scenario())
                 self.assertEqual(self.client.send_control.call_count, 1)
+
+
+class RestartTargetParameterized(_OutcomeFixture, unittest.TestCase):
+    """The run, not the YAML, names the restarted server; a mismatch is refused before any send."""
+
+    def restart_step(self, scenario_id):
+        path = next((ROOT / "tests/e2e/tui_relay/scenarios").glob(f"{scenario_id}-*.yaml"))
+        return next(step for step in driver.yaml.safe_load(path.read_text())["steps"] if "restart_dcserver" in step)
+
+    def test_no_active_scenario_hard_codes_a_restart_target(self):
+        for path in sorted((ROOT / "tests/e2e/tui_relay/scenarios").glob("*.yaml")):
+            for step in driver.yaml.safe_load(path.read_text()).get("steps") or []:
+                if "restart_dcserver" in step:
+                    with self.subTest(path=path.name):
+                        self.assertNotIn("target", step["restart_dcserver"] or {})
+
+    def test_restart_scenarios_restart_the_server_under_test(self):
+        restart = self.stub(driver, "restart_dcserver_for_e2e", return_value={"before": "a", "after": "b"})
+        for base_url, override, expected in (("http://127.0.0.1:8791", None, "release"),
+                                             ("http://127.0.0.1:8797", None, "dev"),
+                                             ("http://agentdesk.test", "dev", "dev"),
+                                             ("http://agentdesk.test", None, "release")):
+            for scenario_id in ("E-8", "E-9", "E-10", "E-14", "E-61"):
+                with self.subTest(base_url=base_url, override=override, scenario=scenario_id):
+                    restart.reset_mock()
+                    self.args.base_url, self.args.restart_target_override = base_url, override
+                    scenario = {**self.scenario(scenario_id, [self.restart_step(scenario_id)]), "agent_mode": "controlled"}
+                    rc, report, _ = self.main_result(scenario)
+                    self.assertEqual((rc, report["scenarios"][0]["status"]), (0, "pass"), report["scenarios"][0].get("reason"))
+                    self.assertEqual(restart.call_args.kwargs["target"], expected)
+
+    def test_target_disagreeing_with_base_url_is_refused_before_any_send(self):
+        restart = self.stub(driver, "restart_dcserver_for_e2e", return_value={"before": "a", "after": "b"})
+        for base_url, override, declared in (("http://127.0.0.1:8791", None, "dev"),
+                                             ("http://127.0.0.1:8791", "dev", None),
+                                             ("http://127.0.0.1:8797", None, "release")):
+            with self.subTest(base_url=base_url, override=override, declared=declared):
+                self.client.send_prompt.reset_mock()
+                self.client.send_control.reset_mock()
+                self.args.base_url, self.args.restart_target_override = base_url, override
+                step = {"restart_dcserver": {"target": declared} if declared else {}}
+                rc, report, _ = self.main_result(self.scenario("E-X", [{"send_prompt": "hello"}, step]))
+                row = report["scenarios"][0]
+                self.assertEqual((rc, row["status"]), (1, "fail"))
+                self.assertEqual(row["failure_attribution"]["source"], "config")
+                self.assertIn("does not match base URL", row["reason"])
+                self.client.send_control.assert_not_called()
+                self.client.send_prompt.assert_not_called()
+        restart.assert_not_called()
 
 
 class E37CodexModelLocalControl(unittest.TestCase):

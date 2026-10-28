@@ -52,7 +52,7 @@ import yaml  # type: ignore[import-untyped]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tui_relay import assertions, discord, durable_delivery, feature_accounting, fixtures, herdr, known_gap, lease, normal_intake_evidence, source_compare, tmux  # noqa: E402
-from tui_relay import herdr_restart, http_auth  # noqa: E402
+from tui_relay import health_readiness, herdr_restart, http_auth, midturn_kill, restart_guard, wait_timeout  # noqa: E402
 
 
 SUPPORTED_CELLS: tuple[str, ...] = (
@@ -126,7 +126,6 @@ TUI_IDLE_DRAFT_GUARD_AFTER_S = float(
 TUI_IDLE_DRAFT_GUARD_POLL_S = float(
     os.environ.get("AGENTDESK_E2E_TUI_IDLE_DRAFT_GUARD_POLL_S", "2")
 )
-DIRECT_INPUT_NOTIFICATION_MARKER = "터미널에 직접 주입된 입력"
 REPORT_RECORD_KEYS: tuple[str, ...] = (
     "deliver_results",
     "discord_prompt_records",
@@ -176,6 +175,9 @@ REPORT_RECORD_KEYS: tuple[str, ...] = (
     "autonomous_background_turn",
     "durable_record_probe",
     "dirty_active_residue",
+    "restart_incarnations",
+    "prompt_sends",
+    "midturn_kill",
 )
 
 
@@ -245,6 +247,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", default=uuid.uuid4().hex, help="Explicit run identity shared with source comparison")
     parser.add_argument("--base-url", default="http://127.0.0.1:8791")
     herdr_restart.add_arguments(parser)
+    midturn_kill.add_arguments(parser)
     parser.add_argument("--herdr-isolated-server", action="store_true", help="Operator attests restart target is a dedicated E2E server with no other channels.")
     parser.add_argument("--herdr-endpoint", help="Boot endpoint key for this channel; required for live Herdr observations.")
     parser.add_argument("--herdr-status-bin", default="agentdesk", help="AgentDesk CLI on the target node (read-only herdr status).")
@@ -363,6 +366,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     herdr_restart.validate_arguments(parser, args)
     herdr.validate_arguments(parser, args)
+    midturn_kill.validate_arguments(parser, args)
     args.turn_start_timeout_s = _bounded_value(
         args.turn_start_timeout_s,
         source="--turn-start-timeout-s",
@@ -821,6 +825,21 @@ def _failure_attribution(
     return attribution
 
 
+def _record_send(record: dict[str, Any], step: str) -> dict[str, Any]:
+    """Log a prompt before it leaves, so a deadline still reports it as attempted."""
+    entry: dict[str, Any] = {"step": step, "send_state": "attempted"}
+    record.setdefault("prompt_sends", []).append(entry)
+    return entry
+
+
+def _ack_send(entry: dict[str, Any], response: Any) -> None:
+    fields = response if isinstance(response, dict) else {}
+    message_id = fields.get("message_id") or fields.get("id")
+    entry.update(send_state="acknowledged", message_id=str(message_id) if message_id else None)
+    if fields.get("turn_id"):
+        entry["turn_id"] = str(fields["turn_id"])
+
+
 def _mark_real_provider_contacted(
     record: dict[str, Any],
     *,
@@ -1012,11 +1031,9 @@ STEP_OPTIONS = {
     "deliver_prompt": {"text", "source"}, "restart_dcserver": {"target", "require_status", "allowed_degraded_reasons"},
     "kill_pane": {"reverify_session_name_substring"}, "poison_claude_tui_relay_offset": set(),
     "capture_session_identity": {"label"}, "assert_session_preserved": {"label"},
-    "send_prompts_concurrent": {"prompts"}, "fixture_followup_probe": {"prompt"},
-    "replay_fixture": {"kind", "provider", "frames"},
+    "send_prompts_concurrent": {"prompts"}, "fixture_followup_probe": {"prompt"}, "replay_fixture": {"kind", "provider", "frames"},
     "local_control_then_prompt": {"control", "notice", "prompt", "notice_timeout_s", "admission_timeout_s", "quiet_s", "poll_interval_s"},
-    "send_timed_response_prompt": {"before_marker", "after_marker", "hold_seconds"},
-    "send_provider_hold_prompt": {"ok_marker", "marker", "late_marker", "hold_seconds"},
+    "send_timed_response_prompt": {"before_marker", "after_marker", "hold_seconds"}, "send_provider_hold_prompt": {"ok_marker", "marker", "late_marker", "hold_seconds"},
     "wait_for_provider_hold_state": {"ok_marker", "marker", "late_marker", "timeout_s", "poll_interval_s"},
     "cancel_turn": {"force", "timeout_s"}, "delete_status_panel": {"panel_regex"},
     "inject_discord_failure": {"operation", "count"}, "clear_discord_failure": {"operation"},
@@ -1027,24 +1044,19 @@ ASSERTION_OPTIONS = {
     **{k: None for k in ("text_present", "provider_text_present", "raw_text_present", "no_duplicate_marker", "ordered_text_present",
                          "no_duplicate_content", "no_resume_prompt_chrome", "no_suppressed_label_chrome",
                          "no_control_chars", "body_not_overwritten", "fixture_followup_ready",
-                         "fixture_no_health_degradation", "no_placeholder_left")},
-    "message_count_between_markers": {"min", "max"},
-    "raw_message_count_between_markers": {"min", "max", "include_our_send"},
+                         "fixture_no_health_degradation", "no_placeholder_left", "no_status_chrome")},
+    "message_count_between_markers": {"min", "max"}, "raw_message_count_between_markers": {"min", "max", "include_our_send"},
     "relay_latency_within": {"max_seconds"}, "body_complete": {"head", "tail"},
-    "chrome_count": {"text", "regex", "min", "max", "exact", "include_our_send"},
-    "raw_text_absent": {"needle", "text", "include_our_send"},
-    "marker_absent": {"marker", "surface", "include_our_send"},
-    "provider_hold_marker_seen": {"marker", "ok_marker"},
+    "chrome_count": {"text", "regex", "min", "max", "exact", "include_our_send"}, "raw_text_absent": {"needle", "text", "include_our_send"},
+    "marker_absent": {"marker", "surface", "include_our_send"}, "provider_hold_marker_seen": {"marker", "ok_marker"},
     "status_panel_after_body": {"body_marker", "panel_regex"}, "single_status_panel": {"panel_regex"},
-    "completion_chrome_after_body": {"body_marker", "required"},
-    "relay_bodies_after_local_control": {"containing", "exact"},
-    "fixture_task_notification": {"source", "kind", "status"},
-    "fixture_finalized": {"finalized", "result_text_source", "active_turn"},
-    "fixture_task_complete_finalized": {"result_text_source", "turn_id"},
-    "fixture_state": {"followup_probe_accepted"},
+    "completion_chrome_after_body": {"body_marker", "required"}, "relay_bodies_after_local_control": {"containing", "exact"},
+    "fixture_task_notification": {"source", "kind", "status"}, "fixture_finalized": {"finalized", "result_text_source", "active_turn"},
+    "fixture_task_complete_finalized": {"result_text_source", "turn_id"}, "fixture_state": {"followup_probe_accepted"},
     "no_duplicate_marker_with_known_gap": {"marker", "known_gap"},
     "deliver_result": {"delivery", "inject_veto"}, "completion_per_turn": {"exact", "marker"},
-    "autonomous_background_turn": {"armed_marker", "auto_marker"},
+    "turn_summary_after_body": {"body_marker", "header", "before_marker", "tool_label", "output_owner"}, "autonomous_background_turn": {"armed_marker", "auto_marker"},
+    "utf16_chunk_integrity": {"max_units", "min_chunks"},
 }
 
 
@@ -1066,12 +1078,12 @@ def validate_scenario_schema(scenario):
                 metadata.add("timeout_s")
             if action == "wait_for_discord_text":
                 metadata.add("relay_author")
-                if entry.get("relay_author", "provider") != "provider":
-                    raise ValueError("relay_author supports only provider")
             if action in {"send_prompt", "send_discord_prompt", "deliver_prompt", "send_provider_hold_prompt", "send_timed_response_prompt"}:
                 metadata.add("post_send_sleep_s")
             if action == "send_discord_prompt" and scenario.get("e36_normal_intake"):
-                metadata.update({"request_key", "body_marker", "hold_marker"})
+                metadata.update({"request_key", "body_marker", "hold_marker", "relay_author"})
+            if "relay_author" in metadata and entry.get("relay_author", "provider") != "provider":
+                raise ValueError("relay_author supports only provider")
             if set(entry) - {action} - metadata:
                 raise ValueError(f"unsupported {kind} sibling options: {entry!r}")
             value, allowed = entry[action], schema[action]
@@ -1082,7 +1094,7 @@ def validate_scenario_schema(scenario):
                 raise ValueError(f"{action} requires mapping options")
             if action in {"send_prompt", "send_discord_prompt", "send_keys", "send_keys_no_enter", "wait_for_discord_text", "wait_for_raw_discord_text", "provider_text_present"} and not isinstance(value, str):
                 raise ValueError(f"{action} requires text")
-            if action in {"no_placeholder_left", "no_duplicate_content", "no_control_chars", "no_resume_prompt_chrome", "no_suppressed_label_chrome"} and value is not True:
+            if action in {"no_placeholder_left", "no_duplicate_content", "no_control_chars", "no_resume_prompt_chrome", "no_suppressed_label_chrome", "no_status_chrome"} and value is not True:
                 raise ValueError(f"{action} must be true")
             if "post_send_sleep_s" in entry:
                 delay = entry["post_send_sleep_s"]
@@ -1131,6 +1143,7 @@ def is_destructive(scenario: dict[str, Any]) -> bool:
             "restart_dcserver",
             "kill_pane",
             "kill_tui_process",
+            "kill_provider_process",
             "send_keys_no_enter",
             "poison_claude_tui_relay_offset",
             "cancel_turn",
@@ -2132,12 +2145,7 @@ def _read_health_detail(base_url: str, *, timeout: float = 5.0) -> dict[str, Any
 
 
 def _health_reason_allowed(reason: str, allowed: tuple[str, ...]) -> bool:
-    for pattern in allowed:
-        if pattern.endswith("*") and reason.startswith(pattern[:-1]):
-            return True
-        if reason == pattern:
-            return True
-    return False
+    return health_readiness.reason_allowed(reason, allowed)
 
 
 def _health_ready_violations(
@@ -2145,33 +2153,10 @@ def _health_ready_violations(
     *,
     allowed_statuses: tuple[str, ...] = ("healthy",),
     allowed_degraded_reasons: tuple[str, ...] = (),
+    target_channel: str | None = None,
 ) -> list[str]:
-    status = str(payload.get("status") or "").lower()
-    allowed_status_set = {s.lower() for s in allowed_statuses}
-    strict_healthy = allowed_status_set == {"healthy"}
-    violations: list[str] = []
-    if status not in allowed_status_set:
-        violations.append(f"status={status or '<missing>'}")
-    if strict_healthy and payload.get("ok") is False:
-        violations.append("ok=false")
-    if strict_healthy and payload.get("degraded") is True:
-        violations.append("degraded=true")
-    # Startup recovery is its own readiness axis; allowing degraded status does not waive it.
-    if payload.get("fully_recovered") is False:
-        violations.append("fully_recovered=false")
-
-    degraded_reasons = payload.get("degraded_reasons") or []
-    if isinstance(degraded_reasons, list):
-        blocked = [
-            str(reason)
-            for reason in degraded_reasons
-            if not _health_reason_allowed(str(reason), allowed_degraded_reasons)
-        ]
-        if blocked:
-            violations.append(f"degraded_reasons={blocked}")
-    elif degraded_reasons:
-        violations.append(f"degraded_reasons={degraded_reasons!r}")
-    return violations
+    return health_readiness.ready_violations(payload, allowed_statuses=allowed_statuses,
+        allowed_degraded_reasons=allowed_degraded_reasons, target_channel=target_channel)
 
 
 def _health_summary(
@@ -2282,7 +2267,8 @@ def _assert_health_once(
 ) -> dict[str, Any]:
     """Single health probe attempt for assert_health polling."""
 
-    status_code, health = _read_api_json(base_url, "/api/health", timeout=5)
+    status_code, health, from_detail = health_readiness.read_health(
+        _read_api_json, base_url, _as_string_tuple(options.get("allowed_degraded_reasons")))
     if not isinstance(health, dict):
         raise assertions.AssertionError(
             f"assert_health /api/health returned non-object HTTP {status_code}: "
@@ -2300,13 +2286,15 @@ def _assert_health_once(
     if "allowed_degraded_reasons" in options:
         allowed_degraded_reasons = _as_string_tuple(options.get("allowed_degraded_reasons"))
     elif forbidden_reasons and {s.lower() for s in required_statuses} != {"healthy"}:
-        allowed_degraded_reasons = tuple(str(reason) for reason in degraded_reasons)
+        allowed_degraded_reasons = tuple(str(reason) for reason in degraded_reasons
+                                        if not health_readiness.unknown_family(reason))
     else:
         allowed_degraded_reasons = ()
     violations = _health_ready_violations(
         health,
         allowed_statuses=required_statuses,
         allowed_degraded_reasons=allowed_degraded_reasons,
+        target_channel=channel_id,
     )
 
     blocked_reasons = [
@@ -2321,10 +2309,10 @@ def _assert_health_once(
     needs_detail = any(
         key in options for key in ("global_active_max", "global_finalizing_max")
     )
-    detail: dict[str, Any] | None = None
+    detail: dict[str, Any] | None = health if from_detail else None
     target_idle = None
     if needs_detail:
-        detail = _read_health_detail(base_url)
+        detail = detail if detail is not None else _read_health_detail(base_url)
         counter_payloads.insert(0, detail)
         if any(
             type(options[key]) is int and options[key] == 0
@@ -2930,47 +2918,6 @@ def _target_mailbox_debug_snapshot(
     }
 
 
-def _classify_wait_timeout(
-    *,
-    window: assertions.Window,
-    needle: str,
-    head: str | None,
-    prompt_draft_present: bool | None,
-    health: dict[str, Any],
-) -> str:
-    if prompt_draft_present is True:
-        return "prompt_not_submitted_input_buffer_still_contains_prompt"
-
-    raw_has_needle = any(needle in (m.get("content") or "") for m in window.raw_messages)
-    relay_has_needle = any(
-        (body := assertions.relay_body(message)) is not None and needle in body
-        for message in window.messages
-    )
-    if raw_has_needle and not relay_has_needle:
-        return "relay_surface_filter_miss_raw_contains_needle"
-
-    if head:
-        for message in window.messages:
-            body = assertions.relay_body(message) or ""
-            head_at = body.find(head)
-            if head_at != -1 and body.find(needle, head_at + len(head)) == -1:
-                return "body_truncated_or_tail_missing_after_head"
-
-    direct_notice_seen = any(
-        DIRECT_INPUT_NOTIFICATION_MARKER in (m.get("content") or "")
-        for m in window.raw_messages
-    )
-    target_mailboxes = health.get("target_mailboxes")
-    busy = False
-    if isinstance(target_mailboxes, list):
-        busy = any((m.get("busy_reasons") or []) for m in target_mailboxes if isinstance(m, dict))
-    if direct_notice_seen and busy:
-        return "direct_input_notified_provider_or_relay_still_busy"
-    if direct_notice_seen:
-        return "direct_input_notified_no_tail_observed"
-    return "no_direct_input_or_relay_evidence"
-
-
 def _collect_wait_timeout_diagnostics(
     *,
     base_url: str,
@@ -3013,9 +2960,10 @@ def _collect_wait_timeout_diagnostics(
         "after_id": after_id,
         "scenario_id": str(scenario.get("id") or ""),
         "cell": cell,
-        "classification": _classify_wait_timeout(
+        "classification": wait_timeout.classify(
             window=window,
             needle=needle,
+            after_id=after_id,
             head=head,
             prompt_draft_present=prompt_draft_present,
             health=health,
@@ -3327,6 +3275,12 @@ def run_scenario(
                 declared=declared_coverage_class,
                 scenario_id=scenario_id,
             )
+        return result
+    try:
+        restart_guard.validate_binding(scenario, args)
+    except ValueError as error:
+        result.update(status="fail", reason=str(error))
+        result["failure_attribution"] = _failure_attribution("config", str(error))
         return result
 
     durable_probe = bool(scenario.get("durable_delivery_probe"))
@@ -3821,7 +3775,9 @@ def run_one_cell(
                     return record
             window.mark_prompt_sent()
             last_sent_prompt = str(step["send_discord_prompt"]).replace("{run_id}", run_id)
+            sent = _record_send(record, "send_discord_prompt")
             response = client.send(channel_id, last_sent_prompt)
+            _ack_send(sent, response)
             if scenario_id == "E-50" and last_sent_prompt.startswith("!clear "):
                 clear_after = str(response.get("message_id") or response.get("id") or "")
             if scenario.get("durable_delivery_probe"):
@@ -3834,11 +3790,13 @@ def run_one_cell(
             _prepare_first_prompt_window()
             window.mark_prompt_sent()
             last_sent_prompt = str(step["send_prompt"])
+            sent = _record_send(record, "send_prompt")
             response = client.send_prompt(
                 channel_id,
                 last_sent_prompt,
                 channel_kind=cell_channel_kind(cell),
             )
+            _ack_send(sent, response)
             _mark_real_provider_contacted(
                 record,
                 declared_agent_mode=declared_agent_mode,
@@ -3862,11 +3820,13 @@ def run_one_cell(
             )
             window.mark_prompt_sent()
             last_sent_prompt = prompt
+            sent = _record_send(record, "send_timed_response_prompt" if timed_response else "send_provider_hold_prompt")
             response = client.send_prompt(
                 channel_id,
                 prompt,
                 channel_kind=cell_channel_kind(cell),
             )
+            _ack_send(sent, response)
             _mark_real_provider_contacted(
                 record,
                 declared_agent_mode=declared_agent_mode,
@@ -4092,8 +4052,8 @@ def run_one_cell(
                 raise ScenarioStepAssertionError(str(error), record=record) from error
         elif "restart_dcserver" in step:
             restart_options = step["restart_dcserver"] or {}
-            target = args.restart_target_override or restart_options.get("target", "release")
-            restart_dcserver_for_e2e(
+            target = restart_guard.target(restart_options, args)
+            record.setdefault("restart_incarnations", []).append(restart_dcserver_for_e2e(
                 target=target,
                 args=args,
                 base_url=client.base_url,
@@ -4105,7 +4065,7 @@ def run_one_cell(
                 allowed_degraded_reasons=_as_string_tuple(
                     restart_options.get("allowed_degraded_reasons")
                 ),
-            )
+            ))
         elif "poison_claude_tui_relay_offset" in step:
             record.setdefault("poisoned_offsets", []).append(
                 poison_claude_tui_relay_offset(
@@ -4311,6 +4271,9 @@ def run_one_cell(
                 declared_agent_mode=declared_agent_mode,
                 dry_run=dry_run,
             )
+        elif midturn_kill.owns(step):
+            midturn_kill.run_step(sys.modules[__name__], step, cell=cell, channel_id=channel_id, args=args,
+                                  record=record, window=window, refresh=_ingest_snapshot)
         else:
             raise assertions.AssertionError(f"unknown step shape: {step!r}")
 
@@ -4531,6 +4494,7 @@ def wait_for_health(
     poll_interval_s: float = 2.0,
     allowed_statuses: tuple[str, ...] = ("healthy",),
     allowed_degraded_reasons: tuple[str, ...] = (),
+    target_channel: str | None = None,
 ) -> None:
     deadline = time.monotonic() + timeout_s
     last_http_status: int | None = None
@@ -4540,7 +4504,7 @@ def wait_for_health(
     observation = "none"
     while time.monotonic() < deadline:
         try:
-            http_status, payload = _read_api_json(base_url, "/api/health", timeout=5)
+            http_status, payload, _ = health_readiness.read_health(_read_api_json, base_url, allowed_degraded_reasons)
             observation = "readable"
             last_http_status = http_status
             if isinstance(payload, dict):
@@ -4549,6 +4513,7 @@ def wait_for_health(
                     payload,
                     allowed_statuses=allowed_statuses,
                     allowed_degraded_reasons=allowed_degraded_reasons,
+                    target_channel=target_channel,
                 )
                 if 200 <= http_status < 300 and not last_violations:
                     return
@@ -4593,12 +4558,7 @@ def _guard_no_foreign_active_turns(
                 f"for foreign mailbox guard (cell={cell}, channel={channel_id}): "
                 f"{type(error).__name__}: {error}"
             ) from error
-        mailboxes = detail.get("mailboxes")
-        if not isinstance(mailboxes, list):
-            raise assertions.AssertionError(
-                "refusing to restart dcserver: /api/health/detail mailboxes is not a list "
-                f"(payload={_payload_summary(detail)})"
-            )
+        mailboxes = restart_guard.observed_mailboxes(detail)
 
         busy: list[str] = []
         for mailbox in mailboxes:
@@ -4662,6 +4622,17 @@ def _guard_no_foreign_active_turns(
         )
 
 
+def _boot_incarnation(base_url: str) -> str:
+    """Per-process id from detail health; restart proof needs one before and after."""
+    status, payload = _read_api_json(base_url, "/api/health/detail", timeout=5)
+    value = payload.get("boot_incarnation") if isinstance(payload, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        raise HarnessEvidenceError(
+            f"/api/health/detail HTTP {status} has no boot_incarnation; a restart cannot be proven"
+        )
+    return value
+
+
 def restart_dcserver_for_e2e(
     *,
     target: str,
@@ -4671,10 +4642,11 @@ def restart_dcserver_for_e2e(
     channel_id: str,
     require_status: tuple[str, ...] = ("healthy",),
     allowed_degraded_reasons: tuple[str, ...] = (),
-) -> None:
+) -> dict[str, str]:
     if target not in ("dev", "release"):
         raise assertions.AssertionError(f"unsupported restart target: {target!r}")
     _guard_no_foreign_active_turns(base_url, channel_id, cell)
+    before = _boot_incarnation(base_url)
 
     if args.restart_script:
         script = Path(args.restart_script).expanduser()
@@ -4709,12 +4681,24 @@ def restart_dcserver_for_e2e(
                 f"stderr:\n{proc.stderr[-4000:]}"
             )
     # Same status/reason semantics as assert_health; the default stays healthy-only.
-    wait_for_health(
-        base_url,
-        timeout_s=90,
-        allowed_statuses=require_status,
-        allowed_degraded_reasons=allowed_degraded_reasons,
-    )
+    deadline = time.monotonic() + 90
+    while True:
+        wait_for_health(
+            base_url,
+            timeout_s=max(deadline - time.monotonic(), 1.0),
+            allowed_statuses=require_status,
+            allowed_degraded_reasons=allowed_degraded_reasons,
+            target_channel=channel_id,
+        )
+        after = _boot_incarnation(base_url)
+        if after != before:
+            return {"target": target, "before": before, "after": after}
+        # The old process can still answer health until the kill lands.
+        if time.monotonic() >= deadline:
+            raise assertions.AssertionError(
+                f"dcserver boot_incarnation stayed {before} after the {target} restart; restart not observed"
+            )
+        time.sleep(2.0)
 
 
 def _assert_provider_hold_marker_seen(
@@ -4741,11 +4725,7 @@ def _assert_provider_hold_marker_seen(
     )
 
 
-# Completed-panel chrome; the idle-recap card is a separate post, not the turn's panel.
-_PANEL_COMPLETION_PATTERNS = tuple(
-    pattern for pattern in assertions._COMPLETION_CHROME_PATTERNS
-    if pattern is not assertions._IDLE_RECAP_COMPLETION_PATTERN
-)
+_PANEL_COMPLETION_PATTERNS = assertions._COMPLETION_CHROME_PATTERNS
 
 
 def completed_panel_in_place(window: assertions.Window) -> None:
@@ -4829,6 +4809,14 @@ def run_assertion(
         if not hasattr(assertions, "no_placeholder_left"):
             raise assertions.AssertionError("assertion not available yet: no_placeholder_left")
         assertions.no_placeholder_left(window)
+    elif spec.get("no_status_chrome"):
+        assertions.no_status_chrome(window)
+    elif "turn_summary_after_body" in spec:
+        params = {key: expand_marker(value) for key, value in spec["turn_summary_after_body"].items()}
+        owner = params.pop("output_owner", None)
+        if owner is not None and (owner not in {"o", "legacy"} or (record or {}).get("durable_record_probe", {}).get("status") != "evaluated" or record["durable_record_probe"].get("output_owner") != owner):
+            raise HarnessEvidenceError("turn summary output owner lacks matching evaluated durable receipt")
+        assertions.turn_summary_after_body(window, **params)
     elif "completion_per_turn" in spec:
         if not hasattr(assertions, "completion_per_turn"):
             raise assertions.AssertionError("assertion not available yet: completion_per_turn")
@@ -4858,6 +4846,10 @@ def run_assertion(
         record["autonomous_background_turn"] = {"binding": binding, **evidence}
     elif spec.get("no_duplicate_content"):
         assertions.no_duplicate_content(window)
+    elif "utf16_chunk_integrity" in spec:
+        params = spec["utf16_chunk_integrity"]
+        assertions.utf16_chunk_integrity(window, max_units=int(params.get("max_units", 2000)),
+                                         min_chunks=int(params.get("min_chunks", 2)))
     elif "text_present" in spec:
         assertions.text_present(window, needle=expand_marker(spec["text_present"]))
     elif "provider_text_present" in spec:
@@ -5168,7 +5160,8 @@ def main() -> int:
     run_id = getattr(args, "run_id", output_dir.name)
     print(f"[e2e] cell={cell} run_id={run_id} output={output_dir}")
 
-    scenarios = load_scenarios(scenarios_dir, cell=cell)
+    # The SIGKILL scenario never comes from YAML, so no default or filtered sweep can select it.
+    scenarios = [midturn_kill.scenario(run_id, cell)] if getattr(args, "midturn_kill", False) else load_scenarios(scenarios_dir, cell=cell)
     if not wanted:
         # E36 claims the whole phase (3540s, exclusive single scenario, a 20s provider hold)
         # and needs --e36-intake-log, so a default sweep cannot carry it. Run it as its own

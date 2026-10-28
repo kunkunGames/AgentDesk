@@ -185,6 +185,20 @@ fn resolve_cancel_force(query_force: bool, body: &Bytes) -> bool {
 #[cfg(test)]
 thread_local! { pub(crate) static CANCEL_SERVICE_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
+fn names_home_stop_envelope(body: &[u8]) -> bool {
+    const FIELDS: [&str; 6] = [
+        "v",
+        "request_id",
+        "expected_holder",
+        "home_epoch",
+        "intent",
+        "surface",
+    ];
+    let parsed = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let object = parsed.as_ref().and_then(serde_json::Value::as_object);
+    object.is_some_and(|object| FIELDS.iter().any(|key| object.contains_key(*key)))
+}
+
 /// Cancel the active turn in a channel.
 ///
 /// Default (`force=false`): preserves the live provider session and watcher;
@@ -204,10 +218,13 @@ pub async fn cancel_turn(
     body: Bytes,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     // A home-stop envelope is a holder's request, never a direct cancel: refused before any effect.
-    let envelope = crate::services::session_forwarding::home_stop::names_envelope(&body);
+    let envelope = names_home_stop_envelope(&body);
     #[cfg(test)]
     let envelope = envelope
-        && !crate::services::cluster::channel_home::command_mutant("cancel_endpoint_accepts_v1");
+        && std::env::var("ADK_TEST_HOME_COMMAND_MUTANT")
+            .ok()
+            .as_deref()
+            != Some("cancel_endpoint_accepts_v1");
     if envelope {
         return Err(
             AppError::bad_request("home stop envelope on a direct cancel")
@@ -229,32 +246,6 @@ pub async fn cancel_turn(
         )
         .await?;
     Ok((StatusCode::OK, Json(response)))
-}
-
-/// POST /api/internal/home-stop/v1 — a gateway's user stop forwarded to a delegated channel's
-/// holder; it runs only through the trusted forward and this node's own `/stop`.
-pub async fn home_stop_v1(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let context = crate::services::session_forwarding::ForwardCallerContext::from(&state);
-    let registry = state.health_registry.clone();
-    #[cfg(test)]
-    let registry = if crate::services::cluster::channel_home::command_mutant(
-        "home_stop_runtime_binding_removed",
-    ) {
-        None
-    } else {
-        registry
-    };
-    let run = |provider, channel| async move {
-        let stop = crate::services::discord::zombie_foreground_release::run_holder_stop;
-        stop(registry.as_deref(), &provider, channel).await
-    };
-    let receive = crate::services::session_forwarding::home_stop::receive;
-    let (status, answer) = receive(&context, &headers, &body, run).await;
-    (status, Json(answer))
 }
 
 // ── GET /api/channels/:id/watcher-state ─────────────────────────
@@ -1050,6 +1041,8 @@ mod cancel_queue_preserve_pg_tests {
             .expect("the purged user message must be recoverable from relay_dead_letter");
         assert_eq!(content, QUEUED_TEXT);
         assert_eq!(message_id, "9101");
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// The preserve path must leave a queue it did not touch exactly as it was:
@@ -1096,6 +1089,8 @@ mod cancel_queue_preserve_pg_tests {
             dead_letter_row(&pool, channel_id).await.is_none(),
             "a preserved queue must not be reported as lost"
         );
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// A mailbox that exists but never answers is an unread queue, not a kept one.
@@ -1114,6 +1109,8 @@ mod cancel_queue_preserve_pg_tests {
         let (status, body) = post_cancel(&app, channel_id, false).await;
         assert_eq!(status, StatusCode::OK, "cancel response: {body}");
         assert_explicit_null(&body, "queue_loss_recorded");
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// Recording every captured item proves nothing when the post-cancel queue was never read.
@@ -1157,6 +1154,8 @@ mod cancel_queue_preserve_pg_tests {
         assert_eq!(loss.dead_lettered_message_ids, vec![9_402]);
         assert!(dead_letter_row(&pool, channel_id).await.is_some());
         assert_eq!(loss.loss_recorded(), None, "{loss:?}");
+        pool.close().await;
+        pg_db.drop().await;
     }
 
     /// An empty global mirror slot is not an absent actor: another registry can still hold the queue.
@@ -1201,5 +1200,5 @@ mod cancel_queue_preserve_pg_tests {
 }
 
 #[cfg(test)]
-#[path = "queue_api_home_stop_tests.rs"]
-pub(crate) mod home_stop_tests;
+#[path = "queue_api_forwarding_tests.rs"]
+pub(crate) mod forwarding_tests;

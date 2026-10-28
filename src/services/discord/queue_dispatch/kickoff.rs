@@ -5,6 +5,82 @@ use super::super::*;
 #[path = "cancel_backstop_race_support_tests.rs"]
 pub(in crate::services::discord) mod cancel_backstop_test_support;
 
+#[cfg(test)]
+type OwnerRacePause = (
+    ChannelId,
+    &'static str,
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+#[cfg(test)]
+static OWNER_RACE_PAUSES: std::sync::Mutex<Vec<OwnerRacePause>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+static OWNER_RACE_KICKS: std::sync::Mutex<Vec<(ChannelId, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(in crate::services::discord) fn owner_race_kick_attempts(channel: ChannelId) -> usize {
+    OWNER_RACE_KICKS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|entry| entry.0 == channel)
+        .map_or(0, |entry| entry.1)
+}
+
+#[cfg(test)]
+pub(in crate::services::discord) fn install_owner_race_pause(
+    channel: ChannelId,
+    stage: &'static str,
+) -> (
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+) {
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut pauses = OWNER_RACE_PAUSES.lock().unwrap();
+    assert!(
+        !pauses
+            .iter()
+            .any(|pause| pause.0 == channel && pause.1 == stage)
+    );
+    pauses.push((channel, stage, entered.clone(), resume.clone()));
+    if stage == "kickoff_before_take" {
+        let mut counts = OWNER_RACE_KICKS.lock().unwrap();
+        if !counts.iter().any(|entry| entry.0 == channel) {
+            counts.push((channel, 0));
+        }
+    }
+    (entered, resume)
+}
+
+#[cfg(test)]
+pub(in crate::services::discord) async fn owner_race_pause(
+    channel: ChannelId,
+    stage: &'static str,
+) {
+    if stage == "kickoff_before_take"
+        && let Some(entry) = OWNER_RACE_KICKS
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry.0 == channel)
+    {
+        entry.1 += 1;
+    }
+    let pause = {
+        let mut pauses = OWNER_RACE_PAUSES.lock().unwrap();
+        pauses
+            .iter()
+            .position(|pause| pause.0 == channel && pause.1 == stage)
+            .map(|at| pauses.remove(at))
+    };
+    if let Some((_, _, entered, resume)) = pause {
+        entered.notify_one();
+        resume.notified().await;
+    }
+}
+
 /// The authority one kickoff runs with: the idle start, or only the busy-TUI paste of the first
 /// ready input, named by the automatic entry point that asked for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,23 +103,14 @@ pub(in crate::services::discord) async fn kickoff_queue_channel(
     channel_id: ChannelId,
     lane: KickoffLane,
 ) -> IdleQueueKickoffChannelOutcome {
-    let permit = match input_runtime::fence::lookup(provider, channel_id.get())
-        .map(|gate| gate.admit())
-        .transpose()
-    {
-        Ok(permit) => permit,
-        Err(_) => return IdleQueueKickoffChannelOutcome::default(),
-    };
-    input_runtime::fence::effect::scope(
-        permit,
-        Box::pin(kickoff_admitted_queue_channel(
-            deps, provider, channel_id, lane,
-        )),
-    )
+    // Boxed so the futures of callers that await a kickoff stay small.
+    Box::pin(kickoff_queue_channel_inner(
+        deps, provider, channel_id, lane,
+    ))
     .await
 }
 
-async fn kickoff_admitted_queue_channel(
+async fn kickoff_queue_channel_inner(
     deps: &router::IntakeDeps<'_>,
     provider: &ProviderKind,
     channel_id: ChannelId,
@@ -51,9 +118,8 @@ async fn kickoff_admitted_queue_channel(
 ) -> IdleQueueKickoffChannelOutcome {
     let shared = deps.shared;
     let settings_snapshot = shared.settings.read().await.clone();
-    if let Err(reason) = session_runtime::validate_rest_channel_routing(
+    let thread_parent = match session_runtime::validate_rest_channel_routing_with_parent(
         deps.http,
-        deps.cache,
         provider,
         &settings_snapshot,
         channel_id,
@@ -61,14 +127,17 @@ async fn kickoff_admitted_queue_channel(
     )
     .await
     {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        tracing::info!(
-            "  [{ts}] ⚠ KICKOFF-GUARD: preserving queued item(s) for channel {} (reason={})",
-            channel_id,
-            reason
-        );
-        return IdleQueueKickoffChannelOutcome::default();
-    }
+        Ok(parent) => parent,
+        Err(reason) => {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            tracing::info!(
+                "  [{ts}] ⚠ KICKOFF-GUARD: preserving queued item(s) for channel {} (reason={})",
+                channel_id,
+                reason
+            );
+            return IdleQueueKickoffChannelOutcome::default();
+        }
+    };
 
     let queued_gate =
         Some(router::queued_head_inject_covers as fn(ChannelId, Option<ChannelId>) -> bool);
@@ -76,9 +145,15 @@ async fn kickoff_admitted_queue_channel(
         KickoffLane::Idle => "idle_kickoff",
         KickoffLane::QueuedOnly(reason) => reason,
     };
-    let held =
-        queue_io::queued_head_inject::try_busy(deps, provider, channel_id, queued_gate, trigger)
-            .await;
+    let held = queue_io::queued_head_inject::try_busy(
+        deps,
+        provider,
+        channel_id,
+        Some(thread_parent),
+        queued_gate,
+        trigger,
+    )
+    .await;
     // The queued-only lane ends here whatever the paste answered: it never owns an idle start.
     if held || lane != KickoffLane::Idle {
         return IdleQueueKickoffChannelOutcome::default();
@@ -88,6 +163,11 @@ async fn kickoff_admitted_queue_channel(
     {
         turn_finalizer::handle_idle_queue_guard_skip(shared, provider, channel_id, &fresh_snapshot)
             .await;
+        return IdleQueueKickoffChannelOutcome::default();
+    }
+
+    #[cfg(unix)]
+    if queue_dispatch::canary_workspace::parked(shared, provider, channel_id).await {
         return IdleQueueKickoffChannelOutcome::default();
     }
 
@@ -104,6 +184,9 @@ async fn kickoff_admitted_queue_channel(
 
     #[cfg(test)]
     let _cancel_backstop_race = cancel_backstop_test_support::pause(channel_id).await;
+
+    #[cfg(test)]
+    owner_race_pause(channel_id, "kickoff_before_take").await;
 
     let take_next = idle_queue_take_next_soft_if_ready(shared, provider, channel_id).await;
     if let Some(error) = take_next.persistence_error.as_ref() {

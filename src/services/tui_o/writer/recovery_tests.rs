@@ -173,6 +173,7 @@ fn h3_future_resolution_and_future_bind_do_not_restore_an_applied_hop() {
         3,
         BindingRecord::Rejected {
             detail: "audit only".into(),
+            closes: None,
         },
         Utc::now(),
     ));
@@ -728,6 +729,7 @@ async fn a_v2_codex_spool_resumes_under_the_current_version_without_reposting_a_
         "exercise a split body and a pending body"
     );
     assert_eq!(writer.deliver(&owed.pop_front().unwrap()).await, Step::Done);
+    let expected_owed = owed.clone();
     drop((sources, writer));
     let written = segments(&harness);
     for segment in &written {
@@ -735,10 +737,10 @@ async fn a_v2_codex_spool_resumes_under_the_current_version_without_reposting_a_
     }
     let (mut sources, mut writer, mut deriver, mut owed) = resume_codex(&harness, bindings);
     assert_eq!(
-        payloads(&owed),
-        expected,
-        "v2 frames derive the same pieces"
+        owed, expected_owed,
+        "v2 frames retain every unposted piece with its exact key/index"
     );
+    assert_eq!(sources.replayed.posted, 1);
     while let Some(item) = owed.pop_front() {
         assert_eq!(writer.deliver(&item).await, Step::Done);
     }
@@ -786,7 +788,7 @@ async fn a_store_a_v3_writer_stopped_on_a_whole_message_row_resumes_once() {
         [WriterAlarm::SchemaBlocked { .. }]
     ));
     assert_eq!(harness.port.posts(), ["first"]);
-    assert!(excluded_keys(&harness).is_empty());
+    assert_eq!(excluded_keys(&harness), ["m1:0#turn"]);
     // As in the stopped production store, the cursor has captured every row the writer stopped on.
     let cursor = harness.channel().cursors().next().unwrap().captured_through;
     assert_eq!(cursor, std::fs::metadata(&path).unwrap().len());
@@ -800,9 +802,9 @@ async fn a_store_a_v3_writer_stopped_on_a_whole_message_row_resumes_once() {
     append(&path, &row("m5", "live"));
     polls(3).await;
     assert!(!task.is_finished(), "the actor keeps running");
-    let posts = ["first", "after", "while stopped", "live"];
+    let posts = ["first", "-# ▸ Bash  ?", "after", "while stopped", "live"];
     assert_eq!(harness.port.posts(), posts);
-    assert_eq!(excluded_keys(&harness), ["m2:2"]);
+    assert_eq!(excluded_keys(&harness), ["m1:0#turn", "m2:2"]);
     let current = segments(&harness).pop().unwrap();
     assert!(
         !stopped.contains(&current),
@@ -813,7 +815,36 @@ async fn a_store_a_v3_writer_stopped_on_a_whole_message_row_resumes_once() {
     let (stop, task) = spawn(harness.writer());
     polls(3).await;
     assert_eq!(harness.port.posts(), posts);
-    assert_eq!(excluded_keys(&harness), ["m2:2"]);
+    assert_eq!(excluded_keys(&harness), ["m1:0#turn", "m2:2"]);
+    assert_eq!(harness.alarms.taken(), []);
+    halt(stop, task).await;
+}
+
+fn tool_list() -> Vec<u8> {
+    codex(
+        json!({"type": "response_item", "payload": {"type": "additional_tools", "id": "at_1",
+        "role": "developer", "tools": [{"type": "namespace", "name": "ns", "description": "d",
+        "tools": [{"type": "function", "name": "t"}]}]}}),
+    )
+}
+
+/// Codex writes the session tool list inside a new session's first turn; the actor skips it and
+/// posts the answer that follows instead of stopping on it.
+#[tokio::test(start_paused = true)]
+async fn a_codex_session_tool_list_is_skipped_and_the_answer_posts() {
+    let (harness, path, _) = switched_over(b"");
+    harness.gate.acquired();
+    let (stop, task) = spawn_as(harness.writer(), ShadowProvider::Codex);
+    let turn = [
+        turn_event("task_started", "t1"),
+        tool_list(),
+        body("a1", "answer"),
+        turn_event("task_complete", "t1"),
+    ];
+    append(&path, &turn.concat());
+    polls(3).await;
+    assert!(!task.is_finished(), "the actor keeps running");
+    assert_eq!(harness.port.posts(), ["answer", "-# ✅ 완료"]);
     assert_eq!(harness.alarms.taken(), []);
     halt(stop, task).await;
 }

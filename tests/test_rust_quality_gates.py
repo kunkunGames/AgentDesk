@@ -6,6 +6,7 @@ import subprocess
 import os
 import tempfile
 import shutil
+import re
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN = """set -o pipefail
@@ -73,7 +74,8 @@ class QualityWiringTest(unittest.TestCase):
             finished = {"reason": "build-finished", "success": True}
             for run in (RUN, PR_RUN):
                 env["CLIPPY_BASE_REF"] = "HEAD^1"
-                for payload, rc, expected in ((stream(*([warning] * 952), finished), 0, 0), (stream(*([warning] * 953), finished), 0, 1), ("garbage", 0, 1), ("garbage", 17, 17)):
+                limit = json.loads((ROOT / "scripts/clippy_warning_baseline.json").read_text())["warnings"]
+                for payload, rc, expected in ((stream(*([warning] * limit), finished), 0, 0), (stream(*([warning] * (limit + 1)), finished), 0, 1), ("garbage", 0, 1), ("garbage", 17, 17)):
                     with self.subTest(run=run, cargo_rc=rc, gate_rc=expected):
                         env.update(PAYLOAD=payload, RC=str(rc))
                         report = root / "target/clippy-observation/report.json"
@@ -90,7 +92,31 @@ class QualityWiringTest(unittest.TestCase):
         import tomllib
         lints = tomllib.loads((ROOT / "Cargo.toml").read_text())["lints"]["clippy"]
         doc = (ROOT / "docs/ci/rust-quality-gates.md").read_text()
-        self.assertEqual(sum(v == "deny" for v in lints.values()), 8)
+        self.assertEqual(sum((v.get("level") if isinstance(v, dict) else v) == "deny"
+                             for v in lints.values()), 11)
         for lint, level in lints.items():
-            if level == "deny":
+            if (level.get("level") if isinstance(level, dict) else level) == "deny":
                 self.assertIn("`" + lint + "`", doc)
+
+    def test_effective_group_denies_have_crate_attributes(self):
+        import tomllib
+        from scripts.check_clippy_allow_ratchet import neutralize_source
+
+        doc = (ROOT / "docs/ci/rust-quality-gates.md").read_text()
+        paragraphs = [p for p in doc.split("\n\n") if p.startswith(
+            "Effective denies for lib/bin under the staged command:")]
+        self.assertEqual(len(paragraphs), 1)
+        effective = set(re.findall(r"`([a-z_]+)`", paragraphs[0]))
+        lints = tomllib.loads((ROOT / "Cargo.toml").read_text())["lints"]["clippy"]
+        self.assertLessEqual(effective, {lint for lint, level in lints.items()
+                                         if (level.get("level") if isinstance(level, dict) else level) == "deny"})
+        group_members = effective - {"dbg_macro", "todo", "unimplemented"}
+        self.assertTrue(group_members, "document the effective group-member deny")
+        for filename in ("src/lib.rs", "src/main.rs"):
+            code, ambiguous = neutralize_source((ROOT / filename).read_text())
+            self.assertFalse(ambiguous, filename)
+            attributes = re.match(r"\s*(?:#!\[[^\[\]]*\]\s*)*", code).group()
+            for lint in sorted(group_members):
+                with self.subTest(crate=filename, lint=lint):
+                    self.assertRegex(attributes, r"#!\[\s*deny\s*\([^)]*\bclippy::"
+                                     + re.escape(lint) + r"\b[^)]*\)\s*\]")

@@ -1,9 +1,7 @@
 //! Reads the active Claude composer and the status row right above its top border from one
 //! `capture-pane -e` capture. Anything outside the recognised layout reads as Unknown.
 
-use unicode_width::UnicodeWidthChar;
-
-use crate::services::tui_input::actor::gate::{claude_border_row, claude_prompt_row};
+mod paste_footer;
 
 /// Draft chips whose payload is not measured to survive a stash round trip.
 const UNMEASURED_CHIPS: [&str; 3] = [
@@ -17,7 +15,7 @@ const MIN_BORDER: usize = 10;
 const FOOTER: &str = "  \u{23f5}\u{23f5} bypass permissions on";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Composer {
+pub(in crate::services::claude_tui) enum Composer {
     Empty,
     /// Rows as typed: the prompt and the two-column continuation indent removed.
     Text(Vec<String>),
@@ -31,15 +29,24 @@ pub(super) enum Stash {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Footer {
+    Normal,
+    PasteExpand,
+    Unknown,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Screen {
     pub(super) composer: Composer,
     pub(super) stash: Stash,
+    pub(super) footer: Footer,
 }
 
 const UNKNOWN: Screen = Screen {
     composer: Composer::Unknown,
     stash: Stash::Unknown,
+    footer: Footer::Unknown,
 };
 
 /// One captured row: all visible text, the part not drawn faint, and the row as captured.
@@ -110,6 +117,40 @@ fn sgr_faint(params: &str, mut faint: bool) -> bool {
     faint
 }
 
+/// Equal box edges and a single prompt delimit the input independently of footer chrome.
+fn box_bounds(rows: &[Row]) -> Option<(usize, usize)> {
+    let prompt = rows.iter().rposition(|row| row.plain.starts_with('❯'))?;
+    let border = |index: usize| -> Option<usize> {
+        let text = rows.get(index)?.plain.trim_end();
+        let width = text.chars().count();
+        (width >= MIN_BORDER && text.chars().all(|c| c == '─')).then_some(width)
+    };
+    let width = border(prompt.checked_sub(1)?)?;
+    let bottom = (prompt + 1..rows.len()).find(|&index| border(index).is_some())?;
+    (border(bottom) == Some(width)).then_some((prompt, bottom))
+}
+
+/// A typed draft C-s may park: not while `› stashed` above the box shows a stash C-s would replace.
+pub(in crate::services::claude_tui) fn parkable(capture: &str) -> bool {
+    let rows: Vec<Row> = capture.lines().map(row).collect();
+    let Some((prompt, bottom)) = box_bounds(&rows) else {
+        return false;
+    };
+    let width = rows[prompt - 1].plain.trim_end().chars().count();
+    let stashed = prompt
+        .checked_sub(2)
+        .is_some_and(|status| stash(&rows[status].plain, width) == Stash::Present);
+    !stashed && matches!(composer(&rows[prompt..bottom]), Composer::Text(_))
+}
+
+/// Unknown never triggers C-s: a faint or incomplete field may hide an old stash toggle.
+pub(in crate::services::claude_tui) fn input_box(capture: &str) -> Composer {
+    let rows: Vec<Row> = capture.lines().map(row).collect();
+    box_bounds(&rows).map_or(Composer::Unknown, |(prompt, bottom)| {
+        composer(&rows[prompt..bottom])
+    })
+}
+
 /// The bottom-most `❯` row between two equal full borders; below, only status-line rows and then
 /// a measured footer as the last row drawn.
 pub(super) fn read(capture: &str) -> Screen {
@@ -153,7 +194,46 @@ pub(super) fn read(capture: &str) -> Screen {
         } else {
             stash(&rows[status].plain, width)
         },
+        footer: if paste_footer::recognized(rows[foot].plain.trim_end()) {
+            Footer::PasteExpand
+        } else {
+            Footer::Normal
+        },
     }
+}
+
+pub(super) fn modal(capture: &str) -> bool {
+    use crate::services::tui_input::actor::gate::{PaneVerdict, judge_pane};
+    use crate::services::tui_o::shadow::ShadowProvider;
+    if judge_pane(ShadowProvider::Claude, capture) == PaneVerdict::Modal {
+        return true;
+    }
+    let plain = crate::services::codex_tui::input::strip_ansi_escape_sequences(capture);
+    let rows: Vec<&str> = plain.lines().collect();
+    let chrome = if input_box(capture) != Composer::Unknown {
+        rows.iter()
+            .rposition(|row| row.starts_with('❯'))
+            .and_then(|prompt| {
+                let bottom = (prompt + 1..rows.len()).find(|&index| {
+                    let row = rows[index].trim_end();
+                    row.chars().count() >= MIN_BORDER && row.chars().all(|c| c == '─')
+                })?;
+                Some(
+                    rows[..prompt]
+                        .iter()
+                        .chain(rows[bottom..].iter())
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            })
+    } else {
+        None
+    };
+    // Retain the older permission-card veto outside a proven composer, including above blanks.
+    crate::services::tmux_common::tmux_capture_indicates_claude_tui_interactive_modal(
+        chrome.as_deref().unwrap_or(&plain),
+    )
 }
 
 /// A row of the user's status line, drawn two columns in like the footer; never a box edge, a
@@ -166,11 +246,11 @@ fn status_line(row: &str) -> bool {
         && first.is_some_and(|c| c != '❯' && !('\u{2500}'..='\u{257f}').contains(&c))
 }
 
-/// The bypass-mode footer and its cycle hint, then the busy hint or the pill counting background
-/// work; a footer cut at the edge is not.
+/// The bypass-mode footer with a measured suffix, or the folded-paste hint; a footer cut at
+/// the edge or carrying an unmeasured suffix is not.
 fn footer(row: &str) -> bool {
     let Some(rest) = row.strip_prefix(FOOTER) else {
-        return false;
+        return paste_footer::recognized(row);
     };
     let rest = rest.strip_prefix(" (shift+tab to cycle)").unwrap_or(rest);
     match rest.strip_prefix(" \u{b7} ") {
@@ -263,169 +343,15 @@ fn stash(status: &str, width: usize) -> Stash {
     }
     // A right-aligned row drawn whole: padding on the left, its last cell two columns from the edge.
     let drawn = status.trim_end();
+    // Measured on Claude Code 2.1.309: this effort row uses a one-cell `◉`.
+    let measured_effort = drawn.trim() == "◉ xhigh · /effort";
     let whole = drawn.starts_with(' ')
-        && drawn.chars().all(|c| c.is_ascii() || c == '\u{b7}')
+        && (measured_effort || drawn.chars().all(|c| c.is_ascii() || c == '\u{b7}'))
         && drawn.chars().count() + 2 == width;
     if whole {
         Stash::AbsentInRecognizedLayout
     } else {
         Stash::Unknown
-    }
-}
-
-/// The person's draft rows when the composer holds plain text, Claude shows no stash and the
-/// frame will render flat; anything else leaves the draft untouched.
-pub(in crate::services::claude_tui) fn stashable(
-    capture: &str,
-    frame: &str,
-    size: Option<(usize, usize)>,
-) -> Option<Vec<String>> {
-    let (width, height) = size?;
-    if !renders_flat(frame, width, height) {
-        return None;
-    }
-    let screen = read(capture);
-    let Composer::Text(rows) = screen.composer else {
-        return None;
-    };
-    (screen.stash == Stash::AbsentInRecognizedLayout).then_some(rows)
-}
-
-/// Claude folds a paste over 800 UTF-16 units or with more newlines than clamp(rows-10, 0, 2),
-/// and wraps rows wider than width-4. Wide characters count two columns; tabs and CR get rewritten.
-fn renders_flat(frame: &str, width: usize, height: usize) -> bool {
-    let newlines = frame.matches('\n').count();
-    frame.encode_utf16().count() <= 800
-        && newlines <= height.saturating_sub(10).min(2)
-        && frame.split('\n').all(|line| {
-            let columns: usize = line.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
-            line.trim_end() == line
-                && !line.chars().any(char::is_control)
-                && columns < width.saturating_sub(4)
-        })
-}
-
-/// How Claude shows a paste in an empty composer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Drawn {
-    /// A `[Pasted text #N …]` placeholder.
-    Folded,
-    /// Every row, the prompt and continuation indent removed.
-    Rows(Vec<String>),
-}
-
-/// Measured on Claude Code 2.1.293: a paste folds as in [`renders_flat`]; otherwise each line
-/// wraps at width-4 and the composer shows at most (rows-10)/2 rows. `None` when not predictable.
-pub(super) fn drawn(frame: &str, size: Option<(usize, usize)>) -> Option<Drawn> {
-    let (width, height) = size?;
-    // Claude may rewrite a tab or CR, changing even a folded paste's line count.
-    if frame
-        .split('\n')
-        .any(|line| line.chars().any(char::is_control))
-    {
-        return None;
-    }
-    let newlines = frame.matches('\n').count();
-    if frame.encode_utf16().count() > 800 || newlines > height.saturating_sub(10).min(2) {
-        return Some(Drawn::Folded);
-    }
-    let mut rows = Vec::new();
-    for line in frame.split('\n') {
-        if line.trim_end() != line {
-            return None;
-        }
-        rows.extend(wrap(line, width.checked_sub(4).filter(|&c| c >= 2)?)?);
-    }
-    // A row the composer reader would take for the prompt or a border could not prove the paste.
-    let misread = |row: &String| {
-        let shown = format!("  {row}");
-        claude_prompt_row(&shown) || claude_border_row(&shown)
-    };
-    if rows[1..].iter().any(misread) {
-        return None;
-    }
-    (rows.len() <= height.saturating_sub(10) / 2).then_some(Drawn::Rows(rows))
-}
-
-/// One line as wrap-ansi `hard` without trim lays it out; Claude drops the leading spaces of each
-/// wrapped row and the capture drops trailing ones. `None` for a wrap past measured characters.
-fn wrap(line: &str, columns: usize) -> Option<Vec<String>> {
-    // Zero-width joiners, selectors, combining marks and modifiers may merge into one glyph.
-    if line.chars().any(may_join) {
-        return None;
-    }
-    // No character is wider than two columns, so this bound proves a line stays on one row.
-    let bound: usize = line.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
-    if bound <= columns {
-        return Some(vec![line.to_string()]);
-    }
-    let mut rows = vec![String::new()];
-    let mut used = 0;
-    for (index, word) in line.split(' ').enumerate() {
-        if index > 0 {
-            if used >= columns {
-                rows.push(String::new());
-                used = 0;
-            }
-            rows.last_mut()?.push(' ');
-            used += 1;
-        }
-        let length = word.chars().map(measured_width).sum::<Option<usize>>()?;
-        if length > columns {
-            // A word wider than the row breaks where it starts unless that costs a row.
-            if (length - 1) / columns < 1 + (length - (columns - used) - 1) / columns {
-                rows.push(String::new());
-                used = 0;
-            }
-            let chars: Vec<char> = word.chars().collect();
-            for (at, &c) in chars.iter().enumerate() {
-                let cells = measured_width(c)?;
-                if used + cells <= columns {
-                    rows.last_mut()?.push(c);
-                    used += cells;
-                } else {
-                    rows.push(c.to_string());
-                    used = cells;
-                }
-                if used == columns && at + 1 < chars.len() {
-                    rows.push(String::new());
-                    used = 0;
-                }
-            }
-            continue;
-        }
-        if used + length > columns && used > 0 && length > 0 {
-            rows.push(String::new());
-            used = 0;
-        }
-        rows.last_mut()?.push_str(word);
-        used += length;
-    }
-    let shown = |(index, row): (usize, String)| {
-        let row = row.trim_end_matches(' ');
-        if index == 0 {
-            row
-        } else {
-            row.trim_start_matches(' ')
-        }
-        .to_string()
-    };
-    Some(rows.into_iter().enumerate().map(shown).collect())
-}
-
-/// A character with no cell of its own, or a flag or skin-tone half that joins its neighbour.
-fn may_join(c: char) -> bool {
-    !matches!(c.width(), Some(1 | 2))
-        || ('\u{1f1e6}'..='\u{1f1ff}').contains(&c)
-        || ('\u{1f3fb}'..='\u{1f3ff}').contains(&c)
-}
-
-/// Columns measured in Claude's composer: printable ASCII one, Hangul syllables and jamo two.
-fn measured_width(c: char) -> Option<usize> {
-    match c {
-        ' '..='~' => Some(1),
-        '\u{ac00}'..='\u{d7a3}' | '\u{3131}'..='\u{318e}' => Some(2),
-        _ => None,
     }
 }
 
@@ -443,24 +369,4 @@ pub(super) fn typed(capture: &str) -> Option<bool> {
     let solid = rows[prompt..end].iter().map(|row| row.solid.as_str());
     let text = solid.collect::<String>().replacen('❯', "", 1);
     Some(text.chars().any(|c| !c.is_whitespace()))
-}
-
-/// The composer shows exactly the frame, row for row, with the draft still stashed.
-pub(in crate::services::claude_tui) fn owns(capture: &str, frame: &str) -> bool {
-    let screen = read(capture);
-    screen.stash == Stash::Present
-        && matches!(&screen.composer, Composer::Text(rows) if rows.iter().map(String::as_str).eq(frame.split('\n')))
-}
-
-/// The C-s took: an empty composer under the stash marker.
-pub(in crate::services::claude_tui) fn stashed(capture: &str) -> bool {
-    let screen = read(capture);
-    screen.stash == Stash::Present && screen.composer == Composer::Empty
-}
-
-/// Claude handed the draft back: the same rows and no stash.
-pub(super) fn restored(capture: &str, draft: &[String]) -> bool {
-    let screen = read(capture);
-    screen.stash == Stash::AbsentInRecognizedLayout
-        && matches!(&screen.composer, Composer::Text(rows) if rows == draft)
 }

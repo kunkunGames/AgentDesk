@@ -1,7 +1,7 @@
 //! One mailbox/token admission boundary shared by chat, headless and routine turns.
 use super::*;
 use crate::services::turn_orchestrator::{
-    ClaimObservation, EnqueueRefusalReason, TryStartTurnResult, TurnAdmissionOrder,
+    ClaimObservation, TryStartTurnResult, TurnAdmissionOrder,
 };
 
 pub(in crate::services::discord) async fn mailbox_try_start_turn_kinded_with_feedback(
@@ -153,6 +153,16 @@ async fn mailbox_try_start_turn_ordered(
                 .await
         }
     };
+    if result.started
+        && let Err(error) = crate::services::discord::inject_disposition::dispatched::record(
+            &shared.provider,
+            channel_id,
+            user_message_id,
+            &result.absorbed_source_ids,
+        )
+    {
+        tracing::warn!(channel_id = channel_id.get(), %error, "dispatch evidence not preserved; catch-up may rescan input");
+    }
     // The alias lands before the claim is reported, hence before any delivery
     // of this episode can append `(user_message_id, turn_nonce)`.
     if result.started
@@ -231,25 +241,16 @@ pub(in crate::services::discord) async fn mailbox_recovery_kickoff(
 #[path = "turn_admission_tests.rs"]
 mod tests;
 
-pub(in crate::services::discord) const INPUT_PENDING_NOTICE: &str =
-    "보류됨 — 입력 전환이 끝나면 자동 접수됩니다(5분 이내 원본). 다시 보내지 않아도 됩니다.";
-pub(in crate::services::discord) async fn input_refusal_notice(
+/// Replies to each source whose input could not be stored, asking the author to resend it.
+pub(in crate::services::discord) async fn input_persistence_refusal_notice(
     shared: &SharedData,
     channel: ChannelId,
     sources: &[u64],
-    failure: super::super::input_runtime::fence::Failure,
 ) {
     let Some(http) = shared.serenity_http_or_token_fallback() else {
         return;
     };
-    let text = if matches!(
-        failure,
-        super::super::input_runtime::fence::Failure::Mode(_)
-    ) {
-        INPUT_PENDING_NOTICE
-    } else {
-        "입력을 저장하지 못했습니다. 원본을 유지하고 다시 시도해 주세요."
-    };
+    let text = "입력을 저장하지 못했습니다. 원본을 유지하고 다시 시도해 주세요.";
     for source in sources {
         if super::super::http::send_channel_message_with_reference(
             &http,
@@ -264,7 +265,6 @@ pub(in crate::services::discord) async fn input_refusal_notice(
             tracing::warn!(
                 channel_id = channel.get(),
                 source,
-                ?failure,
                 "input refusal notice failed; responsibility retained"
             );
         }
@@ -280,16 +280,6 @@ pub(in crate::services::discord) async fn mailbox_enqueue_observed_intervention(
     intervention: Intervention,
     observed: Option<ClaimObservation>,
 ) -> MailboxEnqueueOutcome {
-    let mut sources: Vec<u64> = intervention
-        .source_message_ids
-        .iter()
-        .map(|id| id.get())
-        .collect();
-    if !sources.contains(&intervention.message_id.get()) {
-        sources.push(intervention.message_id.get());
-    }
-    sources.sort_unstable();
-    sources.dedup();
     // Tombstone refusal ⇒ retry on a fresh registered actor
     // instead of orphaning the queue on a purged one.
     let result = shared
@@ -309,17 +299,6 @@ pub(in crate::services::discord) async fn mailbox_enqueue_observed_intervention(
             error = %error,
             "mailbox enqueue failed durable pending-queue persistence"
         );
-    }
-    use crate::services::discord::input_runtime::fence::{self, Failure};
-    let failure = match result.refusal_reason {
-        Some(EnqueueRefusalReason::InputModeFenced(mode)) => Some(Failure::Mode(mode)),
-        Some(EnqueueRefusalReason::LockTimeout) => Some(Failure::LockTimeout),
-        Some(EnqueueRefusalReason::InputPersistence) => Some(Failure::Persistence),
-        _ => None,
-    };
-    if let Some(failure) = failure {
-        fence::record_failure(provider, channel_id.get(), &sources, failure);
-        input_refusal_notice(shared, channel_id, &sources, failure).await;
     }
     if result.enqueued && result.persistence_error.is_none() {
         schedule_post_enqueue_idle_queue_kick(shared.clone(), provider.clone(), channel_id);

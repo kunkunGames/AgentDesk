@@ -1369,7 +1369,6 @@ mod tests {
             channel_id: 42,
             has_cancel_token: false,
             queue_depth: 0,
-            queue_park: Default::default(),
             recovery_started: false,
             active_request_owner: None,
             active_user_message_id: None,
@@ -1405,18 +1404,6 @@ mod tests {
         };
 
         let serialized = serde_json::to_value(mailbox).expect("serialize health mailbox");
-        assert!(serialized.get("queue_park").is_none());
-        assert!(
-            serialized
-                .get("queue_park_oldest_tracked_secs")
-                .unwrap()
-                .is_null()
-        );
-        assert_eq!(serialized["queue_park_tracked_source_count"], 0);
-        assert_eq!(
-            serialized["queue_park_tracked_source_ids"],
-            serde_json::json!([])
-        );
         assert_eq!(serialized["stall_shadow_verdict"], serde_json::Value::Null);
         assert_eq!(
             serialized["relay_backlog"],

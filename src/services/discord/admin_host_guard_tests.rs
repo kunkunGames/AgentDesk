@@ -12,7 +12,7 @@ use poise::serenity_prelude::{ChannelId, Http, HttpBuilder};
 
 use crate::services::discord::admin_host_guard::ManagedReset;
 use crate::services::discord::commands::{
-    SoftClearNotifyMode, build_health_report, build_status_report, clear_channel_session_state,
+    build_health_report, build_status_report, clear_channel_session_state,
     reset_channel_provider_state, reset_provider_session_if_pending,
 };
 use crate::services::discord::host_defer_gate::tests::{
@@ -130,10 +130,10 @@ pub(crate) fn process(name: &str, pid: u32) -> Arc<AtomicBool> {
     alive
 }
 
-// `/clear` and a provider reset refuse a session the host guard keeps before they change
-// anything; a legacy row, or no row yet, clears and kills as in main.
+// `/clear` resets and kills the session whatever host the guard reads; a provider reset still
+// refuses a session the guard keeps before it changes anything.
 #[tokio::test]
-async fn clear_and_reset_refuse_a_kept_session_before_any_change_pg() {
+async fn a_clear_goes_ahead_on_any_host_while_a_reset_refuses_a_kept_session_pg() {
     let _root = crate::config::TestRuntimeRootGuard::new();
     let tmux = ScriptedTmux::install();
     let (db, pool) = postgres().await;
@@ -152,24 +152,26 @@ async fn clear_and_reset_refuse_a_kept_session_before_any_change_pg() {
         let alive = process(&name, n as u32 + 64_000);
         tmux.take_calls();
 
-        let clear = clear_channel_session_state(
-            &http,
-            &shared,
-            &provider,
-            channel,
-            "/clear",
-            SoftClearNotifyMode::Suppress,
+        let clear = clear_channel_session_state(&http, &shared, &provider, channel, "/clear");
+        clear.await.expect("a clear never refuses");
+        assert!(!alive.load(Ordering::SeqCst), "{case:?}: the clear kills");
+        assert!(
+            !session_id(&shared, channel).await,
+            "{case:?}: the clear forgets"
         );
-        let cleared = clear.await;
         if case.admitted() {
-            assert!(cleared.is_ok(), "{case:?}: {cleared:?}");
-            assert!(!alive.load(Ordering::SeqCst), "{case:?}: main kills");
             continue;
         }
-        let error = cleared
-            .expect_err("a kept session refuses the clear")
-            .to_string();
-        assert!(error.contains(&name), "{case:?}: {error}");
+        let alive = process(&name, n as u32 + 64_500);
+        shared
+            .core
+            .lock()
+            .await
+            .sessions
+            .get_mut(&channel)
+            .unwrap()
+            .session_id = Some("sid".into());
+        tmux.take_calls();
         let reset = reset_channel_provider_state(
             &http, &shared, &provider, channel, "/restart", true, false, true,
         );
@@ -198,10 +200,10 @@ async fn clear_and_reset_refuse_a_kept_session_before_any_change_pg() {
     db.drop().await;
 }
 
-// A channel holding no name is judged by its own row before `/clear` changes anything: only
-// a found legacy row, or no row with nothing in flight, clears as in main.
+// A channel holding no name is cleared whatever its own row says, without a tmux call: with no
+// name there is no tmux session to end.
 #[tokio::test]
-async fn clear_judges_a_nameless_channel_by_its_own_row_pg() {
+async fn a_nameless_channel_clears_whatever_its_own_row_says_pg() {
     let _root = crate::config::TestRuntimeRootGuard::new();
     let tmux = ScriptedTmux::install();
     let (db, pool) = postgres().await;
@@ -220,25 +222,14 @@ async fn clear_judges_a_nameless_channel_by_its_own_row_pg() {
             .await;
         tmux.take_calls();
 
-        let clear = clear_channel_session_state(
-            &http,
-            &shared,
-            &provider,
-            channel,
-            "/clear",
-            SoftClearNotifyMode::Suppress,
+        let clear = clear_channel_session_state(&http, &shared, &provider, channel, "/clear");
+        clear.await.expect("a clear never refuses");
+        assert!(
+            !session_id(&shared, channel).await,
+            "{case:?}: the clear forgets"
         );
-        let cleared = clear.await;
-        if matches!(case, Nameless::Legacy | Nameless::Missing) {
-            assert!(cleared.is_ok(), "{case:?}: {cleared:?}");
-            assert!(!session_id(&shared, channel).await, "{case:?}: main clears");
-            continue;
-        }
-        let error = cleared.expect_err("a nameless kept channel refuses the clear");
-        assert!(error.to_string().contains("채널 이름"), "{case:?}: {error}");
-        assert!(session_id(&shared, channel).await, "{case:?}: session kept");
         let core = shared.core.lock().await;
-        assert!(!core.sessions[&channel].cleared, "{case:?}: not cleared");
+        assert!(core.sessions[&channel].cleared, "{case:?}: cleared");
         drop(core);
         let calls = tmux.take_calls();
         assert_eq!(calls, Vec::<String>::new(), "{case:?}: no tmux call");
@@ -884,20 +875,33 @@ async fn a_worker_refusal_without_a_session_fails_its_row_with_its_attachments_p
         preserve_on_cancel: false,
         agent_id: "agent-h".into(),
         provider: "claude".into(),
-        home_epoch: None,
     };
     let insert = crate::db::intake_outbox::insert_pending;
     let row = insert(&pool, &payload, 1, None).await.unwrap();
     let api = Recorder::start().await;
     let _rest = crate::services::discord::shared_state::test_rest::install(api.http.clone());
-    let owner = crate::services::discord::health::owner_runtime_for_tests::registered("claude");
-    let (_registry, owner) = owner.await;
+    let registry = Arc::new(crate::services::discord::health::HealthRegistry::new());
+    let mut owner = shared_on(&pool).await;
+    Arc::get_mut(&mut owner).unwrap().health_registry = Arc::downgrade(&registry);
+    owner
+        .http
+        .cached_bot_token
+        .set("test-token".into())
+        .unwrap();
+    registry.register("claude".into(), owner.clone()).await;
     let _hosts =
         crate::config::session_hosts::force_for_test(Some("mac-mini"), &[(channel, "mac-mini")]);
 
     let not_cancelled = || false;
     let tick = run_intake_worker_tick(&pool, &owner, "worker-1", "claude", "o", &not_cancelled);
     assert_eq!(tick.await.unwrap(), TickOutcome::Processed);
+    assert_eq!(
+        run_intake_worker_tick(&pool, &owner, "worker-1", "claude", "o", &not_cancelled)
+            .await
+            .unwrap(),
+        TickOutcome::QueueEmpty,
+        "the failed refusal is not left pending for another worker tick"
+    );
 
     let row: (String, Option<String>, serde_json::Value) = sqlx::query_as(
         "SELECT status::TEXT, last_error, attachment_refs FROM intake_outbox WHERE id = $1",
@@ -1029,11 +1033,11 @@ async fn a_dispatch_reusing_a_configured_thread_is_refused_before_its_bootstrap_
     db.drop().await;
 }
 
-// `/clear` on a Herdr-configured channel served by a runtime whose backend is not managed tmux
-// is refused before its selector, input or durable selector clear changes.
+// `/clear` on a Herdr-configured channel resets its session and input and never reaches tmux,
+// whatever the runtime's backend: a Herdr channel's process ends through Herdr alone.
 #[tokio::test]
-async fn an_unmanaged_runtime_clear_of_a_configured_channel_changes_nothing_pg() {
-    let test = "services::discord::admin_host_guard::tests::an_unmanaged_runtime_clear_of_a_configured_channel_changes_nothing_pg";
+async fn an_unmanaged_runtime_clear_of_a_configured_channel_resets_it_without_tmux_pg() {
+    let test = "services::discord::admin_host_guard::tests::an_unmanaged_runtime_clear_of_a_configured_channel_resets_it_without_tmux_pg";
     if !api_child(test) {
         return;
     }
@@ -1062,80 +1066,22 @@ async fn an_unmanaged_runtime_clear_of_a_configured_channel_changes_nothing_pg()
         .await;
     tmux.take_calls();
 
-    let mode = SoftClearNotifyMode::Suppress;
-    let clear = clear_channel_session_state(&http, &shared, &provider, channel, "/clear", mode);
-    let cleared = clear.await;
+    let clear = clear_channel_session_state(&http, &shared, &provider, channel, "/clear");
+    clear.await.expect("a configured channel's clear commits");
     let core = shared.core.lock().await;
     let session = &core.sessions[&channel];
-    assert_eq!(session.session_id.as_deref(), Some("sid"), "selector kept");
-    assert_eq!(session.pending_uploads, ["kept"], "input kept");
+    assert_eq!(session.session_id, None, "selector forgotten");
+    assert!(session.pending_uploads.is_empty(), "input discarded");
     drop(core);
-    let calls = api.take();
-    assert!(
-        !calls.iter().any(|c| c.contains("clear-session-id")),
-        "{calls:?}"
-    );
     assert_eq!(tmux.take_calls(), Vec::<String>::new(), "no tmux call");
-    let error = cleared.expect_err("a configured channel refuses the clear");
-    assert!(error.to_string().contains("Herdr"), "{error}");
     db.drop().await;
 }
 
-// A clear's target is main's managed-reset verdict unless the Herdr turn switch is on for a
-// configured channel; then one that cannot be judged is refused before any tmux call.
-#[tokio::test]
-async fn the_clear_target_keeps_mains_verdict_unless_a_configured_channel_is_switched_on_pg() {
-    use super::{ResetTarget, clear_reset_target, managed_reset_refusal};
-    let _root = crate::config::TestRuntimeRootGuard::new();
-    let tmux = ScriptedTmux::install();
-    let (db, pool) = postgres().await;
-    let shared = shared_on(&pool).await;
-    let provider = ProviderKind::Claude;
-    let unresolved = || -> std::future::Ready<Option<String>> {
-        panic!("main's verdict resolves no session key")
-    };
-    let same = |main: Option<String>, target: ResetTarget| match (main, target) {
-        (Some(main), ResetTarget::Refused(reason)) => main == reason,
-        (None, ResetTarget::LegacyTmux) => true,
-        _ => false,
-    };
-    for (s, switch) in [None, Some(false), Some(true)].into_iter().enumerate() {
-        let _switch = crate::services::turn_host::force_switch_for_test(switch);
-        for (n, case) in Case::ALL.into_iter().enumerate() {
-            let channel = ChannelId::new(1_479_671_302_387_091_000 + (s * 100 + n) as u64);
-            let channel_name = format!("p9b4-target-{s}-{n}");
-            let name = provider.build_tmux_session_name(&channel_name);
-            map_channel(&shared, channel, &channel_name).await;
-            case.seed(&pool, &channel_key(&shared, &name), &name, channel.get())
-                .await;
-            let main = managed_reset_refusal(&shared, &provider, channel, true, false, None).await;
-            let target = clear_reset_target(&shared, &provider, channel, None, unresolved).await;
-            assert!(same(main, target), "{switch:?} {case:?}");
-        }
-    }
-    let channel = ChannelId::new(1_479_671_302_387_092_000);
-    let _hosts = crate::config::session_hosts::force_for_test(
-        Some("mac-mini"),
-        &[(channel.get(), "mac-mini")],
-    );
-    map_channel(&shared, channel, "p9b4-configured").await;
-    tmux.take_calls();
-    for switch in [None, Some(false), Some(true)] {
-        let _switch = crate::services::turn_host::force_switch_for_test(switch);
-        let main = managed_reset_refusal(&shared, &provider, channel, true, false, None).await;
-        let key = || async { Some("p9b4-no-row".to_string()) };
-        let target = match switch {
-            Some(true) => clear_reset_target(&shared, &provider, channel, None, key).await,
-            _ => clear_reset_target(&shared, &provider, channel, None, unresolved).await,
-        };
-        match switch {
-            Some(true) => assert!(
-                matches!(&target, ResetTarget::Refused(reason) if reason.contains("herdr turn refused")),
-                "switched on, a configured channel without its row is refused"
-            ),
-            _ => assert!(same(main, target), "{switch:?}"),
-        }
-    }
-    assert_eq!(tmux.take_calls(), Vec::<String>::new(), "no tmux call");
-    db.drop().await;
+/// A bounded runtime for the replay kickoff fixtures.
+pub(in crate::services::discord) fn intake_replay_rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
 }

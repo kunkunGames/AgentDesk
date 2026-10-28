@@ -34,7 +34,7 @@ module.exports = function attachReviewTimeouts(timeouts, helpers) {
         "SELECT kc.id as card_id " +
         "FROM kanban_cards kc " +
         "JOIN task_dispatches td ON td.kanban_card_id = kc.id " +
-        "WHERE kc.status = ? AND COALESCE(kc.review_status, 'reviewing') = 'reviewing' " +
+        "WHERE kc.status = ? AND kc.deleted_at IS NULL AND COALESCE(kc.review_status, 'reviewing') = 'reviewing' " +
         "AND td.dispatch_type = 'review' AND td.status IN ('completed', 'failed') " +
         "AND kc.review_entered_at IS NOT NULL AND kc.review_entered_at < datetime('now', '-30 minutes') " +
         "AND NOT EXISTS (SELECT 1 FROM task_dispatches td2 WHERE td2.kanban_card_id = kc.id " +
@@ -42,32 +42,9 @@ module.exports = function attachReviewTimeouts(timeouts, helpers) {
         [cReview]
       );
       for (var k = 0; k < staleReviews.length; k++) {
-        var disposition = agentdesk.review.disposition(staleReviews[k].card_id);
-        if (disposition !== "unmanaged" && disposition !== "run_local_review") continue;
         var staleReviewReason = "stale review — dispatch 완료 30분+ verdict 없음";
         escalateToManualIntervention(staleReviews[k].card_id, staleReviewReason, { review: true });
         agentdesk.log.warn("[timeout] Stale review → dilemma_pending: card " + staleReviews[k].card_id);
-      }
-    };
-
-  timeouts._section_D = function() {
-      // ─── [D] DoD 대기 타임아웃 (15분) ──────────────────────
-      var dCfg = agentdesk.pipeline.getConfig();
-      var dInitial = agentdesk.pipeline.kickoffState(dCfg);
-      var dInProgress = agentdesk.pipeline.nextGatedTarget(dInitial, dCfg);
-      var dReview = agentdesk.pipeline.nextGatedTarget(dInProgress, dCfg);
-      var stuckDod = agentdesk.db.query(
-        "SELECT id FROM kanban_cards " +
-        "WHERE status = ? AND review_status = 'awaiting_dod' " +
-        "AND awaiting_dod_at IS NOT NULL AND awaiting_dod_at < datetime('now', '-15 minutes')",
-        [dReview]
-      );
-      for (var d = 0; d < stuckDod.length; d++) {
-        var disposition = agentdesk.review.disposition(stuckDod[d].id);
-        if (disposition !== "unmanaged" && disposition !== "run_local_review") continue;
-        var dodReason = "DoD 대기 15분 초과";
-        escalateToManualIntervention(stuckDod[d].id, dodReason, { review: true });
-        agentdesk.log.warn("[timeout] DoD await timeout → dilemma_pending: card " + stuckDod[d].id);
       }
     };
 
@@ -81,7 +58,7 @@ module.exports = function attachReviewTimeouts(timeouts, helpers) {
       var orphanReviews = agentdesk.db.query(
         "SELECT kc.id, kc.title, kc.github_issue_number, kc.assigned_agent_id " +
         "FROM kanban_cards kc " +
-        "WHERE kc.status = ? " +
+        "WHERE kc.status = ? AND kc.deleted_at IS NULL " +
         "AND COALESCE(kc.review_status, 'reviewing') = 'reviewing' " +
         "AND kc.review_entered_at IS NOT NULL " +
         "AND kc.review_entered_at < datetime('now', '-5 minutes') " +
@@ -126,8 +103,6 @@ module.exports = function attachReviewTimeouts(timeouts, helpers) {
       // This avoids partial policy reimplementation (R1/R2 review feedback).
       for (var n = 0; n < orphanReviews.length; n++) {
         var oc = orphanReviews[n];
-        var disposition = agentdesk.review.disposition(oc.id);
-        if (disposition !== "unmanaged" && disposition !== "run_local_review") continue;
         agentdesk.log.warn("[timeout] Orphan review detected: card " + oc.id +
           " (#" + (oc.github_issue_number || "?") + ") in review with no active dispatch → dilemma_pending");
 

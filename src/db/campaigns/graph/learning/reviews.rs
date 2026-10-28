@@ -43,13 +43,13 @@ pub async fn prepare(pool: &PgPool, id: &str, goal: &Goal) -> Result<Option<Pend
     if owner != id {
         return Ok(None);
     }
-    let unsettled: bool = sqlx::query_scalar(&format!(
+    let unsettled: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT EXISTS(SELECT 1 FROM campaign_dag_reviews review
         JOIN campaign_graph_tasks t ON t.task_key=review.task_key
         WHERE review.family_id=$1 AND review.status='failed' AND ({}) AND ({}))",
         super::budget::REVIEW_TASK_SQL,
         super::budget::UNSETTLED_TASK_SQL
-    ))
+    )))
     .bind(&family)
     .fetch_one(&mut *tx)
     .await?;

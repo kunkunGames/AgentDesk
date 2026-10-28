@@ -1,13 +1,12 @@
-# 채널 소유 ingress 판정 계약 (관측 shadow)
+# 채널 소유 ingress 판정 계약 (과거 관측 shadow 기록)
+
+<!-- doc-path-refs: removed src/services/cluster/channel_ingress.rs src/services/cluster/channel_ingress/tests.rs src/services/cluster/channel_home.rs src/services/cluster/channel_home_drain.rs src/db/o_channel_homes.rs ingress_shadow/compat_tests.rs -->
 
 기준: `itismyfield/AgentDesk@070157faf`. §1–§8의 좌표는 이 SHA 기준이다. §9의 관측 연결은 `b0062777a` 위에 얹었고 좌표 대신 심볼로 적는다.
 
-이 문서는 채널 home 권위를 읽어 "이 노드가 채널 ingress의 실행 후보인가"를 판정하는 계약을 고정한다.
-구현은 `src/services/cluster/channel_ingress.rs`의 순수 판정 함수 `observe`다.
-런타임 호출자는 §9의 ingress shadow 하나다. 기본값은 꺼짐이고, 켜도 판정을 구조화 로그로만 남기며 실행·forwarding·ack를 바꾸지 않는다.
-채널 ingress 전환, 자동 takeover, forwarding 제거는 이 문서의 착지 범위가 아니다.
+이 문서는 R1–R6에서 제거한 채널 home·ingress shadow의 과거 설계와 검증 기록이다. 현재 production에는 이 판정 모듈·shadow worker·설정·admission 배선이 없다(§4.4). 아래의 파일 좌표·수용 기준·활성화 절차는 당시 구현을 설명하며 현재 운영 계약이나 F1의 구현 지시가 아니다. 0133·0134 migration과 잔류 테이블은 데이터 보존을 위해 남긴다.
 
-## 1. 착지 형태
+## 1. 당시 착지 형태 (제거됨)
 
 | 항목 | 내용 |
 |---|---|
@@ -16,8 +15,7 @@
 | 시험 | `src/services/cluster/channel_ingress/tests.rs` |
 | 관측 연결 | §9. 시간(PG `statement_timestamp`)과 로컬 gate 표본(`channel_home::ingress_snapshot`) 공급자를 함께 붙였다 |
 
-운영 호출자가 만들지 않는 `SourceEpoch::Routed`와 그 두 보류 사유(`StaleSourceEpoch`, `RouteWithoutHomeEpoch`)는 `#[cfg(test)]`로 둔다.
-새 `#[allow]`와 baseline 인상은 금지라서, 전달 입력을 관측하는 호출자가 생길 때 그 조각이 이 표시를 푼다.
+당시 운영 호출자가 만들지 않던 `SourceEpoch::Routed`와 그 두 보류 사유(`StaleSourceEpoch`, `RouteWithoutHomeEpoch`)는 `#[cfg(test)]`였다. 이 타입과 시험 전용 분기도 R6에서 제거됐다.
 
 ## 2. 판정 계약
 
@@ -82,7 +80,9 @@ row_fresh := 0 <= age_upper < HOLD_FOR
 이 명제는 서로 다른 시점의 관측을 실행 허가로 써도 된다는 뜻이 아니다. handoff 뒤 예전 `LocalCandidate`는 역사적 관측이며, 실행은 그 시점의 gate admission을 다시 통과해야 한다.
 같은 instance_id를 쓰는 두 프로세스는 row holder로 구분하지 못한다(U5). durable source dedup도 이 분류기의 성과가 아니다. claim·accept SQL의 home 조건 재검사를 이 관측으로 대체하지 않는다.
 
-## 3. 후속 전환이 따를 결정
+## 3. 당시 후속 전환 검토 기록
+
+아래 D1–D5는 제거 전의 설계 선택지다. 현재 failover·세션 인수 계약을 정하지 않으며, 새 세션을 여는 F1은 별도 설계로 검토한다.
 
 | 결정 | 내용 |
 |---|---|
@@ -110,14 +110,14 @@ row_fresh := 0 <= age_upper < HOLD_FOR
 | renewal·force | `src/db/o_channel_homes.rs:373–437` `renew`, `force_orphan` | write 성공만 `HeldHome` 생성 |
 | 로컬 gate | `src/services/cluster/channel_home.rs:246–496` | 조회로 gate를 열지 않음. 성공한 renewal과 그 전송 시각만 연다 |
 | registry | `src/services/cluster/channel_home.rs:671–760` | 교체 시 이전 gate 철회 |
-| boot·lease | `src/services/cluster/channel_home_boot.rs:97–254`, `src/services/cluster/channel_home.rs:867–940` | switch-on 준비, renewal loop, row 상실 처리 |
+| 잔류 lease | `src/services/cluster/channel_home.rs` `run_lease` | renewal loop와 row 상실 처리 시험; 위임 boot는 제거됨 |
 | drain·복귀 | `src/services/cluster/channel_home_drain.rs:133–260` | intake 폐쇄 → 의무 확인 → 조건부 leave/remove |
 
 ### 4.3 live ingress 앞단 (home을 직접 읽지 않지만 활성화 때 빠뜨리면 안 되는 경계)
 
 | 경계 | 좌표 | 부수효과 |
 |---|---|---|
-| component interaction | `src/services/discord/router/intake_gate.rs:298–355` | model picker, idle recap, node picker, sidecar |
+| component interaction | `src/services/discord/router/intake_gate.rs:298–355` | model picker, node picker, sidecar |
 | slash command | `src/services/discord/runtime_bootstrap/gateway_runtime.rs:56–83` | Poise `command_check`와 event handler가 별개 |
 | live 메시지 | `src/services/discord/router/intake_gate.rs:356–650` | 로컬 message-ID dedup, thread 문맥, raw/effective 채널 |
 | DM·첨부 | `src/services/discord/router/intake_gate.rs:650–930` | pending DM 회신 소비, checkpoint, 첨부 admission |
@@ -126,68 +126,7 @@ row_fresh := 0 <= age_upper < HOLD_FOR
 
 ### 4.4 home 권위 직접 소비 전수표
 
-`src/` 아래 시험 파일이 아닌 파일 중 `o_channel_homes`, `channel_home::`, `channel_home_boot`, `channel_home_drain`, `home_fence`, `home_availability`를 직접 참조하는 파일 전부다.
-`home_authority_inventory_lists_every_direct_consumer` 시험이 이 표와 소스를 대조한다. 새 직접 소비자를 추가하면 여기에 분류해야 시험이 통과한다.
-
-구분: 생성(권위·epoch·gate 개방) / 변경(조건부 전이·철회) / admission(실행·명령·출력 직전 거절) / 라우팅(배치·전달 결정) / readiness(위임 가능 여부, 소유 발급 아님) / 진단 / 배선 / 시험 / 관측(읽어서 로그만 남김).
-
-| 파일 | 구분 | 직접 소비 지점 |
-|---|---|---|
-| `src/db/o_channel_homes.rs` | 생성·변경·관측 | `delegate` :234, `adopt` :307, `renew` :373(유일한 `HeldHome` 생성자), `force_orphan` :403, 진단 `list_homes` :439·`open_intake_by_epoch` :460, 관측 `read_home_at`(row와 PG 시각을 한 SELECT로) |
-| `src/db/intake_outbox.rs` | 배선·라우팅 | `worker_status` 모듈과 claim/status API 재노출. 실제 home claim SQL은 아래 worker_status에 있다 |
-| `src/db/intake_outbox/worker_status.rs` | 라우팅 | `HOME_CLAIM_FENCE`: epoch 없는 행은 home row 없는 채널에서만, epoch 행은 같은 provider·target holder·home epoch의 worker row에서만 claim한다 |
-| `src/db/mod.rs` | 배선 | 모듈 선언 :32 |
-| `src/cli/channel_home.rs` | 변경·진단 | 운영자 `delegate` :168, `begin_reclaim` :182, `force_orphan` :197, 진단 `list_homes` :120, `read_home` :138 |
-| `src/cli/args.rs` | 배선 | CLI 인자 :571 |
-| `src/cli/run.rs` | 배선 | CLI 실행 :712 |
-| `src/lib.rs` | readiness | `home_availability::{Availability, Unavailable, state}` 재노출 :291 |
-| `src/services/cluster/mod.rs` | 배선 | 모듈 선언 |
-| `src/services/cluster/channel_home.rs` | 생성·변경·admission | 관측 표본 child 모듈 선언, gate `confirm` :340, `admit_unattributed` :182, `admit_command` :195, `HomeGate::admit*` :498–590, `refusal` :592·:759, `register`·`unregister`·`registered` :671–749, `intake_hold` :819, `boot_home` :858, `run_lease` :916 |
-| `src/services/cluster/channel_home_boot.rs` | 생성·변경 | `start` :97(registry 등록 :133, lease :188), `listed` :77, `delegated_boot_ownership` :288 |
-| `src/services/cluster/channel_home_drain.rs` | 변경 | `drain_round` :133(renew :117, read :138), `run_drain` :212, `finish_return` :235 |
-| `src/services/cluster/channel_home_port.rs` | 변경 | drain 의무 포트 :12 |
-| `src/services/cluster/home_availability.rs` | readiness | `preflight` :56, `install_enabled` :94, `refusal` :173. 소유권을 발급하지 않는 별도 가드 |
-| `src/services/cluster/channel_home/ingress_snapshot.rs` | 관측 | `try_sample`·`sample_gate`: registry·local·inner gate를 `try_lock` 한 번씩 읽어 복사만 한다. expire·prune·close·초기화 없음 |
-| `src/services/cluster/channel_ingress.rs` | 관측 | 이 계약. 호출자는 shadow worker뿐 |
-| `src/services/cluster/intake_router_hook.rs` | readiness·라우팅 | `home_availability::refusal` :130, `read_home` :135 → `route_to_home` :162 |
-| `src/services/cluster/intake_worker.rs` | admission | accept 전 `intake_hold` :558 |
-| `src/services/discord/ingress_shadow.rs` | 관측 | 설정·descriptor·bounded 제출. `HomeProvider::parse`로 provider만 정규화 |
-| `src/services/discord/ingress_shadow/worker.rs` | 관측 | `read_home_at` → `ingress_snapshot::try_sample` → `observe` → 로그. 쓰기 없음 |
-| `src/services/discord/commands/control.rs` | admission | `home_fence::admit` :354·:641, `home_fence::refused` :582·:637 |
-| `src/services/discord/commands/control/home_fence.rs` | admission | `admit` :27 → `channel_home::admit_command`, `check` :36, `refused` :41(거절 시 사용자 응답) |
-| `src/services/discord/commands/control/provider_reset.rs` | admission | `home_fence::admit` :27 |
-| `src/services/discord/commands/restart.rs` | admission | `admit_command` :196·:257 |
-| `src/services/discord/commands/skill.rs` | admission | `admit_command` :183 |
-| `src/services/discord/commands/stop.rs` | admission | `home_fence::admit` :122 |
-| `src/services/discord/commands/text_commands.rs` | admission | `current_command` :37, `admit_command` :389·:1300 |
-| `src/services/discord/meeting_orchestrator/lifecycle.rs` | admission | `admit_command` :399 |
-| `src/services/discord/router/message_handler/goal_lifecycle.rs` | admission | `admit_command` :165 |
-| `src/services/discord/router/intake_dispatch.rs` | 라우팅 | `registered` :201. PG가 있고 등록된 채널은 home 경로가 먼저 결정 |
-| `src/services/discord/runtime_bootstrap.rs` | 생성·readiness | 역할별 boot 공급 :503–624(`HomeRole`, `turns_restored`, `HomeSettings`, `install_home_availability`, `start_channel_homes`) |
-| `src/services/discord/runtime_bootstrap/o_writer_host.rs` | admission | `delegated_boot_ownership` :336 |
-| `src/services/discord/runtime_bootstrap/shared_data.rs` | readiness | availability 등록 보관 :7 |
-| `src/services/discord/shared_state.rs` | readiness | availability 등록 보관 :657 |
-| `src/services/discord/mod.rs` | 시험 | 시험 fixture의 `_home_availability: None` :1331 |
-| `src/services/discord/voice_barge_in.rs` | 시험 | 시험 fixture의 `_home_availability: None` :1353 |
-| `src/services/discord/turn_bridge/tmux_runtime/codex_stop_delivery.rs` | admission | `registered_channel` :665, `HomeRefusal::NotHeld` 판정 :734 |
-| `src/services/discord/turn_lease.rs` | admission | `registered_channel` → `admit_recovery` :155 |
-| `src/services/discord/turn_presence/entrypoints.rs` | admission | `HomeGate` 재노출 :7, `withdraw_unmounted` :96: Home mount가 바뀌면 이전 owner에 기댄 presence 승인만 거둔다. row·gate를 쓰지 않는다 |
-| `src/services/discord/health/o_transition.rs` | admission | 운영자 전환 요청의 Context 조달 `home_admission` :109: 같은 home lock 아래 `registered_channel`·`ownership`으로 epoch를 확인하고 `admit_at_epoch(…, recovery=false)`로 `CommandPermit`을 받는다. row·gate를 쓰지 않는다 |
-| `src/services/queue.rs` | admission | `admit_command`·`admit_unattributed` :243, `admit_command` :501 |
-| `src/services/session_forwarding/home_stop.rs` | 라우팅·admission | sender `read_home` :176, receiver `read_home` :335 → `registered` :368 |
-| `src/services/turn_host.rs` | admission·readiness | `home_refusal` :118, `for_turn` :130, `refusal_before_turn` :155 |
-| `src/services/tui_o/cutover.rs` | admission | `delegated` → `registered` :121 |
-| `src/services/tui_o/cutover/intake_route.rs` | readiness·라우팅 | `home_availability::refusal` :39, `held_channels`·`intake_held_channels` :58–59, `any_registered` :88 |
-| `src/services/tui_o/repost/runner.rs` | admission·readiness | `registered_channel`·`home_availability::refusal` :37–38 |
-| `src/services/tui_o/writer/deliver.rs` | admission | `admit` :157–166(availability 거절 뒤 home `admit_post`) |
-| `src/services/tui_o/writer/actor/transition_snapshot.rs` | admission | `home_now` :155. 등록 home의 기대 epoch·Owned·Open을 확인하고, home 없는 채널은 writer gate를 확인한다 |
-| `src/services/tui_o/writer/host.rs` | admission·readiness | `owned_now` :353, `home_availability::refusal` :499, `registered_channel` :505 |
-| `src/services/tui_o/writer/transition_port.rs` | admission·배선 | transition 요청의 `Context`가 home epoch와 `CommandPermit`을 보관한다. mailbox가 요청을 받은 뒤에는 requester가 떠나도 job 종료까지 permit을 유지한다 |
-| `src/services/tui_o/alarm.rs` | 시험 | 시험 모듈의 `registered_channel` :778 |
-| `src/server/routes/agents_stop.rs` | admission | `admit_command`·`admit_unattributed` :66–70 |
-| `src/server/routes/queue_api.rs` | 시험 | test 빌드 전용 뮤턴트 스위치 `command_mutant` :206·:240 |
-| `src/server/routes/health_api/runtime_profile.rs` | 진단 | `channel_home::health` :10(메모리 읽기만) |
-| `src/server/routes/docs/inventory/endpoints/part_04.rs` | 진단 | home stop 전달 endpoint 설명 :538 |
+R1–R6 제거 뒤 home 권위를 직접 소비하는 production 파일은 없다. 이전 admission·라우팅·관측·진단 소비자 행과 전용 inventory 시험은 제거됐다. 이 문서의 나머지 home·shadow 설계는 과거 계약 기록이며 현재 배선을 뜻하지 않는다.
 
 ## 5. 운영 전제
 
@@ -205,7 +144,9 @@ row_fresh := 0 <= age_upper < HOLD_FOR
 
 코드가 강제하는 조건과 배포 설정(U4·U5)은 따로 확인한다.
 
-## 6. 수용 기준과 시험
+## 6. 당시 수용 기준과 시험 (제거됨)
+
+아래 시험·뮤턴트는 과거 구현의 검증 기록이며 현재 시험 등록이나 GREEN 증거가 아니다. §4.4의 소비자 표와 inventory 시험도 R1–R6에서 함께 제거했다.
 
 | AC | 지키는 계약 | 시험 | 뮤턴트 |
 |---|---|---|---|
@@ -218,12 +159,12 @@ row_fresh := 0 <= age_upper < HOLD_FOR
 | AC9 | 두 노드 중 최대 하나 | `two_nodes_never_both_observe_a_candidate_for_one_row` | holder_check_removed |
 | AC10 | 예전 관측으로 현재 admission 통과 불가 | `an_earlier_candidate_admits_nothing_after_a_handoff` | 관측값에서 gate를 여는 API가 없어 행동 뮤턴트를 만들 수 없다(구조 경계) |
 | AC11·AC12·P2-3 | 관측이 기존 home 진입점 결과를 바꾸지 않음, 진입점이 관측을 호출하지 않음 | `observing_leaves_every_existing_home_entry_point_unchanged` | observe_closes_intake, observe_unregisters, entry_point_observes |
-| P2-2 | 4.4 표가 직접 소비자를 빠짐없이 분류 | `home_authority_inventory_lists_every_direct_consumer` | 표에서 `home_fence.rs`·`turn_host.rs` 행 삭제 |
+| 당시 P2-2 | 제거 전 §4.4 표가 직접 소비자를 빠짐없이 분류 | `home_authority_inventory_lists_every_direct_consumer` (제거됨) | 당시 소비자 행 삭제·비소비자 행 추가 |
 
-비간섭 시험이 실제로 부르는 진입점: `admit_unattributed`, `admit_command`, `refusal`, `turn_host::refusal_before_turn`, `intake_hold`(epoch 있음·없음), `HomeGate::{admit, admit_post, ownership, expiry, commands_in_flight}`, `intake_held_channels`, `health`.
-열린 gate, drain 중 gate, 한 번도 잡지 않은 gate, 미등록 채널 네 경우를 모두 부르고, 기대값(열린 채널 permit, drain 거절, 미등록 Legacy)을 먼저 단언해 빈 기록끼리의 비교를 막는다.
+당시 비간섭 시험이 호출했던 진입점: `refusal`, `turn_host::refusal_before_turn`, `intake_hold`(epoch 있음·없음), `HomeGate::{admit, admit_post, ownership, expiry, commands_in_flight}`, `intake_held_channels`, `health`.
+열린 gate, drain 중 gate, 한 번도 잡지 않은 gate, 미등록 채널 네 경우를 모두 호출했고, 기대값(열린 gate epoch, claim 보류, 미등록 Legacy)을 먼저 단언해 빈 기록끼리의 비교를 막았다.
 
-Discord 앞단 `handle_event`와 Poise 명령 경로의 비간섭은 §9.4의 바이트 비교 하네스(`ingress_shadow::compat_tests`)가 증명한다.
+Discord 앞단 `handle_event`와 Poise 명령 경로의 비간섭은 당시 §9.4의 바이트 비교 하네스(`ingress_shadow::compat_tests`)로 검증했다. 이 하네스도 현재는 제거됐다.
 
 ## 7. 미확보 항목 [U]
 
@@ -262,9 +203,11 @@ Discord 앞단 `handle_event`와 Poise 명령 경로의 비간섭은 §9.4의 �
 새 admission 중지 → 진행 중 실행·ack·출력의 종료 또는 불명 상태 보존 → 채널 gate 철회 → 기존 경로가 보존된 source·cursor를 이해하는지 확인 → singleton 경로 재개 순서다.
 이전 바이너리가 새 custody를 이해하지 못하면 자동 롤백하지 않고 보류한다. `intake_outbox` forwarding 제거는 잔여 OPEN 작업의 귀속을 확인한 뒤의 별도 단계다.
 
-## 9. 관측 연결 (ingress shadow)
+## 9. 당시 관측 연결 (ingress shadow, 제거됨)
 
-판정을 실제 gateway 이벤트에 붙이되, 결과는 구조화 로그로만 남긴다. 기존 실행·forwarding·ack의 결정, 효과 순서, payload bytes, 호출 횟수는 바꾸지 않는다.
+아래 설정 키·worker·호출자·비간섭 시험은 모두 제거 전 기록이다. 현재 설정을 켜서 이 경로를 되살릴 수 없다.
+
+당시에는 판정을 실제 gateway 이벤트에 붙이고 결과를 구조화 로그로만 남겼다. 기존 실행·forwarding·ack의 결정, 효과 순서, payload bytes, 호출 횟수는 바꾸지 않는 계약이었다.
 
 ### 9.1 켜는 조건과 수명
 
@@ -278,7 +221,7 @@ Discord 앞단 `handle_event`와 Poise 명령 경로의 비간섭은 §9.4의 �
 
 ### 9.2 경로
 
-1. hook: gateway framework의 event handler(`gateway_runtime::run_bot_framework_options`)가 `handle_event`를 부르기 직전에 `ingress_shadow::observe`를 한 번 부른다. 이 handler가 `handle_event`의 유일한 운영 호출자라 `handle_event` 첫 줄과 같은 지점이고 모든 early return 앞이다. giant 파일 순증 0 게이트 때문에 `router/intake_gate.rs`가 아닌 이 자리에 둔다. Poise `command_check`에는 붙이지 않는다(raw `InteractionCreate`에서 이미 제출한다).
+1. hook: gateway framework의 event handler(`gateway_runtime::run_bot_framework_options`)가 `handle_event`를 부르기 직전에 `ingress_shadow::observe`를 한 번 부른다. 이 handler가 `handle_event`의 유일한 운영 호출자라 `handle_event` 첫 줄과 같은 지점이고 모든 early return 앞이다. hook은 gateway 경계에서 ingress 관측을 소유한다. giant 파일 증가는 현재 경고이며 배치 위치를 줄 수로 정하지 않는다. Poise `command_check`에는 붙이지 않는다(raw `InteractionCreate`에서 이미 제출한다).
 2. 제출: 원본 이벤트를 빌려 종류·실제 channel·원본 ID·application ID만 복사한다. 채널은 thread parent·policy channel이 아니라 이벤트의 channel이다. allowlist 밖이면 아무것도 하지 않는다. `try_send` 한 번이며 DB·HTTP·lock·`await`·task spawn이 없다. 실행 ingress가 아닌 이벤트(edit·delete·ping·presence 등)는 `excluded`로 센다.
 3. queue: 256개 bounded queue, worker 1개. full·closed면 그 descriptor를 버리고 센다. 버린 것도 sequence를 하나 받으므로 기록에서 빈 번호로 드러난다.
 4. 조회: observer 전용 pool(최대 연결 1, 기존 runtime pool의 연결 옵션 복사, 첫 조회 전 연결 없음)로 `o_channel_homes::read_home_at`을 부른다. row와 PG `statement_timestamp()`를 한 SELECT로 읽는다. `started`는 pool acquire 전에 잡고 acquire+query 전체를 250ms로 자른다. timeout·DB 오류·decode 실패는 `Unreadable`, row 없음은 `Missing`이며 retry·cached row는 없다. worker가 끝나면 pool을 닫는다.

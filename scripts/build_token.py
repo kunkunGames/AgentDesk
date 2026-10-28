@@ -169,18 +169,21 @@ def supervised_signals(signals: Iterable[signal.Signals] | None = None,
     return tuple(sorted(chosen))
 
 
-def wait_timeout_secs(env: Mapping[str, str]) -> float:
-    """Read the wait deadline, falling back to the default on any unusable value."""
-    raw = env.get(WAIT_TIMEOUT_ENV)
-    if raw is None:
-        return DEFAULT_WAIT_TIMEOUT_SECS
+def usable_wait_timeout_secs(raw: str | None) -> float | None:
+    """Share the finite-positive timeout contract with the deploy-lock preflight."""
     try:
         parsed = float(raw)
     except (TypeError, ValueError):
-        return DEFAULT_WAIT_TIMEOUT_SECS
+        return None
     if not (0 < parsed < float("inf")):
-        return DEFAULT_WAIT_TIMEOUT_SECS
+        return None
     return parsed
+
+
+def wait_timeout_secs(env: Mapping[str, str]) -> float:
+    """Read the wait deadline, falling back to the default on any unusable value."""
+    parsed = usable_wait_timeout_secs(env.get(WAIT_TIMEOUT_ENV))
+    return DEFAULT_WAIT_TIMEOUT_SECS if parsed is None else parsed
 
 
 def assert_live_token(fd: int, path: str = CANONICAL_TOKEN_PATH) -> None:
@@ -623,7 +626,7 @@ def apply_sccache_env(env: dict[str, str]) -> None:
     env["SCCACHE_DIR"] = cache_dir
     # Adjustable local ceiling to reduce eviction risk; performance gain is unmeasured.
     # Explicit caller limits, including CI-specific values, remain unchanged.
-    env["SCCACHE_CACHE_SIZE"] = env.get("SCCACHE_CACHE_SIZE") or "40G"
+    env["SCCACHE_CACHE_SIZE"] = env.get("SCCACHE_CACHE_SIZE") or "15G"
     # 0 disables the idle exit. Campaign builds queue behind the token for tens of
     # minutes, so the 600s default reaps the daemon between them and its counters
     # restart at zero -- which reads as "sccache is off" and gets it re-enabled.
@@ -691,6 +694,13 @@ def parse_command(argv: Sequence[str]) -> list[str]:
 
 def main(argv: Sequence[str]) -> int:
     args = list(argv)
+    if args[1:2] == ["--validate-deploy-lock-timeout"]:
+        if len(args) != 3 or usable_wait_timeout_secs(args[2]) is None:
+            print("AGENTDESK_DEPLOY_LOCK_TIMEOUT_SECS must be a finite number greater than 0",
+                  file=sys.stderr)
+            return EXIT_USAGE
+        print(args[2])
+        return 0
     delegate = len(args) > 1 and args[1] == "--delegate-lease"
     if delegate:  # Only before --; everything after -- remains command argv.
         del args[1]

@@ -69,6 +69,9 @@ pub(super) struct LastToolCall {
 pub(super) struct StatusPanelState {
     pub(super) status: DerivedStatus,
     pub(super) last_tool: Option<LastToolCall>,
+    pub(super) tool_activity: super::tool_activity::ToolActivityRing,
+    pub(super) tool_activity_display: crate::config::ToolActivityDisplay,
+    tool_cwd: Option<String>,
     pub(super) session: Option<SessionPanelSnapshot>,
     pub(super) task: Option<TaskPanelSnapshot>,
     pub(super) context: Option<ContextPanelSnapshot>,
@@ -101,6 +104,8 @@ impl StatusPanelState {
     pub(super) fn reset_session_content(&mut self) {
         self.status = DerivedStatus::Running;
         self.last_tool = None;
+        self.tool_activity = Default::default();
+        self.tool_cwd = None;
         self.todos.clear();
         self.tasks.clear();
         // #4396 r3: the cleared subagents leave the state — tombstone their keys
@@ -219,7 +224,10 @@ impl StatusPanelState {
     }
 
     pub(super) fn apply(&mut self, event: StatusEvent) {
+        self.tool_activity.apply(&event, self.tool_cwd.as_deref());
         match event {
+            StatusEvent::ToolActivity { .. } => {}
+            StatusEvent::ToolActivityCwd { cwd } => self.tool_cwd = Some(cwd),
             StatusEvent::ToolStart { name, args_summary } => {
                 self.last_tool = Some(LastToolCall {
                     name: name.clone(),
@@ -589,6 +597,18 @@ pub(super) fn render_status_panel(
     // activity line (or `None` for headless/synthetic/id-0 turns).
     turn_trigger_line: Option<String>,
 ) -> String {
+    render_status_panel_for(snapshot, provider, time_line, turn_trigger_line, false)
+}
+
+/// A class render with titled sections over the 2000-unit limit (or, for `footer`, the footer body
+/// budget) is fitted section-wise, because the cuts would otherwise drop trailing sections whole.
+pub(super) fn render_status_panel_for(
+    snapshot: StatusPanelState,
+    provider: &ProviderKind,
+    time_line: String,
+    turn_trigger_line: Option<String>,
+    footer: bool,
+) -> String {
     let activity_line = super::freshness::render_panel_activity_line(&snapshot, provider);
     let time_lines = time_line.lines().collect::<Vec<_>>();
     let mut header_lines = std::iter::once(activity_line.as_str())
@@ -667,7 +687,44 @@ pub(super) fn render_status_panel(
         }
     }
 
-    format_and_truncate_status_panel_sections(sections)
+    if snapshot.tool_activity_display == crate::config::ToolActivityDisplay::Summary
+        && !snapshot.tool_activity.is_empty()
+        && !snapshot.status.is_terminal()
+    {
+        super::tool_activity::fit_panel(sections)
+    } else {
+        // Judge the untruncated panel: the 2000-unit cut below drops trailing sections whole.
+        let formatted = sections
+            .iter()
+            .map(|section| {
+                crate::services::terminal_status_formatting::format_subtext_block(section)
+            })
+            .collect::<Vec<_>>();
+        let lossless = join_status_panel_sections(&formatted);
+        let body = lossless
+            .trim()
+            .split_once('\n')
+            .map_or("", |(_, body)| body);
+        let over_footer_budget = footer
+            && body.len()
+                > super::super::single_message_panel::SINGLE_MESSAGE_PANEL_LIVE_BODY_BUDGET_BYTES;
+        // Without a titled section there is no title to keep, so the plain trailing cut stays.
+        let titled = sections[1..].iter().any(|section| {
+            matches!(
+                section.lines().next(),
+                Some("Plan" | "Tasks" | "Subagents" | "Workflow")
+            )
+        });
+        if over_footer_budget
+            || (footer || titled)
+                && super::super::formatting::discord_message_units(&lossless)
+                    > STATUS_PANEL_MAX_CHARS
+        {
+            super::tool_activity::fit_sections(sections)
+        } else {
+            format_and_truncate_status_panel_sections(sections)
+        }
+    }
 }
 
 pub(super) fn format_and_truncate_status_panel_sections(sections: Vec<String>) -> String {

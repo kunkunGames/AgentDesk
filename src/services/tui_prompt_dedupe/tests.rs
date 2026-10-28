@@ -1,5 +1,107 @@
 use super::*;
 
+// Probes that break whenever another test in the process touches STATE (resets or try_lock contention).
+const PRIVATE_REGISTRY_TESTS: &[&str] = &[
+    "services::tui_prompt_dedupe::shadow_peek::tests::existing_binding_peek_semantics_are_preserved",
+    "services::tui_prompt_dedupe::shadow_peek::tests::detailed_binding_peek_distinguishes_busy_without_mutating_state",
+    "services::tui_prompt_dedupe::shadow_peek::tests::detailed_binding_peek_recovers_poison_with_existing_optional_semantics",
+    "services::tui_prompt_dedupe::tests::reconcile_holds_source_authority_across_read_decision_and_replacement",
+];
+const PRIVATE_REGISTRY_CHILD: &str = "ADK_DEDUPE_PRIVATE_REGISTRY_TEST";
+// When set, each probe body appends its test name so the list can be checked end to end.
+const PRIVATE_REGISTRY_TRACE: &str = "ADK_DEDUPE_PRIVATE_REGISTRY_TRACE";
+
+fn listed_private_registry_test(test_name: &str) -> &str {
+    let test_name = test_name
+        .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+        .expect("crate-qualified test name");
+    assert!(
+        PRIVATE_REGISTRY_TESTS.contains(&test_name),
+        "{test_name} must be listed in PRIVATE_REGISTRY_TESTS"
+    );
+    test_name
+}
+
+// A private process gives lock-state probes their own registry, including unguarded readers.
+// Returns true in the shared process, which must then return without running the body.
+pub(super) fn run_with_private_registry(test_name: &str) -> bool {
+    let test_name = listed_private_registry_test(test_name);
+    if std::env::var(PRIVATE_REGISTRY_CHILD).as_deref() == Ok(test_name) {
+        return false;
+    }
+    let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--format=pretty", "--color=never"])
+        .env(PRIVATE_REGISTRY_CHILD, test_name)
+        .output()
+        .expect("start private registry test process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success()
+            && stdout
+                .lines()
+                .any(|line| line == format!("test {test_name} ... ok"))
+            && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "private registry test {test_name} failed ({status}):\n{stdout}\n{stderr}",
+        status = output.status,
+    );
+    true
+}
+
+// First line of a probe body: the body may only run inside its own private registry process.
+pub(super) fn assert_private_registry_body(test_name: &str) {
+    let test_name = listed_private_registry_test(test_name);
+    assert_eq!(
+        std::env::var(PRIVATE_REGISTRY_CHILD).as_deref(),
+        Ok(test_name),
+        "{test_name} body ran outside its private registry process"
+    );
+    if let Some(trace) = std::env::var_os(PRIVATE_REGISTRY_TRACE) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(trace)
+            .expect("open private registry trace");
+        writeln!(file, "{test_name}").expect("write private registry trace");
+    }
+}
+
+// Every listed probe must run its body in a child, so the shared sweep never runs it unisolated.
+#[test]
+fn private_registry_tests_run_their_bodies_only_in_a_private_process() {
+    let dir = tempfile::tempdir().unwrap();
+    for (index, test_name) in PRIVATE_REGISTRY_TESTS.iter().enumerate() {
+        let trace = dir.path().join(format!("trace-{index}"));
+        let child = {
+            let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test_name, "--format=pretty", "--color=never"])
+                .env_remove(PRIVATE_REGISTRY_CHILD)
+                .env(PRIVATE_REGISTRY_TRACE, &trace)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("start sweep-mode test process")
+        };
+        let output = child.wait_with_output().expect("sweep-mode test output");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success()
+                && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+            "sweep-mode run of {test_name} failed ({status}):\n{stdout}\n{stderr}",
+            status = output.status,
+            stderr = String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&trace).unwrap_or_default(),
+            format!("{test_name}\n"),
+            "{test_name} must run its body once, in its private registry process"
+        );
+    }
+}
+
 fn reset_state() {
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
     *state = TuiPromptDedupeState::default();
@@ -1208,6 +1310,14 @@ fn discord_relayed_user_prompt_format_is_recognized_3527() {
     assert!(is_discord_relayed_user_prompt(
         "[Reply context] ...\n[User: 0hbujang (ID: 343742347365974026)] hi"
     ));
+    let reply = "[Reply context — earlier messages]\nbot: earlier\n\n[Reply context — replied-to message]\nAuthor: bot\nContent: quote\n[End of reply context — the user's reply follows]\n\n[User: Alice (ID: 77)] hi";
+    for prompt in [
+        reply.to_string(),
+        reply.replace('\n', ""),
+        reply.replace('\n', " "),
+    ] {
+        assert!(is_discord_relayed_user_prompt(&prompt));
+    }
     // codex #3527 r2: the legacy pane observer submits join("")/join(" ")
     // collapsed variants of one block, so the marker can be MID-LINE — the
     // whole-string scan must catch those too, not just the newline variant.
@@ -1220,6 +1330,31 @@ fn discord_relayed_user_prompt_format_is_recognized_3527() {
     // author containing parens, collapsed mid-line
     assert!(is_discord_relayed_user_prompt(
         "ctx [User: Alice (ops) team (ID: 77)] deploy it"
+    ));
+}
+
+/// A running turn's input opens with `[User:` yet is never a new turn's relay echo or a machine
+/// event, whatever its body quotes; a v1 new-turn header still is a relayed prompt.
+#[test]
+fn an_inject_header_is_neither_a_relayed_prompt_nor_a_machine_event() {
+    let inject = |body: &str| {
+        let frame = crate::services::tui_input::human_frame::inject;
+        frame(
+            "discord:1:2",
+            "343742347365974026",
+            "0hbujang",
+            "abcdef12",
+            body,
+        )
+    };
+    let quoting = inject("see [User: bob (ID: 5)] above");
+    assert!(!is_discord_relayed_user_prompt(&quoting));
+    assert!(is_discord_relayed_user_prompt(
+        &quoting.replace("mode=inject", "mode=new")
+    ));
+    let xml = "<subagent_notification>{\"status\":{\"completed\":\"x\"}}</subagent_notification>";
+    assert!(!is_user_prefixed_subagent_notification_machine_event(
+        &inject(xml)
     ));
 }
 
@@ -1335,6 +1470,7 @@ fn external_input_turn_lease_carries_owner_and_trace_fields() {
             relay_owner: ExternalInputRelayOwner::SessionBoundRelay,
             runtime_kind: Some(RuntimeHandoffKind::CodexTui),
             generation: EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+            hosted_source: None,
         },
     );
 
@@ -1367,6 +1503,7 @@ fn clear_external_input_relay_lease_if_matches_preserves_newer_turn() {
         relay_owner: ExternalInputRelayOwner::BridgeAdapter,
         runtime_kind: Some(RuntimeHandoffKind::CodexTui),
         generation: EXTERNAL_INPUT_RELAY_LEASE_GENERATION_UNRECORDED,
+        hosted_source: None,
     };
     let newer = ExternalInputRelayLease {
         turn_id: Some("external:codex:42:tmux-trace:2".to_string()),
@@ -1665,6 +1802,7 @@ fn local_compact_entry_id_is_recorded_only_after_a_successful_note_delivery() {
         row_prompt_id: None,
         native_turn_id: None,
         steer_echo: false,
+        hosted_source: None,
     });
     assert_eq!(
         observe_prompt_by_tmux_with_entry_id_at(
@@ -1733,6 +1871,7 @@ fn local_note_delivery_ack_does_not_record_nonlocal_entries() {
         row_prompt_id: None,
         native_turn_id: None,
         steer_echo: false,
+        hosted_source: None,
     };
 
     record_local_only_entry_id_after_note_delivery(&nonlocal);
@@ -2075,6 +2214,76 @@ fn ignores_codex_rollout_environment_context_user_message() {
     });
 
     assert_eq!(extract_codex_rollout_user_prompt(&json), None);
+}
+
+fn codex_user_record(texts: &[&str], kinds: Option<&[&str]>) -> serde_json::Value {
+    let content: Vec<_> = texts
+        .iter()
+        .map(|text| serde_json::json!({ "type": "input_text", "text": text }))
+        .collect();
+    let mut payload = serde_json::json!({ "type": "message", "role": "user", "content": content });
+    if let Some(kinds) = kinds {
+        payload["internal_chat_message_metadata_passthrough"] =
+            serde_json::json!({ "content_item_kinds": kinds });
+    }
+    serde_json::json!({ "type": "response_item", "payload": payload })
+}
+
+/// Codex writes AGENTS.md instructions with its environment as a user record before the prompt;
+/// only that exact record is context, never a typed input that looks like it.
+#[test]
+fn codex_agents_md_context_record_is_not_a_user_prompt() {
+    let agents =
+        "# AGENTS.md instructions\n\n<INSTRUCTIONS>\n# Global\n\n- dummy rule\n</INSTRUCTIONS>";
+    let nested =
+        "# AGENTS.md instructions for /tmp/project\n\n<INSTRUCTIONS>\nnested rule\n</INSTRUCTIONS>";
+    let env = "<environment_context>\n  <cwd>/tmp/project</cwd>\n</environment_context>";
+    let typed = "[User: tester (ID: 1)] first prompt after clear";
+    let (doc, ctx, text) = (
+        "agents_md.instructions",
+        "environments.environment_context",
+        "user.text",
+    );
+    let context = [
+        // Named items decide even where the text shape alone would not.
+        (vec![agents, env], Some(vec![doc, ctx])),
+        (vec![agents, nested, env], Some(vec![doc, doc, ctx])),
+        // Writers without item kinds are known by the exact text shape.
+        (vec![agents, env], None),
+        (vec![nested], None),
+    ];
+    for (texts, kinds) in context {
+        let record = codex_user_record(&texts, kinds.as_deref());
+        assert_eq!(extract_codex_rollout_user_prompt(&record), None, "{record}");
+    }
+    let joined = format!("{agents}\n{env}");
+    let inputs = [
+        (vec![typed], Some(vec![text])),
+        (vec![joined.as_str()], Some(vec![text])),
+        (vec![agents, typed], Some(vec![doc, text])),
+        (vec![agents, env, typed], None),
+        (vec![agents, "and my question"], None),
+        (
+            vec!["# AGENTS.md instructions\n\nplease review my AGENTS.md"],
+            None,
+        ),
+        (
+            vec!["# AGENTS.md instructions\n<INSTRUCTIONS>\nx\n</INSTRUCTIONS>"],
+            None,
+        ),
+        (
+            vec!["# AGENTS.md instructions for\n\n<INSTRUCTIONS>\nx\n</INSTRUCTIONS>"],
+            None,
+        ),
+    ];
+    for (texts, kinds) in inputs {
+        let record = codex_user_record(&texts, kinds.as_deref());
+        assert_eq!(
+            extract_codex_rollout_user_prompt(&record),
+            Some(texts.join("\n")),
+            "{record}"
+        );
+    }
 }
 
 #[test]
@@ -2795,10 +3004,9 @@ fn touch_anchor_on_activity_evicts_expired_anchor_without_resurrecting_it() {
     {
         let state = STATE.lock().unwrap_or_else(|error| error.into_inner());
         assert!(
-            state
+            !state
                 .prompt_anchor_by_tmux
-                .get(&PromptKey::new(provider, tmux))
-                .is_none(),
+                .contains_key(&PromptKey::new(provider, tmux)),
             "the over-ceiling anchor was evicted, not resurrected"
         );
     }
@@ -2891,6 +3099,14 @@ fn extract_yields_none_entry_id_when_uuid_absent() {
 // test fails if the acquisition is moved after the read.
 #[test]
 fn reconcile_holds_source_authority_across_read_decision_and_replacement() {
+    let name = concat!(
+        module_path!(),
+        "::reconcile_holds_source_authority_across_read_decision_and_replacement"
+    );
+    if run_with_private_registry(name) {
+        return;
+    }
+    assert_private_registry_body(name);
     // The authority key follows the runtime root env, so no other test may move it mid-probe.
     let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let _guard = TEST_LOCK

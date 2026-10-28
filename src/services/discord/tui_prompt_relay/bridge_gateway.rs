@@ -1,8 +1,6 @@
 use super::super::gateway::{GatewayFuture, TurnGateway};
 use super::*;
-use crate::services::discord::{
-    mailbox_requeue_intervention_front, schedule_deferred_idle_queue_kickoff,
-};
+use crate::services::discord::schedule_deferred_idle_queue_kickoff;
 use crate::services::turn_orchestrator::Intervention;
 
 pub(super) struct TuiDirectBridgeGateway {
@@ -12,6 +10,21 @@ pub(super) struct TuiDirectBridgeGateway {
 }
 
 impl TurnGateway for TuiDirectBridgeGateway {
+    fn send_notice_once<'a>(
+        &'a self,
+        channel_id: ChannelId,
+        content: &'a str,
+    ) -> GatewayFuture<'a, Result<MessageId, String>> {
+        Box::pin(
+            super::super::outbound::confirmation::send_terminal_notice_http_once(
+                &self.http,
+                &self.shared,
+                channel_id,
+                content,
+            ),
+        )
+    }
+
     fn send_message<'a>(
         &'a self,
         channel_id: ChannelId,
@@ -208,4 +221,16 @@ impl TurnGateway for TuiDirectBridgeGateway {
     fn bot_owner_provider(&self) -> Option<ProviderKind> {
         None
     }
+}
+
+#[cfg(test)]
+pub(in crate::services::discord) fn terminal_notice_test_gateway(
+    http: Arc<serenity::Http>,
+    shared: Arc<SharedData>,
+) -> Arc<dyn TurnGateway> {
+    Arc::new(TuiDirectBridgeGateway {
+        http,
+        shared,
+        provider: ProviderKind::Claude,
+    })
 }

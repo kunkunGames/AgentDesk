@@ -1,5 +1,5 @@
-//! The re-post turn as the channel writer runs it: off it reads nothing, on it sends through the
-//! writer's own lease, gate and ledger, and never beside another post of the channel.
+//! The re-post turn sends through the channel writer's lease, gate and ledger, never beside
+//! another post of the channel.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,11 +10,16 @@ use tokio::sync::{Notify, watch};
 
 use super::*;
 
+#[path = "bo_post_tests.rs"]
+mod bo_post;
 #[path = "local_retry_repost_tests.rs"]
 mod local_retry;
+#[path = "scoped_repost_tests.rs"]
+mod scoped;
+#[path = "tool_result_repost_tests.rs"]
+mod tool_result;
 use crate::db::auto_queue::test_support::TestPostgresDb;
 use crate::services::tui_o::repost::admission::{Admitter, OriginalAttempt, OriginalGate};
-use crate::services::tui_o::repost::config::{RepostConfig, RepostSwitch};
 use crate::services::tui_o::repost::dispatch::{self, Admission, RepostWriter};
 use crate::services::tui_o::repost::identity::PieceKey;
 use crate::services::tui_o::repost::io::probe::ProbeRead;
@@ -32,19 +37,7 @@ use crate::services::tui_o::repost::runner::{
 use crate::services::tui_o::repost::send::{
     AttemptGuard, BoundedTransport, CreatedMessage, RepostEnvelope, WireOutcome,
 };
-use crate::services::tui_o::shadow::tap::TuiOConfig;
 use crate::services::tui_o::store::ledger::PieceRecord;
-
-fn switch(enabled: bool) -> RepostSwitch {
-    let boot = TuiOConfig {
-        repost: RepostConfig {
-            enabled,
-            channels: [CHANNEL].into_iter().collect(),
-        },
-        ..TuiOConfig::default()
-    };
-    RepostSwitch::new(Some(&boot), watch::channel(None).1)
-}
 
 fn key(native_key: &str) -> PieceKey {
     PieceKey::new(unit(native_key), 0).unwrap()
@@ -54,8 +47,7 @@ fn key(native_key: &str) -> PieceKey {
 async fn admitted(pool: &PgPool, native_key: &str, payload: &str) -> PieceKey {
     let dir = tempfile::tempdir().unwrap();
     let mut log = ProvenanceLog::open(&dir.path().join("s.jsonl")).unwrap();
-    let mut on = switch(true);
-    let admitter = Admitter::when_on(&mut on, pool, "node-a", BOT).unwrap();
+    let admitter = Admitter::new(pool, "node-a", BOT);
     let original = OriginalAttempt {
         serial: 3,
         key: key(native_key),
@@ -229,8 +221,8 @@ fn sidecar(harness: &Harness) -> std::path::PathBuf {
     harness._runtime.path().join("repost").join("7.jsonl")
 }
 
-fn turn(harness: &Harness, pool: PgPool, switch: RepostSwitch, io: &Arc<Io>) -> ChannelTurn<Io> {
-    let runner = Runner::new(switch, pool, BOT, run_scope());
+fn turn(harness: &Harness, pool: PgPool, io: &Arc<Io>) -> ChannelTurn<Io> {
+    let runner = Runner::new(pool, BOT, run_scope());
     let io = Arc::clone(io);
     ChannelTurn::new(
         runner,
@@ -270,42 +262,6 @@ impl<W, H: RepostHook<W>> RepostHook<W> for Counted<H> {
     }
 }
 
-/// Off, the actor's turn stops at the switch: the piece posts as without one and nothing reads
-/// PostgreSQL, Discord or the sidecar. On, the sidecar activates and a fresh piece waits on PG.
-#[tokio::test(start_paused = true)]
-async fn f6_default_off_actor_turn_reads_nothing() {
-    for on in [None, Some(false), Some(true)] {
-        let (harness, path, _) = switched_over(b"");
-        harness.gate.acquired();
-        let io = Io::over(&harness.port);
-        let turns = Arc::new(AtomicUsize::new(0));
-        let mut writer = harness.writer();
-        if let Some(on) = on {
-            let inner = turn(&harness, unreachable(), switch(on), &io);
-            let turns = Arc::clone(&turns);
-            writer = writer.with_repost(Some(Box::new(Counted { inner, turns })));
-        }
-        let (stop, task) = spawn(writer);
-        polls(3).await;
-        let idle_turns = turns.load(Ordering::SeqCst);
-        append(&path, &row("m1", "first"));
-        polls(3).await;
-        halt(stop, task).await;
-        let posted = harness.port.posts();
-        match on {
-            None | Some(false) => assert_eq!(posted, ["first"], "{on:?}"),
-            Some(true) => assert!(posted.is_empty(), "an unreadable admission holds it"),
-        }
-        assert_eq!(
-            idle_turns >= 2,
-            on.is_some(),
-            "{on:?}: the actor runs the turn"
-        );
-        assert_eq!((io.reads.load(Ordering::SeqCst), io.wire()), (0, 0));
-        assert_eq!(sidecar(&harness).exists(), on == Some(true), "{on:?}");
-    }
-}
-
 /// Evidence for `key` as this run would gather it now.
 async fn evidence(pool: &PgPool, key: &PieceKey) -> DispatchIntent<'static> {
     let row = load(pool, key).await.unwrap().unwrap();
@@ -334,7 +290,7 @@ async fn is_receipt(pool: &PgPool, key: &PieceKey, id: u64) -> bool {
 
 async fn grant(runner: &mut Runner, writer: &mut Writer, pool: &PgPool, key: &PieceKey) -> bool {
     let intent = evidence(pool, key).await;
-    let admitted = runner.try_next_dispatch(writer, OriginalGate::Admitted, intent);
+    let admitted = runner.try_next_dispatch(writer, intent);
     matches!(admitted.await.unwrap(), Admission::Granted { .. })
 }
 
@@ -383,7 +339,7 @@ async fn f6_general_auto_and_resume_never_overlap_posts_pg() {
         }
     };
     *harness.port.on_post.lock().unwrap() = Some(Box::new(on_post));
-    let hook = turn(&harness, pool.clone(), switch(true), &io);
+    let hook = turn(&harness, pool.clone(), &io);
     let (stop, task) = spawn(harness.writer().with_repost(Some(Box::new(hook))));
     // Admitted later, so the excluded piece's evidence comes first, alone.
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -422,22 +378,19 @@ async fn f6_general_auto_and_resume_never_overlap_posts_pg() {
     db.drop().await;
 }
 
-/// Each writer guard keeps Auto from a slot: re-post off, a stopped writer, a busy lease and a
-/// gateway not owned. The same writer with nothing in the way grants.
+/// Each writer guard keeps Auto from a slot: a disabled writer, a stopped writer, a busy lease
+/// and a gateway not owned. The same writer with nothing in the way grants.
 #[tokio::test]
 async fn f6_t07_all_writer_guards_block_auto_pg() {
     let db = TestPostgresDb::create().await;
     let pool = db.connect_and_migrate().await;
     let key = admitted(&pool, "f6-t07", "piece").await;
     let harness = Harness::new();
-    let on = switch(true);
-    let effective = on.live_for(CHANNEL);
-    let mut runner = Runner::new(on, pool.clone(), BOT, run_scope());
+    let mut runner = Runner::new(pool.clone(), BOT, run_scope());
     for case in 0..4 {
         harness.gate.acquired();
         let mut writer = harness.writer();
         writer.set_live(case != 0);
-        writer.bind_switch(Arc::clone(&effective));
         if case == 1 {
             writer.stop(WriterAlarm::Halted { detail: "x".into() });
         }
@@ -455,7 +408,6 @@ async fn f6_t07_all_writer_guards_block_auto_pg() {
     harness.gate.acquired();
     let mut writer = harness.writer();
     writer.set_live(true);
-    writer.bind_switch(effective);
     assert!(grant(&mut runner, &mut writer, &pool, &key).await);
     pool.close().await;
     db.drop().await;
@@ -484,11 +436,9 @@ async fn f6_t09_open_prepared_blocks_every_sender_pg() {
     let mut writer = harness.writer();
     writer.set_live(true);
     let io = Io::over(&harness.port);
-    let on = switch(true);
-    writer.bind_switch(on.live_for(CHANNEL));
-    let mut runner = Runner::new(on, pool.clone(), BOT, run_scope());
+    let mut runner = Runner::new(pool.clone(), BOT, run_scope());
     let intent = evidence(&pool, &key).await;
-    let admitted = runner.try_next_dispatch(&mut writer, OriginalGate::Admitted, intent);
+    let admitted = runner.try_next_dispatch(&mut writer, intent);
     let Admission::Granted { permit, lease } = admitted.await.unwrap() else {
         panic!("granted once the open one is settled");
     };
@@ -508,8 +458,8 @@ async fn f6_t09_open_prepared_blocks_every_sender_pg() {
     db.drop().await;
 }
 
-/// After a restart an admitted piece never posts as a fresh original and an unreadable admission
-/// holds it; off, nothing asks PostgreSQL and the piece posts as before.
+/// After a restart an admitted piece never posts as a fresh original; an unreadable admission
+/// holds it until PostgreSQL can confirm its ownership.
 #[tokio::test]
 async fn f6_t10_recovered_admitted_piece_never_becomes_new_original_pg() {
     let db = TestPostgresDb::create().await;
@@ -519,24 +469,23 @@ async fn f6_t10_recovered_admitted_piece_never_becomes_new_original_pg() {
     harness.gate.acquired();
     let io = Io::over(&harness.port);
     let work = piece("f6-t10", "piece");
-    let cases = [
-        (pool.clone(), true, Step::Done),
-        (unreachable(), true, Step::LeaseBusy),
-        (unreachable(), false, Step::Done),
-    ];
-    for (pool, on, step) in cases {
-        let hook = turn(&harness, pool, switch(on), &io);
+    let cases = [(pool.clone(), Step::Done), (unreachable(), Step::LeaseBusy)];
+    for (pool, step) in cases {
+        let hook = turn(&harness, pool, &io);
         let mut writer = harness.writer().with_repost(Some(Box::new(hook)));
-        assert_eq!(writer.deliver(&work).await, step, "{on}");
+        assert_eq!(writer.deliver(&work).await, step);
     }
-    assert_eq!(
-        harness.port.posts(),
-        ["piece"],
-        "only the off writer posts it"
+    assert!(
+        harness.port.posts().is_empty(),
+        "recovery invents no original"
     );
-    let ledger = harness.channel();
-    let (serial, _) = ledger.ledger().latest_piece(key.unit(), 0).unwrap();
-    assert_eq!(serial, 0);
+    assert!(
+        harness
+            .channel()
+            .ledger()
+            .latest_piece(key.unit(), 0)
+            .is_none()
+    );
     pool.close().await;
     db.drop().await;
 }
@@ -570,14 +519,14 @@ async fn f6_t11_pre_activation_backlog_never_posts_pg() {
         let (pool, key) = (pool.clone(), key(native));
         async move { load(&pool, &key).await.unwrap().is_some() }
     };
-    turn(&harness, pool.clone(), switch(true), &io)
+    turn(&harness, pool.clone(), &io)
         .turn(&mut harness.writer())
         .await;
     assert!(!admitted("open-before").await);
     let settled = LedgerEntry::NotFound { serial: 1 };
     harness.channel().append_ledger(settled).unwrap();
     // A restarted actor records a new activation; what came before stays out.
-    let mut hook = turn(&harness, pool.clone(), switch(true), &io);
+    let mut hook = turn(&harness, pool.clone(), &io);
     let mut writer = harness.writer();
     hook.turn(&mut writer).await;
     let mut writer = writer.with_repost(Some(Box::new(hook)));
@@ -622,11 +571,9 @@ async fn f6_a_dropped_writer_never_lets_its_repost_send_again_pg() {
     writer.set_live(true);
     let io = Io::over(&harness.port);
     io.throttle_first.store(true, Ordering::SeqCst);
-    let on = switch(true);
-    writer.bind_switch(on.live_for(CHANNEL));
-    let mut runner = Runner::new(on, pool.clone(), BOT, run_scope());
+    let mut runner = Runner::new(pool.clone(), BOT, run_scope());
     let intent = evidence(&pool, &key).await;
-    let admitted = runner.try_next_dispatch(&mut writer, OriginalGate::Admitted, intent);
+    let admitted = runner.try_next_dispatch(&mut writer, intent);
     let Admission::Granted { permit, lease } = admitted.await.unwrap() else {
         panic!("granted");
     };
@@ -649,65 +596,71 @@ async fn f6_a_dropped_writer_never_lets_its_repost_send_again_pg() {
     db.drop().await;
 }
 
-fn config(enabled: bool) -> Arc<crate::config::Config> {
-    let yaml = format!(
-        "server:\n  port: 8791\ntui_o:\n  repost:\n    enabled: {enabled}\n    channels: [{CHANNEL}]\n"
-    );
-    Arc::new(serde_yaml::from_str(&yaml).unwrap())
-}
-
-/// The live config decides each turn without a restart: on, the turn activates the sidecar and
-/// lets a request leave; turned off, the next turn withdraws that before anything else.
-#[tokio::test(start_paused = true)]
-async fn f6_a_live_reload_switches_the_next_turn_without_a_restart() {
-    let harness = Harness::new();
-    harness.gate.acquired();
-    let io = Io::over(&harness.port);
-    let (live, watched) = watch::channel(None);
-    let mut hook = turn(
-        &harness,
-        unreachable(),
-        RepostSwitch::new(None, watched),
-        &io,
-    );
-    let mut writer = harness.writer();
-    hook.turn(&mut writer).await;
-    assert!(writer.guard().is_err() && !sidecar(&harness).exists());
-    live.send_replace(Some(config(true)));
-    hook.turn(&mut writer).await;
-    assert!(writer.guard().is_ok() && sidecar(&harness).exists());
-    live.send_replace(Some(config(false)));
-    hook.turn(&mut writer).await;
-    assert_eq!(writer.guard(), Err("re-post is off".to_owned()));
-    assert_eq!(io.wire(), 0);
-}
-
 #[path = "../repost/writer_activation_tests.rs"]
 mod activation;
 
-#[tokio::test]
-async fn d4b_old_config_without_channels_denies_real_channel_turn() {
+// Delivery and turn selection share the ordinary gateway contract despite stale home state.
+#[tokio::test(flavor = "current_thread")]
+async fn residual_home_row_does_not_change_writer_or_turn_host_pg() {
+    use crate::services::provider::ProviderKind;
+    use crate::services::turn_host::{self, TurnHost};
+
+    let db = TestPostgresDb::create().await;
+    let pool = db.connect_and_migrate().await;
+    let _hosts = crate::config::session_hosts::force_for_test(Some("mini"), &[]);
+    let _channels = crate::services::tui_o::cutover::test_override::force_channels(&[]);
+    let channel = CHANNEL.to_string();
+    let poison_epoch = i64::MAX - 7;
+    sqlx::query(
+        "INSERT INTO o_channel_homes
+          (channel_id, provider, state, holder, target, epoch, renewed_at, detail)
+         VALUES ($1, 'codex', 'worker', 'stale-remote', NULL, $2,
+                 NOW() - INTERVAL '1 year', 'poison: ignore this home authority')",
+    )
+    .bind(&channel)
+    .bind(poison_epoch)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let read = || async {
+        sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT row_to_json(h)::jsonb FROM o_channel_homes h WHERE channel_id=$1",
+        )
+        .bind(&channel)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let before = read().await;
+    assert_eq!(before["epoch"], poison_epoch);
+    assert_eq!(before["holder"], "stale-remote");
+    assert_eq!(before["provider"], "codex");
     let harness = Harness::new();
-    harness.gate.acquired();
-    let io = Io::over(&harness.port);
-    let old: crate::config::Config =
-        serde_yaml::from_str("server:\n  port: 8791\ntui_o:\n  repost:\n    enabled: true\n")
-            .unwrap();
-    let mut hook = turn(
-        &harness,
-        unreachable(),
-        RepostSwitch::new(old.tui_o.as_ref(), watch::channel(None).1),
-        &io,
-    );
     let mut writer = harness.writer();
-    hook.turn(&mut writer).await;
-    assert!(
-        !sidecar(&harness).exists(),
-        "missing selector must create no re-post sidecar"
+    harness.gate.acquired();
+    let posted = writer
+        .deliver(&piece("poison-home", "ignored-home-row"))
+        .await;
+    let refusal =
+        turn_host::refusal_before_turn(Some(&pool), &ProviderKind::Claude, CHANNEL, || async {
+            None
+        })
+        .await;
+    let host = turn_host::for_turn(Some(&pool), &ProviderKind::Claude, CHANNEL, None).await;
+    assert_eq!(
+        (
+            posted == Step::Done,
+            refusal.is_none(),
+            matches!(host, TurnHost::Tmux)
+        ),
+        (true, true, true),
+        "writer and TurnHost ignore residual home authority",
     );
-    assert_eq!(io.reads.load(Ordering::SeqCst), 0);
-    assert_eq!(io.wire(), 0);
+    assert_eq!(harness.port.posts(), ["ignored-home-row"]);
+    assert_eq!(read().await, before, "residual home row is untouched");
+    pool.close().await;
+    db.drop().await;
 }
 
-#[path = "../repost/allowlist_writer_tests.rs"]
-mod allowlist;
+#[path = "always_on_repost_tests.rs"]
+mod always_on;

@@ -248,6 +248,16 @@ pub(super) async fn run_standby_relay(
                 return;
             };
             if delivered {
+                scheduled_settle::settle(
+                    &shared,
+                    &provider,
+                    channel_id,
+                    &output_path,
+                    placeholder_msg_id,
+                    &turn_binding,
+                    result_text,
+                )
+                .await;
                 complete_standby_inflight_state(
                     &provider,
                     channel_id,
@@ -426,8 +436,7 @@ fn final_assistant_response_from_output(output_path: &str, start_offset: u64) ->
         };
         let text = content
             .iter()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .filter_map(crate::services::claude_tui::transcript_tail::visible_assistant_block_text)
             .collect::<String>();
         let text = super::response_sanitizer::strip_leading_tui_response_chrome(&text);
         if !text.trim().is_empty() {
@@ -1023,6 +1032,7 @@ async fn deliver_response(
     }
 }
 
+mod scheduled_settle;
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,5 +1,7 @@
 # design-4712 — `tmux_watcher.rs` 분해 슬라이스 (릴레이 안정화 병목 해소)
 
+<!-- doc-path-refs: removed scripts/check_test_lane_coverage.py scripts/test_lane_coverage_baseline.txt -->
+
 작성 2026-07-29. 설계 에이전트(Claude, read-only)의 산출물을 오케스트레이터가 파일로 옮긴 것.
 설계 에이전트는 Write 도구가 없어 직접 쓰지 못했고, **아래 사실관계는 오케스트레이터가 리포에서 직접 재확인함**(§0.1).
 
@@ -12,7 +14,7 @@
 
 ### F1 — **캡처가 5개가 아니라 6개다. 빠뜨리면 컴파일이 안 된다.** (오케스트레이터 직접 확인)
 
-`tmux_watcher.rs:3501`:
+`tmux_watcher.rs`(작성 당시 3501행):
 ```rust
 if false && pct >= ctx_cfg.compact_pct && !is_prompt_too_long && compact_cooldown_ok {
 ```
@@ -28,7 +30,7 @@ if false && pct >= ctx_cfg.compact_pct && !is_prompt_too_long && compact_cooldow
 **그런데 FLAWED인 지점:**
 1. checker 자신의 메시지가 "ceiling 아래면 **현재 측정값으로** 낮추라"고 한다 (`check_hotfile_ratchet.py:146-150`). 예약은 그 의도를 우회한다.
 2. **만료 조건("#4973 머지 시 또는 4주")을 강제하는 checker가 없다.** 주석뿐이라 잊혀도 CI가 안 잡는다 → 이름만 다른 영구 캡 인상이 된다.
-3. **admission count 해석이 틀렸다.** `ratchet_admission_history.toml:3-8`에 count는 metric별이 아니라 **파일별 누적**이라고 명시돼 있다. 실제: hotfile `count=2` 1건(`:64-70`), giant `count=1`(`:16-22`)과 `count=3`(`:72-78`). 즉 "hotfile 2 / giant 3"은 독립 횟수가 아니라 **파일 전체 시퀀스의 현재 count가 3**이다. (다음 admission이 4가 되어 `count > 3`으로 경고가 뜬다는 결론 자체는 유효 — `ratchet_admission.py:31`, `:267-285`.)
+3. **admission count 해석이 틀렸다.** `ratchet_admission_history.toml:3-8`에 count는 metric별이 아니라 **파일별 누적**이라고 명시돼 있다. 실제: hotfile `count=2` 1건(`:64-70`), giant `count=1`(`:16-22`)과 `count=3`(`:72-78`). 즉 "hotfile 2 / giant 3"은 독립 횟수가 아니라 **파일 전체 시퀀스의 현재 count가 3**이다. (다음 admission이 4가 되어 `count > 3`으로 경고가 뜬다는 결론 자체는 유효 — `ratchet_admission.py`의 `ADMISSION_WARN_THRESHOLD`, `admission_warning_messages`.)
 4. **R=60의 근거가 무효.** PR #4972의 net `+8`은 맞지만, #4973이 그 접근을 **무동작 판정**했다. 실패한 접근의 비용을 승인된 계약의 하한으로 쓸 수 없다.
 
 **결정 필요(둘 중 하나):**
@@ -99,7 +101,7 @@ if false && pct >= ctx_cfg.compact_pct && !is_prompt_too_long && compact_cooldow
 | 주장 | 확인 결과 |
 |---|---|
 | `tmux_watcher/**` 네임스페이스 캡 = **700** (1000 아님) | ✅ `scripts/audit_maintainability_config.toml:35` |
-| hotfile cap 3571 / giant baseline 3571 / 실제 3569 → **여유 2** | ✅ `hotfile_ratchet.toml:123`, `audit_maintainability_giant_baseline.toml:143`, `wc -l` |
+| hotfile cap 3571 / giant baseline 3571 / 실제 3569 → **여유 2** | ✅ `hotfile_ratchet.toml`, `audit_maintainability_giant_baseline.toml:143`, `wc -l` |
 | #4712가 tmux_watcher.rs를 #4229에 위임 | ✅ 댓글 본문 직접 확인 |
 | registry는 `#4712`로 태그 | ✅ `giant_file_registry.toml:636` |
 | **PR #4972 OPEN + 같은 핫파일 + 3개 래칫 매니페스트 전부 수정** | ✅ files: `tmux_watcher.rs`, `hotfile_ratchet.toml`, `audit_maintainability_giant_baseline.toml`, `ratchet_admission_history.toml`, `test_lane_coverage_baseline.txt`, `outbound/delivery_record.rs`, `tmux_watcher/commit_decisions.rs`, `justfile`, `tests/test_fast_check_ci_wiring.py` |
@@ -116,7 +118,7 @@ if false && pct >= ctx_cfg.compact_pct && !is_prompt_too_long && compact_cooldow
 
 ```
 src/services/discord/tmux_watcher.rs                     3569 raw
-scripts/hotfile_ratchet.toml:123                         3571  (raw cap)   → 여유 2
+scripts/hotfile_ratchet.toml                         3571  (raw cap)   → 여유 2
 scripts/audit_maintainability_giant_baseline.toml:143    3571  (prod cap)  → 여유 2
 scripts/audit_maintainability_config.toml:35             tmux_watcher/** = 700
 ```
@@ -129,7 +131,7 @@ scripts/audit_maintainability_config.toml:35             tmux_watcher/** = 700
 - `235–3565` `tmux_output_watcher_with_restore` — **3331줄, 파일의 93.3%**
 - `431–3553` `'watcher_loop: loop`
 
-**모듈 경로 주의**: `tmux.rs:2720`이 `#[path = "tmux_watcher.rs"] mod tmux_watcher;`라서 논리 경로는 `services::discord::tmux::tmux_watcher`다 (`services::discord::tmux_watcher`가 **아님**).
+**모듈 경로 주의**: `tmux.rs`가 `#[path = "tmux_watcher.rs"] mod tmux_watcher;`라서 논리 경로는 `services::discord::tmux::tmux_watcher`다 (`services::discord::tmux_watcher`가 **아님**).
 
 ### 루프 본문 블록 맵 (재측정, #4229 스테이지 라벨)
 
@@ -205,7 +207,7 @@ new_cap = measured_after_slice + R      (R = 60)
 
 ### S-A — W7b: terminal token update + auto-compact tail ← **해제 슬라이스**
 
-- **이동**: `tmux_watcher.rs:3425–3552` → 신규 `src/services/discord/tmux_watcher/terminal_token_update.rs`
+- **이동**: `tmux_watcher.rs`(작성 당시 3425–3552행) → 신규 `src/services/discord/tmux_watcher/terminal_token_update.rs`
 - **정확한 내용**: 단일 `if let Some(tokens) = result_usage.map(|usage| usage.context_occupancy_input_tokens()) { … }` 문장. 내부: ADK 세션키 빌드, `shared.core` 락 하 `channel_name` 조회, `thread_channel_id` 파싱, `resolve_role_binding` → `agent_id`, `watcher_terminal_token_update_status(...)`로 `post_adk_session_status(...)`, auto-compact 임계 평가, pg cooldown-key `bind`/`execute`, `enqueue_outbox_best_effort` 🗜️ 알림.
 - **신규 심볼**: `pub(super) async fn run_watcher_terminal_token_update(ctx: WatcherTerminalTokenUpdateContext<'_>)`
 - **Context 구조체 (5필드, 전부 읽기 전용)**: `shared: &Arc<SharedData>`, `channel_id: ChannelId`, `tmux_session_name: &str`, `result_usage: Option<TokenUsage>`, `watcher_direct_terminal_idle_committed: bool`
@@ -229,7 +231,7 @@ new_cap = measured_after_slice + R      (R = 60)
 
 ### S-C — W7a: missing-inflight liveness fallback
 
-- **이동**: `3335–3423` → `tmux_watcher/post_commit_observation.rs`
+- **이동**: `3335–3423` → `tmux_watcher/post_commit_observation.rs` (제안)
 - **내용**: `missing_inflight_after_session_bound_delivery`, `probe_tmux_session_liveness` 게이트, `recent_turn_stop_for_watcher_range`, `terminal_cleanup_committed` 프로브, `missing_inflight_fallback_observation` 플랜과 3개 arm(recent-stop 억제 / dead-tmux drain + `handle_tmux_watcher_observed_death` + `break` / degraded 표기).
 - **Outcome enum**: `{BreakWatcherLoop, Fallthrough}` — `break 'watcher_loop` 1개.
 - **신규 모듈 크기**: 89 + ~40 ≈ **~130**. PASS.
@@ -276,7 +278,7 @@ new_cap = measured_after_slice + R      (R = 60)
 
 ## 5. 핫파일 동시성 판정
 
-**루트를 건드리는 모든 슬라이스는 엄격히 직렬.** `tmux_watcher.rs`는 `check_hotfile_ratchet.py`의 `REQUIRED_HOTFILES`이자 #3016 동시편집 금지 4파일 중 하나다. **"disjoint" 슬라이스끼리도 병렬 불가** — 모든 슬라이스가 `hotfile_ratchet.toml:123`과 `audit_maintainability_giant_baseline.toml:143`이라는 **단일 물리 라인**(전체 주석 이력을 담은)을 편집하기 때문이다.
+**루트를 건드리는 모든 슬라이스는 엄격히 직렬.** `tmux_watcher.rs`는 `check_hotfile_ratchet.py`의 `REQUIRED_HOTFILES`이자 #3016 동시편집 금지 4파일 중 하나다. **"disjoint" 슬라이스끼리도 병렬 불가** — 모든 슬라이스가 `hotfile_ratchet.toml`과 `audit_maintainability_giant_baseline.toml:143`이라는 **단일 물리 라인**(전체 주석 이력을 담은)을 편집하기 때문이다.
 
 **병렬 가능한 것**: 이미 추출된 자식 모듈 내부 작업(전부 non-hot) / #4973 L1+L2 / 다른 27개 #4712 항목(`session_relay_sink.rs`, `turn_finalizer.rs` 제외 — 별도 hot).
 
@@ -371,7 +373,7 @@ use crate::services::discord::tmux::advance_watcher_confirmed_end as _;
 ## 구현 시 핵심 파일
 
 - `src/services/discord/tmux_watcher.rs` (핫파일; S-A는 `3425–3552` 이동)
-- `scripts/hotfile_ratchet.toml:123` (raw cap `3571`)
+- `scripts/hotfile_ratchet.toml` (raw cap `3571`)
 - `scripts/audit_maintainability_giant_baseline.toml:143` (prod cap `3571`)
 - `scripts/test_lane_coverage_baseline.txt` + `scripts/check_test_lane_coverage.py` (§6.1 하드 게이트)
 - `src/services/discord/tmux_watcher/liveness.rs:666-691` (W8을 제약하는 경로 결합 계약 앵커)

@@ -1,5 +1,5 @@
 //! Channel ownership uses the immutable boot policy and, for a selected channel, this process's
-//! adoption of it; delegated output ownership survives its home closing intake.
+//! adoption of it.
 //! Uncertain identities withhold the body.
 //! This is an ownership fact, never delivery evidence; evidence readers must not consult it.
 
@@ -10,10 +10,11 @@ pub(crate) use super::topology::O_TUI_WRITER;
 
 use super::channel_policy::{self, BootChannels, Candidate, Site};
 use crate::services::agent_protocol::RuntimeHandoffKind;
-use crate::services::cluster::channel_home;
 
 mod channel_gate;
 pub(crate) mod intake_route;
+#[cfg(unix)]
+pub(crate) use channel_gate::peek_o_owns_tui_output_for_channel_quiet;
 pub(crate) use channel_gate::{
     BodyClaim, BodySend, IdentityError, claim_then_send, claim_then_send_held, o_keeps_body,
     o_owns_tui_output_for_channel_reserving, peek_o_owns_tui_output_for_channel,
@@ -74,52 +75,57 @@ fn owned_kind(channel: u64) -> Option<RuntimeHandoffKind> {
 fn owned_in(snapshot: &BootChannels, channel: u64) -> Option<RuntimeHandoffKind> {
     let kind = snapshot.kind(channel);
     let hosted = channel_policy::owns_output(true, snapshot.channels(), channel, kind);
-    input_candidate(snapshot, channel).filter(|c| hosted && c.peek().owned())?;
+    snapshot
+        .candidate(channel)
+        .filter(|c| hosted && c.peek().owned())?;
     kind
 }
 
-fn input_candidate(snapshot: &BootChannels, channel: u64) -> Option<&Candidate> {
-    let Some(home) = delegated(channel) else {
-        return snapshot.candidate(channel);
-    };
-    let candidate = snapshot.candidate(channel).or(snapshot.standby(channel));
-    candidate.filter(|_| home.intake_open())
-}
-
-/// The host's actual candidate: standby participates only with a registered local home.
-/// Input closure never returns Committed/Held output to Legacy.
-fn output_candidate(snapshot: &BootChannels, channel: u64) -> Option<&Candidate> {
-    snapshot
-        .candidate(channel)
-        .or_else(|| delegated(channel).and_then(|_| snapshot.standby(channel)))
-}
-
-/// A reserved delegated host still needs Legacy to execute its first input and bind a source.
-fn late_legacy_input(provider: &str, channel: u64) -> bool {
-    if !writer_enabled() || !provider.trim().eq_ignore_ascii_case("claude") {
-        return false;
+/// The boot turn selection while a selected Codex channel O owns has not confirmed turn mode.
+pub(crate) fn codex_turn_awaited(
+    channel: u64,
+) -> Option<crate::services::tui_o::turn_mode::TurnConfig> {
+    if owned_kind(channel) != Some(RuntimeHandoffKind::CodexTui)
+        || super::turn_mode::transcript_turns(channel)
+    {
+        return None;
     }
-    let Some(home) = delegated(channel) else {
-        return false;
-    };
-    test_override::with_channels(|snapshot| {
-        let Some(snapshot) = snapshot else {
-            return false;
-        };
-        let Some(candidate) = output_candidate(snapshot, channel) else {
-            return false;
-        };
-        home.while_intake_open(|| {
-            snapshot.kind(channel) == Some(RuntimeHandoffKind::ClaudeTui)
-                && candidate.late_adopt_origin()
-                && candidate.peek() == channel_policy::Adoption::Deferred
-        }) == Some(true)
-    })
+    let turn = test_override::with_channels(|snapshot| snapshot.map(|s| s.turn().clone()));
+    turn.filter(|turn| turn.selects(channel))
 }
 
-/// The home gate of a channel this process takes part in as a delegated home.
-fn delegated(channel: u64) -> Option<std::sync::Arc<channel_home::HomeGate>> {
-    channel_home::registered(&channel.to_string())
+/// Whether the boot turn selection names `channel`, so a Codex input there may wait for turn mode.
+pub(crate) fn turn_selected(channel: u64) -> bool {
+    test_override::with_channels(|snapshot| snapshot.is_some_and(|s| s.turn().selects(channel)))
+}
+
+/// Fresh local Codex admission precedes provider effects.
+pub(crate) fn mark_codex_turn_admitted(
+    channel: u64,
+    provider: &crate::services::provider::ProviderKind,
+    provider_session_id: Option<&str>,
+) {
+    use super::writer::binding::{BindingEvents, ChannelBindingLog};
+    if !writer_enabled()
+        || *provider != crate::services::provider::ProviderKind::Codex
+        || provider_session_id.is_some()
+    {
+        return;
+    }
+    test_override::with_channels(|snapshot| {
+        let Some(snapshot) = snapshot.filter(|s| {
+            s.site() == &Site::Home && s.kind(channel) == Some(RuntimeHandoffKind::CodexTui)
+        }) else {
+            return;
+        };
+        if let Some(candidate) = snapshot.candidate(channel) {
+            candidate.mark_turn_admitted(channel, || {
+                ChannelBindingLog::new(channel, super::shadow::ShadowProvider::Codex)
+                    .binding_events_since(channel, 0)
+                    .map(|events| events.last().map_or(0, |event| event.seq))
+            });
+        }
+    });
 }
 
 /// Before a new placement: a non-home node holds a selected channel, and the home releases a
@@ -135,18 +141,6 @@ fn claim_for_placement(channel: Option<u64>) -> Result<(), String> {
         // An unparseable destination may be any selected channel.
         if channel.is_some_and(|channel| !snapshot.channels().contains(&channel)) {
             return Ok(());
-        }
-        // A delegated channel is placed only where its home gate takes intake, whatever the site.
-        if let Some(channel) = channel
-            && let Some(home) = delegated(channel)
-        {
-            let adoption = snapshot.candidate(channel).or(snapshot.standby(channel));
-            // Under the gate lock, so a drain's close never falls between the intake check and claim.
-            let claimed =
-                adoption.and_then(|adoption| home.while_intake_open(|| adoption.claim(channel)));
-            return claimed.map(drop).ok_or_else(|| {
-                format!("O channel {channel} is delegated and its home does not take intake here")
-            });
         }
         if let Site::Foreign { home } = snapshot.site() {
             let channel = channel.map_or("an unknown channel".into(), |c| c.to_string());
@@ -295,15 +289,6 @@ pub(crate) mod test_override {
         force_snapshot(unadopted(channels).foreign(home))
     }
 
-    /// As `force_foreign`, with each selected channel's store kept as standby in `state`.
-    pub(crate) fn force_standby(
-        channels: &[(u64, RuntimeHandoffKind)],
-        home: &str,
-        state: Adoption,
-    ) -> ChannelsGuard {
-        force_snapshot(unadopted(channels).foreign(home).standing_by(state))
-    }
-
     /// Installs a booted snapshot, as `channel_policy::install` would leave it.
     pub(crate) fn force_boot(snapshot: BootChannels) -> ChannelsGuard {
         force_snapshot(snapshot)
@@ -390,10 +375,10 @@ pub(crate) mod test_override {
         false
     }
 
-    /// Without a delegated home, the owned set is exactly what the boot ownership owns: every
-    /// adoption state, on and off the home, with the writer on and off.
+    /// The owned set matches boot ownership in every adoption state, on either site, with the
+    /// writer on and off.
     #[test]
-    fn without_a_delegated_home_owned_channels_match_boot_ownership() {
+    fn owned_channels_match_boot_ownership() {
         let channels = [
             (41, RuntimeHandoffKind::ClaudeTui),
             (42, RuntimeHandoffKind::CodexTui),
@@ -419,7 +404,7 @@ pub(crate) mod test_override {
         for state in states {
             let boots = [
                 unadopted(&channels).adopted(state),
-                unadopted(&channels).foreign("gw").standing_by(state),
+                unadopted(&channels).foreign("gw"),
             ];
             for boot in boots {
                 let _boot = force_boot(boot);

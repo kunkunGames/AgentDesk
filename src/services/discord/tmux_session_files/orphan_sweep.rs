@@ -1,5 +1,4 @@
 //! Conservative orphan cleanup under the exact session source authority.
-use crate::services::discord::input_runtime::fence::{BootTarget, boot_skip};
 
 pub(super) fn source_authority_stem_for_orphan_file(filename: &str) -> &str {
     [
@@ -83,19 +82,6 @@ pub(super) fn remove_judged_orphan_group_under_source_authority(
     use crate::services::session_backend::{
         NativeRegistryPresence, native_registry_presence_for_source_stem,
     };
-    if boot_skip(BootTarget::Unknown) {
-        return false;
-    }
-    let ext = crate::services::tmux_common::TMUX_CHANNEL_TEMP_EXT;
-    let channel = std::fs::read_to_string(dir.join(format!("{stem}.{ext}")))
-        .ok()
-        .and_then(|id| id.trim().parse().ok());
-    let target = channel
-        .filter(|id| *id != 0)
-        .map_or(BootTarget::Unknown, BootTarget::AnyProvider);
-    if boot_skip(target) {
-        return false;
-    }
     if native_registry_presence_for_source_stem(stem) != NativeRegistryPresence::Absent {
         return false;
     }
@@ -142,10 +128,6 @@ pub(super) fn remove_judged_orphan_group_under_source_authority(
 /// before deleting. Legacy `/tmp/` files are *never* swept at startup —
 /// pre-migration wrappers may still be writing into them.
 pub(in crate::services::discord) async fn sweep_orphan_session_files() {
-    if boot_skip(BootTarget::Unknown) {
-        return;
-    }
-
     let Some(dir) = crate::services::tmux_common::persistent_sessions_dir() else {
         return;
     };
@@ -171,11 +153,6 @@ pub(super) fn sweep_orphan_session_files_in(
     dir: &std::path::Path,
     live: &std::collections::HashSet<String>,
 ) {
-    if boot_skip(BootTarget::Unknown) {
-        return;
-    }
-    #[cfg(test)]
-    super::input_fence_tests::scan_started();
     const ORPHAN_MIN_AGE_SECS: u64 = 10 * 60;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

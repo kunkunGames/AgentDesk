@@ -11,19 +11,20 @@ use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
-use crate::config::{AgentChannel, AgentDef, Config};
+use crate::config::Config;
 
 mod advisory_lock;
+mod agent_sync;
 mod migration_catalog;
 pub use advisory_lock::AdvisoryLockLease;
+pub use agent_sync::sync_agents_from_config_pg;
 #[cfg(test)]
-pub(crate) use migration_catalog::install_campaign_fixture_through;
+pub(crate) use migration_catalog::{install_campaign_fixture_through, upstream_migrator_for_test};
 mod shared_config;
 pub(crate) use shared_config::shared_config_sync_enabled;
-pub use shared_config::{startup_reseed, startup_reseed_with_warmup_pool};
+pub use shared_config::startup_reseed_with_warmup_pool;
 
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations/postgres");
-const LEGACY_AGENT_PREFIX: &str = "openclaw-";
 const DEFAULT_PG_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 const STARTUP_PG_ACQUIRE_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_PG_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
@@ -496,292 +497,6 @@ pub async fn register_repo(pool: &PgPool, repo_id: &str) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|error| format!("insert github_repos {repo_id}: {error}"))?;
-
-    Ok(())
-}
-
-pub async fn sync_agents_from_config_pg(
-    pool: &PgPool,
-    agents: &[AgentDef],
-) -> Result<usize, String> {
-    crate::voice::commands::validate_agent_alias_collisions(agents)
-        .map_err(|error| format!("validate voice aliases: {error}"))?;
-
-    let config_ids: BTreeSet<&str> = agents.iter().map(|agent| agent.id.as_str()).collect();
-
-    for agent in agents {
-        upsert_agent_from_config_pg(pool, agent).await?;
-    }
-
-    migrate_legacy_agent_aliases_pg(pool, agents, &config_ids).await?;
-
-    let existing_rows = sqlx::query("SELECT id FROM agents")
-        .fetch_all(pool)
-        .await
-        .map_err(|error| format!("list postgres agents: {error}"))?;
-
-    for row in existing_rows {
-        let db_id: String = row
-            .try_get("id")
-            .map_err(|error| format!("read postgres agent id: {error}"))?;
-        if !config_ids.contains(db_id.as_str()) {
-            clear_agent_fk_references_pg(pool, &db_id).await?;
-            sqlx::query("DELETE FROM agents WHERE id = $1")
-                .bind(&db_id)
-                .execute(pool)
-                .await
-                .map_err(|error| format!("delete postgres agent {db_id}: {error}"))?;
-        }
-    }
-
-    Ok(agents.len())
-}
-
-/// Clear FK references to `agent_id` before deleting the agent row, so the
-/// `kanban_cards.assigned_agent_id` (and similar nullable FK columns) do not
-/// trip a NO ACTION constraint when the agent is being removed from config.
-/// Mirrors the column list of `move_legacy_agent_references_pg` minus the
-/// non-nullable FKs (which are exclusively populated via dispatch creation
-/// flows that retire alongside the agent).
-async fn clear_agent_fk_references_pg(pool: &PgPool, agent_id: &str) -> Result<(), String> {
-    for sql in [
-        "UPDATE github_repos SET default_agent_id = NULL WHERE default_agent_id = $1",
-        "UPDATE pipeline_stages SET agent_override_id = NULL WHERE agent_override_id = $1",
-        "UPDATE kanban_cards SET assigned_agent_id = NULL WHERE assigned_agent_id = $1",
-        "UPDATE kanban_cards SET owner_agent_id = NULL WHERE owner_agent_id = $1",
-        "UPDATE kanban_cards SET requester_agent_id = NULL WHERE requester_agent_id = $1",
-        "UPDATE sessions SET agent_id = NULL WHERE agent_id = $1",
-    ] {
-        sqlx::query(sql)
-            .bind(agent_id)
-            .execute(pool)
-            .await
-            .map_err(|error| format!("clear FK refs to agent {agent_id}: {error}"))?;
-    }
-    Ok(())
-}
-
-fn legacy_agent_alias(agent_id: &str) -> Option<String> {
-    if agent_id.starts_with(LEGACY_AGENT_PREFIX) {
-        return None;
-    }
-    Some(format!("{LEGACY_AGENT_PREFIX}{agent_id}"))
-}
-
-async fn postgres_agent_exists(pool: &PgPool, agent_id: &str) -> Result<bool, String> {
-    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1)")
-        .bind(agent_id)
-        .fetch_one(pool)
-        .await
-        .map_err(|error| format!("check postgres agent {agent_id}: {error}"))
-}
-
-async fn upsert_agent_from_config_pg(pool: &PgPool, agent: &AgentDef) -> Result<(), String> {
-    let discord_channel_cc = agent.channels.get("claude").and_then(AgentChannel::target);
-    let discord_channel_cdx = agent.channels.get("codex").and_then(AgentChannel::target);
-    let provider_primary = match crate::services::provider::ProviderKind::from_str(&agent.provider)
-    {
-        Some(crate::services::provider::ProviderKind::Claude)
-        | Some(crate::services::provider::ProviderKind::Codex)
-        | None => None,
-        Some(_) => agent
-            .channels
-            .get(&agent.provider)
-            .and_then(AgentChannel::target),
-    };
-    let discord_channel_id = provider_primary.or_else(|| discord_channel_cc.clone());
-    let discord_channel_alt = discord_channel_cdx.clone();
-
-    // #3667: config-declared intake node-affinity labels. `None` (key absent
-    // from yaml) binds SQL NULL; the COALESCE then keeps the existing DB value
-    // so an out-of-band label (e.g. ch-td's DB-only `["mac-book"]`, not in yaml)
-    // is never wiped by a routine restart sync. `Some([...])` sets/overwrites it
-    // and `Some([])` explicitly clears it. We reference the bound `$11` (not
-    // EXCLUDED) in the conflict branch so the NULL signal survives the VALUES
-    // COALESCE used to satisfy the NOT NULL column on insert.
-    let preferred_intake_node_labels = agent
-        .preferred_intake_node_labels
-        .as_ref()
-        .map(|labels| serde_json::json!(labels));
-
-    sqlx::query(
-        "INSERT INTO agents (
-            id, name, name_ko, provider, department, avatar_emoji,
-            discord_channel_id, discord_channel_alt, discord_channel_cc, discord_channel_cdx,
-            preferred_intake_node_labels
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, '[]'::JSONB))
-         ON CONFLICT (id) DO UPDATE
-         SET name = EXCLUDED.name,
-             name_ko = EXCLUDED.name_ko,
-             provider = EXCLUDED.provider,
-             department = EXCLUDED.department,
-             avatar_emoji = EXCLUDED.avatar_emoji,
-             discord_channel_id = EXCLUDED.discord_channel_id,
-             discord_channel_alt = EXCLUDED.discord_channel_alt,
-             discord_channel_cc = EXCLUDED.discord_channel_cc,
-             discord_channel_cdx = EXCLUDED.discord_channel_cdx,
-             preferred_intake_node_labels =
-                 COALESCE($11, agents.preferred_intake_node_labels)",
-    )
-    .bind(&agent.id)
-    .bind(&agent.name)
-    .bind(&agent.name_ko)
-    .bind(&agent.provider)
-    .bind(&agent.department)
-    .bind(&agent.avatar_emoji)
-    .bind(discord_channel_id)
-    .bind(discord_channel_alt)
-    .bind(discord_channel_cc)
-    .bind(discord_channel_cdx)
-    .bind(preferred_intake_node_labels)
-    .execute(pool)
-    .await
-    .map_err(|error| format!("upsert postgres agent {}: {error}", agent.id))?;
-
-    Ok(())
-}
-
-async fn migrate_legacy_agent_aliases_pg(
-    pool: &PgPool,
-    agents: &[AgentDef],
-    config_ids: &BTreeSet<&str>,
-) -> Result<(), String> {
-    for agent in agents {
-        let Some(legacy_id) = legacy_agent_alias(&agent.id) else {
-            continue;
-        };
-        if config_ids.contains(legacy_id.as_str()) {
-            tracing::info!(
-                "[agent-sync] Preserving configured legacy agent '{}' while syncing '{}'",
-                legacy_id,
-                agent.id
-            );
-            continue;
-        }
-
-        if postgres_agent_exists(pool, &legacy_id).await? {
-            copy_runtime_fields_from_legacy_pg(pool, &legacy_id, &agent.id).await?;
-        }
-        move_legacy_agent_references_pg(pool, &legacy_id, &agent.id).await?;
-
-        if postgres_agent_exists(pool, &legacy_id).await? {
-            sqlx::query("DELETE FROM agents WHERE id = $1")
-                .bind(&legacy_id)
-                .execute(pool)
-                .await
-                .map_err(|error| format!("delete postgres legacy agent {legacy_id}: {error}"))?;
-            tracing::info!(
-                "[agent-sync] Migrated legacy agent '{}' -> '{}'",
-                legacy_id,
-                agent.id
-            );
-        }
-    }
-
-    Ok(())
-}
-
-async fn copy_runtime_fields_from_legacy_pg(
-    pool: &PgPool,
-    legacy_id: &str,
-    canonical_id: &str,
-) -> Result<(), String> {
-    if !postgres_agent_exists(pool, legacy_id).await?
-        || !postgres_agent_exists(pool, canonical_id).await?
-    {
-        return Ok(());
-    }
-
-    sqlx::query(
-        "UPDATE agents
-         SET status = legacy.status,
-             xp = legacy.xp,
-             skills = legacy.skills,
-             created_at = COALESCE(legacy.created_at, agents.created_at),
-             sprite_number = COALESCE(legacy.sprite_number, agents.sprite_number),
-             description = COALESCE(legacy.description, agents.description),
-             system_prompt = COALESCE(legacy.system_prompt, agents.system_prompt),
-             pipeline_config = COALESCE(legacy.pipeline_config, agents.pipeline_config),
-             -- #3667: inherit a legacy DB-only intake label only when the
-             -- canonical row has none yet (config-set value wins; the column is
-             -- NOT NULL so a plain COALESCE would clobber it with '[]').
-             preferred_intake_node_labels = CASE
-                 WHEN jsonb_array_length(agents.preferred_intake_node_labels) = 0
-                      AND jsonb_array_length(legacy.preferred_intake_node_labels) > 0
-                     THEN legacy.preferred_intake_node_labels
-                 ELSE agents.preferred_intake_node_labels
-             END
-         FROM agents AS legacy
-         WHERE legacy.id = $1
-           AND agents.id = $2",
-    )
-    .bind(legacy_id)
-    .bind(canonical_id)
-    .execute(pool)
-    .await
-    .map_err(|error| {
-        format!("copy postgres legacy runtime fields {legacy_id} -> {canonical_id}: {error}")
-    })?;
-
-    Ok(())
-}
-
-async fn move_legacy_agent_references_pg(
-    pool: &PgPool,
-    legacy_id: &str,
-    canonical_id: &str,
-) -> Result<(), String> {
-    for sql in [
-        "UPDATE github_repos SET default_agent_id = $1 WHERE default_agent_id = $2",
-        "UPDATE pipeline_stages SET agent_override_id = $1 WHERE agent_override_id = $2",
-        "UPDATE kanban_cards SET assigned_agent_id = $1 WHERE assigned_agent_id = $2",
-        "UPDATE kanban_cards SET owner_agent_id = $1 WHERE owner_agent_id = $2",
-        "UPDATE kanban_cards SET requester_agent_id = $1 WHERE requester_agent_id = $2",
-        "UPDATE task_dispatches SET from_agent_id = $1 WHERE from_agent_id = $2",
-        "UPDATE task_dispatches SET to_agent_id = $1 WHERE to_agent_id = $2",
-        "UPDATE sessions SET agent_id = $1 WHERE agent_id = $2",
-        "UPDATE meeting_transcripts SET speaker_agent_id = $1 WHERE speaker_agent_id = $2",
-        "UPDATE skill_usage SET agent_id = $1 WHERE agent_id = $2",
-        "UPDATE turns SET agent_id = $1 WHERE agent_id = $2",
-        "UPDATE dispatch_outbox SET agent_id = $1 WHERE agent_id = $2",
-        "UPDATE auto_queue_runs SET agent_id = $1 WHERE agent_id = $2",
-        "UPDATE auto_queue_entries SET agent_id = $1 WHERE agent_id = $2",
-        "UPDATE api_friction_events SET agent_id = $1 WHERE agent_id = $2",
-        "UPDATE session_transcripts SET agent_id = $1 WHERE agent_id = $2",
-        "UPDATE memento_feedback_turn_stats SET agent_id = $1 WHERE agent_id = $2",
-    ] {
-        sqlx::query(sql)
-            .bind(canonical_id)
-            .bind(legacy_id)
-            .execute(pool)
-            .await
-            .map_err(|error| {
-                format!("rewrite postgres legacy references {legacy_id} -> {canonical_id}: {error}")
-            })?;
-    }
-
-    sqlx::query(
-        "INSERT INTO auto_queue_slots (
-            agent_id, slot_index, assigned_run_id, assigned_thread_group, thread_id_map, created_at, updated_at
-         )
-         SELECT $1, slot_index, assigned_run_id, assigned_thread_group, thread_id_map, created_at, updated_at
-           FROM auto_queue_slots
-          WHERE agent_id = $2
-         ON CONFLICT (agent_id, slot_index) DO NOTHING",
-    )
-    .bind(canonical_id)
-    .bind(legacy_id)
-    .execute(pool)
-    .await
-    .map_err(|error| {
-        format!("upsert postgres auto_queue_slots {legacy_id} -> {canonical_id}: {error}")
-    })?;
-    sqlx::query("DELETE FROM auto_queue_slots WHERE agent_id = $1")
-        .bind(legacy_id)
-        .execute(pool)
-        .await
-        .map_err(|error| format!("delete postgres auto_queue_slots {legacy_id}: {error}"))?;
 
     Ok(())
 }
@@ -1489,7 +1204,7 @@ async fn drop_test_database_with_options(
     for attempt in 1..=3 {
         match run_test_postgres_sqlx_op(
             &format!("{label} drop postgres test db {database_name}"),
-            sqlx::query(&drop_sql).execute(&admin_pool),
+            sqlx::query(sqlx::AssertSqlSafe(drop_sql.as_str())).execute(&admin_pool),
         )
         .await
         {
@@ -1561,9 +1276,9 @@ mod tests {
         connect_test_pool, connect_test_pool_and_migrate, connect_test_pool_and_migrate_config,
         connect_test_pool_with_max_connections, connect_test_pool_with_max_connections_and_migrate,
         create_test_database, database_enabled, database_summary, health_check, require_pg_guard,
-        run_test_postgres_sqlx_op_with_timeout, runtime_pool_settings, shared_config_sync_enabled,
-        should_yield_for_counters, startup_pool_settings, startup_reseed,
-        sync_agents_from_config_pg, with_startup_advisory_lock,
+        run_test_postgres_sqlx_op_with_timeout, runtime_pool_settings,
+        shared_config::startup_reseed, shared_config_sync_enabled, should_yield_for_counters,
+        startup_pool_settings, sync_agents_from_config_pg, with_startup_advisory_lock,
     };
     use sqlx::postgres::PgConnectOptions;
     use sqlx::{Executor as _, PgPool, Row};
@@ -1935,7 +1650,7 @@ mod tests {
             .iter()
             .find(|migration| migration.version == 100)
             .expect("deploy-gate constraint migration"); // agentdesk-audit: allow-unwrap — embedded migration 0100 is required by this test
-        pool.execute(migration.sql.as_ref())
+        pool.execute(sqlx::AssertSqlSafe(migration.sql.as_ref()))
             .await
             .map(|_| ())
             .map_err(|error| format!("apply deploy-gate constraint migration: {error}"))
@@ -1966,7 +1681,6 @@ mod tests {
         .await
         .map(|_| ())
     }
-
     fn postgres_test_config(test_db: &TestDatabase) -> crate::config::Config {
         let mut config = crate::config::Config::default();
         config.database.enabled = true;
@@ -1989,10 +1703,13 @@ mod tests {
             provider: "codex".to_string(),
             channels: crate::config::AgentChannels::new()
                 .with("codex", crate::config::AgentChannel::from("pg-agent-cdx")),
+            peer_keywords: Vec::new(),
+            peer_directory: true,
             keywords: Vec::new(),
             department: Some("platform".to_string()),
             avatar_emoji: Some(":gear:".to_string()),
             preferred_intake_node_labels: None,
+            memory_group: None,
         }];
         config
     }
@@ -2456,14 +2173,6 @@ mod tests {
             Some("pg-agent-cdx".to_string())
         );
 
-        let escalation_override_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM kv_meta WHERE key = $1")
-                .bind("escalation-settings-override")
-                .fetch_one(&pool)
-                .await
-                .expect("count escalation override");
-        assert_eq!(escalation_override_count, 0);
-
         close_test_pool(pool, "db::postgres migration test pool")
             .await
             .expect("close postgres pool");
@@ -2506,7 +2215,7 @@ mod tests {
             let sql = format!(
                 "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb) FROM {table} t"
             );
-            let rows = sqlx::query_scalar(&sql)
+            let rows = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
                 .fetch_one(pool)
                 .await
                 .expect("snapshot shared configuration");
@@ -2514,6 +2223,8 @@ mod tests {
         }
         snapshot
     }
+
+    const RETIRED_ESCALATION_KEY: &str = concat!("escalation-settings", "-override");
 
     #[tokio::test]
     async fn postgres_worker_reseed_preserves_all_leader_configuration_and_overrides() {
@@ -2528,7 +2239,7 @@ mod tests {
         startup_reseed(&pool, &leader).await.expect("seed leader");
         for (key, value) in [
             ("runtime-config", r#"{"maxRetries":8}"#),
-            ("escalation-settings-override", r#"{"enabled":false}"#),
+            (RETIRED_ESCALATION_KEY, r#"{"mode":"pm"}"#),
             ("workspace_root", "/leader/workspaces"),
         ] {
             super::shared_config::upsert_kv_meta(&pool, key, value)
@@ -2555,6 +2266,15 @@ mod tests {
             );
         }
 
+        // A plain leader boot deletes the retired escalation routing row.
+        startup_reseed(&pool, &leader).await.expect("leader reseed");
+        let retired: i64 = sqlx::query_scalar("SELECT count(*) FROM kv_meta WHERE key = $1")
+            .bind(RETIRED_ESCALATION_KEY)
+            .fetch_one(&pool)
+            .await
+            .expect("retired row count");
+        assert_eq!(retired, 0);
+
         // The same reset flag remains effective for the configured owner.
         leader.runtime.reset_overrides_on_restart = true;
         leader.runtime.max_retries = Some(5);
@@ -2566,13 +2286,6 @@ mod tests {
                 .expect("runtime config");
         let runtime: serde_json::Value = serde_json::from_str(&raw).expect("runtime JSON");
         assert_eq!(runtime["maxRetries"], 5);
-        let overrides: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM kv_meta WHERE key = 'escalation-settings-override'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("override count");
-        assert_eq!(overrides, 0);
         close_test_pool(pool, "shared config ownership")
             .await
             .expect("close");
@@ -2831,13 +2544,26 @@ mod tests {
     #[tokio::test]
     async fn postgres_json_extract_0058_up_and_down_preserve_array_path_behavior() {
         let test_db = TestDatabase::create().await;
-        let config = postgres_test_config(&test_db);
 
-        let pool =
-            connect_test_pool_and_migrate_config(&config, "db::postgres json_extract test pool")
-                .await
-                .expect("connect and migrate postgres")
-                .expect("postgres pool");
+        let pool = super::connect_test_pool_with_max_connections(
+            &test_db.database_url,
+            "db::postgres json_extract test pool",
+            4,
+        )
+        .await
+        .expect("postgres pool");
+
+        let fixture = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                POSTGRES_MIGRATOR
+                    .iter()
+                    .filter(|m| m.version <= 58)
+                    .cloned()
+                    .collect(),
+            ),
+            ..sqlx::migrate::Migrator::DEFAULT
+        };
+        fixture.run(&pool).await.expect("migrate to 0058");
 
         let (array_value, strict_mismatch, malformed_path, volatility): (
             Option<String>,
@@ -2861,7 +2587,7 @@ mod tests {
         assert_eq!(malformed_path, None);
         assert_eq!(volatility, "s");
 
-        POSTGRES_MIGRATOR
+        fixture
             .undo(&pool, 57)
             .await
             .expect("undo 0058 json_extract migration");
@@ -2996,7 +2722,6 @@ mod tests {
             .expect("close postgres pool");
         test_db.drop().await;
     }
-
     #[tokio::test]
     async fn postgres_startup_reseed_migrates_legacy_openclaw_agent_ids() {
         let test_db = TestDatabase::create().await;
@@ -3013,10 +2738,13 @@ mod tests {
             provider: "codex".to_string(),
             channels: crate::config::AgentChannels::new()
                 .with("codex", crate::config::AgentChannel::from("maker-cdx")),
+            peer_keywords: Vec::new(),
+            peer_directory: true,
             keywords: Vec::new(),
             department: Some("engineering".to_string()),
             avatar_emoji: Some("🛠️".to_string()),
             preferred_intake_node_labels: None,
+            memory_group: None,
         }];
 
         let pool =
@@ -3108,13 +2836,11 @@ mod tests {
                 .await
                 .expect("load session agent");
         assert_eq!(session_agent.as_deref(), Some("maker"));
-
         close_test_pool(pool, "db::postgres legacy reseed test pool")
             .await
             .expect("close postgres pool");
         test_db.drop().await;
     }
-
     #[tokio::test]
     async fn postgres_startup_reseed_preserves_configured_legacy_openclaw_agent_id() {
         let test_db = TestDatabase::create().await;
@@ -3132,10 +2858,13 @@ mod tests {
                 provider: "codex".to_string(),
                 channels: crate::config::AgentChannels::new()
                     .with("codex", crate::config::AgentChannel::from("maker-cdx")),
+                peer_keywords: Vec::new(),
+                peer_directory: true,
                 keywords: Vec::new(),
                 department: Some("engineering".to_string()),
                 avatar_emoji: None,
                 preferred_intake_node_labels: None,
+                memory_group: None,
             },
             crate::config::AgentDef {
                 id: "openclaw-maker".to_string(),
@@ -3149,10 +2878,13 @@ mod tests {
                 provider: "codex".to_string(),
                 channels: crate::config::AgentChannels::new()
                     .with("codex", crate::config::AgentChannel::from("legacy-cdx")),
+                peer_keywords: Vec::new(),
+                peer_directory: true,
                 keywords: Vec::new(),
                 department: Some("legacy".to_string()),
                 avatar_emoji: None,
                 preferred_intake_node_labels: None,
+                memory_group: None,
             },
         ];
 
@@ -3222,10 +2954,8 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_startup_reseed_clears_session_fk_for_removed_agent() {
-        // Regression: a stale agent left in postgres with a sessions row referencing it
-        // used to break startup with
-        //   `delete postgres agent <id>: ... foreign key constraint "sessions_agent_id_fkey"`
-        // because clear_agent_fk_references_pg() forgot to NULL out sessions.agent_id.
+        // Regression: a sessions row on a stale agent used to fail startup with a
+        // `sessions_agent_id_fkey` violation, because the sync never cleared sessions.agent_id.
         let test_db = TestDatabase::create().await;
         let config = postgres_test_config(&test_db);
 
@@ -3282,6 +3012,110 @@ mod tests {
         );
 
         close_test_pool(pool, "db::postgres stale agent session fk test pool")
+            .await
+            .expect("close postgres pool");
+        test_db.drop().await;
+    }
+
+    async fn insert_stale_agent_for_sync(pool: &PgPool, id: &str) {
+        sqlx::query(
+            "INSERT INTO agents (
+                id, name, provider, status, xp, sprite_number, description, system_prompt, pipeline_config
+             ) VALUES ($1, $1, 'codex', 'idle', 0, 1, '', '', '{}')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("insert stale agent");
+    }
+
+    async fn agent_ids_after_sync(pool: &PgPool) -> Vec<String> {
+        sqlx::query_scalar("SELECT id FROM agents ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .expect("list agents")
+    }
+
+    #[tokio::test]
+    async fn agent_sync_keeps_a_removed_agent_that_an_agent_scheduled_message_needs() {
+        let test_db = TestDatabase::create().await;
+        let config = postgres_test_config(&test_db);
+        let pool = connect_test_pool_and_migrate_config(&config, "db::postgres smsg fk test pool")
+            .await
+            .expect("connect and migrate postgres")
+            .expect("postgres pool");
+        insert_stale_agent_for_sync(&pool, "gone-agent").await;
+        insert_stale_agent_for_sync(&pool, "gone-push").await;
+        for (id, kind, agent) in [
+            ("m-agent", "agent", "gone-agent"),
+            ("m-push", "push", "gone-push"),
+        ] {
+            sqlx::query(
+                "INSERT INTO scheduled_messages
+                     (id, content, target_channel_id, delivery_kind, agent_id, scheduled_at)
+                 VALUES ($1, 'hi', '123', $2, $3, NOW() + INTERVAL '1 day')",
+            )
+            .bind(id)
+            .bind(kind)
+            .bind(agent)
+            .execute(&pool)
+            .await
+            .expect("insert scheduled message");
+        }
+
+        sync_agents_from_config_pg(&pool, &config.agents)
+            .await
+            .expect("an agent-kind scheduled message must not fail the boot sync");
+
+        assert_eq!(
+            agent_ids_after_sync(&pool).await,
+            ["gone-agent", "pg-agent"]
+        );
+        let refs: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, agent_id FROM scheduled_messages ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("list scheduled messages");
+        assert_eq!(
+            refs,
+            [
+                ("m-agent".to_string(), Some("gone-agent".to_string())),
+                ("m-push".to_string(), None),
+            ]
+        );
+
+        close_test_pool(pool, "db::postgres smsg fk test pool")
+            .await
+            .expect("close postgres pool");
+        test_db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_agent_sync_leaves_no_partial_roster() {
+        let test_db = TestDatabase::create().await;
+        let config = postgres_test_config(&test_db);
+        let pool = connect_test_pool_and_migrate_config(&config, "db::postgres sync tx test pool")
+            .await
+            .expect("connect and migrate postgres")
+            .expect("postgres pool");
+        insert_stale_agent_for_sync(&pool, "gone-agent").await;
+        sqlx::raw_sql("CREATE FUNCTION refuse_agent_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected agent delete fault'; END $$; CREATE TRIGGER refuse_agent_delete BEFORE DELETE ON agents FOR EACH ROW EXECUTE FUNCTION refuse_agent_delete()")
+            .execute(&pool)
+            .await
+            .expect("install delete fault");
+
+        let error = sync_agents_from_config_pg(&pool, &config.agents)
+            .await
+            .expect_err("the injected delete fault must fail the sync");
+
+        assert!(error.contains("injected agent delete fault"), "{error}");
+        assert_eq!(
+            agent_ids_after_sync(&pool).await,
+            ["gone-agent"],
+            "the configured agent's upsert must roll back with the failed sync"
+        );
+
+        close_test_pool(pool, "db::postgres sync tx test pool")
             .await
             .expect("close postgres pool");
         test_db.drop().await;

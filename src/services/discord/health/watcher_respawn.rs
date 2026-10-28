@@ -49,7 +49,7 @@ use poise::serenity_prelude::ChannelId;
 
 use super::HealthRegistry;
 use super::snapshot::WatcherStateSnapshot;
-use crate::services::discord::input_runtime::fence::{BootTarget, boot_skip};
+use super::tick_mailboxes::{TickMailboxes, WatcherRead};
 use crate::services::discord::{self as discord, SharedData};
 use crate::services::provider::ProviderKind;
 
@@ -60,7 +60,7 @@ use absence_state::{WatcherAbsenceKey, WatcherAbsenceState, respawn_backoff_secs
 mod idle_relay_absence;
 mod live_bridge_guard;
 pub(super) use live_bridge_guard::complete_force_clean_watcher_recovery;
-pub(in crate::services::discord) use live_bridge_guard::retry_pending_watcher_respawn;
+use live_bridge_guard::retry_pending_watcher_respawn;
 
 use idle_relay_absence::observe_routable_unwatched_tui_sessions;
 
@@ -233,24 +233,25 @@ async fn complete_force_clean_watcher_recovery_admitted(
 pub(super) async fn sweep_and_retry_absences(
     registry: &HealthRegistry,
     provider: &ProviderKind,
-    runtimes: &[Arc<SharedData>],
+    tick: &TickMailboxes,
     watcher_derived: &std::collections::HashSet<ChannelId>,
     now_unix_secs: i64,
 ) {
     observe_watcher_absence_for_unwatched_work(
         registry,
         provider,
-        runtimes,
+        tick,
         watcher_derived,
         now_unix_secs,
     )
     .await;
+    let runtimes = tick.runtimes();
     // #5957: the registry-derived authority runs AFTER the relay-work one, so a
     // channel both can reach is observed by the sweep carrying the richer
     // evidence and this one steps aside (see `observed_on_this_tick`).
     observe_routable_unwatched_tui_sessions(provider, runtimes, watcher_derived, now_unix_secs)
         .await;
-    retry_pending_watcher_respawns(registry, provider, runtimes, now_unix_secs).await;
+    retry_pending_watcher_respawns(registry, provider, tick, now_unix_secs).await;
 }
 
 /// Re-attempt a respawn for every channel still tracked as watcher-absent whose
@@ -272,13 +273,16 @@ pub(super) async fn sweep_and_retry_absences(
 pub(super) async fn retry_pending_watcher_respawns(
     registry: &HealthRegistry,
     provider: &ProviderKind,
-    runtimes: &[Arc<SharedData>],
+    tick: &TickMailboxes,
     now_unix_secs: i64,
 ) -> usize {
     let mut attempted = 0usize;
     for channel_id in pending_absent_channels(provider) {
-        if retry_pending_watcher_respawn(registry, provider, runtimes, channel_id, now_unix_secs)
-            .await
+        // An actor that did not answer this tick keeps its entry, attempts and due time.
+        if tick.is_unknown(channel_id) {
+            continue;
+        }
+        if retry_pending_watcher_respawn(registry, provider, tick, channel_id, now_unix_secs).await
         {
             attempted += 1;
         }
@@ -302,24 +306,16 @@ pub(super) async fn retry_pending_watcher_respawns(
 pub(super) async fn observe_watcher_absence_for_unwatched_work(
     registry: &HealthRegistry,
     provider: &ProviderKind,
-    runtimes: &[Arc<SharedData>],
+    tick: &TickMailboxes,
     watcher_derived: &std::collections::HashSet<ChannelId>,
     now_unix_secs: i64,
 ) -> usize {
     let mut absent = 0usize;
     for (channel_id, shared) in
-        unwatched_relay_work_candidates(provider, runtimes, watcher_derived).await
+        unwatched_relay_work_candidates(provider, tick, watcher_derived).await
     {
-        if super::legacy_supervision::is_retired(provider.as_str(), channel_id.get()) {
-            continue;
-        }
-        // Like boot, absence observation leaves a protected channel to its move or handback.
-        if boot_skip(BootTarget::Channel(provider, channel_id.get())) {
-            continue;
-        }
-        let Some(snapshot) = registry
-            .snapshot_watcher_state_for_shared(provider, shared, channel_id.get())
-            .await
+        let WatcherRead::Observed(snapshot) =
+            tick.watcher_state(registry, shared, channel_id).await
         else {
             continue;
         };
@@ -339,14 +335,19 @@ pub(super) async fn observe_watcher_absence_for_unwatched_work(
 /// mailbox and the persisted inflight row.
 async fn unwatched_relay_work_candidates(
     provider: &ProviderKind,
-    runtimes: &[Arc<SharedData>],
+    tick: &TickMailboxes,
     watcher_derived: &std::collections::HashSet<ChannelId>,
 ) -> Vec<(ChannelId, Arc<SharedData>)> {
+    let runtimes = tick.runtimes();
     let mut seen: std::collections::HashSet<ChannelId> = watcher_derived.clone();
     let mut candidates: Vec<(ChannelId, Arc<SharedData>)> = Vec::new();
-    for shared in runtimes {
-        for (channel_id, mailbox) in shared.mailboxes.snapshot_all().await {
-            if !mailbox_owes_relay_work(&mailbox) {
+    for (shared, mailboxes) in tick.mailboxes() {
+        for (&channel_id, mailbox) in mailboxes {
+            // An actor that did not answer may still owe work, so it stays a candidate.
+            if mailbox
+                .as_ref()
+                .is_ok_and(|mailbox| !mailbox_owes_relay_work(mailbox))
+            {
                 continue;
             }
             if seen.insert(channel_id) {
@@ -561,9 +562,6 @@ pub(super) fn detect_and_escalate_watcher_absence(
     watcher_present: bool,
     now_unix_secs: i64,
 ) -> bool {
-    if super::legacy_supervision::is_retired(provider.as_str(), channel_id.get()) {
-        return false;
-    }
     if discord::live_bridge::is_live(provider, channel_id.get()) {
         return false;
     }
@@ -712,10 +710,11 @@ fn pending_absent_channels(provider: &ProviderKind) -> Vec<ChannelId> {
 async fn retry_pending_watcher_respawn_admitted(
     registry: &HealthRegistry,
     provider: &ProviderKind,
-    runtimes: &[Arc<SharedData>],
+    tick: &TickMailboxes,
     channel_id: ChannelId,
     now_unix_secs: i64,
 ) -> bool {
+    let runtimes = tick.runtimes();
     let owner = runtime_owning_watcher(runtimes, channel_id);
     if owner.is_some() {
         // A runtime already owns a live watcher — nothing to respawn. Clear the
@@ -740,13 +739,15 @@ async fn retry_pending_watcher_respawn_admitted(
     let snapshot_runtime = runtimes.first().cloned();
     let snapshot = match snapshot_runtime.as_ref() {
         Some(snapshot_runtime) => {
-            registry
-                .snapshot_watcher_state_for_shared(
-                    provider,
-                    snapshot_runtime.clone(),
-                    channel_id.get(),
-                )
+            match tick
+                .watcher_state(registry, snapshot_runtime.clone(), channel_id)
                 .await
+            {
+                WatcherRead::Observed(snapshot) => Some(*snapshot),
+                WatcherRead::Gone => None,
+                // Unanswered by the deadline: no attempt this tick and nothing charged.
+                WatcherRead::Unknown => return false,
+            }
         }
         None => None,
     };
@@ -792,14 +793,9 @@ async fn retry_pending_watcher_respawn_admitted(
     // `WatcherReattach` arm clears the canonical row and re-mints a synthetic
     // one; pinned, the same arm adopts it, and a row that changed underneath us
     // fails the rebind instead of being overwritten.
-    // The read can backfill an old-format row, so an admitted retry runs it on the input worker.
-    let expected_episode = live_bridge_guard::row_io({
-        let (provider, channel_id) = (provider.clone(), channel_id.get());
-        move || discord::inflight::load_inflight_state(&provider, channel_id)
-    })
-    .await
-    .as_ref()
-    .map(discord::inflight::InflightEpisodePin::from_state);
+    let expected_episode = discord::inflight::load_inflight_state(provider, channel_id.get())
+        .as_ref()
+        .map(discord::inflight::InflightEpisodePin::from_state);
     if let Some(pin) = expected_episode.as_ref() {
         reclaim_watcherless_session_bound_relay(registry, provider, channel_id, pin).await;
     }
@@ -861,15 +857,12 @@ pub(in crate::services::discord) async fn reclaim_watcherless_session_bound_rela
             None => return,
         },
     };
-    let outcome = live_bridge_guard::row_io({
-        let (provider, channel_id, pin) = (provider.clone(), channel_id.get(), pin.clone());
-        move || {
-            discord::inflight::reclaim_watcherless_session_bound_relay_owner(
-                &shared, &provider, channel_id, &pin,
-            )
-        }
-    })
-    .await;
+    let outcome = discord::inflight::reclaim_watcherless_session_bound_relay_owner(
+        &shared,
+        provider,
+        channel_id.get(),
+        pin,
+    );
     if outcome == discord::inflight::OrphanRelayReclaimOutcome::Downgraded {
         tracing::warn!(
             channel_id = channel_id.get(),
@@ -925,10 +918,9 @@ fn record_failed_respawn_attempt(
 }
 
 pub(super) fn gc_watcher_absence_state(now_unix_secs: i64) {
-    WATCHER_ABSENCE.retain(|key, state| {
-        super::legacy_supervision::is_retired(&key.provider, key.channel_id)
-            || saturating_age_secs(state.last_seen_unix_secs, now_unix_secs)
-                <= WATCHER_ABSENCE_STATE_TTL_SECS
+    WATCHER_ABSENCE.retain(|_, state| {
+        saturating_age_secs(state.last_seen_unix_secs, now_unix_secs)
+            <= WATCHER_ABSENCE_STATE_TTL_SECS
     });
 }
 
@@ -1506,7 +1498,7 @@ mod tests {
         retry_pending_watcher_respawns(
             &registry,
             &provider,
-            &runtimes,
+            &TickMailboxes::enumerate(&provider, runtimes.clone()).await,
             1_000_000 + WATCHER_ABSENCE_DEADMAN_SECS as i64 + 100,
         )
         .await;
@@ -1608,7 +1600,13 @@ mod tests {
         // Empty registry ⇒ `rebind_inflight` returns `None` ⇒ respawn reports
         // failure (no spawn). The absence MUST survive for the next tick.
         let registry = HealthRegistry::new();
-        retry_pending_watcher_respawns(&registry, &provider, &runtimes, now).await;
+        retry_pending_watcher_respawns(
+            &registry,
+            &provider,
+            &TickMailboxes::enumerate(&provider, runtimes.clone()).await,
+            now,
+        )
+        .await;
 
         assert!(
             WATCHER_ABSENCE.contains_key(&WatcherAbsenceKey::new(&provider, channel)),
@@ -1619,7 +1617,13 @@ mod tests {
         // A second tick re-attempts the respawn against the still-live absence
         // (it was never stranded). Presence is still false, snapshot still None,
         // so the entry persists for continued retry rather than being lost.
-        retry_pending_watcher_respawns(&registry, &provider, &runtimes, now + 1).await;
+        retry_pending_watcher_respawns(
+            &registry,
+            &provider,
+            &TickMailboxes::enumerate(&provider, runtimes.clone()).await,
+            now + 1,
+        )
+        .await;
         assert!(
             WATCHER_ABSENCE.contains_key(&WatcherAbsenceKey::new(&provider, channel)),
             "the absence survives across retries until respawn succeeds or a \
@@ -1782,7 +1786,8 @@ mod tests {
         runtimes: &[std::sync::Arc<crate::services::discord::SharedData>],
         watcher_derived: &std::collections::HashSet<ChannelId>,
     ) -> Vec<ChannelId> {
-        unwatched_relay_work_candidates(provider, runtimes, watcher_derived)
+        let tick = TickMailboxes::enumerate(provider, runtimes.to_vec()).await;
+        unwatched_relay_work_candidates(provider, &tick, watcher_derived)
             .await
             .into_iter()
             .map(|(channel_id, _)| channel_id)
@@ -1877,7 +1882,7 @@ mod tests {
         let absent = observe_watcher_absence_for_unwatched_work(
             &registry,
             &provider,
-            &[shared],
+            &TickMailboxes::enumerate(&provider, vec![shared]).await,
             &std::collections::HashSet::new(),
             chrono::Utc::now().timestamp(),
         )
@@ -1917,7 +1922,7 @@ mod tests {
         observe_watcher_absence_for_unwatched_work(
             &registry,
             &provider,
-            &runtimes,
+            &TickMailboxes::enumerate(&provider, runtimes.clone()).await,
             &std::collections::HashSet::new(),
             t0,
         )
@@ -1931,7 +1936,14 @@ mod tests {
         // `>=`, not `==`: the count is process-wide and sibling tests share the
         // absence map.
         assert!(
-            retry_pending_watcher_respawns(&registry, &provider, &runtimes, t0).await >= 1,
+            retry_pending_watcher_respawns(
+                &registry,
+                &provider,
+                &TickMailboxes::enumerate(&provider, runtimes.clone()).await,
+                t0
+            )
+            .await
+                >= 1,
             "the armed channel must reach the respawn path"
         );
         assert_eq!(
@@ -1940,7 +1952,13 @@ mod tests {
             "the failed respawn must be charged to this channel"
         );
 
-        retry_pending_watcher_respawns(&registry, &provider, &runtimes, t0).await;
+        retry_pending_watcher_respawns(
+            &registry,
+            &provider,
+            &TickMailboxes::enumerate(&provider, runtimes.clone()).await,
+            t0,
+        )
+        .await;
         assert_eq!(
             failed_attempts(&provider, channel),
             Some(1),
@@ -1949,7 +1967,7 @@ mod tests {
         retry_pending_watcher_respawns(
             &registry,
             &provider,
-            &runtimes,
+            &TickMailboxes::enumerate(&provider, runtimes.clone()).await,
             t0 + WATCHER_RESPAWN_BACKOFF_BASE_SECS as i64 - 1,
         )
         .await;
@@ -1961,7 +1979,7 @@ mod tests {
         retry_pending_watcher_respawns(
             &registry,
             &provider,
-            &runtimes,
+            &TickMailboxes::enumerate(&provider, runtimes.clone()).await,
             t0 + WATCHER_RESPAWN_BACKOFF_BASE_SECS as i64,
         )
         .await;
@@ -2002,7 +2020,8 @@ mod tests {
         let mut attempts = 0usize;
         for step in 0..(2 * WATCHER_RESPAWN_MAX_ATTEMPTS as i64) {
             let now = t0 + step * WATCHER_RESPAWN_BACKOFF_CEILING_SECS as i64;
-            if retry_pending_watcher_respawn(&registry, &provider, &runtimes, channel, now).await {
+            let tick = TickMailboxes::enumerate(&provider, runtimes.clone()).await;
+            if retry_pending_watcher_respawn(&registry, &provider, &tick, channel, now).await {
                 attempts += 1;
             }
         }
@@ -2520,47 +2539,51 @@ mod tests {
              waits a whole extra tick"
         );
     }
-
-    /// Like boot, both absence observers leave an input-protected channel to its move or
-    /// handback: neither arms it for respawn while its tmux is live and work is owed.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn absence_observers_leave_an_input_protected_channel_unarmed() {
-        use crate::services::discord::input_runtime::fence::{Gate, test_health};
-        let _absence = lock_watcher_absence_for_test().await;
-        let provider = ProviderKind::Codex;
-        let (protected, routable) = (ChannelId::new(6_325_579_001), ChannelId::new(6_325_579_002));
-        clear_watcher_absence(&provider, protected);
-        clear_watcher_absence(&provider, routable);
-        let _tmux = FakeTmux::answering_alive(true);
-        let shared = crate::services::discord::make_shared_data_for_tests();
-        engage_mailbox_bound_to_tmux(&shared, protected, 6_325_579_101, "AgentDesk-codex-c2b2a")
-            .await;
-        let gates = [protected, routable].map(|channel| {
-            let gate = Gate::protect(provider.clone(), channel.get()).unwrap();
-            test_health::Clear::new(&gate)
-        });
-        let registry = HealthRegistry::new();
-        let now = chrono::Utc::now().timestamp();
-        let none = std::collections::HashSet::new();
-        let runtimes = [shared];
-        let absent =
-            observe_watcher_absence_for_unwatched_work(&registry, &provider, &runtimes, &none, now);
-        assert_eq!(absent.await, 0);
-        assert!(!observe_routable_unwatched_session(
-            &provider,
-            &candidate(routable),
-            now
-        ));
-        let pending = pending_absent_channels(&provider);
-        assert!(!pending.contains(&protected) && !pending.contains(&routable));
-        drop(gates);
-    }
 }
 
 #[cfg(test)]
 static RESPAWN_TEST_COUNTS: LazyLock<dashmap::DashMap<u64, [usize; 2]>> =
     LazyLock::new(dashmap::DashMap::new);
+
+/// Retries `channel` on a tick of its own, for tests outside the watchdog pass.
+#[cfg(all(test, unix))]
+pub(in crate::services::discord) async fn retry_pending_watcher_respawn_for_tests(
+    registry: &HealthRegistry,
+    provider: &ProviderKind,
+    runtimes: &[Arc<SharedData>],
+    channel_id: ChannelId,
+    now_unix_secs: i64,
+) -> bool {
+    let tick = TickMailboxes::enumerate(provider, runtimes.to_vec()).await;
+    retry_pending_watcher_respawn(registry, provider, &tick, channel_id, now_unix_secs).await
+}
+
+/// Seeds an absence due at `now_unix_secs` and zeroes the channel's retry counters.
+#[cfg(all(test, unix))]
+pub(in crate::services::discord::health) fn seed_due_absence_for_test(
+    provider: &ProviderKind,
+    channel: ChannelId,
+    now_unix_secs: i64,
+) {
+    WATCHER_ABSENCE.insert(
+        WatcherAbsenceKey::new(provider, channel),
+        WatcherAbsenceState::newly_absent(now_unix_secs),
+    );
+    RESPAWN_TEST_COUNTS.insert(channel.get(), [0, 0]);
+}
+
+/// The retry's snapshot reads and reclaims for `channel`, then its absence's attempts and due time.
+#[cfg(all(test, unix))]
+pub(in crate::services::discord::health) fn retry_trace_for_test(
+    provider: &ProviderKind,
+    channel: ChannelId,
+) -> ([usize; 2], Option<(u32, i64)>) {
+    let counts = *RESPAWN_TEST_COUNTS.get(&channel.get()).unwrap();
+    let absence = WATCHER_ABSENCE
+        .get(&WatcherAbsenceKey::new(provider, channel))
+        .map(|state| (state.failed_attempts, state.next_attempt_unix_secs));
+    (counts, absence)
+}
 
 #[cfg(test)]
 pub(in crate::services::discord) fn seed_live_bridge_respawn_test(channel: ChannelId) {

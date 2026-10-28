@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod agent_input_tests;
 pub mod agents;
 mod agents_crud;
 mod agents_setup;
@@ -26,7 +28,6 @@ pub mod github_dashboard;
 pub mod health_api;
 pub mod home_metrics;
 pub mod hooks;
-pub mod idle_recap;
 pub(crate) mod kakao_calendar;
 pub mod kanban;
 pub mod kanban_repos;
@@ -55,14 +56,13 @@ mod runtime_profile_tests;
 #[cfg(test)]
 #[cfg(unix)]
 mod herdr_legacy_tests;
-pub(crate) mod o_transition;
 pub mod scheduled_messages;
 pub(crate) mod session_activity;
 mod session_evidence;
 pub mod settings;
 mod skill_usage_analytics;
 pub mod skills_api;
-mod skills_manifest_audit;
+pub(crate) mod skills_manifest_audit;
 #[path = "../state.rs"]
 pub mod state;
 pub mod stats;
@@ -78,6 +78,9 @@ pub mod voice_config;
 #[cfg(test)]
 #[path = "tests/auto_queue_preflight_harness_tests.rs"]
 mod auto_queue_preflight_harness_tests;
+
+#[cfg(test)]
+mod auto_queue_admission_pg_tests;
 
 #[cfg(test)]
 mod auto_queue_lifecycle_pg_tests;
@@ -805,6 +808,9 @@ fn response_is_json(response: &Response) -> bool {
 }
 
 #[cfg(test)]
-pub(crate) use queue_api::home_stop_tests::{
-    app_with as home_stop_test_app, post as home_stop_test_post,
+pub(crate) use queue_api::forwarding_tests::{
+    app_with as cancel_route_test_app, post as cancel_route_test_post,
 };
+
+#[cfg(test)]
+pub(crate) use agents_turn_target::codex_replacement_start_conflict_for_test;

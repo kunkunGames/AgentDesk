@@ -6,7 +6,7 @@ use poise::serenity_prelude::ChannelId;
 use super::DispatchProfile;
 use super::meeting::{MeetingAgentConfig, MeetingConfig, SummaryAgentConfig, SummaryAgentRule};
 use super::settings::{
-    PeerAgentInfo, RegisteredChannelBinding, RoleBinding, resolve_memory_settings,
+    PeerAgentInfo, RegisteredChannelBinding, RoleBinding, resolve_agent_memory_settings,
 };
 use crate::config::{
     AgentChannel, AgentChannelConfig, AgentChannels, AgentDef, Config, MeetingAgentEntry,
@@ -17,18 +17,7 @@ use crate::services::provider::ProviderKind;
 use crate::utils::format::expand_tilde_string as expand_tilde;
 
 fn load_agentdesk_config_with_path() -> Option<(Config, std::path::PathBuf)> {
-    let root = crate::config::runtime_root()?;
-    for path in [
-        crate::runtime_layout::config_file_path(&root),
-        crate::runtime_layout::legacy_config_file_path(&root),
-    ] {
-        if path.is_file() {
-            return crate::config::load_from_path(&path)
-                .ok()
-                .map(|config| (config, path));
-        }
-    }
-    None
+    crate::config::config_path::load_runtime_config_file()
 }
 
 #[derive(Clone, Debug)]
@@ -47,23 +36,13 @@ pub(crate) enum AgentSetupConfigMutation {
     Conflict(String),
 }
 
-pub(crate) fn agent_setup_config_path(root: &Path) -> PathBuf {
-    crate::runtime_layout::config_file_path(root)
-}
-
 pub(crate) fn load_agent_setup_config(root: &Path) -> Result<(Config, PathBuf, bool), String> {
-    for path in [
-        crate::runtime_layout::config_file_path(root),
-        crate::runtime_layout::legacy_config_file_path(root),
-    ] {
-        if path.is_file() {
-            let config = crate::config::load_from_path(&path)
-                .map_err(|error| format!("load '{}': {error}", path.display()))?;
-            return Ok((config, path, true));
-        }
+    let path = crate::config::config_path::config_path_in(root);
+    match crate::config::config_path::load_config_file(&path) {
+        Ok(Some(config)) => Ok((config, path, true)),
+        Ok(None) => Ok((Config::default(), path, false)),
+        Err(error) => Err(format!("load '{}': {error}", path.display())),
     }
-
-    Ok((Config::default(), agent_setup_config_path(root), false))
 }
 
 pub(crate) fn ensure_agent_setup_config(
@@ -99,7 +78,6 @@ pub(crate) fn ensure_agent_setup_config(
     }
     let mut channels = AgentChannels::default();
     channels.insert(&input.provider, channel);
-
     let mut next_agents = config.agents.clone();
     next_agents.push(AgentDef {
         id: input.agent_id.clone(),
@@ -112,10 +90,13 @@ pub(crate) fn ensure_agent_setup_config(
         voice: crate::config::AgentVoiceConfig::default(),
         provider: input.provider.clone(),
         channels,
+        peer_keywords: Vec::new(),
+        peer_directory: true,
         keywords: Vec::new(),
         department: None,
         avatar_emoji: None,
         preferred_intake_node_labels: None,
+        memory_group: None,
     });
 
     if let Err(error) = crate::voice::commands::validate_agent_alias_collisions(&next_agents) {
@@ -153,7 +134,7 @@ fn agent_setup_config_matches(agent: &AgentDef, input: &AgentSetupConfigInput) -
         && channel.provider().as_deref() == Some(input.provider.as_str())
 }
 
-fn load_agentdesk_config() -> Option<Config> {
+pub(super) fn load_agentdesk_config() -> Option<Config> {
     load_agentdesk_config_with_path().map(|(config, _)| config)
 }
 
@@ -315,6 +296,10 @@ pub(super) struct ChannelWorktreeIsolationPolicy {
     pub(super) channel_provider: Option<ProviderKind>,
 }
 
+#[cfg(test)]
+#[path = "agentdesk_memory_tests.rs"]
+mod memory_tests;
+
 fn role_binding_from_channel(
     agent: &crate::config::AgentDef,
     provider_key: &str,
@@ -331,9 +316,8 @@ fn role_binding_from_channel(
         model: channel.model(),
         reasoning_effort: channel.reasoning_effort(),
         peer_agents_enabled: channel.peer_agents().unwrap_or(true),
-        quality_feedback_injection_enabled: channel.quality_feedback_injection().unwrap_or(true),
         auth_profile: "default".to_string(),
-        memory: resolve_memory_settings(None, None),
+        memory: resolve_agent_memory_settings(Some(agent)),
     }
 }
 
@@ -345,9 +329,8 @@ fn role_binding_from_agent(agent: &crate::config::AgentDef, provider: ProviderKi
         model: None,
         reasoning_effort: None,
         peer_agents_enabled: true,
-        quality_feedback_injection_enabled: true,
         auth_profile: "default".to_string(),
-        memory: resolve_memory_settings(None, None),
+        memory: resolve_agent_memory_settings(Some(agent)),
     }
 }
 
@@ -465,7 +448,7 @@ fn meeting_agent_from_entry(
                 reasoning_effort: None,
                 workspace: default_workspace(role_id),
                 peer_agents_enabled: true,
-                memory: resolve_memory_settings(None, None),
+                memory: resolve_agent_memory_settings(agent),
             })
         }
         MeetingAgentEntry::Detailed(def) => {
@@ -504,7 +487,7 @@ fn meeting_agent_from_entry(
                 reasoning_effort: None,
                 workspace: default_workspace(&def.role_id),
                 peer_agents_enabled: true,
-                memory: resolve_memory_settings(None, None),
+                memory: resolve_agent_memory_settings(agent),
             })
         }
     }
@@ -520,13 +503,7 @@ pub(super) fn resolve_role_binding(
     {
         return Some(role_binding_from_channel(agent, provider_key, channel));
     }
-    // Voice channels are configured via `agents[].voice.channel_id`, not
-    // `agents[].channels`, so `find_channel_binding` never matches them. Without
-    // a role-map entry the voice transcript announce to the voice channel is
-    // rejected with 403 `channel not in role-map`, which makes voice_barge_in
-    // refuse the direct voice turn fallback and the agent never replies. Treat a
-    // configured voice channel as role-mapped to its owning agent so the
-    // announce + dispatch path is authorized automatically when voice is set up.
+    // Voice channels bind through the owning agent rather than provider channels.
     resolve_voice_channel_role_binding(&config, channel_id)
 }
 
@@ -766,43 +743,10 @@ pub(super) fn load_peer_agents() -> Vec<PeerAgentInfo> {
         return Vec::new();
     };
 
-    if let Some(meeting) = &config.meeting {
-        let available_agents = &meeting.available_agents;
-        if !available_agents.is_empty() {
-            let mut peers = Vec::new();
-            let mut seen = HashSet::new();
-            for entry in available_agents {
-                let Some(agent) = meeting_agent_from_entry(&config, entry) else {
-                    continue;
-                };
-                if !seen.insert(agent.role_id.clone()) {
-                    continue;
-                }
-                let provider = agent.provider.clone();
-                let identity = identity_from_parts(
-                    &agent.role_id,
-                    &agent.display_name,
-                    provider
-                        .clone()
-                        .unwrap_or_else(|| ProviderKind::Unsupported("unknown".into())),
-                    agent.model.clone(),
-                    None,
-                );
-                peers.push(PeerAgentInfo {
-                    role_id: agent.role_id,
-                    display_name: agent.display_name,
-                    keywords: agent.keywords,
-                    provider,
-                    identity_label: identity_label(&identity),
-                });
-            }
-            return peers;
-        }
-    }
-
     let mut peers = config
         .agents
         .iter()
+        .filter(|agent| agent.peer_directory)
         .map(|agent| {
             let provider = ProviderKind::from_str(&agent.provider);
             let identity = identity_from_parts(
@@ -817,7 +761,7 @@ pub(super) fn load_peer_agents() -> Vec<PeerAgentInfo> {
             PeerAgentInfo {
                 role_id: agent.id.clone(),
                 display_name: agent_display_name(agent),
-                keywords: agent.keywords.clone(),
+                keywords: agent.peer_keywords.clone(),
                 provider,
                 identity_label: identity_label(&identity),
             }
@@ -866,7 +810,7 @@ pub(super) fn load_meeting_config() -> Option<MeetingConfig> {
                     reasoning_effort: None,
                     workspace: default_workspace(&agent.id),
                     peer_agents_enabled: true,
-                    memory: resolve_memory_settings(None, None),
+                    memory: resolve_agent_memory_settings(Some(agent)),
                 })
                 .collect()
         } else {

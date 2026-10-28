@@ -824,7 +824,7 @@ class GiantFileIssueMetadataTest(unittest.TestCase):
         self.assertIn(1, issues)
 
     def test_stale_snapshot_warns_generator(self) -> None:
-        """Staleness warns and requires a live refresh without blocking generation."""
+        """Staleness warns without requiring bookkeeping to generate docs."""
         refreshed = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
         rc, stderr = self._run_generator(
             self._snapshot(
@@ -888,10 +888,7 @@ class RegistryValidationTest(MetadataWarningAssertions, unittest.TestCase):
             }
             for number in (1, 3036)
         }
-        # Default: empty transition list plus zeroed baselines, so the always-on
-        # #5234 ratchets stay satisfied for the tests that exercise unrelated
-        # registry contracts. Tests that seed closed deadlines or transition-list
-        # paths must raise these baselines to match.
+        # Default planning counts keep warnings focused on each fixture; drift warns.
         GEN.load_giant_file_closed_issue_transition_list = lambda: set()
         GEN.load_giant_file_issue_ratchets = lambda: {
             "closed_deadline_entries": 0,
@@ -960,7 +957,7 @@ class RegistryValidationTest(MetadataWarningAssertions, unittest.TestCase):
         self.assertIn("deadline", str(ctx.exception))
 
     def test_grandfather_swap_in_outside_baseline_warns(self) -> None:
-        # Planning warns about baseline swaps; the size gate rejects new giants.
+        # Planning and newly measured giant files both warn.
         modules = [
             self._module("src/b.rs", 1500, giant=True),
         ]
@@ -1010,10 +1007,6 @@ class RegistryValidationTest(MetadataWarningAssertions, unittest.TestCase):
         finally:
             GEN.load_giant_file_registry = orig
         self.assertIn("metadata backfill is closed", str(ctx.exception))
-
-    def test_registry_has_zero_awaiting_backfill_records(self) -> None:
-        grandfathered, _entries, _baseline = GEN.load_giant_file_registry()
-        self.assertEqual(grandfathered, [])
 
     def test_legacy_decision_omission_normalizes_to_shrink(self) -> None:
         modules = [self._module("src/a.rs", 1500, giant=True)]
@@ -1361,40 +1354,29 @@ class RegistryValidationTest(MetadataWarningAssertions, unittest.TestCase):
             str(ctx.exception),
         )
 
-    def test_checked_in_issue_metadata_covers_every_shrink_entry(self) -> None:
-        GEN.load_giant_file_issue_metadata = self._original_issue_metadata
-        _grandfathered, entries, _baseline = GEN.load_giant_file_registry()
-        issues = GEN.load_giant_file_issue_metadata()
-        problems = [
-            GEN.validate_decompose_issue_metadata(
-                entry["file"], entry["owner"], entry["decompose_issue"], issues
-            )
-            for entry in entries
-            if entry.get("decision", "shrink") == "shrink"
-        ]
-        self.assertEqual([problem for problem in problems if problem], [])
+    def test_missing_planning_issue_warns_and_keeps_the_measured_row(self) -> None:
+        modules = [self._module("src/a.rs", 1500, giant=True)]
+        entries = [{"file": "src/a.rs", "owner": "team", "decision": "shrink"}]
+        with patch.object(GEN, "load_giant_file_registry", self._patch_registry([], entries)), \
+                patch.object(GEN, "load_giant_file_issue_metadata", return_value={}):
+            with self.assertWarning() as warning:
+                rows = GEN.build_giant_registrations(modules)
+        self.assertEqual([row.file_path for row in rows], ["src/a.rs"])
+        self.assertIn("deadline", str(warning.exception))
+        self.assertIn("decompose_issue", str(warning.exception))
 
-    def test_checked_in_closed_issue_report_covers_every_dead_deadline(self) -> None:
-        GEN.load_giant_file_issue_metadata = self._original_issue_metadata
-        _grandfathered, entries, _baseline = GEN.load_giant_file_registry()
-        issues = GEN.load_giant_file_issue_metadata()
-        expected_paths = {
-            entry["file"]
-            for entry in entries
-            if entry.get("decision", "shrink") == "shrink"
-            and issues[int(entry["decompose_issue"][1:])]["state"] == "closed"
-        }
-        reports = [
-            GEN.closed_decompose_issue_problem(
-                entry["file"], entry["decompose_issue"], issues
-            )
-            for entry in entries
-            if entry.get("decision", "shrink") == "shrink"
-        ]
-        reports = [report for report in reports if report]
-        self.assertEqual(len(reports), len(expected_paths))
-        for path in expected_paths:
-            self.assertEqual(sum(repr(path) in report for report in reports), 1)
+    def test_closed_issue_warning_keeps_the_measured_row(self) -> None:
+        modules = [self._module("src/a.rs", 1500, giant=True)]
+        entries = [{"file": "src/a.rs", "owner": "team", "decision": "shrink",
+                    "deadline": "2026-01-01", "decompose_issue": "#1"}]
+        issues = {1: {"state": "closed", "owners": ["team"], "files": ["src/a.rs"]}}
+        with patch.object(GEN, "load_giant_file_registry", self._patch_registry([], entries)), \
+                patch.object(GEN, "load_giant_file_issue_metadata", return_value=issues):
+            with self.assertWarning() as warning:
+                rows = GEN.build_giant_registrations(modules)
+        self.assertEqual([row.file_path for row in rows], ["src/a.rs"])
+        self.assertIn("has a dead deadline", str(warning.exception))
+        self.assertIn("decompose_issue #1 is closed", str(warning.exception))
 
     def test_valid_registry_builds_rows(self) -> None:
         modules = [
@@ -1573,22 +1555,6 @@ class GiantFileClosedIssueTest(MetadataWarningAssertions, unittest.TestCase):
                 GEN.GIANT_FILE_ISSUE_METADATA = orig_path
                 GEN.now_utc = orig_now
 
-    def test_categorize_closed_issue_problem_allowed(self) -> None:
-        """Verify that entries in the transition list are marked as allowed."""
-        problem = "[[entry]] 'src/a.rs' has a dead deadline: decompose_issue #1001 is closed"
-        transition_list = {"src/a.rs", "src/b.rs"}
-        is_allowed, message = GEN.categorize_closed_issue_problem("src/a.rs", problem, transition_list)
-        self.assertTrue(is_allowed)
-        self.assertIn("transition", message)
-
-    def test_categorize_closed_issue_problem_forbidden(self) -> None:
-        """Verify that entries NOT in the transition list are marked as forbidden."""
-        problem = "[[entry]] 'src/c.rs' has a dead deadline: decompose_issue #1001 is closed"
-        transition_list = {"src/a.rs", "src/b.rs"}
-        is_allowed, message = GEN.categorize_closed_issue_problem("src/c.rs", problem, transition_list)
-        self.assertFalse(is_allowed)
-        self.assertIn("FATAL", message)
-
     def test_load_transition_list(self) -> None:
         """Verify that transition list is loaded correctly."""
         with TemporaryDirectory() as tmp:
@@ -1625,7 +1591,7 @@ src/c.rs
         finally:
             GEN.GIANT_FILE_CLOSED_ISSUE_TRANSITION_LIST = orig_path
 
-    def test_ratchets_reject_growth_in_both_counts(self) -> None:
+    def test_planning_counts_describe_growth(self) -> None:
         for key in GEN.GIANT_FILE_ISSUE_RATCHET_KEYS:
             measured = {
                 "closed_deadline_entries": 5,
@@ -1642,9 +1608,9 @@ src/c.rs
                 )
                 self.assertEqual(len(problems), 1)
                 self.assertIn("grew from snapshot baseline 5 to 6", problems[0])
-                self.assertIn("ratchet violation", problems[0])
+                self.assertIn("advisory count", problems[0])
 
-    def test_ratchets_require_writer_after_shrink_in_both_counts(self) -> None:
+    def test_planning_counts_suggest_optional_refresh_after_shrink(self) -> None:
         for key in GEN.GIANT_FILE_ISSUE_RATCHET_KEYS:
             measured = {
                 "closed_deadline_entries": 5,

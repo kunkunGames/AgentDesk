@@ -16,14 +16,13 @@ pub(super) async fn run_bot_framework_setup(
     startup_reconcile_remaining: Arc<std::sync::atomic::AtomicUsize>,
     startup_doctor_started: Arc<std::sync::atomic::AtomicBool>,
     api_port: u16,
-    ingress_shadow: Option<super::super::ingress_shadow::ShadowConfig>,
 ) -> Result<Data, Error> {
     // Register in each guild for instant slash command propagation
     // (register_globally can take up to 1 hour)
     let commands = &framework.options().commands;
     // Populate known slash command names for router fallback logic
     let cmd_names: std::collections::HashSet<String> =
-        commands.iter().map(|c| c.name.clone()).collect();
+        commands.iter().map(|c| c.name.to_string()).collect();
     let _ = shared_for_migrate
         .known_slash_commands
         .set(cmd_names.clone());
@@ -64,6 +63,11 @@ pub(super) async fn run_bot_framework_setup(
     enrich_role_map_with_channel_ids();
 
     let shared_for_tmux = shared_for_migrate.clone();
+
+    super::footer_retirement::enqueue_completed_singletons(
+        &provider_for_setup,
+        &shared_for_tmux.token_hash,
+    );
 
     // (Phase 5.1 of intake-node-routing — issue #2007: `run_bot()` starts the
     // intake worker only after the lease result authorizes a registered gateway
@@ -118,7 +122,7 @@ pub(super) async fn run_bot_framework_setup(
     );
 
     // Background: periodic cleanup for stale Discord upload files
-    super::spawns::run_bot_spawn_upload_cleanup();
+    super::spawns::run_bot_spawn_upload_cleanup(&provider_for_setup);
 
     // #1115 placeholder stall sweeper: safety net for placeholders
     // whose owning turn task is stuck or dead. Edits Discord
@@ -184,13 +188,13 @@ pub(super) async fn run_bot_framework_setup(
     // Background: periodic reaper for dead tmux sessions that
     // still show as working in the DB (catches watcher gaps)
     #[cfg(unix)]
-    super::spawns::run_bot_spawn_dead_tmux_reaper(&shared_clone);
+    super::spawns::run_bot_spawn_dead_tmux_reaper(&shared_clone, &provider_for_setup);
 
     // Background: periodic GC for stale thread sessions in DB.
     // Normal idle/disconnected thread rows expire after 1 hour,
     // but rows still carrying an active_dispatch_id stay until the
     // 3-hour safety TTL so warm-resume sessions keep DB ownership.
-    super::spawns::run_bot_spawn_stale_session_gc(&shared_clone);
+    super::spawns::run_bot_spawn_stale_session_gc(&shared_clone, &provider_for_setup);
     super::intake_delivery_sweep::spawn_intake_delivery_sweep(shared_clone.clone());
 
     super::voice::run_bot_spawn_voice_auto_join(
@@ -202,23 +206,12 @@ pub(super) async fn run_bot_framework_setup(
     )
     .await;
 
-    let ingress_shadow = super::super::ingress_shadow::start_if_enabled(
-        ingress_shadow.as_ref(),
-        &provider_for_setup,
-        || super::super::ingress_shadow::Begin {
-            bot: ready.user.id.to_string(),
-            generation: shared_clone.restart.current_generation,
-            pool: shared_clone.pg_pool.clone(),
-        },
-    );
-
     Ok(Data {
         shared: shared_clone,
         token: token_owned,
         provider: provider_for_setup,
         voice_config: voice_config_for_setup,
         voice_receiver: voice_receiver_for_setup,
-        ingress_shadow,
     })
 }
 
@@ -227,7 +220,6 @@ pub(super) async fn run_bot_framework_setup(
 pub(in crate::services::discord) fn run_bot_build_slash_commands()
 -> Vec<poise::Command<Data, Error>> {
     let mut slash_commands = vec![
-        commands::cmd_start(),
         commands::cmd_resume(),
         commands::cmd_pwd(),
         commands::cmd_status(),
@@ -235,45 +227,26 @@ pub(in crate::services::discord) fn run_bot_build_slash_commands()
         commands::cmd_clear(),
         commands::cmd_stop(),
         commands::cmd_cancel_queued(),
-        commands::cmd_down(),
-        commands::cmd_shell(),
         commands::cmd_skill(),
-        commands::cmd_cc(),
-        commands::cmd_metrics(),
         commands::cmd_model(),
         commands::cmd_node(),
         commands::cmd_sidecar(),
         commands::cmd_fast(),
+        commands::cmd_tool_call(),
         commands::cmd_goals(),
         commands::cmd_effort(),
         commands::cmd_compact(),
-        commands::cmd_cost(),
-        commands::cmd_context(),
         commands::cmd_adk(),
         commands::cmd_voice(),
-        commands::cmd_vc_join(),
-        commands::cmd_vc_leave(),
     ];
     slash_commands.extend([
         commands::cmd_queue(),
         commands::cmd_health(),
-        commands::cmd_sessions(),
-        commands::cmd_deletesession(),
-        commands::cmd_allowedtools(),
-        commands::cmd_allowed(),
-        commands::cmd_debug(),
         commands::cmd_allowall(),
-        commands::cmd_adduser(),
-        commands::cmd_removeuser(),
         commands::cmd_usage(),
-        commands::cmd_receipt(),
         commands::cmd_help(),
-        commands::cmd_meeting(),
+        commands::cmd_system_prompt(),
         commands::cmd_restart(),
-        commands::cmd_deadlock_recover(),
-        commands::cmd_machine_flip(),
-        commands::cmd_stuck_pr_rebase(),
-        commands::cmd_adk_phase(),
     ]);
     slash_commands
 }

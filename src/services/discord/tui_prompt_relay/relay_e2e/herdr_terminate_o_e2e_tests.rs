@@ -557,11 +557,11 @@ fn assistant(id: &str, text: &str) -> Vec<u8> {
     }))
 }
 
-/// A row that derives nothing to post, `size` bytes of thinking.
+/// A signature-only row of `size` bytes that derives nothing to post.
 fn thinking(id: &str, size: usize) -> Vec<u8> {
     line(serde_json::json!({
         "type": "assistant", "uuid": format!("u-{id}"), "apiBlockIndex": 0,
-        "message": {"id": id, "content": [{"type": "thinking", "thinking": "z".repeat(size)}]},
+        "message": {"id": id, "content": [{"type": "thinking", "thinking": "", "signature": "z".repeat(size)}]},
     }))
 }
 
@@ -839,6 +839,10 @@ fn successor_stamps(nonce: &str, provider: &str) -> ExpectedExecution {
 struct Successor(&'static str);
 
 impl HerdrLaunchHost for Successor {
+    fn mode(&self, _: &HerdrLaunchEndpoint) -> crate::config::session_hosts::EndpointMode {
+        crate::config::session_hosts::EndpointMode::LegacyDedicated
+    }
+
     fn restore_resume(&self, _: &HerdrLaunchEndpoint) -> RestoreResume {
         RestoreResume::Off {
             witness: ServerWitness::for_test(1),

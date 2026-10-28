@@ -622,17 +622,17 @@ async fn initial_plan_capacity_replan_rejects_profile_evidence_authority_and_chr
         .unwrap();
     for field in ["created_at", "updated_at"] {
         // Both retained timestamps are nullable in the authoritative schema.
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE task_dispatches SET {field}=NULL WHERE id=$1"
-        ))
+        )))
         .bind(ATTEMPT)
         .execute(&pool)
         .await
         .unwrap();
         refusal(&pool, &f, &f.request).await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE task_dispatches SET {field}=$2::text::timestamptz WHERE id=$1"
-        ))
+        )))
         .bind(ATTEMPT)
         .bind(original["dispatch"][field].as_str().unwrap())
         .execute(&pool)

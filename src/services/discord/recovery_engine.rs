@@ -67,8 +67,13 @@ mod tmux_probe;
 // spawn-cwd derivation) into a leaf module.
 #[path = "recovery_engine/analytics_transcript.rs"]
 mod analytics_transcript;
+#[cfg(unix)]
+#[path = "recovery_engine/producer_resume.rs"]
+pub(in crate::services::discord) mod producer_resume;
 #[path = "recovery_engine/rebind_runtime.rs"]
 mod rebind_runtime;
+#[path = "recovery_engine/relay_output_replacements.rs"]
+pub(in crate::services::discord) mod relay_output_replacements;
 #[path = "recovery_engine/state_extractors.rs"]
 mod state_extractors;
 // #3834: behavior-preserving extraction of the manual-rebind recovery path
@@ -86,12 +91,6 @@ mod manual_rebind_override;
 mod routing_orphan;
 #[path = "recovery_engine/terminal_text_idempotency.rs"]
 mod terminal_text_idempotency;
-// #5071 T1 S5: the ONE `cfg` door between this ungated subtree and the
-// `#[cfg(unix)]` delivery journal. Private on purpose — only
-// `terminal_text_idempotency` may reach the journal, and it may reach it only
-// through here.
-#[path = "recovery_engine/unix_journal.rs"]
-mod unix_journal;
 // #3834: behavior-preserving extraction of the runtime-rediscovery recovery path
 // (`reregister_active_turn_from_inflight` + its private
 // `reseed_watcher_owned_finalizer_ledger` helper and unit tests) into a leaf
@@ -124,6 +123,9 @@ pub(in crate::services::discord) mod herdr_admitted_restart;
 #[cfg(unix)]
 #[path = "recovery_engine/herdr_before_start_restart.rs"]
 mod herdr_before_start_restart;
+#[cfg(unix)]
+#[path = "recovery_engine/herdr_row_end.rs"]
+pub(in crate::services::discord) mod herdr_row_end;
 // Unix only, like the `tmux::execution_identity` comparison it calls.
 #[cfg(unix)]
 #[path = "recovery_engine/herdr_reader.rs"]
@@ -184,10 +186,7 @@ use self::terminal_watcher::{
 // members (the worktree path/branch/info/git helpers, `recovery_dispatch_id`,
 // `recovery_requires_worktree_context` and `inflight_ready_for_input_without_tui_pane`)
 // stay private to the submodule.
-use self::rebind_runtime::{
-    claude_rebind_transcript_path, resolve_rebind_runtime_state,
-    spawn_codex_tui_rebind_relay_output,
-};
+use self::rebind_runtime::{resolve_rebind_runtime_state, spawn_codex_tui_rebind_relay_output};
 use self::state_extractors::{
     inflight_or_legacy_tmux_ready_for_input, interrupted_recovery_message, recovery_spawn_adk_cwd,
     recovery_tmux_session_name, restore_recovered_session_worktree,
@@ -199,11 +198,6 @@ pub(super) use self::state_extractors::save_missing_session_handoff;
 // #3834: `rebind_inflight_for_channel` is re-exported (not just re-imported) so the
 // `recovery_engine::rebind_inflight_for_channel` path stays valid for its `health`
 // caller. Its private cluster (`codex_tui_*`, `Pending*`) is not re-exported.
-#[cfg(test)]
-pub(crate) use self::manual_rebind::{
-    EpisodeAuthorityHeldBarrier, PostAdoptionClaimBarrier, install_episode_authority_held_barrier,
-    install_post_adoption_claim_barrier,
-};
 pub(crate) use self::manual_rebind::{
     rebind_inflight_for_channel, rebind_inflight_for_channel_with_minimum_start_offset,
 };
@@ -230,7 +224,7 @@ pub(in crate::services::discord) use self::completion_delivery::{
 #[cfg(unix)]
 use self::restore_inflight::detect_live_tmux_output_path;
 pub(in crate::services::discord) use self::restore_inflight::{
-    finish_recovered_turn_mailbox, restore_inflight_states, restore_inflight_turns,
+    finish_recovered_turn_mailbox, restore_inflight_turns,
 };
 use self::restore_persist_outcome::{RestorePersistOutcome, restore_codex_rollout_output_path};
 pub(super) use self::runtime::reregister_active_turn_from_inflight;
@@ -508,8 +502,6 @@ pub enum RebindError {
     /// `tmux_session` not provided and no in-memory session supplies a
     /// channel_name — cannot derive the canonical tmux session name. 400.
     ChannelNameMissing,
-    /// The channel's input gate is not open to new Legacy effects; nothing was written. 409.
-    InputFenced(String),
     /// Unrecoverable internal error (inflight write, lock poisoning, etc.). 500.
     Internal(String),
 }
@@ -563,7 +555,6 @@ impl std::fmt::Display for RebindError {
                 f,
                 "channel name missing — pass tmux_session or pre-register the channel"
             ),
-            Self::InputFenced(reason) => write!(f, "input fence refused rebind: {reason}"),
             Self::Internal(msg) => write!(f, "internal: {msg}"),
         }
     }
@@ -589,3 +580,7 @@ pub(in crate::services) fn mark_reconcile_complete(shared: &SharedData) {
         .reconcile_done
         .store(true, std::sync::atomic::Ordering::Release);
 }
+
+#[cfg(all(test, unix))]
+#[path = "recovery_engine/o_settlement_tests.rs"]
+pub(in crate::services::discord) mod o_settlement_tests;

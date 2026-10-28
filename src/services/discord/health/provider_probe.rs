@@ -6,7 +6,7 @@ use poise::serenity_prelude::ChannelId;
 use serde::Serialize;
 
 use super::{HealthStatus, ProviderEntry, ProviderRuntimeRole};
-use crate::services::turn_orchestrator::ChannelMailboxSnapshot;
+use crate::services::turn_orchestrator::{ChannelMailboxSnapshot, MailboxObservationFailure};
 
 #[derive(Debug, Serialize)]
 pub(super) struct ProviderHealthSnapshot {
@@ -62,14 +62,25 @@ struct ProviderHealthClassification {
     degraded_reasons: Vec<String>,
 }
 
-pub(super) async fn probe_provider(entry: &ProviderEntry) -> ProviderProbe {
+/// Counts and classifies a provider from its mailbox reads: only answered reads are counted,
+/// and an unanswered one leaves the runtime state incomplete instead of idle.
+pub(super) fn probe_provider(
+    entry: &ProviderEntry,
+    observations: &HashMap<ChannelId, Result<ChannelMailboxSnapshot, MailboxObservationFailure>>,
+) -> ProviderProbe {
     let session_count = entry
         .shared
         .core
         .try_lock()
         .map(|data| data.sessions.len())
         .unwrap_or(0);
-    let mailbox_snapshots = entry.shared.mailboxes.snapshot_all().await;
+    let mailbox_snapshots: HashMap<ChannelId, ChannelMailboxSnapshot> = observations
+        .iter()
+        .filter_map(|(channel, observation)| Some((*channel, observation.as_ref().ok()?.clone())))
+        .collect();
+    let runtime_state_complete = !observations
+        .values()
+        .any(|observation| matches!(observation, Err(MailboxObservationFailure::Unreachable)));
     let active_turns = mailbox_snapshots
         .values()
         .filter(|snapshot| snapshot.cancel_token.is_some())
@@ -138,7 +149,7 @@ pub(super) async fn probe_provider(entry: &ProviderEntry) -> ProviderProbe {
             runtime_role: entry.role,
             connected,
             active_turns,
-            runtime_state_complete: true,
+            runtime_state_complete,
             queue_depth,
             sessions: session_count,
             restart_pending,
@@ -147,7 +158,8 @@ pub(super) async fn probe_provider(entry: &ProviderEntry) -> ProviderProbe {
             tui_output_gateway_channels: gateway_channels.filter(|count| *count > 0),
         },
         status: classification.status,
-        fully_recovered: classification.fully_recovered,
+        // A channel that did not answer may be recovering, so recovery is not claimed.
+        fully_recovered: classification.fully_recovered && runtime_state_complete,
         deferred_hooks,
         queue_depth,
         watcher_count,
@@ -467,39 +479,6 @@ mod tests {
                 .unwrap()
                 .contains(&serde_json::json!("provider:codex:restart_pending"))
         );
-    }
-
-    /// A worker's own retired-channel residue is its reason, never a process-global alarm,
-    /// though both are named `tui_o:`.
-    #[tokio::test]
-    async fn worker_own_legacy_residue_is_not_taken_for_a_process_alarm() {
-        let _boot = crate::services::tui_o::cutover::test_override::force_channels(&[]);
-        let registry = HealthRegistry::new();
-        let shared = crate::services::discord::make_shared_data_for_tests();
-        registry
-            .register_worker("codex".to_string(), shared.clone())
-            .await;
-        let channel = ChannelId::new(NEXT_STANDBY_TEST_CHANNEL.fetch_add(1, Ordering::Relaxed));
-        assert!(
-            crate::services::discord::mailbox_try_start_turn(
-                shared.as_ref(),
-                channel,
-                Arc::new(CancelToken::new()),
-                UserId::new(1),
-                MessageId::new(2),
-            )
-            .await
-        );
-        shared.restart.global_active.store(1, Ordering::Relaxed);
-        let _retired = crate::services::discord::health::legacy_supervision::RetiredForTest::new(
-            "codex",
-            channel.get(),
-        );
-
-        let (status, _, own) = snapshot_apart_from_process_alarms(&registry).await;
-
-        assert_eq!(own, [format!("tui_o:legacy_residue:{channel}")]);
-        assert_eq!(status, HealthStatus::Degraded);
     }
 
     #[tokio::test]

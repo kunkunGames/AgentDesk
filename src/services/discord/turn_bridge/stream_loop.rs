@@ -48,6 +48,10 @@ pub(super) async fn run_stream_loop(
     let (request_owner_name, adk_session_key) = (ctx.request_owner_name, ctx.adk_session_key);
     let (adk_session_name, adk_session_info) = (ctx.adk_session_name, ctx.adk_session_info);
     let (adk_cwd, dispatch_id) = (ctx.adk_cwd, ctx.dispatch_id);
+    shared_owned
+        .ui
+        .placeholder_live_events
+        .set_tool_activity_cwd(channel_id, adk_cwd.as_deref());
     let (role_binding, turn_id) = (ctx.role_binding, ctx.turn_id);
     let voice_progress_playback_channel_id = ctx.voice_progress_playback_channel_id;
     let single_message_panel_footer_mode = ctx.single_message_panel_footer_mode;
@@ -126,6 +130,19 @@ pub(super) async fn run_stream_loop(
         crate::services::discord::inflight::InflightTurnIdentity::from_state(&inflight_state);
     let mut persisted_inflight_baseline = inflight_state.clone();
 
+    macro_rules! runtime_handoff_ctx {
+        () => {
+            RuntimeHandoffLoopContext {
+                shared_owned: &shared_owned,
+                provider: &provider,
+                channel_id,
+                done,
+                persisted_inflight_baseline: &persisted_inflight_baseline,
+                adk_session_name: &adk_session_name,
+                captured_nonce: cancel_token.turn_nonce(),
+            }
+        };
+    }
     macro_rules! refresh_or_retain_runtime_handoff {
         ($outcome:expr, $retry_pending:ident, $retry_retained:ident) => {{
             let outcome = $outcome;
@@ -397,6 +414,7 @@ pub(super) async fn run_stream_loop(
                                     single_message_panel_footer_mode,
                                     footer_owner,
                                     current_msg_id: &mut current_msg_id,
+                                    captured_nonce: cancel_token.turn_nonce(),
                                 },
                                 StreamToolArmState {
                                     state_dirty: &mut state_dirty,
@@ -479,6 +497,7 @@ pub(super) async fn run_stream_loop(
                                     single_message_panel_footer_mode,
                                     footer_owner,
                                     current_msg_id: &mut current_msg_id,
+                                    captured_nonce: cancel_token.turn_nonce(),
                                 },
                                 StreamToolArmState {
                                     state_dirty: &mut state_dirty,
@@ -563,6 +582,7 @@ pub(super) async fn run_stream_loop(
                                     single_message_panel_footer_mode,
                                     footer_owner,
                                     current_msg_id: &mut current_msg_id,
+                                    captured_nonce: cancel_token.turn_nonce(),
                                 },
                                 StreamToolArmState {
                                     state_dirty: &mut state_dirty,
@@ -615,14 +635,7 @@ pub(super) async fn run_stream_loop(
                                     tmux_session_name,
                                     last_offset,
                                 },
-                                RuntimeHandoffLoopContext {
-                                    shared_owned: &shared_owned,
-                                    provider: &provider,
-                                    channel_id,
-                                    done,
-                                    persisted_inflight_baseline: &persisted_inflight_baseline,
-                                    adk_session_name: &adk_session_name,
-                                },
+                                runtime_handoff_ctx!(),
                                 RuntimeHandoffLoopState {
                                     terminal_control_ready_observed:
                                         &mut terminal_control_ready_observed,
@@ -657,14 +670,7 @@ pub(super) async fn run_stream_loop(
                             *state.entry_watcher_epoch_current = false;
                             let outcome = handle_runtime_handoff_loop_message(
                                 RuntimeHandoffLoopMessage::RuntimeReady { handoff },
-                                RuntimeHandoffLoopContext {
-                                    shared_owned: &shared_owned,
-                                    provider: &provider,
-                                    channel_id,
-                                    done,
-                                    persisted_inflight_baseline: &persisted_inflight_baseline,
-                                    adk_session_name: &adk_session_name,
-                                },
+                                runtime_handoff_ctx!(),
                                 RuntimeHandoffLoopState {
                                     terminal_control_ready_observed:
                                         &mut terminal_control_ready_observed,
@@ -707,14 +713,7 @@ pub(super) async fn run_stream_loop(
                                     session_name,
                                     last_offset,
                                 },
-                                RuntimeHandoffLoopContext {
-                                    shared_owned: &shared_owned,
-                                    provider: &provider,
-                                    channel_id,
-                                    done,
-                                    persisted_inflight_baseline: &persisted_inflight_baseline,
-                                    adk_session_name: &adk_session_name,
-                                },
+                                runtime_handoff_ctx!(),
                                 RuntimeHandoffLoopState {
                                     terminal_control_ready_observed:
                                         &mut terminal_control_ready_observed,
@@ -748,14 +747,7 @@ pub(super) async fn run_stream_loop(
                         StreamMessage::OutputOffset { offset } => {
                             let outcome = handle_runtime_handoff_loop_message(
                                 RuntimeHandoffLoopMessage::OutputOffset { offset },
-                                RuntimeHandoffLoopContext {
-                                    shared_owned: &shared_owned,
-                                    provider: &provider,
-                                    channel_id,
-                                    done,
-                                    persisted_inflight_baseline: &persisted_inflight_baseline,
-                                    adk_session_name: &adk_session_name,
-                                },
+                                runtime_handoff_ctx!(),
                                 RuntimeHandoffLoopState {
                                     terminal_control_ready_observed:
                                         &mut terminal_control_ready_observed,
@@ -841,6 +833,7 @@ pub(super) async fn run_stream_loop(
                 provider: &provider,
                 turn_id: turn_id.as_str(),
                 expected_identity: &stream_tick_expected_identity,
+                captured_nonce: cancel_token.turn_nonce(),
                 status_interval,
                 single_message_panel_footer_mode,
                 footer_owner,
@@ -977,6 +970,7 @@ pub(super) async fn run_stream_loop(
         persisted_inflight_baseline: &mut persisted_inflight_baseline,
         expected_identity: &stream_tick_expected_identity,
         pending_current_message_candidate: &mut pending_current_message_candidate,
+        captured_nonce: cancel_token.turn_nonce(),
         state,
     })
     .await;
@@ -990,3 +984,7 @@ pub(super) async fn run_stream_loop(
         pending_long_running_retarget_after_state_save,
     }
 }
+
+#[cfg(test)]
+#[path = "stream_loop/rewind_owner_tests.rs"]
+mod rewind_owner_tests;

@@ -2,7 +2,6 @@
 //! injection's owner.
 use super::*;
 use crate::services::discord::inject_disposition::{self as disposition, InjectionOutcome};
-use crate::services::discord::input_runtime::fence::{self, Permit};
 
 /// iMessage refusal reasons for a handback that was never written, or whose result never came back.
 pub(crate) const HANDBACK_NOT_WRITTEN: &str = "handback_persistence";
@@ -16,8 +15,8 @@ const HANDBACK_DELAYS: [Duration; 4] = [
 ];
 
 /// The owner's share; a reservation whose lease only the actor holds counts as gone.
-#[derive(Debug)]
-pub(crate) struct InjectionLease;
+#[derive(Debug, Default)]
+pub(crate) struct InjectionLease(std::sync::atomic::AtomicBool);
 
 /// A live reservation. Not `Clone`: settling or abandoning consumes it.
 #[derive(Debug)]
@@ -34,11 +33,11 @@ pub(crate) enum ReserveOutcome {
     Reserved(InjectionTicket),
     /// The message is already queued, reserved for dispatch, or held by the active turn.
     Owned,
-    /// The message was already injected.
+    /// The message was already injected or explicitly discarded.
     Consumed,
     HolderChanged,
     Backlog,
-    /// Closed, fenced or unreachable: nothing was reserved.
+    /// Closed or unreachable: nothing was reserved.
     Unavailable,
 }
 
@@ -62,52 +61,31 @@ pub(crate) enum SettleOutcome {
     Unknown,
 }
 
-/// One injection's actor messages, each carrying the permit its owner was admitted with.
+/// One injection's actor messages.
 pub(crate) enum InjectionMsg {
     Reserve {
-        input_permit: Option<Permit>,
         message_id: Option<MessageId>,
         expected_claim: ExpectedClaim,
         persistence: QueuePersistenceContext,
         reply: oneshot::Sender<ReserveOutcome>,
     },
     Settle {
-        input_permit: Option<Permit>,
         ticket: InjectionTicket,
         settlement: InjectionSettlement,
         persistence: QueuePersistenceContext,
         reply: oneshot::Sender<SettleOutcome>,
     },
     Abandon {
-        input_permit: Option<Permit>,
         ticket: InjectionTicket,
         reply: oneshot::Sender<()>,
     },
     /// A queued head's claim or settlement; see `queued_head.rs`.
     Head(super::queued_head::HeadMsg),
+    /// A held boot restore's settle probe; see `dispatch_reservation/held_settle.rs`.
+    Held(super::dispatch_reservation::held_settle::HeldSettleMsg),
 }
 
 impl InjectionMsg {
-    /// The owner's permit: an injection settles under it even while the gate is Closing.
-    pub(super) fn take_permit(&mut self) -> Option<Permit> {
-        match self {
-            Self::Reserve { input_permit, .. }
-            | Self::Settle { input_permit, .. }
-            | Self::Abandon { input_permit, .. } => input_permit.take(),
-            Self::Head(_) => None,
-        }
-    }
-
-    pub(super) fn persistence(&self) -> Option<&QueuePersistenceContext> {
-        match self {
-            Self::Reserve { persistence, .. } | Self::Settle { persistence, .. } => {
-                Some(persistence)
-            }
-            Self::Abandon { .. } => None,
-            Self::Head(msg) => Some(msg.persistence()),
-        }
-    }
-
     /// Answers without the actor: nothing is reserved, a settle gets its ticket back uncommitted,
     /// and an abandon's ticket drops here, orphaning its reservation. Returns the arm name.
     pub(super) fn refuse(self, error: String) -> &'static str {
@@ -124,6 +102,10 @@ impl InjectionMsg {
             Self::Head(msg) => {
                 msg.refuse(error);
                 "QueuedHead"
+            }
+            Self::Held(msg) => {
+                msg.refuse(error);
+                "HeldSettle"
             }
         }
     }
@@ -155,6 +137,7 @@ pub(super) fn step(state: &mut ChannelMailboxState, channel_id: ChannelId, msg: 
             let _ = reply.send(());
         }
         InjectionMsg::Head(msg) => super::queued_head::step(state, channel_id, msg),
+        InjectionMsg::Held(msg) => msg.step(state, channel_id),
     }
 }
 
@@ -190,6 +173,9 @@ pub(super) fn reserve(
     persistence: &QueuePersistenceContext,
 ) -> ReserveOutcome {
     if let Some(message) = message_id {
+        if state.remint_fence.refuses_discarded(&[message]) {
+            return ReserveOutcome::Consumed;
+        }
         let now = std::time::Instant::now();
         if disposition::terminal(Some(&persistence.provider), message, now).is_some() {
             return ReserveOutcome::Consumed;
@@ -247,7 +233,7 @@ pub(super) fn reserve(
             None => ReserveOutcome::Unavailable,
         };
     }
-    let lease = Arc::new(InjectionLease);
+    let lease = Arc::new(InjectionLease::default());
     state.injection_reserved = Some((message_id, lease.clone()));
     if let Some(message) = message_id {
         // A catch-up enqueue classified before this reservation is refused by its claim CAS.
@@ -352,6 +338,26 @@ fn release(state: &mut ChannelMailboxState, ticket: &InjectionTicket) {
     }
 }
 
+pub(super) fn discard_waiting_reservation(
+    state: &mut ChannelMailboxState,
+    protected: &[MessageId],
+) -> (Option<MessageId>, bool) {
+    if state
+        .injection_reserved
+        .as_ref()
+        .is_some_and(|(id, _)| id.is_some_and(|id| protected.contains(&id)))
+    {
+        return (None, false);
+    }
+    match state.injection_reserved.take() {
+        Some((id, lease)) => {
+            lease.0.store(true, Ordering::Release);
+            (id, id.is_none())
+        }
+        None => (None, false),
+    }
+}
+
 /// The reservation ends only with a written handback; a write that did not land keeps it.
 pub(super) fn settle(
     state: &mut ChannelMailboxState,
@@ -371,6 +377,15 @@ pub(super) fn settle(
             return SettleOutcome::Committed { queue_exit_events };
         }
     };
+    if ticket.lease.0.load(Ordering::Acquire) || super::clear_fence::refuses(state, &intervention) {
+        release(state, &ticket);
+        return SettleOutcome::Committed {
+            queue_exit_events: vec![QueueExitEvent::new(
+                *intervention,
+                QueueExitKind::Superseded,
+            )],
+        };
+    }
     if let Some(error) = absorb_disk_queue_error(state, channel_id, persistence) {
         return SettleOutcome::NotCommitted { ticket, error };
     }
@@ -419,11 +434,9 @@ impl ChannelMailboxHandle {
         message_id: Option<MessageId>,
         expected_claim: ExpectedClaim,
         persistence: QueuePersistenceContext,
-        input_permit: Option<Permit>,
     ) -> ReserveOutcome {
         self.request(|reply| {
             ChannelMailboxMsg::Injection(InjectionMsg::Reserve {
-                input_permit,
                 message_id,
                 expected_claim,
                 persistence,
@@ -440,19 +453,17 @@ impl ChannelMailboxHandle {
         ticket: InjectionTicket,
         settlement: InjectionSettlement,
         persistence: QueuePersistenceContext,
-        input_permit: Option<Permit>,
     ) -> SettleOutcome {
         let (reply, answer) = oneshot::channel();
         let msg = ChannelMailboxMsg::Injection(InjectionMsg::Settle {
-            input_permit,
             ticket,
             settlement,
             persistence,
             reply,
         });
-        match self.sender.send((msg, fence::effect::current())) {
+        match self.sender.send(msg) {
             Ok(()) => answer.await.unwrap_or(SettleOutcome::Unknown),
-            Err(unsent) => match unsent.0.0 {
+            Err(unsent) => match unsent.0 {
                 ChannelMailboxMsg::Injection(InjectionMsg::Settle { ticket, .. }) => {
                     let error = "mailbox_unreachable".to_string();
                     SettleOutcome::NotCommitted { ticket, error }
@@ -469,14 +480,12 @@ impl ChannelMailboxHandle {
         mut ticket: InjectionTicket,
         intervention: Intervention,
         persistence: QueuePersistenceContext,
-        input_permit: Option<Permit>,
     ) -> Result<Vec<QueueExitEvent>, &'static str> {
         for delay in HANDBACK_DELAYS {
             tokio::time::sleep(delay).await;
             let settlement = InjectionSettlement::HandBack(Box::new(intervention.clone()));
-            let permit = input_permit.clone();
             match self
-                .settle_injected_input(ticket, settlement, persistence.clone(), permit)
+                .settle_injected_input(ticket, settlement, persistence.clone())
                 .await
             {
                 SettleOutcome::Committed { queue_exit_events } => return Ok(queue_exit_events),
@@ -491,13 +500,7 @@ impl ChannelMailboxHandle {
             }
         }
         let _ = self
-            .request(|reply| {
-                ChannelMailboxMsg::Injection(InjectionMsg::Abandon {
-                    input_permit,
-                    ticket,
-                    reply,
-                })
-            })
+            .request(|reply| ChannelMailboxMsg::Injection(InjectionMsg::Abandon { ticket, reply }))
             .await;
         Err(HANDBACK_NOT_WRITTEN)
     }

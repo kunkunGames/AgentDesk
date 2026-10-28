@@ -79,13 +79,11 @@ mod availability;
 pub(crate) mod health_probe;
 #[cfg(unix)]
 pub(crate) mod session_inventory;
-mod sized;
 
 pub use availability::{
     cached_unavailable_due_to_missing, invalidate_cache as invalidate_availability_cache,
     is_available, mark_available_from_live_session,
 };
-pub use sized::{SizedCleanup, create_session_sized};
 
 /// Get tmux version string (e.g. "tmux 3.4").
 pub fn version() -> Result<String, String> {
@@ -853,26 +851,26 @@ fn parse_ps_etime(raw: &str) -> Option<std::time::Duration> {
     ))
 }
 
+pub(in crate::services) fn pane_dead_is_live(output: &str) -> bool {
+    output.trim() == "0"
+}
+
 /// Check if a session has any live (non-dead) panes.
 pub fn has_live_pane(session_name: &str) -> bool {
-    if !has_session(session_name) {
-        return false;
-    }
-    tmux_output([
-        "list-panes",
-        "-t",
-        &exact_target(session_name),
-        "-F",
-        "#{pane_dead}",
-    ])
-    .ok()
-    .filter(|o| o.status.success())
-    .map(|o| {
-        String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .any(|line| line.trim() == "0")
-    })
-    .unwrap_or(false)
+    has_session(session_name)
+        && tmux_output([
+            "list-panes",
+            "-t",
+            &exact_target(session_name),
+            "-F",
+            "#{pane_dead}",
+        ])
+        .is_ok_and(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(pane_dead_is_live)
+        })
 }
 
 /// #4489 introduced three-state liveness of a tmux session's panes and the
@@ -932,32 +930,30 @@ pub fn set_option(session_name: &str, key: &str, value: &str) {
     let _ = tmux_output(["set-option", "-t", &exact_target(session_name), key, value]);
 }
 
-/// Read one tmux session option without treating a missing session/option as a
-/// fatal condition. Callers that rehydrate best-effort runtime metadata should
-/// use this instead of shelling out themselves: malformed targets, absent tmux,
-/// and non-success responses all resolve to `None`.
-pub fn get_option(session_name: &str, key: &str) -> Option<String> {
-    if is_blank_session_name(session_name) || key.trim().is_empty() {
-        return None;
-    }
-    let output = tmux_output([
-        "show-options",
-        "-qv",
-        "-t",
-        &exact_target(session_name),
-        key,
-    ])
-    .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
 #[cfg(test)]
 mod target_safety_tests {
     use super::*;
+
+    /// Reads one tmux session option; malformed targets, absent tmux and
+    /// non-success responses resolve to `None`.
+    fn get_option(session_name: &str, key: &str) -> Option<String> {
+        if is_blank_session_name(session_name) || key.trim().is_empty() {
+            return None;
+        }
+        let output = tmux_output([
+            "show-options",
+            "-qv",
+            "-t",
+            &exact_target(session_name),
+            key,
+        ])
+        .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
 
     #[test]
     fn tmux_command_enables_utf8_mode() {

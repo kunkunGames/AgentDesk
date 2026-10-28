@@ -60,12 +60,12 @@ pub async fn known_policy_failure(pool: &PgPool, key: &str) -> Result<Option<Str
         MISSING_END,
         DEADLINE,
     ];
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT review.reason FROM campaign_dag_reviews review
         JOIN campaign_graph_tasks t ON t.task_key=review.task_key
         WHERE review.task_key=$1 AND review.status='failed' AND review.reason=ANY($2)
           AND ({REVIEW_TASK_SQL})"
-    ))
+    )))
     .bind(key)
     .bind(&reasons[..])
     .fetch_optional(pool)
@@ -96,28 +96,28 @@ pub async fn usage_on_connection(
     } else {
         String::new()
     };
-    let published_tasks = sqlx::query_scalar(&format!(
+    let published_tasks = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM campaign_graph_tasks t WHERE t.campaign_id=$1{selection}"
-    ))
+    )))
     .bind(id)
     .fetch_one(&mut *connection)
     .await?;
-    let elapsed_dispatch_seconds = sqlx::query_scalar(&format!(
+    let elapsed_dispatch_seconds = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COALESCE(SUM(GREATEST(0,EXTRACT(EPOCH FROM
         (COALESCE(d.completed_at,CASE WHEN d.status IN ('completed','failed','cancelled','rejected')
           THEN d.updated_at ELSE NOW() END)-d.created_at)))),0)::float8
         FROM task_dispatches d JOIN campaign_graph_tasks t ON t.card_id=d.kanban_card_id
         WHERE t.campaign_id=$1 AND d.dispatch_type IN ('implementation','rework'){selection}"
-    ))
+    )))
     .bind(id)
     .fetch_one(&mut *connection)
     .await?;
-    let observed_tool_calls = sqlx::query_scalar(&format!(
+    let observed_tool_calls = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM campaign_graph_progress p
         JOIN task_dispatches d ON d.id=p.dispatch_id
         JOIN campaign_graph_tasks t ON t.card_id=d.kanban_card_id
         WHERE t.campaign_id=$1{selection}"
-    ))
+    )))
     .bind(id)
     .fetch_one(&mut *connection)
     .await?;
@@ -143,9 +143,9 @@ pub async fn publication_count(
     } else {
         String::new()
     };
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM campaign_graph_tasks t WHERE t.campaign_id=$1{selection}"
-    ))
+    )))
     .bind(id)
     .fetch_one(&mut **tx)
     .await?)
@@ -322,19 +322,19 @@ pub async fn expire_pending(pool: &PgPool, id: &str) -> Result<Vec<String>> {
 /// Failed read-only claims still own real processes/queues until cancellation
 /// settles. Return their keys even after the claim's status was made terminal.
 pub async fn failed_keys(pool: &PgPool, id: &str) -> Result<Vec<String>> {
-    Ok(sqlx::query_scalar(&format!("SELECT r.task_key FROM campaign_dag_reviews r JOIN campaign_graph_tasks t ON t.task_key=r.task_key WHERE r.owner_campaign_id=$1 AND r.status='failed' AND ({REVIEW_TASK_SQL}) AND ({UNSETTLED_TASK_SQL}) ORDER BY r.created_at LIMIT 64"))
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT r.task_key FROM campaign_dag_reviews r JOIN campaign_graph_tasks t ON t.task_key=r.task_key WHERE r.owner_campaign_id=$1 AND r.status='failed' AND ({REVIEW_TASK_SQL}) AND ({UNSETTLED_TASK_SQL}) ORDER BY r.created_at LIMIT 64")))
         .bind(id).fetch_all(pool).await?)
 }
 
 pub async fn failed_owners_unsettled(pool: &PgPool, id: &str) -> Result<bool> {
-    Ok(sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM campaign_dag_reviews r JOIN campaign_graph_tasks t ON t.task_key=r.task_key WHERE r.owner_campaign_id=$1 AND r.status='failed' AND ({REVIEW_TASK_SQL}) AND ({UNSETTLED_TASK_SQL}))"))
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT EXISTS(SELECT 1 FROM campaign_dag_reviews r JOIN campaign_graph_tasks t ON t.task_key=r.task_key WHERE r.owner_campaign_id=$1 AND r.status='failed' AND ({REVIEW_TASK_SQL}) AND ({UNSETTLED_TASK_SQL}))")))
         .bind(id).fetch_one(pool).await?)
 }
 
 pub async fn review_card_runs(pool: &PgPool, key: &str) -> Result<(String, Vec<String>)> {
-    let card: String = sqlx::query_scalar(&format!(
+    let card: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT t.card_id FROM campaign_graph_tasks t WHERE t.task_key=$1 AND ({REVIEW_TASK_SQL})"
-    ))
+    )))
     .bind(key)
     .fetch_one(pool)
     .await?;
@@ -354,6 +354,6 @@ pub async fn review_card_runs(pool: &PgPool, key: &str) -> Result<(String, Vec<S
 pub async fn unsettled(pool: &PgPool, key: &str) -> Result<bool> {
     // Historical thread mappings and quiescent reusable TUI sessions are not
     // evidence of an open turn. Actual live turns, slots and cleanup stay fenced.
-    Ok(sqlx::query_scalar(&format!("SELECT EXISTS(SELECT 1 FROM campaign_graph_tasks t WHERE t.task_key=$1 AND ({UNSETTLED_TASK_SQL}))"))
+    Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT EXISTS(SELECT 1 FROM campaign_graph_tasks t WHERE t.task_key=$1 AND ({UNSETTLED_TASK_SQL}))")))
         .bind(key).fetch_one(pool).await?)
 }

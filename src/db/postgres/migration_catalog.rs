@@ -29,7 +29,14 @@ impl Lineage {
 
     pub(super) fn migrator(self) -> Migrator {
         let mut migrations: Vec<Migration> = match self {
-            Self::Upstream => super::POSTGRES_MIGRATOR.iter().cloned().collect(),
+            Self::Upstream => super::POSTGRES_MIGRATOR
+                .iter()
+                .filter(|m| {
+                    m.version <= 141
+                        || (m.version == 146 && m.description == "campaign upstream convergence")
+                })
+                .cloned()
+                .collect(),
             Self::CampaignV5 => super::POSTGRES_MIGRATOR
                 .iter()
                 .filter(|m| m.version <= 130)
@@ -271,7 +278,7 @@ pub(super) async fn migrate(pool: &PgPool) -> Result<(), String> {
             );
             lineage
                 .migrator()
-                .run_direct(&mut conn)
+                .run_direct(None, &mut conn, false)
                 .await
                 .map_err(|e| format!("run {} migrations: {e}", lineage.label()))
         }
@@ -299,4 +306,9 @@ mod tests;
 #[cfg(test)]
 pub(crate) async fn install_campaign_fixture_through(pool: &PgPool, version: i64) {
     tests::install_fixture(pool, Lineage::CampaignV5, version).await;
+}
+
+#[cfg(test)]
+pub(crate) fn upstream_migrator_for_test() -> Migrator {
+    Lineage::Upstream.migrator()
 }

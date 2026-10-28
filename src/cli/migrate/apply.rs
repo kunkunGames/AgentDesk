@@ -2700,7 +2700,6 @@ fn copy_source_snapshot(
     }
     copy_tree_filtered(source_root, snapshot_root, warnings)
 }
-
 fn merge_imported_agents(
     config: &mut config::Config,
     plan: &ImportPlan,
@@ -2722,10 +2721,13 @@ fn merge_imported_agents(
             voice: crate::config::AgentVoiceConfig::default(),
             provider,
             channels: AgentChannels::default(),
+            peer_keywords: Vec::new(),
+            peer_directory: true,
             keywords: Vec::new(),
             department: None,
             avatar_emoji: agent.avatar_emoji.clone(),
             preferred_intake_node_labels: None,
+            memory_group: None,
         };
 
         if let Some(existing) = config

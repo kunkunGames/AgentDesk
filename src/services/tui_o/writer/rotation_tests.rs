@@ -342,7 +342,7 @@ async fn an_old_backlog_longer_than_one_read_is_posted_before_the_new_source() {
         codex_line(
             serde_json::json!({"type": "assistant", "uuid": format!("u-t{i}"),
             "apiBlockIndex": 0, "message": {"id": format!("t{i}"),
-            "content": [{"type": "thinking", "thinking": text}]}}),
+            "content": [{"type": "thinking", "thinking": "", "signature": text}]}}),
         )
     };
     let backlog: Vec<u8> = (0..6).flat_map(thinking).collect();
@@ -479,7 +479,7 @@ mod recovery_tests;
 #[path = "renumber_tests.rs"]
 mod renumber_tests;
 #[path = "retire_tests.rs"]
-mod retire_tests;
+pub(crate) mod retire_tests;
 #[cfg(unix)]
 #[path = "source_identity_tests.rs"]
 mod source_identity_tests;

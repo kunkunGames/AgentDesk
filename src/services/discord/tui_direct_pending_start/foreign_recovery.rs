@@ -16,7 +16,7 @@ pub(super) async fn submit_stale_foreign_inflight_cancel(
     provider: &crate::services::provider::ProviderKind,
     channel_id: poise::serenity_prelude::ChannelId,
     probe: &super::super::destructive_cancel_gate::DestructiveCancelProbeSnapshot,
-    source: ForeignRecoverySource,
+    _source: ForeignRecoverySource,
 ) -> bool {
     let finalizer_turn_id = probe.pin.finalizer_turn_id;
     if finalizer_turn_id == 0 {
@@ -38,15 +38,6 @@ pub(super) async fn submit_stale_foreign_inflight_cancel(
     }
     #[cfg(test)]
     retirement_recheck_tests::pause("leaked_row_cancel_after_mailbox", channel_id.get()).await;
-    if source == ForeignRecoverySource::LeakedRowSweep
-        && super::super::health::legacy_supervision::legacy_retired(
-            provider.as_str(),
-            channel_id.get(),
-            "leaked_row_cancel_after_mailbox",
-        )
-    {
-        return false;
-    }
 
     // Bind the execution identity to the watcher incarnation before cancellation.
     let pinned = probe
@@ -172,7 +163,7 @@ async fn submit_committed_foreign_inflight_complete(
     channel_id: poise::serenity_prelude::ChannelId,
     probe: &super::super::destructive_cancel_gate::DestructiveCancelProbeSnapshot,
     restart_orphan_evidence: bool,
-    source: ForeignRecoverySource,
+    _source: ForeignRecoverySource,
 ) -> bool {
     let finalizer_turn_id = probe.pin.finalizer_turn_id;
     if finalizer_turn_id == 0 {
@@ -222,15 +213,6 @@ async fn submit_committed_foreign_inflight_complete(
 
     #[cfg(test)]
     retirement_recheck_tests::pause("leaked_row_complete_after_mailbox", channel_id.get()).await;
-    if source == ForeignRecoverySource::LeakedRowSweep
-        && super::super::health::legacy_supervision::legacy_retired(
-            provider.as_str(),
-            channel_id.get(),
-            "leaked_row_complete_after_mailbox",
-        )
-    {
-        return false;
-    }
 
     let committed_identity = super::super::inflight::InflightTurnIdentity::from_state(&current);
     if restart_orphan_evidence {
@@ -314,6 +296,22 @@ async fn demote_stale_foreign_inflight(
     else {
         return false;
     };
+    // A restarted Herdr row's end belongs to its dedicated owner, never to this sweep; the sweep
+    // only asks that owner to look again, so a stalled end pass cannot hold the channel.
+    #[cfg(unix)]
+    if super::super::recovery_engine::herdr_row_end::owner::dedicated_cleanup_owner(
+        &provider,
+        &state,
+        shared.restart.current_generation,
+    ) {
+        tracing::info!(
+            provider = %record.provider,
+            channel_id = record.channel_id,
+            "tui_direct_pending_start: left a restarted Herdr row to its dedicated owner"
+        );
+        super::super::recovery_engine::herdr_row_end::request_row_end(shared, &provider, channel);
+        return false;
+    }
     let capture_offset = output_capture_offset(&state);
     if committed_foreign_inflight_is_finalize_clearable(&state, record) {
         let mailbox_active_user_msg_id = super::super::mailbox_snapshot(shared, channel)

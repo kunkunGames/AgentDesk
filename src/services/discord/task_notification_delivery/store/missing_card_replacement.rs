@@ -5,19 +5,40 @@ use super::*;
 #[derive(Clone, Debug)]
 pub(in crate::services::discord::task_notification_delivery) enum MissingCardReplacementClaim {
     Existing { message_id: u64, bot_key: String },
-    Owned(ClaimedCard),
+    Owned(Box<ClaimedCard>),
     Busy { bot_key: String },
 }
 
+#[cfg(test)]
 pub(in crate::services::discord::task_notification_delivery) async fn claim_missing_card_replacement(
     pool: Option<&PgPool>,
     scope: &TaskCardScope,
     missing_message_id: u64,
 ) -> Result<MissingCardReplacementClaim, String> {
+    claim(pool, scope, missing_message_id, None).await
+}
+
+pub(in crate::services::discord::task_notification_delivery) async fn claim_missing_card_replacement_without_metadata(
+    pool: Option<&PgPool>,
+    scope: &TaskCardScope,
+    missing_message_id: u64,
+    payload: &super::super::TaskCardPayload,
+) -> Result<MissingCardReplacementClaim, String> {
+    claim(pool, scope, missing_message_id, Some(payload)).await
+}
+
+async fn claim(
+    pool: Option<&PgPool>,
+    scope: &TaskCardScope,
+    missing_message_id: u64,
+    payload: Option<&super::super::TaskCardPayload>,
+) -> Result<MissingCardReplacementClaim, String> {
     match pool {
-        Some(pool) => claim_missing_card_replacement_pg(pool, scope, missing_message_id).await,
+        Some(pool) => {
+            claim_missing_card_replacement_pg(pool, scope, missing_message_id, payload).await
+        }
         None if cfg!(any(test, debug_assertions)) => {
-            claim_missing_card_replacement_memory(scope, missing_message_id)
+            claim_missing_card_replacement_memory(scope, missing_message_id, payload)
         }
         None => Err(memory_fallback_unavailable()),
     }
@@ -27,10 +48,11 @@ async fn claim_missing_card_replacement_pg(
     pool: &PgPool,
     scope: &TaskCardScope,
     missing_message_id: u64,
+    payload: Option<&super::super::TaskCardPayload>,
 ) -> Result<MissingCardReplacementClaim, String> {
     let channel_id = db_id(scope.channel_id, "channel_id")?;
     let current = sqlx::query(
-        "SELECT delivery_state, bot_key, discord_message_id, revision, rendered_content,
+        "SELECT delivery_state, bot_key, discord_message_id, revision, rendered_content, content_hash, update_count, post_started_at,
                 (lease_owner IS NOT NULL AND lease_expires_at > NOW()) AS lease_active
          FROM task_notification_card_state
          WHERE channel_id = $1 AND provider = $2 AND session_key = $3 AND event_key = $4",
@@ -60,15 +82,33 @@ async fn claim_missing_card_replacement_pg(
             return Ok(MissingCardReplacementClaim::Busy { bot_key });
         }
         let lease_owner = uuid::Uuid::new_v4().to_string();
+        let content = payload.map_or_else(
+            || current.get::<String, _>("rendered_content"),
+            |payload| {
+                replacement_content(
+                    &current.get::<String, _>("rendered_content"),
+                    payload,
+                    u64::try_from(current.get::<i64, _>("update_count")).unwrap_or(1),
+                )
+            },
+        );
+        let desired = payload
+            .filter(|payload| !payload.is_completion_card())
+            .map(|_| super::super::provider_bot_key(&scope.provider))
+            .unwrap_or_else(|| bot_key.clone());
+        let hash = super::super::content_hash(&content);
         let row = sqlx::query(
             "UPDATE task_notification_card_state
              SET lease_owner = $5,
+                 bot_key=CASE WHEN post_started_at IS NULL THEN $7 ELSE bot_key END,
+                 rendered_content=CASE WHEN post_started_at IS NULL THEN $8 ELSE rendered_content END,
+                 content_hash=CASE WHEN post_started_at IS NULL THEN $9 ELSE content_hash END,
                  lease_expires_at = NOW() + make_interval(secs => $6),
                  updated_at = NOW()
              WHERE channel_id = $1 AND provider = $2 AND session_key = $3 AND event_key = $4
                AND delivery_state = 'posting'
                AND (lease_owner IS NULL OR lease_expires_at <= NOW())
-             RETURNING bot_key, discord_nonce, revision, update_count, rendered_content",
+             RETURNING bot_key, discord_nonce, revision, update_count, rendered_content, post_started_at",
         )
         .bind(channel_id)
         .bind(&scope.provider)
@@ -76,18 +116,16 @@ async fn claim_missing_card_replacement_pg(
         .bind(&scope.event_key)
         .bind(&lease_owner)
         .bind(LEASE_SECONDS)
+        .bind(&desired).bind(&content).bind(&hash)
         .fetch_optional(pool)
         .await
         .map_err(|error| format!("resume missing task card replacement: {error}"))?;
         let Some(row) = row else {
             return Ok(MissingCardReplacementClaim::Busy { bot_key });
         };
-        return Ok(MissingCardReplacementClaim::Owned(claimed_from_row(
-            scope,
-            lease_owner,
-            &row,
-            ClaimAction::Post,
-        )?));
+        return Ok(MissingCardReplacementClaim::Owned(Box::new(
+            claimed_from_row(scope, lease_owner, &row, ClaimAction::Post)?,
+        )));
     }
     if state != "card_posted" || lease_active {
         return Ok(MissingCardReplacementClaim::Busy { bot_key });
@@ -96,18 +134,32 @@ async fn claim_missing_card_replacement_pg(
     let current_revision: i32 = current.get("revision");
     let next_revision = current_revision.saturating_add(1);
     let next_nonce = stable_nonce(scope, next_revision);
-    let rendered_content: String = current.get("rendered_content");
+    let original: String = current.get("rendered_content");
+    let original_hash: String = current.get("content_hash");
+    let count =
+        u64::try_from(current.get::<i64, _>("update_count")).map_err(|error| error.to_string())?;
+    let rendered_content = payload.map_or_else(
+        || original.clone(),
+        |payload| replacement_content(&original, payload, count),
+    );
+    let desired_bot = payload
+        .filter(|payload| !payload.is_completion_card())
+        .map(|_| super::super::provider_bot_key(&scope.provider))
+        .unwrap_or_else(|| bot_key.clone());
+    let hash = super::super::content_hash(&rendered_content);
     let lease_owner = uuid::Uuid::new_v4().to_string();
     let row = sqlx::query(
         "UPDATE task_notification_card_state
          SET delivery_state = 'posting', discord_message_id = NULL,
+             rendered_content = $11, content_hash = $12, bot_key = $15,
              revision = $7, discord_nonce = $8, lease_owner = $9,
              lease_expires_at = NOW() + make_interval(secs => $10),
              post_started_at = NULL, last_error = NULL, updated_at = NOW()
          WHERE channel_id = $1 AND provider = $2 AND session_key = $3 AND event_key = $4
            AND delivery_state = 'card_posted' AND discord_message_id = $5
-           AND revision = $6 AND (lease_owner IS NULL OR lease_expires_at <= NOW())
-         RETURNING bot_key, discord_nonce, revision, update_count, rendered_content",
+           AND revision = $6 AND content_hash = $13 AND bot_key = $14
+           AND (lease_owner IS NULL OR lease_expires_at <= NOW())
+         RETURNING bot_key, discord_nonce, revision, update_count, rendered_content, post_started_at",
     )
     .bind(channel_id)
     .bind(&scope.provider)
@@ -119,6 +171,11 @@ async fn claim_missing_card_replacement_pg(
     .bind(next_nonce)
     .bind(&lease_owner)
     .bind(LEASE_SECONDS)
+    .bind(&rendered_content)
+    .bind(&hash)
+    .bind(&original_hash)
+    .bind(&bot_key)
+    .bind(&desired_bot)
     .fetch_optional(pool)
     .await
     .map_err(|error| format!("claim missing task card replacement: {error}"))?;
@@ -129,12 +186,13 @@ async fn claim_missing_card_replacement_pg(
     if claimed.rendered_content.is_empty() {
         claimed.rendered_content = rendered_content;
     }
-    Ok(MissingCardReplacementClaim::Owned(claimed))
+    Ok(MissingCardReplacementClaim::Owned(Box::new(claimed)))
 }
 
 fn claim_missing_card_replacement_memory(
     scope: &TaskCardScope,
     missing_message_id: u64,
+    payload: Option<&super::super::TaskCardPayload>,
 ) -> Result<MissingCardReplacementClaim, String> {
     let mut rows = MEMORY_STORE
         .lock()
@@ -159,12 +217,22 @@ fn claim_missing_card_replacement_memory(
         row.lease_owner = Some(lease_owner.clone());
         row.lease_expires_at = Some(now + Duration::from_secs(LEASE_SECONDS as u64));
         row.last_error = None;
-        return Ok(MissingCardReplacementClaim::Owned(memory_claim(
+        if row.post_started_at.is_none()
+            && let Some(payload) = payload
+        {
+            row.rendered_content =
+                replacement_content(&row.rendered_content, payload, row.update_count);
+            row.content_hash = super::super::content_hash(&row.rendered_content);
+            if !payload.is_completion_card() {
+                row.bot_key = super::super::provider_bot_key(&scope.provider);
+            }
+        }
+        return Ok(MissingCardReplacementClaim::Owned(Box::new(memory_claim(
             scope,
             &lease_owner,
             row,
             ClaimAction::Post,
-        )));
+        ))));
     }
     if row.state != MemoryState::CardPosted || lease_active {
         return Ok(MissingCardReplacementClaim::Busy {
@@ -172,6 +240,14 @@ fn claim_missing_card_replacement_memory(
         });
     }
     let lease_owner = uuid::Uuid::new_v4().to_string();
+    if let Some(payload) = payload {
+        let content = replacement_content(&row.rendered_content, payload, row.update_count);
+        row.content_hash = super::super::content_hash(&content);
+        row.rendered_content = content;
+        if !payload.is_completion_card() {
+            row.bot_key = super::super::provider_bot_key(&scope.provider);
+        }
+    }
     row.revision = row.revision.saturating_add(1);
     row.nonce = stable_nonce(scope, row.revision);
     row.state = MemoryState::Posting;
@@ -180,10 +256,23 @@ fn claim_missing_card_replacement_memory(
     row.lease_owner = Some(lease_owner.clone());
     row.lease_expires_at = Some(now + Duration::from_secs(LEASE_SECONDS as u64));
     row.last_error = None;
-    Ok(MissingCardReplacementClaim::Owned(memory_claim(
+    Ok(MissingCardReplacementClaim::Owned(Box::new(memory_claim(
         scope,
         &lease_owner,
         row,
         ClaimAction::Post,
-    )))
+    ))))
+}
+
+fn replacement_content(
+    original: &str,
+    payload: &super::super::TaskCardPayload,
+    count: u64,
+) -> String {
+    if !payload.is_completion_card() {
+        return payload.render(count);
+    }
+    let clean = super::super::retired_metadata::without_metadata(original, payload, count)
+        .unwrap_or_else(|| original.to_string());
+    super::inline_claim::normalize_completion(&clean)
 }

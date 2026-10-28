@@ -18,7 +18,6 @@ pub(crate) enum MailboxRefusal {
     Closed,
     /// The actor task is gone.
     Unreachable,
-    InputFenced(crate::services::discord::input_runtime::fence::Failure),
 }
 
 /// Reply of a verdict arm: `send` is its answer; only the closed gate refuses.
@@ -27,13 +26,6 @@ pub(super) struct VerdictReply<T>(oneshot::Sender<Result<T, MailboxRefusal>>);
 impl<T> VerdictReply<T> {
     pub(super) fn send(self, value: T) -> Result<(), Result<T, MailboxRefusal>> {
         self.0.send(Ok(value))
-    }
-
-    pub(super) fn input_refuse(
-        self,
-        failure: crate::services::discord::input_runtime::fence::Failure,
-    ) {
-        let _ = self.0.send(Err(MailboxRefusal::InputFenced(failure)));
     }
 
     /// The closed gate's answer; returns `arm` for its log line.
@@ -78,8 +70,29 @@ impl ChannelMailboxHandle {
         &self,
         persistence: QueuePersistenceContext,
     ) -> Result<ClearChannelResult, MailboxRefusal> {
-        self.request_verdict(|reply| ChannelMailboxMsg::Clear { persistence, reply })
+        self.clear_with_policy(persistence, super::clear_channel::ActivePolicy::Release)
             .await
+    }
+
+    pub(crate) async fn discard_waiting_or_refused(
+        &self,
+        persistence: QueuePersistenceContext,
+    ) -> Result<ClearChannelResult, MailboxRefusal> {
+        self.clear_with_policy(persistence, super::clear_channel::ActivePolicy::Preserve)
+            .await
+    }
+
+    async fn clear_with_policy(
+        &self,
+        persistence: QueuePersistenceContext,
+        active: super::clear_channel::ActivePolicy,
+    ) -> Result<ClearChannelResult, MailboxRefusal> {
+        self.request_verdict(|reply| ChannelMailboxMsg::Clear {
+            persistence,
+            active,
+            reply,
+        })
+        .await
     }
 
     pub(crate) async fn hydrate_pending_queue_from_disk_or_refused(

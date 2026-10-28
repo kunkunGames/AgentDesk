@@ -22,8 +22,6 @@ pub(crate) enum RecoveryKickoffResult {
     RefusedClosed,
     /// Recovery admission refused or the actor was unreachable.
     Unavailable,
-    InputModeFenced(crate::services::discord::input_runtime::fence::Mode),
-    InputFailure(crate::services::discord::input_runtime::fence::Failure),
 }
 
 impl RecoveryKickoffResult {
@@ -43,6 +41,9 @@ pub(super) fn kickoff_refusal(
     candidate: &CancelToken,
     user_message_id: Option<MessageId>,
 ) -> Option<RecoveryKickoffResult> {
+    if user_message_id.is_some_and(|id| state.remint_fence.refuses_discarded(&[id])) {
+        return Some(RecoveryKickoffResult::Unavailable);
+    }
     let occupant = state.cancel_token.as_deref()?;
     Some(occupied_kickoff_outcome(
         state,

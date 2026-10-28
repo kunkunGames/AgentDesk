@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn default_strict_loader_rejects_retired_provider_and_channel_runtime() {
-        let _env = crate::config::test_env_lock::acquire_shared_test_env_lock();
+        let _root = crate::config::TestRuntimeRootGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("candidate.yaml");
         let _path = crate::config::test_env::TestEnvVarGuard::set_path_after_shared_test_env_lock(
@@ -225,7 +225,14 @@ mod tests {
         provider_hosting::install_provider_hosting_config(&fixture(Some("pipe"), false, "claude"));
         let before = provider_hosting::resolve_provider_session_selection(&ProviderKind::Claude);
         let config = fixture(Some("claude_e"), false, "claude");
-        let error = crate::bootstrap::install_boot_snapshots(&config).unwrap_err();
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::bootstrap::prepare_and_install_boot_snapshots(
+                &config, None,
+            ))
+            .unwrap_err();
         assert!(format!("{error:#}").contains(REMOVED), "{error:#}");
         assert_eq!(
             provider_hosting::resolve_provider_session_selection(&ProviderKind::Claude),

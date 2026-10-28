@@ -1,5 +1,6 @@
 use super::retry_fixture::RetryFixture;
 use super::*;
+use std::sync::mpsc;
 
 #[test]
 fn provider_failure_after_tool_effect_is_terminal_not_retryable() {

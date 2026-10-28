@@ -29,8 +29,9 @@ class ReleaseTokenWiringTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory(prefix="release-wiring-input-")
         self.addCleanup(temp.cleanup)
         self.repo = Path(temp.name)
-        (self.repo / "scripts").mkdir()
-        for name in ("build-release.sh", "deploy-release.sh", "build_token.py"):
+        (self.repo / "scripts/lib").mkdir(parents=True)
+        for name in ("build-release.sh", "deploy-release.sh", "_deploy_policy_generation.sh",
+                     "build_token.py", "lib/deploy_allow_degraded.sh"):
             shutil.copy2(REPO / "scripts" / name, self.repo / "scripts" / name)
 
     def inject(self, script, command):
@@ -140,7 +141,7 @@ class SccacheConsumerTests(unittest.TestCase):
         self.assertEqual(seen["RUSTC_WRAPPER"], str(self.brew / "sccache"))
         self.assertEqual(seen["PATH"], f"{self.brew}:{self.env['PATH']}")
         self.assertEqual(seen["SCCACHE_DIR"], str(self.root / ".cache/sccache"))
-        self.assertEqual(seen["SCCACHE_CACHE_SIZE"], "40G")
+        self.assertEqual(seen["SCCACHE_CACHE_SIZE"], "15G")
         self.assertEqual(seen["SCCACHE_IDLE_TIMEOUT"], "0")
 
     def test_release_consumers_preserve_shell_activation_or_the_empty_opt_out_pair(self):
@@ -175,7 +176,7 @@ raise SystemExit(bt.run(sys.argv[3:], path={str(self.root / 'token')!r}))
                                 ("deploy-release.sh", "release"),
                                 ("deploy-release.sh", "release-fast")):
             source = (REPO / "scripts" / script).read_text()
-            start = 'export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-40G}"'
+            start = 'export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-15G}"'
             end = ('echo "[2/3] Dashboard' if script == "build-release.sh" else
                    '# Rebuild dashboard so deploy never ships a stale dist.')
             self.assertEqual(source.count(start), 1)
@@ -192,12 +193,18 @@ python3() {{ {shlex.quote(sys.executable)} {shlex.quote(str(driver))} "$@"; }}
 BUILD_PROFILE={profile}
 DEPLOY_BUILD_PROFILE={profile}
 DEPLOY_LOCK_TIMEOUT_SECS=5
+DEPLOY_RUN_STARTED="$SECONDS"
 TARGET=aarch64-apple-darwin
 CARGO_TARGET_ARGS=(--target "$TARGET")
 _ensure_dashboard_dependencies() {{ :; }}
 _check_repo_remote_freshness() {{ :; }}
 _external_artifact_would_skip_o_writer() {{ return 1; }}
 _resolve_default_release_binary() {{ echo "$REPO/artifact"; }}
+# Exercise the source-build consumer without peers, transfers or a ledger floor.
+_schema_order_peers() {{ :; }}
+_peer_binary_platform() {{ return 1; }}
+_select_peer_binary() {{ PEER_BINARY_ACCEPTED=0; }}
+_binary_would_revert_o_ledger() {{ return 1; }}
 """ + start + fragment + "\n:\n")
             for installed in (False, True):
                 sccache = self.bin / "sccache"
@@ -210,9 +217,10 @@ _resolve_default_release_binary() {{ echo "$REPO/artifact"; }}
                     result = subprocess.run(["/bin/bash", str(scenario)], env=self.env,
                                             text=True, capture_output=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn("command not found", result.stderr)
                     seen = json.loads(self.output.read_text())
                     self.assertEqual(seen["PATH"], self.env["PATH"])
-                    self.assertEqual(seen["SCCACHE_CACHE_SIZE"], "40G")
+                    self.assertEqual(seen["SCCACHE_CACHE_SIZE"], "15G")
                     if installed:
                         self.assertEqual(seen["RUSTC_WRAPPER"], str(sccache))
                         self.assertEqual(seen["SCCACHE_DIR"], str(self.root / ".cache/sccache"))

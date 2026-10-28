@@ -1,3 +1,4 @@
+use super::consume_once as consume;
 use super::*;
 use crate::db::dispatched_sessions::hosted_execution::HostedOwner;
 use crate::services::discord;
@@ -76,7 +77,7 @@ fn coldstop_phases_require_positive_untouched_and_preserve_base_hold() {
             }
         }
         let (actor, _) = prepared(provider.clone(), 903);
-        finish_execution(Some(&actor));
+        finish_execution(Some(&actor), false);
         assert_eq!(
             actor
                 .herdr_interrupt_state()
@@ -303,7 +304,7 @@ fn coldstop_closed_drops_callback_and_own_start_is_negative_evidence() {
     let (actor, _) = prepared(ProviderKind::Codex, 915);
     let state = actor.herdr_interrupt_state().unwrap();
     state.own_start_observed(1, "own");
-    finish_execution(Some(&actor));
+    finish_execution(Some(&actor), false);
     state.user_stop.store(true, Ordering::Release);
     assert_eq!(seal_exit(&actor, false, false), ExitDecision::Hold);
 }
@@ -838,11 +839,12 @@ impl Close {
     }
 }
 
-#[path = "before_start_stop_disk_gate_tests.rs"]
-mod disk_gate;
-
 #[path = "before_start_stop_clear_order_tests.rs"]
 mod clear_order;
+#[path = "before_start_stop_disk_gate_tests.rs"]
+mod disk_gate;
+#[path = "before_start_stop_o_reply_tests.rs"]
+mod o_reply;
 
 #[path = "before_start_stop_policy_tests.rs"]
 mod policy;
@@ -850,9 +852,10 @@ mod policy;
 #[path = "before_start_stop_reconcile_tests.rs"]
 mod reconcile;
 
+#[path = "before_start_stop_retry_tests.rs"]
+mod retry;
 #[path = "before_start_stop_tail_tests.rs"]
 mod tail;
-
 /// A notice that records being polled and otherwise shows the notice.
 async fn recorded(
     polled: &std::sync::atomic::AtomicBool,
@@ -863,7 +866,6 @@ async fn recorded(
 
 /// A change applied to a row.
 type Shape = fn(&mut InflightTurnState);
-
 /// Nothing is shown or released before the receipt is durable: a failed write keeps the turn held
 /// and its row as it was; the notice runs with the receipt on disk and no inflight lock held.
 #[tokio::test(flavor = "current_thread")]
@@ -998,8 +1000,8 @@ async fn coldstop_receipt_admission_spares_successor_row() {
     }
 }
 
-/// The bridge shows the stop only where it owns the body: an O-owned destination or a message
-/// anchor that moved keeps the receipt pending, sends nothing and holds the turn.
+/// The bridge shows the stop only on the durable row's own message: an anchor that moved keeps the
+/// receipt pending, sends nothing and holds the turn. An O-owned body is in `o_reply`.
 #[tokio::test(flavor = "current_thread")]
 async fn coldstop_bridge_shows_the_stop_only_on_its_own_body() {
     let close = Close::open(924, |row| {
@@ -1007,16 +1009,11 @@ async fn coldstop_bridge_shows_the_stop_only_on_its_own_body() {
     })
     .await;
     let polled = std::sync::atomic::AtomicBool::new(false);
-    {
-        let _o = crate::services::tui_o::cutover::test_override::force_channels(&[(
-            924,
-            crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
-        )]);
-        assert!(!close.consume(recorded(&polled)).await);
-    }
-    assert!(!polled.load(Ordering::Acquire), "O owns the body");
-    assert_eq!(close.receipt_pending(), Some(true));
-    assert!(close.held().await);
+    let (proof, generation) = (&close.proof, close.shared.restart.current_generation);
+    let admitted = close
+        .row
+        .admit_before_start_receipt(&proof.turn_nonce, proof.basis, generation);
+    assert!(admitted.await.is_some());
     let mut moved = close.durable().unwrap();
     moved.current_msg_id += 1;
     discord::inflight::save_inflight_state(&moved).unwrap();
@@ -1030,11 +1027,11 @@ const CRASH_FILTER: &str = "coldstop_restart_finishes_a_close_that_crashed_midwa
 
 #[tokio::test(flavor = "current_thread")]
 async fn coldstop_policy_clear_requires_exact_acked_snapshot() {
-    use crate::services::turn_orchestrator::policy_close::{PolicyClear, test_hooks};
+    use crate::services::turn_orchestrator::policy_close::PolicyClear;
     use discord::inflight::{GuardedClearOutcome, InflightTurnIdentity};
     let clear = |row: &InflightTurnState, generation| {
         let receipt = row.clone().into_policy_receipt(generation);
-        test_hooks::with_authority(None, |legacy| receipt.try_clear(legacy))
+        receipt.try_clear()
     };
     let close = Close::open(925, |_| {}).await;
     let generation = close.shared.restart.current_generation;

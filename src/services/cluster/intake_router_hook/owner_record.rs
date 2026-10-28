@@ -666,7 +666,7 @@ async fn existing_open_route_in_tx(
           ORDER BY created_at ASC
           LIMIT 1"
     );
-    sqlx::query_as::<_, OpenRouteRow>(&query)
+    sqlx::query_as::<_, OpenRouteRow>(sqlx::AssertSqlSafe(query))
         .bind(channel_id)
         .fetch_optional(&mut **tx)
         .await
@@ -1034,7 +1034,6 @@ mod tests {
             wait_for_completion: false,
             preserve_on_cancel: false,
             agent_id: "agent-x".to_string(),
-            home_epoch: None,
         }
     }
 

@@ -4,6 +4,12 @@ The cell-based E2E harness exercises every (provider, runtime) cell against a
 dedicated Discord channel. The legacy single-pair smoke against
 `adk-dashboard-e2e` is being archived in favour of this matrix.
 
+**Live scenarios are manual execution specifications, not CI-executed coverage.**
+The [scenario execution contract](../../tests/e2e/tui_relay/scenarios/README.md)
+defines the live prerequisites, manual commands, fixture/known-gap meanings and
+the conditional automatic post-deploy subset (`E-1`, `E-35`, `E-50`, `E-51`).
+CI inventories live rows and executes the two local fixture rows.
+
 ## Cells
 
 | Cell           | Provider | Runtime    | Worker agent            | Channel                  |
@@ -29,6 +35,7 @@ is in that list.
 id: E-1
 agent_mode: real_live
 coverage_class: live
+# Manual execution specification; not run in CI.
 cells: [claude-pipe, claude-tui, codex-pipe, codex-tui]
 steps:
   - send_prompt: ...
@@ -68,6 +75,13 @@ instead of silently downgrading. Machine-readable reports include
 `agent_mode`, `agent_mode_actual`, `provider_identity`, `real_provider_contacted`,
 `coverage_class`, `coverage_class_actual`, `run_id`, and `failure_attribution`
 on each scenario.
+
+A `wait_for_discord_text` step (or an `E-36` request) with `relay_author: provider`
+matches only bodies posted by the cell's provider bot, and `provider_text_present`
+applies the same author check to the final presence assertion. Notify and
+announce bot posts that quote a marker therefore never count as delivery.
+`E-4` scopes its direct-input body; `E-1`, `E-2`, `E-36`, `E-50` and `E-51` scope
+every turn marker, on legacy and Herdr cells.
 
 Provider-specific scenarios (`E-6` claude `/compact`, `E-7` codex `/compact`)
 narrow the list. TUI-keystroke-only scenarios (`E-4`, `E-10`, `E-12`) include
@@ -220,6 +234,12 @@ Covered P0/P1 backlog items:
 - `foreign-active destructive restart refusal` (#2935): `E-17`, orchestrator-owned
   hold of a foreign `claude-tui` mailbox while a `codex-tui` restart is attempted
   (guard-only, no real restart).
+- `/compact recap not relayed as input`: `E-6`, Claude cells. The oracle is the
+  two continuation openings `injected_prompt_policy.rs` classifies; no bot post may
+  quote either, so a relayed recap or a direct-input notice for it fails.
+- `multi-unit characters across chunk boundaries`: `E-15`'s second (UTF-16) turn,
+  all cells. Every post stays within 2000 UTF-16 units with no U+FFFD or lone
+  surrogate, and the emoji payload must reach at least two relay bodies.
 
 Remaining exact gaps:
 
@@ -297,6 +317,13 @@ checks inside scenarios that never ran. Dry runs contribute no executed passes.
 The matrix forwards these totals and reports partial coverage when either dormant
 scenarios or skipped assertions remain, even if all executed scenarios passed.
 
+Every prompt send appends a `prompt_sends` row (`send_state: attempted`) before it
+leaves and fills `message_id` with `send_state: acknowledged` when the response
+returns; provider contact is claimed only after that acknowledgement. When the
+phase deadline expires, including inside a failure handler's teardown or inside
+one of E-18's Herdr text-stop subcases, the report row still carries those rows
+and the contact fact.
+
 Post-deploy relay continuity uses a narrower operational wrapper around the
 same driver:
 
@@ -306,7 +333,7 @@ python3 scripts/e2e/post_deploy_relay_continuity.py --fixture pass
 python3 scripts/e2e/post_deploy_relay_continuity.py \
     --cell claude-tui \
     --dry-run \
-    --deploy-command 'AGENTDESK_DEPLOY_ALLOW_NON_MAIN=1 scripts/deploy-release.sh --skip-review'
+    --deploy-command 'AGENTDESK_DEPLOY_ALLOW_NON_MAIN=1 scripts/deploy-release.sh'
 ```
 
 The live form adds `--confirm-live` and runs only TUI cells (`claude-tui` or
@@ -334,6 +361,46 @@ Before a destructive restart, the driver now fails closed if
 mailbox state, cancel token, inflight state, queue depth, recovery/finalizing
 state, pending Discord callback, stale thread proof, or relay stall state.
 
+### Mid-turn provider SIGKILL (`--midturn-kill`)
+
+`run_tui_relay.py --cell codex-tui|claude-tui --midturn-kill --allow-destructive`
+(with `AGENTDESK_E2E_ALLOW_DESTRUCTIVE=1`) runs only scenario `MK-1` from
+`scripts/e2e/tui_relay/midturn_kill.py`. It is not a YAML scenario, so default
+and `--filter` sweeps never select it, and YAML cannot use its steps.
+
+- Target: the cell's provider process only. The harness follows the runtime
+  session record (`sessions/*-<session>.owner`, `runtime-kind`, launch script
+  `AGENTDESK_BINDING_CONTEXT`) to a binding whose `tmux_session`, `channel_id`,
+  provider and owner match the run, then the session's single live pane. A
+  wrapper pane process (Codex `node`) is never signalled; its one native
+  `codex` child is. The agent must end in `-e2e`; Herdr and pipe cells are
+  refused. dcserver, the tmux server and the harness itself are protected.
+- Before any send, the newest runtime binding of the cell's session must name
+  `--channel-id` and the target mailbox must have no busy reason. The mode
+  turns off the pre-scenario force-cancel reset, which tears down an idle tmux
+  session.
+- Hold: the E2E worker roles forbid shell commands, so Claude keeps the turn
+  running with a fixed chain of `Read` calls after the early marker. Codex has
+  only the shell command; on `codex-tui` it answers the early marker as its
+  final answer, and the run fails before any kill (`provider not observed
+  mid-turn`).
+- Kill: the identity is first read once the hold prompt's early marker is in
+  the provider inflight row with a tool running (`provider_hold_observed`) and
+  the mailbox is busy. Right before `SIGKILL` it is read again; any change of
+  pid, start time, cmdline, parent, pane or binding refuses without a signal.
+  The turn's inflight row is also read again: it must still be this turn, hold
+  the early marker without the final one, and have no committed terminal
+  delivery. A delivery-only busy mailbox does not license the kill.
+- Verdicts (`midturn_kill.capabilities` in the report): `provider_killed`,
+  `turn_settled` (two polls in a row with a readable idle mailbox, empty queue
+  files and no live processing status as any message's current text, within
+  300 s; a first idle poll at the deadline is not enough),
+  `pre_kill_output_delivered` (the early marker in a provider-bot body within
+  30 s of settlement; otherwise the run fails before the follow-up is sent),
+  `next_turn_new_provider` (a fresh marker answered by the provider bot after
+  the follow-up, by a process other than the killed pid/start time). Each
+  failing capability fails its own step, so the run cannot pass with one.
+
 Health waits parse the JSON payload, not just HTTP 2xx. By default a run is
 considered ready only when the health body is healthy (`status: healthy`, `ok`
 not false, `fully_recovered` not false, and no unallowed degraded reasons). A
@@ -343,6 +410,26 @@ only the status and the `ok`/`degraded` flags, never `fully_recovered` or an
 unlisted degraded reason. A failed `launchctl kickstart` fails the step. Other
 bodies keep polling until timeout and then fail with the last health summary.
 
+`/api/health/detail.boot_incarnation` is a random id generated once per dcserver
+process (the public body does not carry it). A restart step reads it before the
+kickstart and passes only when health returns with a different value; an
+unchanged value fails the step as `restart not observed`, and a missing value is
+unevaluable before any kickstart. Herdr restarts and the observe-only `verify`
+use the same comparison; `verify` falls back to the uptime inference only when
+either side lacks the field.
+
+Unknown channels, including other cells, still fail default strict readiness.
+Public health probes request `/api/health/detail` for an Unknown waiver only
+when a `turn_presence_unknown` reason actually matches an explicit allowlist.
+That one detail body supplies the entire readiness decision; public and detail
+facts are never combined. Waiving Unknown requires complete, matching group and
+channel evidence proving every Unknown channel is outside the tested target.
+The target channel is never waived, regardless of provider, and missing,
+malformed, ambiguous, or inconsistent evidence is never waived. Herdr applies
+the same attribution check to its existing detail probe. For public probes,
+other explicit reason waivers retain public-only readiness; counter and idle
+checks can independently require detail.
+
 After every executed scenario, the driver also asserts the tested cell's
 mailbox is idle via `/api/health/detail`: `agent_turn_status=idle`,
 `queue_depth=0`, no cancel token, no inflight state, no active user message, no
@@ -351,7 +438,8 @@ tested provider/channel's on-disk pending queue and queued placeholder files
 under the runtime root are empty.
 
 Scenario steps can also run an explicit `assert_health` probe. The probe reads
-`/api/health` and, when counter caps are requested, `/api/health/detail`; it can
+`/api/health` and, for counter caps or a matching explicit Unknown waiver,
+`/api/health/detail`; it can
 require `status: healthy`, forbid degraded reason substrings such as
 `global_active_counter_out_of_bounds`, and cap `global_active` /
 `global_finalizing`. Destructive scenarios use this after the tested turn has

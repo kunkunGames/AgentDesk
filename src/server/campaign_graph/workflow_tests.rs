@@ -1034,7 +1034,10 @@ async fn workflow_goal_completion_waits_for_cleanup_then_skips_unpublished_suffi
         let sql = format!(
             "INSERT INTO auto_queue_run_cleanup_tasks(run_ids,{field}) VALUES('{{}}','{{\"retained\":true}}') RETURNING id"
         );
-        let cleanup: i64 = sqlx::query_scalar(&sql).fetch_one(&pool).await.unwrap();
+        let cleanup: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert!(
             !workflow::store::complete(&pool, &campaign.id, &finish_key)
                 .await
@@ -1043,7 +1046,7 @@ async fn workflow_goal_completion_waits_for_cleanup_then_skips_unpublished_suffi
         );
         let sql = format!("SELECT {field} FROM auto_queue_run_cleanup_tasks WHERE id=$1");
         assert_eq!(
-            sqlx::query_scalar::<_, Value>(&sql)
+            sqlx::query_scalar::<_, Value>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(cleanup)
                 .fetch_one(&pool)
                 .await
@@ -1070,7 +1073,7 @@ async fn workflow_goal_completion_waits_for_cleanup_then_skips_unpublished_suffi
         let sql = format!(
             "INSERT INTO auto_queue_run_cleanup_tasks(run_ids,{field}) VALUES('{{}}',$1) RETURNING id"
         );
-        let cleanup: i64 = sqlx::query_scalar(&sql)
+        let cleanup: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&invalid)
             .fetch_one(&pool)
             .await
@@ -1083,7 +1086,7 @@ async fn workflow_goal_completion_waits_for_cleanup_then_skips_unpublished_suffi
         );
         let sql = format!("SELECT {field} FROM auto_queue_run_cleanup_tasks WHERE id=$1");
         assert_eq!(
-            sqlx::query_scalar::<_, Value>(&sql)
+            sqlx::query_scalar::<_, Value>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(cleanup)
                 .fetch_one(&pool)
                 .await

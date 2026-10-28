@@ -1,5 +1,16 @@
 //! Tui session launch.
 
+#[cfg(unix)]
+pub(in crate::services::codex) mod first_input;
+pub(super) mod launch_policy;
+#[cfg(unix)]
+pub(super) use launch_policy::{
+    preflight_codex_tui_turn_with_policy, prepare_codex_herdr_launch,
+    prepare_codex_tui_incarnation_with_policy, tui_preflight_with_policy,
+};
+#[cfg(unix)]
+pub(crate) use launch_policy::{successor_hooks_ready, validate_herdr_fresh_argv};
+
 use super::*;
 use crate::services::tui_prompt_dedupe::binding_context::PreparedIncarnation;
 
@@ -38,13 +49,7 @@ pub(crate) fn tui_preflight(
     options: &CodexLaunchOptions,
     resume_root: Option<&std::path::Path>,
 ) -> Result<&'static str, CodexTuiLaunchRefused> {
-    let policy = crate::services::codex_tui::canary::launch_policy(tmux, channel)
-        .map_err(CodexTuiLaunchRefused::SourceModeInvalid)?;
-    if policy != "verified" {
-        return Ok(policy);
-    }
-    verified_eligibility(options, resume_root)?;
-    Ok(policy)
+    tui_preflight_with_policy(tmux, channel, options, resume_root, false)
 }
 
 /// A warm incarnation keeps its verified policy when the next launch mode changes.
@@ -151,7 +156,7 @@ fn codex_tui_home(
     (home, unpinned)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(super) fn prepare_codex_tui_incarnation(
     tmux: &str,
     channel: Option<u64>,
@@ -159,26 +164,10 @@ pub(super) fn prepare_codex_tui_incarnation(
     overlay: &crate::services::provider_auth_profile::ProviderAuthOverlay,
     resume_root: Option<&std::path::Path>,
 ) -> Result<PreparedIncarnation, CodexTuiLaunchRefused> {
-    if crate::services::herdr_launch::herdr_configured_for_tui_launch(channel) {
-        return Err(CodexTuiLaunchRefused::HerdrNotAdmitted);
-    }
-    let policy = tui_preflight(tmux, channel, options, resume_root)?;
-    use sha2::{Digest, Sha256};
-    let digest = format!("sha256:{:x}", Sha256::digest(options.prompt.as_bytes()));
-    PreparedIncarnation::prepare_pinned(
-        "codex",
-        tmux,
-        channel,
-        options.resume_session_id.as_deref(),
-        options.resume_session_id.is_some(),
-        codex_tui_home(overlay).0.map(|home| home.join("sessions")),
-        (Some(digest), Some(policy.to_owned())),
-    )
-    .map_err(CodexTuiLaunchRefused::PreparationUnavailable)
+    prepare_codex_tui_incarnation_with_policy(tmux, channel, options, overlay, resume_root, false)
 }
 
-/// Verified panes cannot use legacy warm input; prepare only the new incarnation.
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub(super) fn preflight_codex_tui_turn(
     tmux: &str,
     channel: Option<u64>,
@@ -187,35 +176,9 @@ pub(super) fn preflight_codex_tui_turn(
     existing: (bool, bool),
     overlay: &crate::services::provider_auth_profile::ProviderAuthOverlay,
 ) -> Result<(Option<PreparedIncarnation>, Option<PathBuf>), CodexTuiLaunchRefused> {
-    let exact = selection.candidate_count == 1
-        && selection.resume
-        && selection.requested_session_id == selection.selected_session_id
-        && options.resume_session_id.as_deref() == selection.resume_session_id()
-        && selection
-            .resume_session_id()
-            .is_some_and(exact_codex_resume_id);
-    let resume_root = exact
-        .then(|| codex_tui_home(overlay).0.map(|home| home.join("sessions")))
-        .flatten();
-    let policy = tui_preflight(tmux, channel, options, resume_root.as_deref())?;
-    if policy != "verified" {
-        return Ok((None, resume_root));
-    }
-    if !existing.1 && selection.requested_session_id.is_some() && resume_root.is_none() {
-        return Err(CodexTuiLaunchRefused::ResumeUnavailable);
-    }
-    if existing.0 && !existing.1 && resume_root.is_none() {
-        return Err(CodexTuiLaunchRefused::UnprovedPane);
-    }
-    let prepared =
-        prepare_codex_tui_incarnation(tmux, channel, options, overlay, resume_root.as_deref())?;
-    #[cfg(test)]
-    BEFORE_PANE_EFFECT.with_borrow_mut(|slot| {
-        if let Some(effect) = slot.take() {
-            effect();
-        }
-    });
-    Ok((Some(prepared), resume_root))
+    preflight_codex_tui_turn_with_policy(
+        tmux, channel, options, selection, existing, overlay, false,
+    )
 }
 
 #[cfg(all(test, unix))]
@@ -252,144 +215,8 @@ fn prepare_codex_tui_launch_script(
     )
 }
 
-/// Publish markers and script after the driver completes its cleanup.
 #[cfg(unix)]
-pub(super) fn publish_codex_tui_launch_script(
-    tmux_session_name: &str,
-    session_id: Option<&str>,
-    prompt: &str,
-    launch_options: &CodexLaunchOptions,
-    report: (Option<u64>, Option<ProviderKind>),
-    warm_followup_enabled: bool,
-    launch: (
-        &crate::services::provider_auth_profile::ProviderAuthOverlay,
-        PreparedIncarnation,
-    ),
-) -> Result<CodexTuiLaunchScript, String> {
-    let (report_channel_id, report_provider) = report;
-    use crate::services::herdr_launch::{HERDR_NOT_ADMITTED, herdr_configured_for_tui_launch};
-    // Refused before any launch I/O; a Herdr channel never gets a tmux session.
-    if herdr_configured_for_tui_launch(report_channel_id) {
-        return Err(HERDR_NOT_ADMITTED.to_string());
-    }
-    let (auth_overlay, prepared) = launch;
-    let policy = prepared
-        .context
-        .source_policy
-        .as_deref()
-        .ok_or("missing launch policy")?;
-    write_tmux_owner_marker(tmux_session_name)?;
-    crate::services::tmux_common::write_tmux_runtime_kind_marker(
-        tmux_session_name,
-        crate::services::agent_protocol::RuntimeHandoffKind::CodexTui,
-    )?;
-    let owner_path = tmux_owner_path(tmux_session_name);
-
-    let script_path = crate::services::tmux_common::session_temp_path(tmux_session_name, "sh");
-    // The auth profile decides the child's home; an unpinned one is exported only with hooks.
-    let (codex_home, unpinned) = codex_tui_home(auth_overlay);
-    let resolution = resolve_codex_binary();
-    let codex_bin = resolution
-        .resolved_path
-        .clone()
-        .ok_or_else(|| "Codex CLI not found".to_string())?;
-    let mut env_lines = build_tmux_launch_env_lines(
-        resolution.exec_path.as_deref(),
-        report_channel_id,
-        report_provider,
-    );
-    env_lines
-        .push_str(&crate::services::provider_auth_profile::overlay_shell_env_lines(auth_overlay));
-    env_lines.push_str(&prepared.env_lines());
-    env_lines.push_str(&format!(
-        "export AGENTDESK_CODEX_DIRECT_TUI_SOURCE_MODE={}\n",
-        shell_escape(policy)
-    ));
-    let mut args = build_codex_tui_args(launch_options);
-    let hooks_enabled = codex_direct_tui_hook_overrides_enabled();
-    let hooks_injected = hooks_enabled
-        && {
-            let capability = crate::services::claude_tui::hook_bundle::codex_hook_capability(
-                crate::services::claude_tui::hook_bundle::probe_codex_cli_version_with_path(
-                    &codex_bin,
-                    resolution.exec_path.as_deref(),
-                )
-                .as_deref(),
-                codex_resume_supports_hook_trust_bypass(&codex_bin, &resolution),
-            );
-            if !capability.hooks_available() {
-                tracing::warn!(
-                    codex_bin,
-                    trust_hash = ?capability.trust_hash,
-                    "Codex resume does not advertise --dangerously-bypass-hook-trust; launching without hook relays"
-                );
-            }
-            add_codex_tui_hooks(&mut args, capability, || {
-                prepare_codex_tui_hook_overrides(
-                    tmux_session_name,
-                    session_id,
-                    &codex_bin,
-                    resolution.exec_path.as_deref(),
-                )
-            })
-        };
-    if policy == "verified"
-        && !hooks_injected
-        && (hooks_enabled
-            || !launch_options
-                .resume_session_id
-                .as_deref()
-                .is_some_and(exact_codex_resume_id))
-    {
-        return Err(CodexTuiLaunchRefused::HooksUnavailable.to_string());
-    }
-    if !hooks_injected {
-        tracing::info!(
-            tmux_session_name,
-            "Codex direct TUI session hook overrides not injected; using rollout transcript tail for relay"
-        );
-    }
-    if unpinned
-        && (hooks_injected || policy == "verified")
-        && let Some(home) = &codex_home
-    {
-        // Verified sources must use the recorded home, including resumes without hooks.
-        env_lines.push_str(&format!(
-            "export CODEX_HOME={}\n",
-            shell_escape(&home.to_string_lossy())
-        ));
-    }
-    let script_content = render_codex_tui_tmux_script(&env_lines, &codex_bin, &args);
-    let rollout_modified_since = std::time::SystemTime::now();
-
-    std::fs::write(&script_path, &script_content)
-        .map_err(|e| format!("Failed to write Codex TUI launch script: {}", e))?;
-    if warm_followup_enabled {
-        crate::services::codex_tui::warm_followup::write_codex_tui_launch_options_evidence(
-            tmux_session_name,
-            launch_options,
-        )?;
-    }
-    // The launch's tail holds this until it returns.
-    let handoff = crate::services::tui_prompt_dedupe::reserve_discord_handoff(
-        ProviderKind::Codex.as_str(),
-        tmux_session_name,
-        prompt,
-    );
-    crate::services::tui_prompt_dedupe::record_discord_originated_prompt(
-        ProviderKind::Codex.as_str(),
-        tmux_session_name,
-        prompt,
-    );
-    Ok(CodexTuiLaunchScript {
-        prepared,
-        script_path,
-        owner_path,
-        rollout_modified_since,
-        handoff,
-    })
-}
-
+pub(super) use first_input::publish_codex_tui_launch_script;
 /// Why a Codex Herdr launch is refused, judged from reads before its Pending row.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,52 +280,6 @@ pub(super) fn codex_herdr_home(
         Some(home) => Some(PathBuf::from(home)),
         None => crate::services::codex_tui::rollout_tail::default_codex_home(),
     }
-}
-
-/// The Herdr pane command of one prepared incarnation: no prompt in the argv, `--no-daemon`,
-/// hooks and an exported home, with the Herdr pane variables unset right before the exec.
-#[cfg(unix)]
-pub(super) fn prepare_codex_herdr_launch(
-    prepared: &PreparedIncarnation,
-    launchable: &CodexHerdrLaunchable,
-    launch_options: &CodexLaunchOptions,
-    auth_overlay: &crate::services::provider_auth_profile::ProviderAuthOverlay,
-    home: &std::path::Path,
-) -> Result<crate::services::herdr_launch::HerdrLaunchCommand, String> {
-    use crate::services::herdr_launch::{HerdrLaunchCommand, unset_herdr_env_before_exec};
-    let logical = prepared.context.tmux_session.as_str();
-    let (codex_bin, exec_path) = (
-        &launchable.codex_bin,
-        launchable.resolution.exec_path.as_deref(),
-    );
-    let channel = prepared.context.channel_id;
-    let mut env_lines = build_tmux_launch_env_lines(exec_path, channel, Some(ProviderKind::Codex));
-    env_lines
-        .push_str(&crate::services::provider_auth_profile::overlay_shell_env_lines(auth_overlay));
-    env_lines.push_str(&prepared.env_lines());
-    env_lines.push_str(&format!(
-        "export AGENTDESK_CODEX_DIRECT_TUI_SOURCE_MODE={}\nexport CODEX_HOME={}\n",
-        shell_escape(launchable.policy),
-        shell_escape(&home.to_string_lossy())
-    ));
-    let mut args = codex_tui_option_args(launch_options);
-    args.insert(0, "--no-daemon".to_string());
-    let overrides = prepare_codex_tui_hook_overrides(logical, None, codex_bin, exec_path);
-    if overrides.is_empty() {
-        return Err("codex herdr launch: no hook overrides".into());
-    }
-    append_codex_config_overrides(&mut args, overrides);
-    insert_codex_resume_option_before_other_options(&mut args, "--dangerously-bypass-hook-trust");
-    let script = render_codex_tui_tmux_script(&env_lines, codex_bin, &args);
-    let script = unset_herdr_env_before_exec(&script)?;
-    let path = crate::services::tmux_common::session_temp_path(logical, "sh");
-    std::fs::write(&path, script)
-        .map_err(|error| format!("Failed to write Codex Herdr launch script: {error}"))?;
-    let cwd = launch_options.cwd.as_deref().map(PathBuf::from);
-    Ok(HerdrLaunchCommand {
-        cwd: cwd.ok_or("codex herdr launch: no working directory")?,
-        command: format!("bash {}", shell_escape(&path)),
-    })
 }
 
 fn codex_resume_supports_hook_trust_bypass(

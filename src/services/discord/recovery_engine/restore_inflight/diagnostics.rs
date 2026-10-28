@@ -1,20 +1,5 @@
-//! Recovery-snapshot and attempt diagnostics, emitted in the scan's original order.
+//! Recovery attempt diagnostics, emitted in the scan's original order.
 use super::{ChannelId, ProviderKind, emit_recovery_quality_event, inflight, resolve_role_binding};
-
-pub(super) fn observe_restore_inflight_snapshot(
-    provider: &ProviderKind,
-    states: &[inflight::InflightTurnState],
-    boot_elapsed: std::time::Duration,
-) {
-    let current_generation = super::super::runtime_store::process_generation();
-    tracing::info!(provider = %provider.as_str(), snapshot_rows = states.len(), boot_elapsed_ms = boot_elapsed.as_millis(), "restore_inflight snapshot loaded");
-    for state in states
-        .iter()
-        .filter(|state| state.born_generation != 0 && state.born_generation == current_generation)
-    {
-        tracing::warn!(provider = %provider.as_str(), channel_id = state.channel_id, user_msg_id = state.user_msg_id, born_generation = state.born_generation, current_generation, boot_elapsed_ms = boot_elapsed.as_millis(), "restore_inflight snapshot contains a row authored by the running process");
-    }
-}
 
 pub(super) fn emit_recovery_fired(
     provider: &ProviderKind,

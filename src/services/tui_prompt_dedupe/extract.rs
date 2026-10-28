@@ -1,5 +1,6 @@
 use super::observation::PromptObservationEffect;
 use super::*;
+use crate::services::tui_input::human_frame;
 
 pub fn extract_prompt_from_hook_payload(payload: &Value) -> Option<String> {
     for key in [
@@ -37,7 +38,7 @@ pub fn extract_codex_rollout_user_prompt_with_entry_id(
     {
         return None;
     }
-    if is_codex_shell_command_record(payload) {
+    if is_codex_shell_command_record(payload) || is_codex_context_record(payload) {
         return None;
     }
     let prompt = reject_synthetic_tui_user_prompt(extract_message_content_text(payload)?)?;
@@ -56,15 +57,28 @@ pub fn extract_codex_rollout_user_prompt_with_evidence(
 /// Codex records a `!cmd` run as a user message whose every item is the shell's; typed text
 /// with the same body names `user.text` (or nothing, on older writers) and stays an input.
 fn is_codex_shell_command_record(payload: &Value) -> bool {
-    payload
+    codex_content_item_kinds(payload)
+        .is_some_and(|mut kinds| kinds.all(|kind| kind == Some("shell.user_command")))
+}
+
+/// Codex writes its AGENTS.md instructions and environment as a user message before the prompt.
+/// Named item kinds decide; a writer that names none is known by the exact text shape.
+pub(crate) fn is_codex_context_record(payload: &Value) -> bool {
+    const CONTEXT: [&str; 2] = ["agents_md.instructions", "environments.environment_context"];
+    let text = extract_message_content_text(payload).unwrap_or_default();
+    let context = match codex_content_item_kinds(payload) {
+        Some(mut kinds) => kinds.all(|kind| kind.is_some_and(|kind| CONTEXT.contains(&kind))),
+        None => is_codex_agents_md_prompt(&text),
+    };
+    context || is_environment_context_prompt(&text)
+}
+
+fn codex_content_item_kinds(payload: &Value) -> Option<impl Iterator<Item = Option<&str>>> {
+    let kinds = payload
         .pointer("/internal_chat_message_metadata_passthrough/content_item_kinds")
         .and_then(Value::as_array)
-        .is_some_and(|kinds| {
-            !kinds.is_empty()
-                && kinds
-                    .iter()
-                    .all(|kind| kind.as_str() == Some("shell.user_command"))
-        })
+        .filter(|kinds| !kinds.is_empty())?;
+    Some(kinds.iter().map(Value::as_str))
 }
 
 fn extract_codex_rollout_entry_id(json: &Value, payload: &Value) -> Option<String> {
@@ -175,11 +189,19 @@ pub fn extract_qwen_jsonl_user_prompt(json: &Value) -> Option<String> {
 /// (`tmux_watcher/prompt_observe.rs`) submits `join("")` / `join(" ")` /
 /// `join("\n")` variants of one block, so a line-anchored check would miss the
 /// collapsed ones (codex #3527). Scan the WHOLE string: find `[User: `, then any
-/// following `(ID: <digits>)]` (author may itself contain parens).
+/// following `(ID: <digits>)]` (author may itself contain parens). A v1 header counts only as a
+/// new turn's; input pasted into a running turn is settled by the injected-input ledger.
 pub(super) fn is_discord_relayed_user_prompt(prompt: &str) -> bool {
     let Some(user_at) = prompt.find("[User: ") else {
         return false;
     };
+    let header = &prompt[user_at..];
+    if let Some((header, _)) = human_frame::parse(header) {
+        return header.mode == human_frame::Mode::New;
+    }
+    if human_frame::opens_inject(header) {
+        return false;
+    }
     let mut tail = &prompt[user_at + "[User: ".len()..];
     while let Some(id_at) = tail.find("(ID: ") {
         let after_id = &tail[id_at + "(ID: ".len()..];
@@ -261,7 +283,11 @@ fn strip_leading_tui_response_chrome(input: &str) -> &str {
     }
 }
 
+/// A running turn's input keeps its header, so its body is never read as a machine event.
 fn strip_leading_user_author_prefix(text: &str) -> Option<&str> {
+    if human_frame::opens_inject(text) {
+        return None;
+    }
     let rest = text.strip_prefix("[User: ")?;
     let close = rest.find(']')?;
     Some(rest[close + 1..].trim_start())
@@ -545,6 +571,7 @@ pub(super) struct Observation<'a> {
     pub(super) distinct_handoff_input: bool,
     pub(super) effect: PromptObservationEffect,
     pub(super) observed_at: DateTime<Utc>,
+    pub(super) hosted_source: Option<&'a hosted_source::HostedSourcePin>,
 }
 
 pub(super) enum Decision {
@@ -606,6 +633,7 @@ pub(super) fn decide_observation(
                 entry_id,
                 native_turn,
                 observation.observed_at,
+                observation.hosted_source,
             )
         {
             return Decision::Parked;

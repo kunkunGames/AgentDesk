@@ -7,6 +7,66 @@ pub(crate) const SESSION_TRANSITION_LOCK_WAIT_TIMEOUT: std::time::Duration =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionTransitionBusy;
 
+/// The exact channel lock held by a claim; a borrowed guard cannot release its caller's lock.
+pub(crate) struct SessionTransitionLease<'a> {
+    shared: &'a SharedData,
+    channel: ChannelId,
+    hold: TransitionHold<'a>,
+}
+
+enum TransitionHold<'a> {
+    Owned(tokio::sync::OwnedMutexGuard<()>),
+    Borrowed(&'a tokio::sync::OwnedMutexGuard<()>),
+}
+
+impl<'a> SessionTransitionLease<'a> {
+    pub(crate) fn try_acquire(
+        shared: &'a SharedData,
+        channel: ChannelId,
+    ) -> Result<Self, SessionTransitionBusy> {
+        let guard = shared
+            .session_transition_lock(channel)
+            .try_lock_owned()
+            .map_err(|_| SessionTransitionBusy)?;
+        Ok(Self {
+            shared,
+            channel,
+            hold: TransitionHold::Owned(guard),
+        })
+    }
+
+    pub(crate) fn borrow(
+        shared: &'a SharedData,
+        channel: ChannelId,
+        guard: &'a tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<Self, SessionTransitionBusy> {
+        if !Arc::ptr_eq(
+            tokio::sync::OwnedMutexGuard::mutex(guard),
+            &shared.session_transition_lock(channel),
+        ) {
+            return Err(SessionTransitionBusy);
+        }
+        Ok(Self {
+            shared,
+            channel,
+            hold: TransitionHold::Borrowed(guard),
+        })
+    }
+
+    pub(crate) fn matches(&self, shared: &SharedData, channel: ChannelId) -> bool {
+        let guard = match &self.hold {
+            TransitionHold::Owned(guard) => guard,
+            TransitionHold::Borrowed(guard) => guard,
+        };
+        std::ptr::eq(self.shared, shared)
+            && self.channel == channel
+            && Arc::ptr_eq(
+                tokio::sync::OwnedMutexGuard::mutex(guard),
+                &shared.session_transition_lock(channel),
+            )
+    }
+}
+
 impl SharedData {
     pub(crate) fn session_transition_lock(
         &self,
@@ -54,43 +114,44 @@ impl SharedData {
     }
 }
 
-/// Dormant queue barrier only: B2 population sealing is still required before Move/start.
-#[allow(dead_code)]
-pub(crate) struct FrozenQueueTransition {
-    pub(crate) closing: Arc<super::input_runtime::fence::Closing>,
-    _session: tokio::sync::OwnedMutexGuard<()>,
-}
-impl SharedData {
-    #[allow(dead_code)]
-    pub(crate) async fn freeze_legacy_queue(
-        &self,
-        closing: Arc<super::input_runtime::fence::Closing>,
-        persistence: crate::services::turn_orchestrator::QueuePersistenceContext,
-    ) -> Result<FrozenQueueTransition, super::input_runtime::fence::Failure> {
-        closing.drain().await;
-        let channel = ChannelId::new(closing.channel());
-        let session = self
-            .acquire_session_transition(channel)
-            .await
-            .map_err(|_| super::input_runtime::fence::Failure::Busy)?;
-        // An epoch that cannot advance refuses before the queue freeze persists anything.
-        closing.check_freeze()?;
-        let ack = self
-            .mailbox(channel)
-            .freeze_input(closing.clone(), persistence)
-            .await?;
-        closing.freeze(ack)?;
-        Ok(FrozenQueueTransition {
-            closing,
-            _session: session,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::services::discord::make_shared_data_for_tests;
+
+    #[test]
+    fn transition_lease_excludes_a_second_claim_until_it_is_dropped() {
+        let shared = make_shared_data_for_tests();
+        let channel = ChannelId::new(4_794_903);
+        let lease = SessionTransitionLease::try_acquire(&shared, channel).unwrap();
+        assert!(lease.matches(&shared, channel));
+        assert!(SessionTransitionLease::try_acquire(&shared, channel).is_err());
+        drop(lease);
+        assert!(SessionTransitionLease::try_acquire(&shared, channel).is_ok());
+    }
+
+    #[test]
+    fn borrowed_transition_requires_the_same_channel_and_shared_owner() {
+        let shared = make_shared_data_for_tests();
+        let other = make_shared_data_for_tests();
+        let channel = ChannelId::new(4_794_904);
+        let guard = shared
+            .session_transition_lock(channel)
+            .try_lock_owned()
+            .unwrap();
+        let lease = SessionTransitionLease::borrow(&shared, channel, &guard).unwrap();
+        assert!(lease.matches(&shared, channel));
+        assert!(!lease.matches(&other, channel));
+        assert!(!lease.matches(&shared, ChannelId::new(4_794_905)));
+        assert!(SessionTransitionLease::borrow(&other, channel, &guard).is_err());
+        assert!(
+            SessionTransitionLease::borrow(&shared, ChannelId::new(4_794_905), &guard).is_err()
+        );
+        drop(lease);
+        assert!(SessionTransitionLease::try_acquire(&shared, channel).is_err());
+        drop(guard);
+        assert!(SessionTransitionLease::try_acquire(&shared, channel).is_ok());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn transition_acquisition_times_out_after_contract_window() {
@@ -140,88 +201,5 @@ mod tests {
         assert!(!shared.session_transition_locks.contains_key(&old_channel));
         assert!(shared.session_transition_locks.contains_key(&live_channel));
         assert!(shared.session_transition_locks.contains_key(&new_channel));
-    }
-}
-
-#[cfg(test)]
-mod input_fence_contract_tests {
-    use super::super::input_runtime::fence::{Failure, Gate, Mode};
-    use super::*;
-    use crate::services::provider::ProviderKind;
-    use crate::services::turn_orchestrator::QueuePersistenceContext;
-
-    struct Env(Option<std::ffi::OsString>);
-    impl Drop for Env {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.0 {
-                    Some(old) => std::env::set_var("AGENTDESK_ROOT_DIR", old),
-                    None => std::env::remove_var("AGENTDESK_ROOT_DIR"),
-                }
-            }
-        }
-    }
-    #[test]
-    fn input_fence_session_helper_drains_before_lock_and_holds_lock_through_ack() {
-        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
-        let root = tempfile::tempdir().unwrap();
-        let _env = Env(std::env::var_os("AGENTDESK_ROOT_DIR"));
-        unsafe {
-            std::env::set_var("AGENTDESK_ROOT_DIR", root.path());
-        }
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let shared = super::super::make_shared_data_for_tests();
-                let channel = ChannelId::new(6_325_401);
-                let gate = Gate::protect(ProviderKind::Claude, channel.get()).unwrap();
-                let permit = gate.admit().unwrap();
-                let closing = Arc::new(gate.close().unwrap());
-                let lock = shared.session_transition_lock(channel);
-                let work = shared.freeze_legacy_queue(
-                    closing.clone(),
-                    QueuePersistenceContext::new(&ProviderKind::Claude, "session", None),
-                );
-                tokio::pin!(work);
-                assert!(futures::poll!(work.as_mut()).is_pending());
-                let held = lock
-                    .try_lock()
-                    .expect("drain must not hold the session mutex");
-                assert!(
-                    !root.path().join("runtime/discord_inflight").exists(),
-                    "no prepare before drain"
-                );
-                drop(held);
-                drop(permit);
-                let transition = work.await.unwrap();
-                assert_eq!(transition.closing.channel(), channel.get());
-                assert_eq!(gate.mode(), Mode::Frozen);
-                assert!(lock.try_lock().is_err(), "owned guard survives the ACK");
-                drop(transition);
-                assert!(lock.try_lock().is_ok());
-            });
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn input_fence_session_guard_timeout_never_prepares() {
-        let shared = super::super::make_shared_data_for_tests();
-        let channel = ChannelId::new(6_325_402);
-        let gate = Gate::protect(ProviderKind::Claude, channel.get()).unwrap();
-        let closing = Arc::new(gate.close().unwrap());
-        let held = shared.session_transition_lock(channel).lock_owned().await;
-        let work = shared.freeze_legacy_queue(
-            closing,
-            QueuePersistenceContext::new(&ProviderKind::Claude, "session", None),
-        );
-        tokio::pin!(work);
-        assert!(futures::poll!(work.as_mut()).is_pending());
-        assert!(shared.mailboxes.peek(channel).is_none());
-        tokio::time::advance(SESSION_TRANSITION_LOCK_WAIT_TIMEOUT).await;
-        assert!(matches!(work.await, Err(Failure::Busy)));
-        assert!(shared.mailboxes.peek(channel).is_none());
-        assert_eq!(gate.mode(), Mode::Closing);
-        drop(held);
     }
 }

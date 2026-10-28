@@ -1,5 +1,5 @@
-//! Text `!clear` through the real dispatcher into a recording Discord: a refused clear answers
-//! with the reason `/clear` shows and changes nothing; one that runs answers only its notice.
+//! Text `!clear` through the real dispatcher into a recording Discord: the clear runs whatever
+//! host the channel's session has, and answers its notice once, with a warning line at most.
 #![cfg(unix)]
 
 use std::sync::Arc;
@@ -12,9 +12,7 @@ use serenity::{ChannelId, MessageId, UserId};
 use crate::db::session_transcripts::{ChannelClearFence, observe_channel_clear_fence_once};
 use crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui;
 use crate::services::discord::admin_host_guard::tests::{Recorder, process};
-use crate::services::discord::commands::{
-    SESSION_CLEARED_RESPONSE, SoftClearNotifyMode, clear_channel_session_state,
-};
+use crate::services::discord::commands::SESSION_CLEARED_RESPONSE;
 use crate::services::discord::host_defer_gate::tests::{Case, ScriptedTmux, map_channel, postgres};
 use crate::services::discord::host_teardown_gate::test_support::{Stored, channel_key, shared_on};
 use crate::services::discord::tui_prompt_relay::relay_e2e::discord_mock;
@@ -22,7 +20,6 @@ use crate::services::discord::{Data, Error, SharedData};
 use crate::services::provider::ProviderKind;
 use crate::services::turn_orchestrator::{Intervention, InterventionMode, QueuePersistenceContext};
 
-const REFUSED: &str = "세션을 초기화하지 못했어요: ";
 const NODE: &str = "mac-mini";
 
 /// A Claude runtime on PostgreSQL whose Discord REST calls land in a recorder, over a scripted tmux.
@@ -43,7 +40,6 @@ struct Rig {
 struct Channel {
     id: ChannelId,
     tmux_name: String,
-    queued: MessageId,
     alive: Arc<AtomicBool>,
     fence: ChannelClearFence,
 }
@@ -69,7 +65,6 @@ impl Rig {
             provider: ProviderKind::Claude,
             voice_receiver: crate::voice::VoiceReceiver::from_voice_config(&voice_config),
             voice_config,
-            ingress_shadow: None,
         };
         Self {
             api,
@@ -111,7 +106,6 @@ impl Rig {
         Channel {
             id,
             tmux_name,
-            queued,
             alive,
             fence,
         }
@@ -135,14 +129,8 @@ impl Rig {
         message.author.name = "clear-test".into();
         message.content = "!clear".into();
         self.api.take();
-        let handled = Box::pin(super::handle_text_command_with_uploads(
-            &self.ctx,
-            &message,
-            &self.data,
-            channel.id,
-            "!clear",
-            &[],
-            &mut None,
+        let handled = Box::pin(super::handle_text_command(
+            &self.ctx, &message, &self.data, channel.id, "!clear",
         ))
         .await;
         let posted = format!("POST /api/v10/channels/{}/messages ", channel.id.get());
@@ -159,48 +147,6 @@ impl Rig {
             )
         });
         (handled, replies.collect())
-    }
-
-    /// What `/clear` shows for the same channel: the error its poise handler answers with.
-    async fn slash_error(&self, channel: &Channel) -> String {
-        let (provider, quiet) = (ProviderKind::Claude, SoftClearNotifyMode::Suppress);
-        let http = &self.ctx.http;
-        let clear =
-            clear_channel_session_state(http, &self.shared, &provider, channel.id, "/clear", quiet);
-        clear.await.expect_err("the same clear refuses").to_string()
-    }
-
-    /// A refused clear left the session, its queue, its process and its transcript alone, and
-    /// neither started a turn nor queued its own text.
-    async fn assert_untouched(&self, channel: &Channel, what: &str) {
-        let core = self.shared.core.lock().await;
-        let session = &core.sessions[&channel.id];
-        assert_eq!(
-            session.session_id.as_deref(),
-            Some("sid"),
-            "{what}: selector kept"
-        );
-        assert!(!session.cleared, "{what}: not cleared");
-        drop(core);
-        let mailbox = self.shared.mailbox(channel.id).snapshot().await;
-        assert!(mailbox.cancel_token.is_none(), "{what}: no turn started");
-        let queued: Vec<_> = mailbox
-            .intervention_queue
-            .iter()
-            .map(|q| q.message_id)
-            .collect();
-        assert_eq!(queued, [channel.queued], "{what}: the queue is as it was");
-        assert!(
-            channel.alive.load(Ordering::SeqCst),
-            "{what}: the process is kept"
-        );
-        assert_eq!(
-            self.tmux.take_calls(),
-            Vec::<String>::new(),
-            "{what}: no tmux call"
-        );
-        let fence = self.clear_fence(channel.id).await;
-        assert_eq!(fence, channel.fence, "{what}: no transcript boundary");
     }
 
     async fn finish(self, channels: &[&Channel]) {
@@ -233,30 +179,47 @@ fn input(id: MessageId) -> Intervention {
     }
 }
 
-/// The refused command is handled, answers once with the reason and never the cleared notice.
-fn assert_refusal_answered(
+/// The fixture's one queued input.
+const WAITING: &str = "대기 메시지 1건을 비웠어요.";
+
+/// The clear ran: one reply, the notice with `warning` under it, and the session, its queue and
+/// its transcript boundary are reset.
+async fn assert_cleared(
+    rig: &Rig,
+    channel: &Channel,
     (handled, replies): (Result<bool, Error>, Vec<(u64, String)>),
-    what: &str,
-) -> String {
-    let handled = handled.unwrap_or_else(|error| panic!("{what}: the refusal left as {error}"));
-    assert!(handled, "{what}: the command is consumed");
-    let cleared = replies
-        .iter()
-        .any(|(_, text)| text == SESSION_CLEARED_RESPONSE);
-    assert!(
-        !cleared,
-        "{what}: no cleared notice for a refused clear: {replies:?}"
+    warning: Option<&str>,
+) {
+    assert!(handled.expect("the clear ran"), "the command is consumed");
+    let notice = format!("{SESSION_CLEARED_RESPONSE}\n{WAITING}");
+    let notice = match warning {
+        Some(warning) => format!("{notice}\n⚠️ {warning}"),
+        None => notice,
+    };
+    assert_eq!(replies, [(channel.id.get() + 2, notice)], "one notice");
+    let core = rig.shared.core.lock().await;
+    let session = &core.sessions[&channel.id];
+    assert_eq!(
+        (session.session_id.as_deref(), session.cleared),
+        (None, true)
     );
-    assert_eq!(replies.len(), 1, "{what}: one answer: {replies:?}");
-    let reason = replies[0].1.clone();
-    assert!(reason.starts_with(REFUSED), "{what}: {reason}");
-    reason
+    drop(core);
+    let mailbox = rig.shared.mailbox(channel.id).snapshot().await;
+    assert!(
+        mailbox.intervention_queue.is_empty(),
+        "the queue is discarded"
+    );
+    assert_ne!(
+        rig.clear_fence(channel.id).await,
+        channel.fence,
+        "the boundary moved"
+    );
 }
 
-// A Herdr-configured channel whose O still reads rotated-away sources refuses `!clear`; the text
-// command answers that reason instead of failing silently.
+// A Herdr-configured channel whose O still reads rotated-away sources used to refuse `!clear`;
+// the clear now runs, leaves tmux alone and warns that its Herdr end was not confirmed.
 #[tokio::test]
-async fn a_herdr_refused_text_clear_answers_the_channel_with_its_reason_pg() {
+async fn a_text_clear_of_an_unsettled_herdr_channel_runs_and_warns_pg() {
     let rig = Rig::start().await;
     let channel = rig.channel(1_479_671_305_340_101_000, Stored::Hosted).await;
     let id = channel.id.get();
@@ -273,37 +236,32 @@ async fn a_herdr_refused_text_clear_answers_the_channel_with_its_reason_pg() {
     let _writer = crate::services::herdr_launch::force_writer_accepts(Some(true));
     let _unsettled = crate::services::tui_o::writer::host::force_unsettled_for_test(Some(59));
 
-    let reason = assert_refusal_answered(rig.text_clear(&channel).await, "herdr");
+    let cleared = rig.text_clear(&channel).await;
 
+    let unconfirmed = "이전 세션 프로세스의 종료를 확인하지 못했어요.";
+    assert_cleared(&rig, &channel, cleared, Some(unconfirmed)).await;
     assert!(
-        reason.contains("herdr clear refused: rotation_unsettled(59)"),
-        "{reason}"
+        channel.alive.load(Ordering::SeqCst),
+        "no tmux reset on a Herdr channel"
     );
-    rig.assert_untouched(&channel, "herdr").await;
-    assert_eq!(
-        reason,
-        rig.slash_error(&channel).await,
-        "as `/clear` shows it"
-    );
+    assert_eq!(rig.tmux.take_calls(), Vec::<String>::new(), "no tmux call");
     rig.finish(&[&channel]).await;
 }
 
-// A tmux channel whose stored host is not a confirmed legacy one refuses `!clear` through main's
-// managed-reset guard; the text command answers that reason too.
+// A tmux channel whose stored host is not a confirmed legacy one used to refuse `!clear`; the
+// clear now runs and ends the tmux session.
 #[tokio::test]
-async fn a_tmux_refused_text_clear_answers_the_channel_with_its_reason_pg() {
+async fn a_text_clear_of_an_unconfirmed_tmux_host_runs_and_ends_the_session_pg() {
     let rig = Rig::start().await;
     let _switch = crate::services::turn_host::force_switch_for_test(Some(false));
     let channel = rig.channel(1_479_671_305_340_102_000, Stored::Future).await;
 
-    let reason = assert_refusal_answered(rig.text_clear(&channel).await, "tmux");
+    let cleared = rig.text_clear(&channel).await;
 
-    assert!(reason.contains(&channel.tmux_name), "{reason}");
-    rig.assert_untouched(&channel, "tmux").await;
-    assert_eq!(
-        reason,
-        rig.slash_error(&channel).await,
-        "as `/clear` shows it"
+    assert_cleared(&rig, &channel, cleared, None).await;
+    assert!(
+        !channel.alive.load(Ordering::SeqCst),
+        "the session's process ends"
     );
     rig.finish(&[&channel]).await;
 }
@@ -318,7 +276,7 @@ async fn a_text_clear_that_runs_answers_only_the_cleared_notice_pg() {
     let (handled, replies) = rig.text_clear(&channel).await;
 
     assert!(handled.expect("the clear ran"), "the command is consumed");
-    let notice = SESSION_CLEARED_RESPONSE.to_string();
+    let notice = format!("{SESSION_CLEARED_RESPONSE}\n{WAITING}");
     assert_eq!(
         replies,
         [(channel.id.get() + 2, notice)],
@@ -339,3 +297,6 @@ async fn a_text_clear_that_runs_answers_only_the_cleared_notice_pg() {
     assert_ne!(fence, channel.fence, "the transcript boundary moved");
     rig.finish(&[&channel]).await;
 }
+
+#[path = "clear_http_overlap_tests.rs"]
+mod http_overlap;

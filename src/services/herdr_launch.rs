@@ -1,7 +1,12 @@
-//! Herdr launch preparation for one channel's canonical session row. No launch selects
-//! Herdr yet. The order is fixed: Pending commit, `.host_kind` and nonce markers, then one create.
-//! A Pending pane left without evidence is only probed again, never recreated.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Herdr launch preparation for one channel's canonical row.
+//! Durable Pending and user-default grants precede create; retries only probe.
+
+pub(crate) mod policy;
+mod prepared;
+pub(crate) mod retired_hold;
+
+use crate::config::session_hosts::EndpointMode;
+use policy::{LaunchGrantStore, PermitFuture, UserDefaultCreateRequest};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,7 +22,7 @@ use crate::db::dispatched_sessions::hosted_execution::{
     ExpectedExecution, HostedCasOutcome, HostedExecution, HostedLocation, HostedLookup,
     HostedLookupKey, HostedObservation, HostedOwner, HostedRecord, HostedState, SourceRef,
     install_pending_pg, load_hosted_execution_pg, record_launch_evidence_pg,
-    record_pane_location_pg,
+    record_pane_location_pg, retire_pg,
 };
 use crate::services::agent_protocol::RuntimeHandoffKind;
 use crate::services::claude_tui::hook_output_guard::configured_claude_projects_root;
@@ -81,7 +86,7 @@ fn writer_accepts(channel: u64) -> bool {
 }
 
 /// A configured Herdr endpoint; no field falls back to a default socket, session or pane.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HerdrLaunchEndpoint {
     pub execution_node: String,
     pub config_key: String,
@@ -109,7 +114,7 @@ pub(crate) enum HerdrCreateOutcome {
     NotSent(String),
     /// The server may have acted without a usable reply: lost ACK, wrong id, remote error.
     Indeterminate(String),
-    /// The pane exists but its command was not confirmed to start (cwd mismatch, E7 lost,
+    /// The pane exists but its command was not confirmed to start (cwd mismatch, policy lost,
     /// unclear input reply). The pane is recorded; nothing is resent or killed.
     CreatedUnconfirmed {
         pane_id: String,
@@ -130,6 +135,25 @@ pub(crate) struct EvidenceProbe {
 
 /// Herdr calls of one launch. They run on a blocking thread with no DB transaction open.
 pub(crate) trait HerdrLaunchHost: Send + Sync {
+    fn mode(&self, endpoint: &HerdrLaunchEndpoint) -> EndpointMode;
+    fn create_permit<'a>(&'a self, _: &'a HerdrLaunchEndpoint) -> PermitFuture<'a> {
+        Box::pin(async { Err("user-default policy source unavailable".into()) })
+    }
+    fn remember_grant(
+        &self,
+        _: crate::services::session_host::policy::permit::LaunchAdmissionGrant,
+    ) {
+    }
+    fn grants(&self) -> &dyn LaunchGrantStore {
+        &policy::UNINTRODUCED
+    }
+    fn current_witness(&self, _: &HerdrLaunchEndpoint) -> Result<ServerWitness, String> {
+        Err("peer unavailable".into())
+    }
+    fn create_user_default(&self, _: &UserDefaultCreateRequest) -> HerdrCreateOutcome {
+        policy::unsupported_create()
+    }
+
     /// A fresh read of the endpoint server's effective resume-on-restore; never cached.
     fn restore_resume(&self, endpoint: &HerdrLaunchEndpoint) -> RestoreResume;
     fn create(&self, request: &HerdrCreateRequest) -> HerdrCreateOutcome;
@@ -177,12 +201,16 @@ pub(crate) enum HerdrLaunchError {
     Row(String),
     /// The row holds a Pending, Bound or unreadable record (`None`).
     Occupied(Option<HostedState>),
+    /// The retired predecessor's input hold is not confirmed durably absent.
+    RetiredHold(String),
     Prepare(String),
+    /// The grant store cannot establish whether authority was recorded.
+    GrantUnavailable(String),
     /// Pending did not commit; nothing was created.
     Pending(String),
-    /// Pending committed without its markers; nothing was created.
+    /// Pending committed without its markers; nothing was created, so its Pending is retired.
     Marker(String),
-    /// The create request never left; Pending stays for reconcile.
+    /// The create request never left, so no pane can exist and its Pending is retired.
     NotSent(String),
     /// The Pending pane still has no launch evidence; nothing was created, typed or removed.
     Evidence(EvidenceGap),
@@ -301,22 +329,72 @@ pub(crate) async fn launch_herdr_session(
     host: Arc<dyn HerdrLaunchHost>,
 ) -> Result<HerdrLaunchOutcome, HerdrLaunchError> {
     let endpoint = admit(launch.endpoint.as_ref())?.clone();
-    let Some(admitted) = restore_off_witness(&host, &endpoint).await else {
-        return Err(HerdrLaunchError::Unsupported(RESTORE_RESUME_NOT_OFF));
+    let mode = host.mode(&endpoint);
+    let admitted = if mode == EndpointMode::LegacyDedicated {
+        Some(
+            restore_off_witness(&host, &endpoint)
+                .await
+                .ok_or(HerdrLaunchError::Unsupported(RESTORE_RESUME_NOT_OFF))?,
+        )
+    } else {
+        None
     };
     let owner = launch.owner;
     let observed = load_row(pool, &owner).await?;
     if let HostedRecord::Known(record) = &observed.record
         && let Some(location) = awaiting_evidence(record, &endpoint)
     {
-        return probe_again(pool, &owner, record, location, admitted, &host).await;
+        let witness = match admitted {
+            Some(witness) => witness,
+            None => {
+                let grant = host
+                    .grants()
+                    .load(&endpoint, &record.execution_nonce)
+                    .await
+                    .map_err(HerdrLaunchError::GrantUnavailable)?
+                    .ok_or_else(|| HerdrLaunchError::Prepare("pending grant missing".into()))?;
+                let granted = grant
+                    .witness_for(&endpoint, &record.execution_nonce)
+                    .map_err(|why| HerdrLaunchError::Prepare(format!("{why:?}")))?
+                    .clone();
+                let endpoint = endpoint.clone();
+                let current =
+                    on_blocking_thread(&host, move |host| host.current_witness(&endpoint)).await;
+                if current != Some(Ok(granted.clone())) {
+                    return Err(HerdrLaunchError::Prepare(
+                        "pending grant witness changed".into(),
+                    ));
+                }
+                host.remember_grant(grant);
+                granted
+            }
+        };
+        return probe_again(pool, &owner, record, location, witness, &host).await;
     }
     match &observed.record {
         HostedRecord::Legacy => {}
-        HostedRecord::Known(record) if record.state == HostedState::Retired => {}
+        HostedRecord::Known(record) if record.state == HostedState::Retired => {
+            #[cfg(unix)]
+            {
+                retired_hold::before_fresh(&owner, record).await?;
+            }
+            #[cfg(not(unix))]
+            return Err(HerdrLaunchError::RetiredHold(
+                "retired hold durability is unavailable on this platform".into(),
+            ));
+        }
         HostedRecord::Known(record) => return Err(HerdrLaunchError::Occupied(Some(record.state))),
         HostedRecord::Unknown(_) => return Err(HerdrLaunchError::Occupied(None)),
     }
+    let create_permit = if mode == EndpointMode::UserDefault {
+        Some(
+            host.create_permit(&endpoint)
+                .await
+                .map_err(HerdrLaunchError::Prepare)?,
+        )
+    } else {
+        None
+    };
     let expected_native = launch.expected_native_session_id.as_deref();
     let incarnation = herdr_incarnation(
         &owner,
@@ -343,26 +421,31 @@ pub(crate) async fn launch_herdr_session(
     }
     // The new execution is held until a reconcile admits it; an earlier admission ends here.
     crate::services::tui_prompt_dedupe::install_herdr_execution(&owner.logical_key, &nonce);
-    record_herdr_host_marker(&owner.logical_key).map_err(HerdrLaunchError::Marker)?;
+    let markers = record_herdr_host_marker(&owner.logical_key).map_err(HerdrLaunchError::Marker);
     // Hooks and binding events name an execution by its spawn nonce marker, as on tmux.
     #[cfg(unix)]
-    crate::services::discord::stamp_spawn_markers(&owner.logical_key, Some(&incarnation))
-        .map_err(|error| HerdrLaunchError::Marker(error.to_string()))?;
+    let markers = markers.and_then(|()| {
+        crate::services::discord::stamp_spawn_markers(&owner.logical_key, Some(&incarnation))
+            .map_err(|error| HerdrLaunchError::Marker(error.to_string()))
+    });
+    if let Err(error) = markers {
+        return Err(retire_unsent(pool, &owner, &nonce, error).await);
+    }
 
-    // Read again right before create: the first reading may predate a reconnect or reload.
-    let Some(restore_off_witness) = restore_off_witness(&host, &endpoint).await else {
-        return Err(HerdrLaunchError::NotSent(RESTORE_RESUME_NOT_OFF.into()));
-    };
-    let witness = restore_off_witness.clone();
-    let request = HerdrCreateRequest {
-        endpoint: endpoint.clone(),
-        label: owner.logical_key.clone(),
-        cwd: command.cwd,
-        command: command.command,
-        restore_off_witness,
-    };
-    let sent_at = SystemTime::now();
-    let created = on_blocking_thread(&host, move |host| host.create(&request)).await;
+    let prepared::Created {
+        witness,
+        created,
+        sent_at,
+    } = prepared::create(
+        pool,
+        &owner,
+        &nonce,
+        &endpoint,
+        command,
+        &host,
+        create_permit,
+    )
+    .await?;
     let indeterminate = |detail: String| HerdrLaunchOutcome::Indeterminate {
         execution_nonce: nonce.clone(),
         detail,
@@ -381,7 +464,10 @@ pub(crate) async fn launch_herdr_session(
         ) => {
             return Ok(indeterminate("create reply named no pane".into()));
         }
-        Some(HerdrCreateOutcome::NotSent(detail)) => return Err(HerdrLaunchError::NotSent(detail)),
+        Some(HerdrCreateOutcome::NotSent(detail)) => {
+            let error = HerdrLaunchError::NotSent(detail);
+            return Err(retire_unsent(pool, &owner, &nonce, error).await);
+        }
         Some(HerdrCreateOutcome::Indeterminate(detail)) => return Ok(indeterminate(detail)),
         None => return Ok(indeterminate("create call did not return".into())),
     };
@@ -428,6 +514,35 @@ pub(crate) async fn launch_herdr_session(
     })
 }
 
+/// Retires this launch's own Pending once no create left for it; a row that moved on or names a
+/// pane is kept. Returns `error`, the failure that proved nothing was sent.
+async fn retire_unsent(
+    pool: &PgPool,
+    owner: &HostedOwner,
+    nonce: &str,
+    error: HerdrLaunchError,
+) -> HerdrLaunchError {
+    let retired = match load_row(pool, owner).await {
+        Ok(current) => match &current.record {
+            HostedRecord::Known(record)
+                if record.state == HostedState::Pending
+                    && record.location.is_none()
+                    && record.expected.is_none() =>
+            {
+                retire_pg(pool, &current, owner, nonce)
+                    .await
+                    .map_err(|e| format!("{e:?}"))
+            }
+            _ => Err("the row is no longer this launch's unplaced Pending".into()),
+        },
+        Err(row) => Err(format!("{row:?}")),
+    };
+    if retired != Ok(HostedCasOutcome::Written) {
+        tracing::warn!(nonce, ?retired, ?error, "herdr launch: unsent Pending kept");
+    }
+    error
+}
+
 /// The pane of a Pending that has one on this endpoint but no evidence: its provider was
 /// not confirmed when it was launched.
 fn awaiting_evidence<'a>(
@@ -442,7 +557,7 @@ fn awaiting_evidence<'a>(
     (record.state == HostedState::Pending && record.expected.is_none() && here).then_some(location)
 }
 
-/// Probes the recorded pane again under the server E7 admitted now. No process that started
+/// Probes the recorded pane under the selected policy's exact witness. No process that started
 /// before the execution's binding context existed can carry its nonce.
 async fn probe_again(
     pool: &PgPool,
@@ -573,4 +688,4 @@ fn record_herdr_host_marker(logical_key: &str) -> Result<(), String> {
 
 #[cfg(test)]
 #[path = "herdr_launch_tests.rs"]
-mod tests;
+pub(crate) mod tests;

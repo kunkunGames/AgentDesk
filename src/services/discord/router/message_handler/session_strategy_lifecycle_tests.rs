@@ -1703,7 +1703,7 @@ fn verified_codex_queued_followup_waits_before_dequeue_with_unknown_permission()
     .unwrap();
     let nonce_path = crate::services::tmux_common::session_temp_path(&tmux, "spawn_nonce");
     std::fs::create_dir_all(std::path::Path::new(&nonce_path).parent().unwrap()).unwrap();
-    std::fs::write(nonce_path, &prepared.context.execution_nonce).unwrap();
+    std::fs::write(&nonce_path, &prepared.context.execution_nonce).unwrap();
     dedupe::register_tmux_channel(&tmux, channel.get());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1749,6 +1749,7 @@ fn verified_codex_queued_followup_waits_before_dequeue_with_unknown_permission()
             .await;
         let before = crate::services::discord::mailbox_snapshot(&shared, channel).await;
         assert!(hosted_tui_promote_readiness_blocked(&shared, &provider, channel).await);
+        assert!(hosted_tui_promote_readiness_blocked(&shared, &provider, channel).await);
         let after = crate::services::discord::mailbox_snapshot(&shared, channel).await;
         assert_eq!(after.intervention_queue.len(), 1);
         assert_eq!(
@@ -1759,6 +1760,12 @@ fn verified_codex_queued_followup_waits_before_dequeue_with_unknown_permission()
             after.intervention_queue[0].text,
             before.intervention_queue[0].text
         );
+        dedupe::reset_state_for_tests();
+        std::fs::remove_file(&nonce_path).unwrap();
+        assert!(!hosted_tui_promote_readiness_blocked(&shared, &provider, channel).await);
+        std::fs::write(&nonce_path, &prepared.context.execution_nonce).unwrap();
+        dedupe::register_tmux_channel(&tmux, channel.get());
+        assert!(hosted_tui_promote_readiness_blocked(&shared, &provider, channel).await);
     });
     dedupe::reset_state_for_tests();
 }

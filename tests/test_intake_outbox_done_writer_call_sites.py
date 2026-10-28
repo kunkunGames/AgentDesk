@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from scripts import check_durable_frontier_writer_call_sites as durable
+from scripts import skip_pin_registry
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/check_intake_outbox_done_writer_call_sites.py"
 PROOF_OWNER = "src/services/discord/runtime_bootstrap/intake_delivery_reconciler.rs"
-SETTLEMENT_OWNER = "src/services/discord/turn_bridge/intake_settlement.rs"
 SPEC = importlib.util.spec_from_file_location("intake_outbox_done_writer_guard", SCRIPT)
 guard = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(guard)
@@ -22,7 +26,6 @@ SPEC.loader.exec_module(guard)
 CURRENT_EXPECTED_CALL_SITES = {
     "mark_done": {"src/services/cluster/intake_worker.rs": 1},
     "mark_done_from_delivery_proof": {PROOF_OWNER: 1},
-    "settle_intake_done_from_receipt": {SETTLEMENT_OWNER: 1},
 }
 
 
@@ -95,23 +98,6 @@ class DiscriminationTests(unittest.TestCase):
                 "    )\n"
                 "}\n",
             )
-        write(
-            root,
-            SETTLEMENT_OWNER,
-            "use crate::db::intake_outbox_delivery_proof::{\n"
-            "    IntakeSettlementSource, settle_intake_done_from_receipt,\n"
-            "};\n"
-            "async fn settle_with_lock_timeout(\n"
-            "    pool: &sqlx::PgPool,\n"
-            "    outbox_id: i64,\n"
-            "    source: IntakeSettlementSource,\n"
-            ") -> Result<bool, sqlx::Error> {\n"
-            "    let mut transaction = pool.begin().await?;\n"
-            "    let won = settle_intake_done_from_receipt(&mut transaction, outbox_id, source).await?;\n"
-            "    transaction.commit().await?;\n"
-            "    Ok(won)\n"
-            "}\n",
-        )
         return root
 
     def run_guard(self, root: Path, expected=None) -> tuple[bool, str]:
@@ -126,9 +112,12 @@ class DiscriminationTests(unittest.TestCase):
         copied_script = root / "scripts/check_intake_outbox_done_writer_call_sites.py"
         copied_script.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(SCRIPT, copied_script)
+        for name in ("test_only_module_skip_pin.py", "skip_pin_registry.py", "registration_fragments.py"):
+            shutil.copy2(ROOT / "scripts" / name, root / "scripts" / name)
+        shutil.copytree(ROOT / "scripts/test_only_module_skip_pin.d", root / "scripts/test_only_module_skip_pin.d")
         shutil.copy2(
-            ROOT / "scripts/test_only_module_skip_pin.py",
-            root / "scripts/test_only_module_skip_pin.py",
+            ROOT / "scripts/test_only_module_skip_pin_paths.py",
+            root / "scripts/test_only_module_skip_pin_paths.py",
         )
         shutil.copy2(
             ROOT / "scripts/generate_inventory_docs.py",
@@ -200,39 +189,12 @@ class DiscriminationTests(unittest.TestCase):
             root,
             "src/services/cluster/test_only.rs",
             "#[cfg(test)]\nmod tests { fn probe() { crate::db::intake_outbox::mark_done(); } }\n"
-            "#[cfg(all(test, unix))]\nfn probe_all() { crate::db::intake_outbox::mark_done(); }\n"
-            "#[cfg(test)]\nmod settlement_tests {\n"
-            "    async fn probe() {\n"
-            "        crate::db::intake_outbox_delivery_proof::settle_intake_done_from_receipt(\n"
-            "            &mut transaction, id, IntakeSettlementSource::Committed,\n"
-            "        ).await;\n"
-            "    }\n"
-            "}\n",
+            "#[cfg(all(test, unix))]\nfn probe_all() { crate::db::intake_outbox::mark_done(); }\n",
+
         )
         ok, message = self.run_guard(root)
         self.assertTrue(ok, message)
 
-    def test_receipt_writer_wiring_deletion_is_fail_closed(self):
-        root = self.fixture()
-        write(
-            root,
-            SETTLEMENT_OWNER,
-            "use crate::db::intake_outbox_delivery_proof::{\n"
-            "    IntakeSettlementSource, settle_intake_done_from_receipt,\n"
-            "};\n"
-            "async fn settle_with_lock_timeout(\n"
-            "    pool: &sqlx::PgPool,\n"
-            "    outbox_id: i64,\n"
-            "    source: IntakeSettlementSource,\n"
-            ") -> Result<bool, sqlx::Error> {\n"
-            "    let mut transaction = pool.begin().await?;\n"
-            "    transaction.commit().await?;\n"
-            "    Ok(false)\n"
-            "}\n",
-        )
-        ok, message = self.run_guard(root)
-        self.assertFalse(ok)
-        self.assertIn("settle_intake_done_from_receipt: call site GONE", message)
 
     def test_production_possible_cfg_forms_are_scanned(self):
         for body in (
@@ -263,7 +225,7 @@ class DiscriminationTests(unittest.TestCase):
         root = self.fixture(proof=True)
         ok, message = self.run_guard(root)
         self.assertTrue(ok, message)
-        self.assertIn("3 production sites across 3 symbols", message)
+        self.assertIn("2 production sites across 2 symbols", message)
 
         write(
             root,
@@ -394,7 +356,7 @@ class TransportLegacyInventoryTests(unittest.TestCase):
             ],
         )
         self.assertEqual(tick.count("admission_action("), 3)
-        self.assert_effect_release_sites(tick)
+        self.assertEqual(tick.count("release_cancelled_claim(pool, &row, claim_owner)"), 3)
         self.assertIn("let owner_shutdown = runtime.shared.restart.shutdown_reader();", tick)
         self.assertIn("shared.restart.intake_worker_lifecycle.admission_is_fenced()", tick)
         self.assertIn("owner_shutdown.load(Ordering::Acquire)", tick)
@@ -426,58 +388,6 @@ class TransportLegacyInventoryTests(unittest.TestCase):
             self.assertEqual(self.RAW_STORE.findall(caller), [], caller_file)
             stores += len(expected)
         self.assertEqual((len(rows), stores), (7, 10))
-
-    def assert_effect_release_sites(self, tick: str) -> None:
-        release = "release_cancelled_claim(pool, &row, claim_owner)"
-        held = re.escape(release) + r"\.await\?;\s*return Ok\(TickOutcome::Held\);"
-        admit = re.compile(
-            r"let input_permit = match input_channel \{\s*"
-            r"Some\(channel\) => match crate::services::discord::input_runtime::fence::effect::admit\("
-            r"\s*&input_provider,\s*channel,\s*\) \{\s*"
-            r"Ok\(permit\) => permit,\s*Err\(_\) => \{\s*" + held +
-            r"\s*\}\s*\},\s*None => None,\s*\};"
-        )
-        mode = re.compile(
-            r"test_executor::checkpoint\(test_executor::Checkpoint::PreAccept\)\.await;\s*"
-            r"if input_channel\.is_some_and\(\|channel\| \{\s*"
-            r"crate::services::discord::input_runtime::fence::lookup\(&input_provider, channel\)"
-            r"\s*\.is_some_and\(\|gate\| gate\.mode\(\) != "
-            r"crate::services::discord::input_runtime::fence::Mode::LegacyOpen\)"
-            r"\s*\}\) \{\s*" + held + r"\s*\}"
-        )
-        spans = []
-        for pattern in (admit, mode):
-            matches = list(pattern.finditer(tick))
-            self.assertEqual(len(matches), 1, "each held release stays in its admission guard")
-            spans.append(matches[0].span())
-        accept = tick.index("mark_accepted(")
-        self.assertLess(spans[0][1], spans[1][0])
-        self.assertLess(spans[1][1], accept)
-        self.assertEqual(tick.count(release), 5)
-        legacy = tick
-        for start, end in reversed(spans):
-            legacy = legacy[:start] + legacy[end:]
-        self.assertEqual(legacy.count(release), 3)
-
-    def test_effect_release_inventory_rejects_guard_drift(self):
-        tick = self.item(self.WORKER.read_text(encoding="utf-8"),
-                         "pub(crate) async fn run_intake_worker_tick(")
-        mutations = {
-            "admit succeeds": ("Err(_) => {", "Ok(_) => {"),
-            "mode inverted": ("gate.mode() !=", "gate.mode() =="),
-            "wrong checkpoint": ("Checkpoint::PreAccept)", "Checkpoint::AfterClaim)"),
-            "accept before guards": ("let input_permit = match input_channel {",
-                                     "mark_accepted(pool, row.id, claim_owner).await?;\n"
-                                     "let input_permit = match input_channel {"),
-            "extra release": ("let input_permit = match input_channel {",
-                              "release_cancelled_claim(pool, &row, claim_owner).await?;\n"
-                              "let input_permit = match input_channel {"),
-        }
-        for name, (before, after) in mutations.items():
-            with self.subTest(name=name):
-                self.assertIn(before, tick)
-                with self.assertRaises(AssertionError):
-                    self.assert_effect_release_sites(tick.replace(before, after, 1))
 
     def assert_reader_surface(self, owner: str) -> None:
         """Audit every `impl ... ShutdownReader`; first-block-only was #5831 P1-1."""
@@ -526,6 +436,119 @@ class TransportLegacyInventoryTests(unittest.TestCase):
                     "struct ShutdownReader(pub(in crate::services) Arc<",
                 )
             )
+
+
+class SharedSkipRuleTests(unittest.TestCase):
+    def test_repository_skips_match_data_resolver_pin_and_basename_rule(self):
+        data = runpy.run_path(str(ROOT / "scripts/test_only_module_skip_pin_paths.py"))
+        self.assertNotIn("PINNED_BASENAME_TEST_FILES", data)
+        resolver = skip_pin_registry.load(ROOT).frozensets()[1]
+        self.assertLessEqual(data["PINNED_RESOLVER_TEST_ONLY_FILES"], resolver)
+        self.assertEqual(guard.PINNED_TEST_ONLY_MODULE_FILES, resolver)
+        basename = {
+            path.relative_to(ROOT).as_posix() for path in (ROOT / "src").rglob("*.rs")
+            if path.name == "tests.rs" or path.name.endswith("_tests.rs")
+        }
+        files, skips = guard._SKIP_PIN.validated_scan_files(
+            ROOT, guard.SCAN_ROOT, guard.is_test_file
+        )
+        self.assertEqual({path.relative_to(ROOT).as_posix() for path in skips}, basename | resolver)
+        self.assertEqual(len(skips), len(basename) + len(resolver))
+        self.assertTrue(set(files) - skips)
+
+    def test_basename_rule_is_exact(self):
+        for name in ("tests.rs", "a_tests.rs", "_tests.rs"):
+            self.assertTrue(guard.is_test_file(name), name)
+        for name in ("test.rs", "tests/mod.rs", "a_test.rs", "tests_pg.rs", "Tests.rs", "a_tests.RS"):
+            self.assertFalse(guard.is_test_file(name), name)
+        self.assertIs(guard.PINNED_TEST_ONLY_MODULE_FILES,
+                      guard._SKIP_PIN.PINNED_RESOLVER_TEST_ONLY_FILES)
+        self.assertFalse(hasattr(guard._SKIP_PIN, "PINNED_BASENAME_TEST_FILES"))
+
+    def run_both_skip_gates(self, root, pinned):
+        names = ("EXPECTED_CALL_SITES", "EXPECTED_RAW_ATOMIC_MUTATIONS",
+                 "EXPECTED_BARE_REFERENCES", "EXPECTED_PINNED_USE_ALIASES",
+                 "EXPECTED_DEFINITION_FILE_COUNTS")
+        expected = {name: {} for name in names}
+        expected["EXPECTED_CALL_SITES"] = {symbol: {} for symbol in durable.EXPECTED_CALL_SITES}
+        with patch.multiple(durable, **expected):
+            return (durable.check(root, pinned_test_only_files=pinned),
+                    guard.check(root, {}, pinned_test_only_files=pinned))
+
+    def test_new_basename_files_need_no_pin_change(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        write(root, "src/main.rs", "#[cfg(test)] mod new_tests;\nfn main() {}\n")
+        body = (
+            "fn probe() { crate::write_delivered_frontier(); "
+            "crate::db::intake_outbox::mark_done(); }\n"
+        )
+        for rel in ("src/new_tests.rs", "src/nested/tests.rs"):
+            write(root, rel, body)
+        before = (ROOT / "scripts/test_only_module_skip_pin.py").read_bytes()
+        for ok, message in self.run_both_skip_gates(root, frozenset()):
+            self.assertTrue(ok, message)
+        self.assertEqual(before, (ROOT / "scripts/test_only_module_skip_pin.py").read_bytes())
+
+    def test_production_mod_mounts_of_basename_files_fail_without_pin(self):
+        for declaration in (
+            "mod hidden_tests;",
+            '#[path="hidden_tests.rs"] mod helper;',
+            '#[cfg(not(test))] mod hidden_tests;',
+            '#[cfg(any(test, feature="x"))] mod hidden_tests;',
+        ):
+            with self.subTest(declaration=declaration):
+                root = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, root)
+                write(root, "src/main.rs", declaration + "\nfn main() {}\n")
+                write(root, "src/hidden_tests.rs", "pub fn probe() {}\n")
+                for ok, message in self.run_both_skip_gates(root, frozenset()):
+                    self.assertFalse(ok, message)
+                    self.assertIn("production module mounts basename test file", message)
+
+    def test_basename_classifier_widening_is_rejected(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        write(root, "src/main.rs", "fn main() {}\n")
+        write(root, "src/helper_test.rs", "")
+        with self.assertRaisesRegex(RuntimeError, "basename classifier differs"):
+            guard._SKIP_PIN.validated_scan_files(
+                root, guard.SCAN_ROOT, lambda name: name.endswith("_test.rs"), pinned_paths=()
+            )
+
+    def test_test_only_parents_and_nested_test_cfg_mounts_are_accepted(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        write(root, "src/main.rs", '#[cfg(test)] mod harness;\nfn main() {}\n'
+              '#[cfg(all(test, unix))] mod nested { #[path="../hidden_tests.rs"] mod helper; }\n')
+        write(root, "src/harness.rs", '#[path="hidden_tests.rs"] mod helper;\n')
+        write(root, "src/hidden_tests.rs", "fn probe() {}\n")
+        for ok, message in self.run_both_skip_gates(root, {"src/harness.rs"}):
+            self.assertTrue(ok, message)
+
+    def test_production_basename_mount_cannot_be_authorized_by_resolver_pin(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        write(root, "src/main.rs", "mod hidden_tests;\nfn main() {}\n")
+        write(root, "src/hidden_tests.rs", "pub fn probe() {}\n")
+        for ok, message in self.run_both_skip_gates(root, {"src/hidden_tests.rs"}):
+            self.assertFalse(ok, message)
+            self.assertIn("production module mounts basename test file", message)
+
+    def test_ungated_mount_of_imports_and_test_gated_modules_keeps_production_items_visible(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root)
+        write(root, "src/main.rs", "mod hidden_tests;\nfn main() {}\n")
+        gated = "use super::*;\n#[cfg(test)] mod tests { fn probe() {} }"
+        write(root, "src/hidden_tests.rs", gated)
+        for ok, message in self.run_both_skip_gates(root, frozenset()):
+            self.assertTrue(ok, message)
+        for tail in (" fn production() {}", "\nconst PRODUCTION: u8 = 1;"):
+            with self.subTest(tail=tail):
+                write(root, "src/hidden_tests.rs", gated + tail)
+                for ok, message in self.run_both_skip_gates(root, frozenset()):
+                    self.assertFalse(ok, message)
+                    self.assertIn("production module mounts basename test file", message)
 
 
 if __name__ == "__main__":

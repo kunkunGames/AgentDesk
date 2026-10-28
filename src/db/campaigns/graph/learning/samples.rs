@@ -106,7 +106,10 @@ pub async fn collect_family(pool: &PgPool, family: &str) -> Result<()> {
         AND {VERIFIED_NODES_SQL}
         AND NOT EXISTS(SELECT 1 FROM campaign_dag_samples sample WHERE sample.campaign_id=s.campaign_id)
         ORDER BY c.updated_at LIMIT 32");
-    let ids: Vec<(String, Value)> = sqlx::query_as(&query).bind(family).fetch_all(pool).await?;
+    let ids: Vec<(String, Value)> = sqlx::query_as(sqlx::AssertSqlSafe(query))
+        .bind(family)
+        .fetch_all(pool)
+        .await?;
     for (id, goal) in ids {
         collect(pool, &id, &serde_json::from_value(goal)?).await?;
     }

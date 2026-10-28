@@ -10,17 +10,19 @@ from collections import Counter
 from pathlib import Path
 try:
     from scripts import check_durable_frontier_writer_call_sites as classifier
+    from scripts import skip_pin_registry as registry
 except ModuleNotFoundError:
     import check_durable_frontier_writer_call_sites as classifier
+    import skip_pin_registry as registry
 
 D = "src/services/discord/"
 R = D + "runtime_bootstrap/boot_retirement"
 ENTRIES = {}
 # Boot activation sites are pinned per function so unrelated edits elsewhere in a file pass;
-# "*" pins the whole file: legacy_supervision.rs owns RETIRED, and a new writer there escapes SYMBOL.
+# "*" pins a whole file.
 PROTECTED = {
-    'src/cli/dcserver.rs': {'handle_dcserver': 'cd0fa633d7bbf6ed71ab6887cba145d5d2cc01e6255ed5668ea4173659b9cd66'},
-    'src/services/discord/runtime_bootstrap.rs': {'run_bot': 'de34ae33a679f5db0c88dc5a2446f992e0dd323dd2e296bc29876f0702458060'},
+    'src/cli/dcserver.rs': {'handle_dcserver': '903876d162c8f181cf0eb613702698f701c7863d99d690878ef91b8cfdeed1b8'},
+    'src/services/discord/runtime_bootstrap.rs': {'run_bot': '4f05e439ba7e24dcb602976cabb0532a859c7cfea7c34f5caeb94239b9f3855c'},
     'src/services/discord/inflight/removal/boot_reaper.rs': {
         'run_once': '6364c6e13da83bbf08092a6460de03dda10281c0af81b5f1293ab51b3ace9858',
         'prepare_before_reap': '9de0e7d478987fc0464a1753bee32171dc54a76cbebd4f8db4a7df6b47068f3e',
@@ -29,9 +31,10 @@ PROTECTED = {
         'reap_inflight_rows_after_preparation': 'f3fee466ddc3d3925b5bfee8805a6678875db72874f30c51a9a74fee38d693bd'},
     'src/services/discord/tui_direct_pending_start/turn_retirement.rs': {'confirm_at_boot': '835b358746ebb4b1dd99bf662b73923f4904b73ce0b973b9aea84fa1d128ad07'},
     'src/services/discord/runtime_bootstrap/o_writer_host.rs': {'adopted': '0fe2f48e1465b84da5a3b7155df25e012efc1510762c78a4c61ae55ea48f2a23'},
-    'src/services/discord/health/legacy_supervision.rs': {'*': '1c1497db24b104d698762e3d24c51e224acce622e0cc4255806b1d02dd55a4b3'},
-    'src/services/discord/health/snapshot.rs': {'build_health_snapshot_with_options': '0fc8cff1cbfee104a995a38aa89c6990e653b87802ffcf3fe904a98a19a3a6b0'}}
+    'src/services/discord/health/snapshot.rs': {'build_health_snapshot_with_options': '4730b977981e4e43ee409a37bb322d9820897c60f311e3134977bd2d3b1282cc'}}
 SYMBOL = re.compile(r"\b(?:Boot(?:Cohort|Slot|Publication|WorkOnce|Roster|Bot|Selection|Result|RetirementHealth)|boot_retirement|boot_status|install_process|wait_released|publish_with)\b")
+# The deleted RETIRED gate (#6325 23C): any production return of its owner or readers fails.
+RETIRED_GATE = re.compile(r"\b(?:legacy_supervision|legacy_retired|retired_in|RetiredForTest)\b")
 FN = re.compile(r"\bfn\s+(\w+)")
 
 def digest(code):
@@ -85,7 +88,9 @@ def audit(sources, entries=ENTRIES, protected=PROTECTED, skips=frozenset()):
             errors.append(f"{path}: unclassified primitive file")
         if path in entries or path in skips or path in tests:
             continue
-        pattern = SYMBOL if not ("RETIRED" in code and "legacy_supervision" in code) else re.compile(SYMBOL.pattern + r"|\bRETIRED\b")
+        if "/legacy_supervision" in path:
+            errors.append(f"{path}: deleted RETIRED owner restored")
+        pattern = re.compile(SYMBOL.pattern + "|" + RETIRED_GATE.pattern)
         for match in pattern.finditer(code):
             owners = FN.findall(code[:match.start()])
             line = code[:match.start()].count("\n") + 1
@@ -104,46 +109,21 @@ def check(root):
     names = "canonical_retired_production_writers boot_cohort_application_install_calls boot_barrier_application_wait_calls boot_publication_application_calls typed_completion_live_reaper_connections boot_health_endpoint_connections"
     return True, "B1_DORMANT=PASS\n" + "\n".join(name + "=0" for name in names.split()) + "\nactivation_ready=false"
 
-def sync_skips(root, promoted_paths=(), deleted_paths=()):
+def sync_skips(root, promoted_paths=(), deleted_paths=(), *, fragment=None):
+    """Validate basename mounts, then sync resolver fragments without rewriting legacy pins."""
     pin = classifier._SKIP_PIN
     files = pin._lexical_rust_files(root, Path("src"))
     basename = {p for p in files if classifier.is_test_file(p.name)}
     resolved = pin._INVENTORY.test_only_module_files(production_files=[p for p in files if p not in basename], all_files=files)
-    path = root / "scripts/test_only_module_skip_pin.py"
-    source = path.read_text()
-    actual = {p.relative_to(root).as_posix() for p in basename | resolved}
+    pin.validate_basename_mounts(files, basename, resolved)
+    measured = {p.relative_to(root).as_posix(): "resolver" for p in resolved}
+    prior = registry.load(root)
+    for path in basename:
+        rel = path.relative_to(root).as_posix()
+        if rel in prior.rows and prior.rows[rel].payload == "basename":
+            measured[rel] = "basename"
     existing = {p.relative_to(root).as_posix() for p in files}
-    promoted = set(promoted_paths)
-    deleted = set(deleted_paths)
-    for rel in sorted(deleted):
-        if (root / rel).exists() or (root / rel).is_symlink():
-            raise RuntimeError("deletion path still exists: " + rel)
-        if rel not in pin.PINNED_TEST_ONLY_MODULE_FILES:
-            raise RuntimeError("deletion is not pinned: " + rel)
-    for rel in sorted(promoted):
-        if rel not in existing:
-            raise RuntimeError("promotion path missing: " + rel)
-        if rel in actual:
-            raise RuntimeError("promotion remains test-only: " + rel)
-        if rel not in pin.PINNED_TEST_ONLY_MODULE_FILES:
-            raise RuntimeError("promotion is not pinned: " + rel)
-    if pin.PINNED_TEST_ONLY_MODULE_FILES - actual - promoted - deleted:
-        raise RuntimeError("refusing pin removal")
-    for rel in sorted(promoted | deleted):
-        pattern = r'(?m)^[ \t]*"' + re.escape(rel) + r'",\n'
-        source, count = re.subn(pattern, '', source)
-        if count != 1:
-            raise RuntimeError("removal pin is ambiguous: " + rel)
-    for name, paths in (("PINNED_BASENAME_TEST_FILES", basename), ("PINNED_RESOLVER_TEST_ONLY_FILES", resolved)):
-        measured = {p.relative_to(root).as_posix() for p in paths}
-        for rel in sorted(measured - pin.PINNED_TEST_ONLY_MODULE_FILES):
-            start = source.index(name + " =")
-            end = source.index("\n    }\n)", start)
-            directory = re.escape(Path(rel).parent.as_posix() + '/')
-            sibling = re.search(r'\n[ \t]*"' + directory + r'[^"/]+",', source[start:end])
-            at = start + sibling.start() if sibling else end
-            source = source[:at] + '\n        "' + rel + '",' + source[at:]
-    path.write_text(source)
+    return registry.sync(root, measured, existing, promoted_paths, fragment, deleted=deleted_paths)
 
 
 if __name__ == "__main__":
@@ -153,9 +133,13 @@ if __name__ == "__main__":
                             help='explicitly remove this existing production module from the skip pin')
         parser.add_argument('--remove-deleted', '--delete-pin', action='append', default=[], metavar='PATH',
                             help='explicitly remove this deleted file from the skip pin')
+        parser.add_argument('--fragment', metavar='NODE-ISSUE-SLICE',
+                            help='skip-pin fragment for new pins (default: one auto fragment per new path)')
         args = parser.parse_args(sys.argv[2:])
-        sync_skips(Path.cwd(), args.promote, args.remove_deleted)
-        sys.exit(0)
+        manual, written = sync_skips(Path.cwd(), args.promote, args.remove_deleted, fragment=args.fragment)
+        for line in (*(f"skip pin fragment written: {path}" for path in written), *manual):
+            print(line, file=sys.stderr if manual else sys.stdout)
+        sys.exit(1 if manual else 0)
     ok, report = check(Path.cwd())
     print(report)
     sys.exit(0 if ok else 1)

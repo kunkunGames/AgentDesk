@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::session_hosts::EndpointMode;
+
 use crate::services::session_host::model::{HostError, HostKind, HostLiveness, HostPresence};
 
 pub(crate) const HERDR_PROTOCOL: u32 = 22;
@@ -27,6 +29,7 @@ pub(crate) struct HerdrEndpoint {
     herdr_session: String,
     /// Directory of the dedicated server's own config; without it E7 never reads Off.
     herdr_home: Option<PathBuf>,
+    mode: EndpointMode,
 }
 
 impl HerdrEndpoint {
@@ -50,6 +53,7 @@ impl HerdrEndpoint {
             socket_path: socket_path.to_path_buf(),
             herdr_session: herdr_session.to_string(),
             herdr_home: None,
+            mode: EndpointMode::LegacyDedicated,
         })
     }
 
@@ -62,6 +66,14 @@ impl HerdrEndpoint {
             herdr_home: Some(herdr_home.to_path_buf()),
             ..self
         })
+    }
+
+    pub(crate) fn with_mode(self, mode: EndpointMode) -> Self {
+        Self { mode, ..self }
+    }
+
+    pub(crate) fn mode(&self) -> EndpointMode {
+        self.mode
     }
 
     pub(crate) fn execution_node(&self) -> &str {
@@ -161,6 +173,13 @@ pub(crate) enum HerdrReadSource {
     Detection,
 }
 
+/// A `pane.read` rendering other than Herdr's default `text`; only `Ansi` keeps SGR styling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HerdrReadFormat {
+    Ansi,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "method", content = "params")]
 pub(crate) enum HerdrRequest {
@@ -179,6 +198,8 @@ pub(crate) enum HerdrRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         lines: Option<u32>,
         strip_ansi: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        format: Option<HerdrReadFormat>,
     },
     #[serde(rename = "pane.close")]
     PaneClose { pane_id: String },

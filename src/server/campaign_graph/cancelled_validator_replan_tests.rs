@@ -208,7 +208,7 @@ async fn immutable_card_rejection(pool: &PgPool, fixture: &CancelledFixture, sta
     // Published card contracts cannot drift through a legal Kanban writer.
     // Assert the production boundary rather than fabricating a protected edit.
     let mut tx = pool.begin().await.unwrap();
-    let error = sqlx::query(statement)
+    let error = sqlx::query(sqlx::AssertSqlSafe(statement.to_string()))
         .bind(&card)
         .execute(&mut *tx)
         .await

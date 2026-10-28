@@ -168,6 +168,10 @@ impl ChannelMailboxState {
     ) -> Option<EnqueueRefusalReason> {
         let injected = super::injected_inputs::enqueue_refusal(self, intervention);
         injected
+            .or_else(|| {
+                super::clear_fence::refuses(self, intervention)
+                    .then_some(EnqueueRefusalReason::SupersededByClear)
+            })
             .or_else(|| active_turn_enqueue_refusal(self, intervention))
             .or_else(|| {
                 let sources = &intervention.source_message_ids;
@@ -197,19 +201,7 @@ impl ChannelMailboxHandle {
         persistence: QueuePersistenceContext,
         observed: Option<ClaimObservation>,
     ) -> EnqueueInterventionResult {
-        self.enqueue_observed_with_permit(intervention, persistence, observed, None)
-            .await
-    }
-
-    pub(crate) async fn enqueue_observed_with_permit(
-        &self,
-        intervention: Intervention,
-        persistence: QueuePersistenceContext,
-        observed: Option<ClaimObservation>,
-        input_permit: Option<crate::services::discord::input_runtime::fence::Permit>,
-    ) -> EnqueueInterventionResult {
         self.request(|reply| ChannelMailboxMsg::Enqueue {
-            input_permit,
             intervention,
             persistence,
             observed,

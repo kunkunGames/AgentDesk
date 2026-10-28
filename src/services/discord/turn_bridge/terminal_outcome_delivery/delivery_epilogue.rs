@@ -2,7 +2,6 @@
 
 use std::sync::{Arc, atomic::Ordering};
 
-use super::super::streaming_edit_text::TuiErrorClassification;
 use super::*;
 
 pub(super) enum DeliveryEpilogueMessage {
@@ -64,13 +63,22 @@ pub(super) async fn handle_delivery_epilogue(
     let watcher_delivery_pin = ctx.watcher_delivery_pin;
     let can_deliver_directly = gateway.can_deliver_directly();
     let inflight_generation = ctx.inflight_generation;
+    let waiting = ctx.claude_tui_followup_pre_submit_requeue_candidate
+        || ctx.claude_tui_busy_requeue_pending
+        || state.busy_requeue_outcome.is_some()
+        || super::completion_proof::waiting(state.inflight_state).is_some();
+    let input_confirmed = !waiting && super::completion_proof::input_confirmed(&provider, state.inflight_state, &full_response);
+    let projection_allowed = ctx.terminal_delivery_committed && (input_confirmed || (ctx.provider_failure && !waiting));
 
     let mut response_sent_offset = *state.response_sent_offset;
     let inflight_state = &mut *state.inflight_state;
     let terminal_full_replay_cleanup_msg_ids =
         &mut *state.terminal_full_replay_cleanup_msg_ids;
-    let mut bridge_should_emit_completion = *state.bridge_should_emit_completion;
-    let mut status_panel_terminal_committed = *state.status_panel_terminal_committed;
+    #[cfg(unix)]
+    let bridge_should_emit_completion;
+    #[cfg(not(unix))]
+    let bridge_should_emit_completion = *state.bridge_should_emit_completion;
+    let status_panel_terminal_committed;
     let busy_requeue_outcome = &mut *state.busy_requeue_outcome;
 
     match message {
@@ -80,6 +88,16 @@ pub(super) async fn handle_delivery_epilogue(
             inflight_state.response_sent_offset = response_sent_offset;
             inflight_state.terminal_delivery_committed = true;
             inflight_state.full_response = full_response.clone();
+            // The scheduled outcome is mirrored with the commit so a crash before the
+            // postlude record still settles this exact turn.
+            let scheduled_outcome = crate::services::scheduled_messages::turn_completion::classify(
+                &full_response,
+                ctx.transcript_terminal_error,
+                ctx.provider_failure,
+            );
+            inflight_state
+                .scheduled
+                .set_outcome(scheduled_outcome.filter(|_| !cancelled));
             let mirror_outcome =
                 crate::services::discord::inflight::save_inflight_state_if_identity_unchanged(
                     &mut *inflight_state,
@@ -153,7 +171,7 @@ pub(super) async fn handle_delivery_epilogue(
             // 0) is never a voice turn — voice turns carry a synthetic,
             // non-zero voice message id — so the voice-handoff completion
             // routing (all keyed on the user message id) does not apply.
-            if !ctx.already_receipted && let Some(user_msg_id) = user_msg_id {
+            if projection_allowed && !ctx.already_receipted && let Some(user_msg_id) = user_msg_id {
                 let pg_pool_for_handoff = shared_owned.pg_pool.as_ref();
                 let in_memory_handoff_agent_id = crate::voice::announce_meta::global_store()
                     .get_handoff(user_msg_id)
@@ -258,7 +276,7 @@ pub(super) async fn handle_delivery_epilogue(
         // the two gate sites.
         #[cfg(unix)]
         {
-            let tui_transport_error_skip_gate = claude_tui_followup_pre_submit_requeue_candidate
+            let skip_tui_quiescence = claude_tui_followup_pre_submit_requeue_candidate
                 || (transport_error
                     && bridge_tui_transport_error_should_skip_quiescence(
                         &provider,
@@ -268,7 +286,8 @@ pub(super) async fn handle_delivery_epilogue(
                     ));
             let bridge_gate_outcome = if terminal_delivery_committed
                 && !preserve_inflight_for_cleanup_retry
-                && !tui_transport_error_skip_gate
+                && !skip_tui_quiescence
+                && projection_allowed
             {
                 if let Some(outcome) = bridge_tui_gate_outcome_early {
                     outcome
@@ -285,7 +304,7 @@ pub(super) async fn handle_delivery_epilogue(
                     super::super::super::tmux::TuiCompletionGateOutcome::NotGated
                 }
             } else {
-                if terminal_delivery_committed && tui_transport_error_skip_gate {
+                if terminal_delivery_committed && skip_tui_quiescence {
                     tracing::info!(
                         provider = %provider.as_str(),
                         channel_id = channel_id.get(),
@@ -295,11 +314,8 @@ pub(super) async fn handle_delivery_epilogue(
                 }
                 followup_requeue::requeue_if_needed(
                     busy_requeue_outcome,
-                    claude_tui_followup_pre_submit_requeue_candidate,
-                    claude_tui_busy_requeue_pending,
-                    &shared_owned,
-                    &provider,
-                    channel_id,
+                    (claude_tui_followup_pre_submit_requeue_candidate, claude_tui_busy_requeue_pending),
+                    (&shared_owned, &provider, channel_id),
                     &inflight_state,
                     dispatch_id.as_deref(),
                     adk_session_key.as_deref(),
@@ -317,8 +333,8 @@ pub(super) async fn handle_delivery_epilogue(
 
         settle_terminal_dispatch(TerminalDispatchSettlement {
             shared: &shared_owned, dispatch_id: dispatch_id.as_deref(), adk_cwd: adk_cwd.as_deref(),
-            full_response: &full_response, should_complete: should_complete_work_dispatch_after_delivery,
-            should_fail: should_fail_dispatch_after_delivery, committed: terminal_delivery_committed,
+            full_response: &full_response, should_complete: should_complete_work_dispatch_after_delivery && !waiting,
+            should_fail: should_fail_dispatch_after_delivery && !waiting, committed: terminal_delivery_committed,
             preserve: preserve_inflight_for_cleanup_retry, resume_failure: resume_failure_detected, recovery_retry,
         }).await;
 
@@ -327,7 +343,7 @@ pub(super) async fn handle_delivery_epilogue(
         // `preserve_inflight_for_cleanup_retry = true`, so this gate (encoded in
         // `bridge_epilogue_marks_watcher_delivered`) does NOT mark the watcher
         // delivered — the bridge never delivered the range; the holder owns it.
-        if bridge_epilogue_marks_watcher_delivered(
+        if input_confirmed && terminal_delivery_committed && bridge_epilogue_marks_watcher_delivered(
             preserve_inflight_for_cleanup_retry,
             bridge_relay_delegated_to_watcher,
         ) && let Some(pin) = watcher_delivery_pin
@@ -338,18 +354,18 @@ pub(super) async fn handle_delivery_epilogue(
         }
 
         if !ctx.already_receipted && can_deliver_directly
+            && !waiting
+            && terminal_delivery_committed
             && !preserve_inflight_for_cleanup_retry
             && !delivery_response.trim().is_empty()
             && let Some(user_msg_id) = user_msg_id
         {
-            tv_done(
-                &shared_owned,
-                channel_id,
-                user_msg_id,
-                inflight_generation,
-                "done",
-            )
-            .await;
+            // A delivered provider failure notice marks the request failed, not done.
+            if ctx.provider_failure {
+                tv_fail(&shared_owned, channel_id, user_msg_id, inflight_generation, "fail").await;
+            } else if input_confirmed {
+                tv_done(&shared_owned, channel_id, user_msg_id, inflight_generation, "done").await;
+            }
         }
 
         td_warn(
@@ -361,7 +377,7 @@ pub(super) async fn handle_delivery_epilogue(
             terminal_delivery_committed,
             terminal_body_visible,
             preserve_inflight_for_cleanup_retry,
-        );
+        ) && projection_allowed;
         if status_panel_terminal_committed {
             let ts = chrono::Local::now().format("%H:%M:%S");
             tracing::info!("  [{ts}] ▶ Response sent");
@@ -373,7 +389,7 @@ pub(super) async fn handle_delivery_epilogue(
     }
 
     *state.response_sent_offset = response_sent_offset;
-    *state.bridge_should_emit_completion = bridge_should_emit_completion && !ctx.already_receipted;
+    *state.bridge_should_emit_completion = bridge_should_emit_completion && projection_allowed && !ctx.already_receipted;
     *state.status_panel_terminal_committed = status_panel_terminal_committed;
 
     DeliveryEpilogueOutcome::Continue

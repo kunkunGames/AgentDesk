@@ -7,7 +7,6 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -16,16 +15,15 @@ use super::{
     CURSOR_DIR, ChannelStore, HaltReason, Initialized, SPOOL_DIR, StoreError, damage, durable,
 };
 use crate::services::discord::runtime_store::fsync_parent_dir;
-use crate::services::tui_o::shadow::capture::{FileMatch, Fingerprint, file_identity, file_match};
+use crate::services::tui_o::shadow::capture::{FileMatch, file_identity, file_match};
 use crate::services::tui_o::shadow::{CaptureBatch, CapturedRecord, IDENTITY_VERSION, SourceId};
 
 /// A segment takes no more appends past this size; GC removes whole segments.
 pub const SEGMENT_MAX_BYTES: u64 = 64 << 20;
 /// Per-channel spool ceiling; reaching it pauses the source instead of dropping records.
 pub const SPOOL_CAP_BYTES: u64 = 1 << 30;
-/// Replayable versions: v3 only reads Codex `turn_aborted` as Idle and v4 only keys Claude rows v3
-/// blocked, so older frames keep every delivered unit's key. Appends roll to a current segment.
-const READABLE_IDENTITY_VERSIONS: [u32; 3] = [2, 3, 4];
+/// Replay keeps each segment's body-selection version; new appends roll forward to current rules.
+const READABLE_IDENTITY_VERSIONS: [u32; 5] = [2, 3, 4, 5, 6];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cursor {
@@ -39,39 +37,11 @@ pub struct Cursor {
     pub transition_cleanup: Option<TransitionCleanup>,
 }
 
-/// The record of an operator's transition cleanup of one unproven hop. It explains a past
-/// retirement and never authorizes another one.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransitionCleanup {
-    pub job_id: String,
-    pub operator: String,
-    pub at: DateTime<Utc>,
-    pub reason: String,
-    /// The last hop seq the transition covers.
-    pub cutoff: u64,
-    pub hop_seq: u64,
-    pub verified: VerifiedEnd,
-    pub ended: ExecutionEnd,
-}
-
-/// The cursor and file state checked before the retirement.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VerifiedEnd {
-    pub offset: u64,
-    pub prefix_hash: String,
-    pub fingerprint: Fingerprint,
-}
-
-/// The operator's statement that the execution writing the source has ended.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionEnd {
-    pub host: String,
-    pub pane: String,
-    /// Hop seqs the statement covers, both ends included.
-    pub first_seq: u64,
-    pub last_seq: u64,
-    pub basis: String,
-}
+mod retention;
+pub use retention::{
+    ExecutionEnd, RetentionBasisV1, RetentionClaimV1, RetentionEvidenceV1, TransitionCleanup,
+    VerifiedEnd,
+};
 
 /// A spooled span: a complete record, or bytes capture consumed without one (a torn first line).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -606,7 +576,7 @@ impl ChannelStore {
     pub fn for_each_frame(
         &mut self,
         source: &SourceId,
-        mut visit: impl FnMut(SpoolFrame),
+        mut visit: impl FnMut(SpoolFrame, u32),
     ) -> Result<(), StoreError> {
         self.mutate(|store| {
             let spool = store
@@ -617,7 +587,7 @@ impl ChannelStore {
             for segment in &spool.segments {
                 scan_segment(&segment.path, |frame| {
                     if frame.end() <= through {
-                        visit(frame);
+                        visit(frame, segment.identity_version);
                     }
                 })?;
             }
@@ -763,7 +733,7 @@ mod tests {
     fn lines(channel: &mut ChannelStore, source: &SourceId) -> Vec<String> {
         let mut lines = Vec::new();
         channel
-            .for_each_frame(source, |frame| {
+            .for_each_frame(source, |frame, _| {
                 lines.push(match frame {
                     SpoolFrame::Record(record) => String::from_utf8(record.line).unwrap(),
                     SpoolFrame::Skipped { start, end } => format!("skip {start}..{end}"),
@@ -1084,7 +1054,7 @@ mod tests {
         let bytes = fs::read(&segment).unwrap();
         fs::remove_file(&segment).unwrap();
         fs::create_dir(&segment).unwrap();
-        let read = channel.for_each_frame(&fixture.source, |_| ());
+        let read = channel.for_each_frame(&fixture.source, |_, _| ());
         assert!(matches!(read, Err(StoreError::Io(_))));
         fs::remove_dir(&segment).unwrap();
         fs::write(&segment, bytes).unwrap();

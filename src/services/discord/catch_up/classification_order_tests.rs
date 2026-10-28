@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use poise::serenity_prelude as serenity;
 
 use super::api::{CatchUpFetchCursor, CatchUpFetchRequest};
+#[path = "i7441_tests.rs"]
+pub(in crate::services::discord) mod i7441_tests;
 use super::settled_frontier::SettledFrontier;
 use super::{
     CATCH_UP_RETRY_DEFERRED_REARM_LIMIT, CatchUpClassification, CatchUpClassificationDecision,
@@ -373,43 +375,39 @@ fn catch_up_human_visible_marker_recovers_and_strips_but_bot_marker_is_rejected(
 }
 
 #[test]
-fn aged_task_notify_and_system_messages_never_become_actionable_too_old() {
-    let task = view(
-        INFO_BOT_ID,
-        true,
-        3_600,
-        "✅ Task completed: informational echo",
-    );
-    let notify = view(
-        INFO_BOT_ID,
-        true,
-        3_600,
-        "⚠️ 스톨 의심: 정상 작업 중이면 무시하세요",
-    );
-    let mut system = view(INFO_BOT_ID, true, 3_600, "thread-created system event");
-    system.is_processable_kind = false;
+fn provider_background_subtext_never_recovers_or_becomes_actionable_too_old() {
+    use CatchUpClassification::{NotAllowed, SelfAuthored, SystemKind};
 
-    for (label, message, expected) in [
-        ("task", task, CatchUpClassification::NotAllowed),
-        ("notify", notify, CatchUpClassification::NotAllowed),
-        ("system", system, CatchUpClassification::SystemKind),
-    ] {
-        let outcome = classify(&message);
-        assert_eq!(
-            outcome, expected,
-            "{label} classification must win before the age gate"
-        );
-        assert!(
-            !too_old_is_actionable(
-                outcome,
-                message.author_id,
-                message.author_is_bot,
-                &[],
+    for (text, age_secs) in [
+        "-# ✅ Background command \"short task\" completed (exit code 0)",
+        "-# ⌨️ first \\*\\*bold\\*\\*\n-# second\n-# third",
+    ]
+    .into_iter()
+    .flat_map(|text| [60, 3_600].map(|age_secs| (text, age_secs)))
+    {
+        for (author_id, author_is_bot, expected) in [
+            (CURRENT_BOT_ID, true, SelfAuthored),
+            (CURRENT_BOT_ID, false, SelfAuthored),
+            (INFO_BOT_ID, true, NotAllowed),
+            (INFO_BOT_ID, false, NotAllowed),
+            (NOTIFY_BOT_ID, true, NotAllowed),
+        ] {
+            let message = view(author_id, author_is_bot, age_secs, text);
+            let outcome = classify_catch_up_message(
+                &message,
+                Some(CURRENT_BOT_ID),
+                &HashSet::new(),
+                &HashSet::new(),
+                300,
+                &[INFO_BOT_ID],
                 None,
-                None,
-            ),
-            "{label} must not enter the actionable TooOld warning gate"
-        );
+                Some(NOTIFY_BOT_ID),
+            );
+            assert_eq!(outcome, expected, "age={age_secs}, author={author_id}");
+        }
+        let mut system = view(INFO_BOT_ID, true, age_secs, "thread-created system event");
+        system.is_processable_kind = false;
+        assert_eq!(classify(&system), SystemKind);
     }
 }
 
@@ -657,6 +655,15 @@ fn write_checkpoint(
     std::fs::create_dir_all(path.parent().expect("last-message provider dir"))
         .expect("create last-message provider dir");
     std::fs::write(path, checkpoint.to_string()).expect("write last-message checkpoint");
+    let progress = serde_json::json!({
+        "version": 1, "provider": provider.as_str(), "channel_id": channel_id.get(),
+        "after": checkpoint, "origin": "observed_frontier",
+    });
+    std::fs::write(
+        checkpoint_path(root, provider, channel_id).with_extension("sweep.json"),
+        progress.to_string(),
+    )
+    .expect("seed scanner checkpoint");
 }
 
 fn checkpoint_path(
@@ -692,15 +699,18 @@ fn write_role_map(root: &std::path::Path, provider: &ProviderKind, channel_id: C
     .expect("write role map");
 }
 
+type ScriptedHistoryFetches = Mutex<VecDeque<Result<Vec<serenity::Message>, String>>>;
+
 struct TestCatchUpApi {
     current_user_id: Option<u64>,
     messages: Vec<serenity::Message>,
     phase2_messages: Option<Vec<serenity::Message>>,
-    scripted_fetches: Option<Mutex<VecDeque<Result<Vec<serenity::Message>, String>>>>,
+    scripted_fetches: Option<ScriptedHistoryFetches>,
     fetch_calls: AtomicUsize,
     dead_letters: Arc<Mutex<Vec<crate::db::relay_dead_letter::RelayDeadLetterRecord>>>,
     announce_resolution: UtilityBotUserIdResolution,
     notify_resolution: UtilityBotUserIdResolution,
+    fail_dead_letter: bool,
 }
 
 impl TestCatchUpApi {
@@ -714,6 +724,7 @@ impl TestCatchUpApi {
             dead_letters: Arc::new(Mutex::new(Vec::new())),
             announce_resolution: UtilityBotUserIdResolution::Unconfigured,
             notify_resolution: UtilityBotUserIdResolution::Unconfigured,
+            fail_dead_letter: false,
         }
     }
 
@@ -801,16 +812,23 @@ impl CatchUpDiscordApi for TestCatchUpApi {
     ) {
     }
 
-    fn record_too_old_dead_letter(
+    async fn record_too_old_dead_letter(
         &self,
         pool: Option<&sqlx::PgPool>,
         record: crate::db::relay_dead_letter::RelayDeadLetterRecord,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    ) -> Option<crate::db::relay_dead_letter::TooOldRecordOutcome> {
         self.dead_letters
             .lock()
             .expect("dead-letter capture lock")
             .push(record.clone());
-        crate::db::relay_dead_letter::record_detached(pool, record)
+        if self.fail_dead_letter {
+            return None;
+        }
+        if pool.is_some() {
+            crate::db::relay_dead_letter::record_too_old(pool, record).await
+        } else {
+            Some(crate::db::relay_dead_letter::TooOldRecordOutcome::Inserted)
+        }
     }
 
     async fn utility_bot_user_ids(

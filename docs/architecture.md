@@ -63,7 +63,7 @@ docs` workflow가 누적 drift를 maintenance PR로 갱신한다. 단, giant-fil
 registry 불일치나 필수 metadata 누락처럼 generator가 검증하는 유지보수
 invariant 위반은 별도의 hard gate다.
 
-- [Module inventory](generated/module-inventory.md)
+- Module inventory: `docs/generated/module-inventory.md` (untracked; 위 generator로 로컬에서 생성)
 - [Route inventory](generated/route-inventory.md)
 - [Bootstrap worker inventory](generated/worker-inventory.md)
 
@@ -638,10 +638,6 @@ rate_limits:
   - `/api/settings/config` whitelist를 통해서만 노출/수정
   - 응답에는 `baseline`, `override_active`, `editable`, `restart_behavior`가 포함되어 baseline과 live override를 구분한다
   - YAML-backed key는 재시작 시 YAML baseline이 다시 seed되고, hardcoded-only key는 reset flag가 꺼져 있으면 기존 override를 유지한다
-- `kv_meta['escalation-settings-override']`
-  - PM/owner escalation 라우팅용 전용 override surface
-  - baseline은 `escalation:` + `discord.owner_id` + `kanban.manager_channel_id`
-  - `/api/settings/escalation`은 `current`와 `defaults`를 함께 돌려준다
 - 온보딩 전용 key/API
   - 토큰, provider, 초기 Discord 설정
   - 일반 settings form이 아니라 `/api/onboarding/*`와 wizard가 정본

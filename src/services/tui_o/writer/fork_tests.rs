@@ -1,7 +1,7 @@
 use super::switch_tests::{link, spool};
 use super::*;
 use crate::services::tui_o::store::StoreError;
-use crate::services::tui_o::store::rotation::{Boundary, ResolveFrom, Rotation};
+use crate::services::tui_o::store::rotation::{Boundary, Rotation};
 use crate::services::tui_o::store::spool::{SpoolFrame, source_key};
 
 fn line(value: serde_json::Value) -> Vec<u8> {
@@ -15,7 +15,7 @@ fn prompt(uuid: &str, text: &str) -> Vec<u8> {
     line(serde_json::json!({"type": "user", "uuid": uuid, "message": {"content": text}}))
 }
 
-/// A user row of error tool results, each posted as its own unit.
+/// A user row of error tool results, each sealed as its own internal unit.
 fn results(uuid: &str, results: &[(&str, &str)]) -> Vec<u8> {
     let item = |(id, text): &(&str, &str)| serde_json::json!({"type": "tool_result", "tool_use_id": id, "is_error": true, "content": text});
     let content: Vec<_> = results.iter().map(item).collect();
@@ -170,7 +170,7 @@ fn pending_gc_frames(harness: &Harness, source: &SourceId, tag: &str) -> Vec<Spo
     );
     let mut frames = Vec::new();
     store
-        .for_each_frame(source, |frame| frames.push(frame))
+        .for_each_frame(source, |frame, _| frames.push(frame))
         .unwrap();
     assert!(!frames.is_empty(), "{tag} Pending has spooled rows");
     let gc = store.gc_oldest_segment(source);
@@ -189,7 +189,7 @@ fn pending_gc_frames(harness: &Harness, source: &SourceId, tag: &str) -> Vec<Spo
     );
     let mut after = Vec::new();
     store
-        .for_each_frame(source, |frame| after.push(frame))
+        .for_each_frame(source, |frame, _| after.push(frame))
         .unwrap();
     assert_eq!(after, frames, "{tag} every Pending frame kept");
     frames
@@ -352,10 +352,19 @@ async fn a_fork_decides_the_same_whether_or_not_the_writer_restarts_while_its_pa
         );
         append(&a_path, &results("u-k1", &[("k1", "one")]));
         polls(3).await;
+        assert!(
+            harness.port.posts().is_empty(),
+            "{tag} tool results stay internal"
+        );
+        let channel = harness.channel();
+        let key = UnitKey {
+            native_key: "k1".into(),
+            kind: UnitKind::ToolResult,
+            ..unit("")
+        };
         assert_eq!(
-            harness.port.posts(),
-            ["one"],
-            "{tag} the parent posts its row"
+            channel.ledger().excluded(&key),
+            Some(pieces::TOOL_RESULT_INTERNAL)
         );
         if restart {
             halt(stop, task).await;
@@ -364,7 +373,7 @@ async fn a_fork_decides_the_same_whether_or_not_the_writer_restarts_while_its_pa
         }
         append(&b_path, rest);
         polls(3).await;
-        assert_eq!(harness.port.posts(), ["one"], "{tag} posts");
+        assert!(harness.port.posts().is_empty(), "{tag} posts");
         let pending = WriterAlarm::BoundaryPending { source: b.clone() };
         assert_eq!(harness.alarms.taken(), [pending], "{tag} alarm");
         let held = matches!(boundary(&harness, &b), Boundary::Pending { .. });
@@ -436,11 +445,7 @@ async fn a_retired_fork_left_undecided_at_its_end_is_held_for_the_operator() {
     assert_eq!(harness.alarms.taken(), [pending], "{tag} alarm");
     assert!(harness.port.posts().is_empty(), "{tag} posts");
     halt(stop, task).await;
-    let path = b_path.display().to_string();
-    let from = ResolveFrom::Offset(end);
-    let recorded = harness
-        .store
-        .record_boundary_resolved(CHANNEL, &path, &from, "op");
+    let recorded = harness.store.seed_boundary_resolved(CHANNEL, b, end);
     assert_eq!(recorded.unwrap(), (b.clone(), end), "{tag} resolvable");
     let (stop, task) = spawn_with(
         harness.writer(),

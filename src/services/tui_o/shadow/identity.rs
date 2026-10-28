@@ -1,7 +1,6 @@
 //! Transcript identity rules: which records carry output units, how each unit is keyed,
 //! and which records open or close a turn. Changing a rule here requires `IDENTITY_VERSION`.
 
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::{ShadowProvider, UnitKind};
@@ -9,6 +8,18 @@ use crate::services::discord::response_sanitizer::is_standalone_tui_response_chr
 // Variant values only: the write-zero allowlist audits these two, not ProviderKind's methods.
 use crate::services::provider::ProviderKind::{Claude as ClaudeKind, Codex as CodexKind};
 use crate::services::tui_turn_state::envelope_is_turn_end_terminator;
+
+/// Visible assistant prose, preserving the block's text and excluding signatures and blank thinking.
+pub(crate) fn visible_assistant_block_text(block: &serde_json::Value) -> Option<&str> {
+    match block.get("type").and_then(serde_json::Value::as_str) {
+        Some("text") => block.get("text").and_then(serde_json::Value::as_str),
+        Some("thinking") => block
+            .get("thinking")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty()),
+        _ => None,
+    }
+}
 
 /// What a unit would post; `Excluded` units are recorded but never posted.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,8 +47,17 @@ pub enum RecordFact {
 }
 
 pub fn classify(provider: ShadowProvider, record: &Value) -> Vec<RecordFact> {
+    classify_with_version(provider, record, super::IDENTITY_VERSION)
+}
+
+/// Classifies replay using the identity version stored with the frame.
+pub(crate) fn classify_with_version(
+    provider: ShadowProvider,
+    record: &Value,
+    identity_version: u32,
+) -> Vec<RecordFact> {
     match provider {
-        ShadowProvider::Claude => claude(record),
+        ShadowProvider::Claude => claude(record, identity_version),
         ShadowProvider::Codex => codex(record),
     }
 }
@@ -47,18 +67,14 @@ pub fn row_key(record: &Value) -> Option<String> {
     str_at(record, "uuid").map(str::to_owned)
 }
 
-pub fn native_time(record: &Value) -> Option<DateTime<Utc>> {
-    str_at(record, "timestamp")?.parse().ok()
-}
-
-fn claude(record: &Value) -> Vec<RecordFact> {
+fn claude(record: &Value, identity_version: u32) -> Vec<RecordFact> {
     // Strict E wins over any other reading of the row, e.g. an interrupt marker user row.
     if envelope_is_turn_end_terminator(&ClaudeKind, record) {
         return vec![RecordFact::Idle(None)];
     }
     match str_at(record, "type") {
         Some("assistant") => std::iter::once(RecordFact::Assistant)
-            .chain(claude_blocks(record))
+            .chain(claude_blocks(record, identity_version))
             .collect(),
         Some("user") => claude_user(record),
         _ => Vec::new(),
@@ -67,7 +83,7 @@ fn claude(record: &Value) -> Vec<RecordFact> {
 
 /// Each block is keyed `(message.id, apiBlockIndex + position)`, so a one-block row keeps its key;
 /// any unplaceable block blocks the whole row.
-fn claude_blocks(record: &Value) -> Vec<RecordFact> {
+fn claude_blocks(record: &Value, identity_version: u32) -> Vec<RecordFact> {
     let message = record.get("message").unwrap_or(&Value::Null);
     let content = message.get("content").and_then(Value::as_array);
     #[cfg(test)]
@@ -85,9 +101,21 @@ fn claude_blocks(record: &Value) -> Vec<RecordFact> {
     let index = record.get("apiBlockIndex").and_then(Value::as_u64);
     let mut facts = Vec::new();
     for (position, block) in (0u64..).zip(blocks) {
+        #[cfg(test)]
+        if V5_RULE.get() && str_at(block, "type") == Some("thinking") {
+            continue;
+        }
         let (kind, content) = match str_at(block, "type") {
+            Some("thinking") if visible_assistant_block_text(block).is_some() => {
+                let content = if identity_version < 6 {
+                    UnitContent::Excluded("pre_v6_thinking")
+                } else {
+                    claude_body(resumed, block)
+                };
+                (UnitKind::Body, content)
+            }
             Some("thinking" | "redacted_thinking") => continue,
-            Some("text") => (UnitKind::Body, claude_text(resumed, block)),
+            Some("text") => (UnitKind::Body, claude_body(resumed, block)),
             Some("tool_use") => (UnitKind::Tool, tool_call(block, &["input"])),
             other => return vec![blocked(&format!("unsupported assistant block {other:?}"))],
         };
@@ -128,10 +156,34 @@ impl Drop for V3Rule {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static V5_RULE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Captures a store using the old thinking-skip rule without creating thinking ledger entries.
+#[cfg(test)]
+pub(crate) struct V5Rule(());
+
+#[cfg(test)]
+impl V5Rule {
+    pub(crate) fn hold() -> Self {
+        V5_RULE.set(true);
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for V5Rule {
+    fn drop(&mut self) {
+        V5_RULE.set(false);
+    }
+}
+
 /// A cold resume writes a synthetic non-error row holding only TUI chrome; Legacy strips it, so it
 /// is not posted. API error rows always post.
-fn claude_text(resumed: bool, block: &Value) -> UnitContent {
-    let text = str_at(block, "text").unwrap_or("");
+fn claude_body(resumed: bool, block: &Value) -> UnitContent {
+    let text = visible_assistant_block_text(block).unwrap_or("");
     if resumed && is_standalone_tui_response_chrome(text) {
         return UnitContent::Excluded("claude_synthetic_resume_chrome");
     }
@@ -163,7 +215,7 @@ fn claude_user(record: &Value) -> Vec<RecordFact> {
     }
 }
 
-/// Each `tool_result` is its own unit keyed by `tool_use_id`; only error results are posted.
+/// Each `tool_result` keeps its native key and historical seal; the writer excludes its body.
 fn claude_tool_result(item: &Value) -> RecordFact {
     let Some(id) = str_at(item, "tool_use_id").filter(|id| !id.is_empty()) else {
         return blocked("tool_result without tool_use_id");
@@ -222,8 +274,8 @@ fn codex_item(item: &Value, item_type: &str) -> Option<RecordFact> {
             let texts: Vec<&str> = parts.filter_map(|part| str_at(part, "text")).collect();
             return Some(RecordFact::Prompt(false, texts.join("\n")));
         }
-        // Reasoning, other roles and inter-agent traffic are not channel output.
-        ("message" | "reasoning" | "agent_message", _) => return None,
+        // Reasoning, other roles, inter-agent traffic and the session's tool list are not output.
+        ("message" | "reasoning" | "agent_message" | "additional_tools", _) => return None,
         ("function_call" | "custom_tool_call" | "tool_search_call", _) => (
             UnitKind::Tool,
             tool_call(item, &["arguments", "input", "action"]),
@@ -347,13 +399,12 @@ mod tests {
         }
     }
 
-    /// A row holding a whole message keys each block from its `apiBlockIndex`, exactly as one-block
-    /// rows of that message would; thinking yields nothing and an unplaceable block blocks the row.
+    /// Whole-message rows preserve each block's native index; empty thinking yields no unit.
     #[test]
     fn claude_multi_block_row_keys_each_block_like_one_block_rows() {
         use super::{RecordFact, UnitContent, classify};
         use crate::services::tui_o::shadow::UnitKind::{Body, Tool};
-        let thinking = json!({"type": "thinking", "thinking": "t", "signature": "s"});
+        let thinking = json!({"type": "thinking", "thinking": "", "signature": "s"});
         let tool = json!({"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"c": 1}});
         let text = |text: &str| json!({"type": "text", "text": text});
         let row = |index: Value, content: Vec<Value>| {
@@ -409,6 +460,24 @@ mod tests {
         let mut synthetic = row(Value::Null, vec![text("a"), text("b")]);
         synthetic["isApiErrorMessage"] = true.into();
         blocked(synthetic, "assistant row without a supported identity");
+    }
+
+    /// The session tool list Codex writes in a new session yields nothing, while any other unknown
+    /// response item of the same shape still blocks.
+    #[test]
+    fn codex_tool_list_yields_nothing_and_unknown_items_still_block() {
+        use super::{RecordFact, classify};
+        let item = |kind: &str| {
+            json!({"type": "response_item", "payload": {"type": kind, "id": "at_1",
+                "role": "developer", "tools": [{"type": "function", "name": "t"}]}})
+        };
+        assert_eq!(
+            classify(ShadowProvider::Codex, &item("additional_tools")),
+            []
+        );
+        let blocked = RecordFact::Blocked("unsupported response_item definitely_unknown".into());
+        let unknown = classify(ShadowProvider::Codex, &item("definitely_unknown"));
+        assert_eq!(unknown, [blocked]);
     }
 
     #[test]

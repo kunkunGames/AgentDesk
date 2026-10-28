@@ -78,6 +78,8 @@ pub(super) struct ParkedObservation {
     /// A complete same-text record proved a different input while this copy was held.
     #[serde(default)]
     pub(super) distinct_record: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) hosted_source: Option<hosted_source::HostedSourcePin>,
 }
 
 impl ParkedObservation {
@@ -364,7 +366,17 @@ pub(crate) fn drain_expired_handoffs() {
 /// Observes each held input exactly once, outside the STATE lock; a missing entry id stays None.
 pub(super) fn drain_parked(provider: &str, tmux: &str, parked: Vec<ParkedObservation>) {
     for held in parked {
-        let observation = observation::observe_held_prompt(provider, tmux, &held);
+        let entry_id = held.entry_ids.first().map(String::as_str);
+        let observation = observation::observe_held_prompt(
+            provider,
+            tmux,
+            &held.prompt,
+            entry_id,
+            held.native_turn.as_deref(),
+            held.observed_at,
+            held.hosted_source.clone(),
+            held.distinct_record,
+        );
         for extra in held.entry_ids.iter().skip(1) {
             record_relayed_entry_id(provider, tmux, extra);
         }
@@ -381,6 +393,7 @@ impl TuiPromptDedupeState {
         entry_id: Option<&str>,
         native_turn: Option<&str>,
         observed_at: DateTime<Utc>,
+        hosted_source: Option<&hosted_source::HostedSourcePin>,
     ) -> bool {
         let Some(entry) = self.handoff_by_tmux.get_mut(key) else {
             return false;
@@ -391,7 +404,9 @@ impl TuiPromptDedupeState {
         }
         let parked = &mut entry.value.parked;
         let same = parked.iter_mut().find(|held| {
-            held.native_turn.as_deref() == native_turn && prompts_match(&held.prompt, prompt)
+            held.native_turn.as_deref() == native_turn
+                && held.hosted_source.as_ref() == hosted_source
+                && prompts_match(&held.prompt, prompt)
         });
         match same {
             Some(held) => {
@@ -407,6 +422,7 @@ impl TuiPromptDedupeState {
                 entry_ids: entry_id.map(str::to_string).into_iter().collect(),
                 observed_at,
                 distinct_record: false,
+                hosted_source: hosted_source.cloned(),
             }),
         }
         true
@@ -728,7 +744,8 @@ pub(crate) fn codex_rehydrated_scan_offset(tmux: &str, rollout_path: &Path) -> u
             let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
             state.handoff_by_tmux.entry(key).or_insert(TimedValue {
                 value,
-                recorded_at: Instant::now() - age,
+                // Windows cannot date an Instant before boot; the fallback extends expiry by up to `age`.
+                recorded_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
             });
             tracing::info!(tmux, held, "restored a Codex handoff holding inputs");
             reserved_wall

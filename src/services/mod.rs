@@ -24,13 +24,9 @@ pub mod codex_tui;
 pub mod cswap;
 pub mod discord;
 pub mod discord_config_audit;
+pub(crate) mod managed_checks;
 #[allow(dead_code)]
 pub(crate) mod tui_input;
-// Read only by its tests until the `adk custody status` wiring lands on top of it.
-#[allow(dead_code)]
-pub(crate) mod discord_custody;
-
-pub(crate) mod managed_checks;
 // #1693: `discord_delivery` moved to `dispatches::discord_delivery`. The
 // flat path is preserved as a re-export so existing import sites and
 // tests keep working without churn.
@@ -44,13 +40,11 @@ pub mod dispatch_watchdog;
 pub mod dispatched_sessions;
 pub mod dispatches;
 pub mod dispatches_followup;
-pub mod escalation_settings;
 pub mod explicit_auth_route;
 pub mod gemini;
 pub mod git;
 pub mod github_issue_creation;
 pub(crate) mod hang_forensics;
-pub mod health_active_session_audit;
 pub mod health_diagnostics;
 pub(crate) mod herdr_admission;
 pub(crate) mod herdr_launch;
@@ -117,6 +111,7 @@ pub mod qwen_tmux_wrapper;
 pub(crate) mod recovery_defer;
 pub(crate) mod release_source;
 pub mod remote_stub;
+pub(crate) mod resident_loops;
 pub mod retrospectives;
 pub mod review_decision;
 pub mod routines;
@@ -136,7 +131,6 @@ pub mod session_forwarding;
 pub mod session_host;
 pub mod session_resume;
 pub mod settings;
-pub mod shell_guard;
 pub mod slo;
 pub(crate) mod stale_turn_reconciler;
 pub(crate) mod task_completion_v1;
@@ -150,8 +144,6 @@ pub mod tmux_diagnostics;
 pub(crate) mod tmux_turn_liveness;
 pub mod tmux_wrapper;
 pub mod tool_output_guard;
-#[allow(dead_code)]
-pub(crate) mod writer_protocol;
 // Output track: the shadow and the dormant writer store, each behind an off-by-default flag.
 #[allow(dead_code)]
 pub(crate) mod tui_o {
@@ -166,7 +158,6 @@ pub(crate) mod tui_o {
     pub(crate) mod ownership;
     pub(crate) mod repost;
     pub(crate) mod shadow;
-    pub(crate) mod shadow_host;
     pub(crate) mod store;
     pub(crate) mod topology;
     pub(crate) mod turn_mode;
@@ -187,6 +178,7 @@ pub mod turn_cancel_queue_guard;
 pub(crate) mod turn_host;
 pub mod turn_lifecycle;
 pub mod turn_orchestrator;
+pub(crate) mod turn_summary_line;
 pub(crate) mod voice_conductor;
 
 // Compatibility alias only: code referencing `services::remote::*` still

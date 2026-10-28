@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 
 use poise::serenity_prelude as serenity;
 
-use super::super::formatting::{canonical_tool_name, risk_badge, send_long_message_ctx, tool_info};
 use super::super::model_catalog::{
     SOURCE_DISPATCH_ROLE, SOURCE_PROVIDER_DEFAULT, SOURCE_ROLE_MAP, SOURCE_RUNTIME_OVERRIDE,
     is_default_picker_value,
@@ -151,9 +150,9 @@ pub(in crate::services::discord) fn codex_goals_supported(provider: &ProviderKin
 
 pub(in crate::services::discord) fn session_toggle_reset_line(reset_pending: bool) -> &'static str {
     if reset_pending {
-        "다음 사용자 턴 시작 전에 기존 세션을 정리한 뒤 반영됩니다."
+        "다음 사용자 턴 시작 전 세션 리셋이 필요합니다(맥락 소실). 리셋 후 새 세션에 반영됩니다."
     } else {
-        "현재 세션부터 반영됩니다."
+        "현재 세션을 유지하며 다음 사용자 턴부터 반영됩니다."
     }
 }
 
@@ -190,6 +189,10 @@ pub(in crate::services::discord) async fn channel_fast_mode_setting(
     settings
         .channel_fast_modes
         .get(&channel_id.get().to_string())
+        .or_else(|| {
+            SharedData::feature_settings_parent(channel_id)
+                .and_then(|parent| settings.channel_fast_modes.get(&parent.get().to_string()))
+        })
         .copied()
 }
 
@@ -201,6 +204,10 @@ pub(in crate::services::discord) async fn channel_codex_goals_setting(
     settings
         .channel_codex_goals
         .get(&channel_id.get().to_string())
+        .or_else(|| {
+            SharedData::feature_settings_parent(channel_id)
+                .and_then(|parent| settings.channel_codex_goals.get(&parent.get().to_string()))
+        })
         .copied()
 }
 
@@ -298,145 +305,10 @@ fn runtime_model_for_turn(
     }
 }
 
-pub(in crate::services::discord) async fn update_channel_model_override(
-    shared: &Arc<SharedData>,
-    token: &str,
-    channel_id: serenity::ChannelId,
-    provider: &ProviderKind,
-    next_override: Option<String>,
-) -> bool {
-    if !would_channel_model_override_change(shared, channel_id, next_override.as_deref()) {
-        return false;
-    }
-
-    let current_override = shared
-        .overrides
-        .model_overrides
-        .get(&channel_id)
-        .map(|value| value.clone());
-    let reset_required = session_reset_required_for_model_change(
-        provider,
-        current_override.as_deref(),
-        next_override.as_deref(),
-    );
-
-    match next_override {
-        Some(model) => {
-            shared
-                .overrides
-                .model_overrides
-                .insert(channel_id, model.clone());
-            let mut settings = shared.settings.write().await;
-            settings
-                .channel_model_overrides
-                .insert(channel_id.get().to_string(), model);
-            save_bot_settings(token, &settings);
-        }
-        None => {
-            shared.overrides.model_overrides.remove(&channel_id);
-            let mut settings = shared.settings.write().await;
-            settings
-                .channel_model_overrides
-                .remove(&channel_id.get().to_string());
-            save_bot_settings(token, &settings);
-        }
-    }
-
-    if reset_required {
-        shared
-            .overrides
-            .model_session_reset_pending
-            .insert(channel_id);
-    } else {
-        shared
-            .overrides
-            .model_session_reset_pending
-            .remove(&channel_id);
-    }
-    sync_session_reset_pending(shared, channel_id);
-
-    true
-}
-
-pub(in crate::services::discord) async fn update_channel_fast_mode(
-    shared: &Arc<SharedData>,
-    token: &str,
-    channel_id: serenity::ChannelId,
-    provider: &ProviderKind,
-    enabled: bool,
-) -> bool {
-    let current_enabled = channel_fast_mode_enabled(shared, channel_id);
-    if current_enabled == enabled {
-        return false;
-    }
-
-    if enabled {
-        shared.overrides.fast_mode_channels.insert(channel_id);
-    } else {
-        shared.overrides.fast_mode_channels.remove(&channel_id);
-    }
-
-    let mut settings = shared.settings.write().await;
-    if enabled {
-        settings
-            .channel_fast_modes
-            .insert(channel_id.get().to_string(), true);
-    } else {
-        settings
-            .channel_fast_modes
-            .insert(channel_id.get().to_string(), false);
-    }
-    settings
-        .channel_fast_mode_reset_pending
-        .retain(|entry| !fast_mode_reset_entry_matches_provider(entry, channel_id, provider));
-    settings
-        .channel_fast_mode_reset_pending
-        .insert(fast_mode_reset_pending_key(channel_id, provider));
-    save_bot_settings(token, &settings);
-
-    clear_fast_mode_reset_pending_for_provider(shared, channel_id, provider);
-    shared
-        .overrides
-        .fast_mode_session_reset_pending
-        .insert(fast_mode_reset_pending_key(channel_id, provider));
-    sync_session_reset_pending(shared, channel_id);
-    true
-}
-
-pub(in crate::services::discord) async fn update_channel_codex_goals(
-    shared: &Arc<SharedData>,
-    token: &str,
-    channel_id: serenity::ChannelId,
-    enabled: bool,
-) -> bool {
-    let current_enabled = channel_codex_goals_enabled(shared, channel_id);
-    if current_enabled == enabled {
-        return false;
-    }
-
-    if enabled {
-        shared.overrides.codex_goals_channels.insert(channel_id);
-    } else {
-        shared.overrides.codex_goals_channels.remove(&channel_id);
-    }
-
-    let channel_key = channel_id.get().to_string();
-    let mut settings = shared.settings.write().await;
-    settings
-        .channel_codex_goals
-        .insert(channel_key.clone(), enabled);
-    settings
-        .channel_codex_goals_reset_pending
-        .insert(channel_key);
-    save_bot_settings(token, &settings);
-
-    shared
-        .overrides
-        .codex_goals_session_reset_pending
-        .insert(channel_id);
-    sync_session_reset_pending(shared, channel_id);
-    true
-}
+mod provider_settings;
+pub(in crate::services::discord) use provider_settings::{
+    update_channel_codex_goals, update_channel_fast_mode, update_channel_model_override,
+};
 
 pub(in crate::services::discord) fn would_channel_model_override_change(
     shared: &Arc<SharedData>,
@@ -666,225 +538,22 @@ pub(in crate::services::discord) fn build_model_picker_components_from_snapshot(
     )
 }
 
-/// /allowedtools — Show currently allowed tools
-#[poise::command(slash_command, rename = "allowedtools")]
-pub(in crate::services::discord) async fn cmd_allowedtools(ctx: Context<'_>) -> Result<(), Error> {
-    let user_id = ctx.author().id;
-    let user_name = &ctx.author().name;
-    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
-        return Ok(());
-    }
-
-    log_command_received!(ctx.channel_id().get(), user_name, "/allowedtools");
-
-    let tools = {
-        let settings = ctx.data().shared.settings.read().await;
-        settings.allowed_tools.clone()
-    };
-
-    let mut msg = String::from("**Allowed Tools**\n\n");
-    for tool in &tools {
-        let (desc, destructive) = tool_info(tool);
-        let badge = risk_badge(destructive);
-        if badge.is_empty() {
-            msg.push_str(&format!("`{}` — {}\n", tool, desc));
-        } else {
-            msg.push_str(&format!("`{}` {} — {}\n", tool, badge, desc));
-        }
-    }
-    msg.push_str(&format!(
-        "\n{} = destructive\nTotal: {}",
-        risk_badge(true),
-        tools.len()
-    ));
-
-    send_long_message_ctx(ctx, &msg).await?;
-    Ok(())
+/// `/allowall` action; `status` reports the setting without changing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, poise::ChoiceParameter)]
+enum AllowAllAction {
+    #[name = "on"]
+    On,
+    #[name = "off"]
+    Off,
+    #[name = "status"]
+    Status,
 }
 
-/// /allowed <+/-tool> — Add or remove a tool
-#[poise::command(slash_command, rename = "allowed")]
-pub(in crate::services::discord) async fn cmd_allowed(
-    ctx: Context<'_>,
-    #[description = "Use +name to add, -name to remove (e.g. +Bash or -Bash)"] action: String,
-) -> Result<(), Error> {
-    let user_id = ctx.author().id;
-    let user_name = &ctx.author().name;
-    if !check_auth(user_id, user_name, &ctx.data().shared, &ctx.data().token).await {
-        return Ok(());
-    }
-    // Issue #1005: tool-grant tier — owner-only AND default-disabled. The
-    // ability to grant new tools (e.g. `+Bash`) escalates the model's
-    // capability surface and must not be reachable via `allow_all_users`.
-    if !super::enforce_slash_command_policy(&ctx, "/allowed").await? {
-        return Ok(());
-    }
-
-    log_command_received!(ctx.channel_id().get(), user_name, "/allowed", action = %action);
-
-    let arg = action.trim();
-    let (op, raw_name) = if let Some(name) = arg.strip_prefix('+') {
-        ('+', name.trim())
-    } else if let Some(name) = arg.strip_prefix('-') {
-        ('-', name.trim())
-    } else {
-        ctx.say("Use `+toolname` to add or `-toolname` to remove.\nExample: `/allowed +Bash`")
-            .await?;
-        return Ok(());
-    };
-
-    if raw_name.is_empty() {
-        ctx.say("Tool name cannot be empty.").await?;
-        return Ok(());
-    }
-
-    let Some(tool_name) = canonical_tool_name(raw_name).map(str::to_string) else {
-        ctx.say(format!(
-            "Unknown tool `{}`. Use `/allowedtools` to see valid tool names.",
-            raw_name
-        ))
-        .await?;
-        return Ok(());
-    };
-
-    let response_msg = {
-        let mut settings = ctx.data().shared.settings.write().await;
-        match op {
-            '+' => {
-                if settings.allowed_tools.iter().any(|t| t == &tool_name) {
-                    format!("`{}` is already in the list.", tool_name)
-                } else {
-                    settings.allowed_tools.push(tool_name.clone());
-                    save_bot_settings(&ctx.data().token, &settings);
-                    format!("Added `{}`", tool_name)
-                }
-            }
-            '-' => {
-                let before_len = settings.allowed_tools.len();
-                settings.allowed_tools.retain(|t| t != &tool_name);
-                if settings.allowed_tools.len() < before_len {
-                    save_bot_settings(&ctx.data().token, &settings);
-                    format!("Removed `{}`", tool_name)
-                } else {
-                    format!("`{}` is not in the list.", tool_name)
-                }
-            }
-            _ => unreachable!(),
-        }
-    };
-
-    ctx.say(&response_msg).await?;
-    Ok(())
-}
-
-/// /adduser @user — Allow another user to use the bot (owner only)
-#[poise::command(slash_command, rename = "adduser")]
-pub(in crate::services::discord) async fn cmd_adduser(
-    ctx: Context<'_>,
-    #[description = "User to add"] user: serenity::User,
-) -> Result<(), Error> {
-    let author_id = ctx.author().id;
-    let author_name = &ctx.author().name;
-    if !check_auth(
-        author_id,
-        author_name,
-        &ctx.data().shared,
-        &ctx.data().token,
-    )
-    .await
-    {
-        return Ok(());
-    }
-    if !check_owner(author_id, &ctx.data().shared).await {
-        ctx.say("Only the owner can add users.").await?;
-        return Ok(());
-    }
-
-    let target_id = user.id.get();
-    let target_name = &user.name;
-
-    log_command_received!(ctx.channel_id().get(), author_name, "/adduser", target_user = %target_name);
-
-    {
-        let mut settings = ctx.data().shared.settings.write().await;
-        if settings.allowed_user_ids.contains(&target_id) {
-            ctx.say(format!("`{}` is already authorized.", target_name))
-                .await?;
-            return Ok(());
-        }
-        settings.allowed_user_ids.push(target_id);
-        save_bot_settings(&ctx.data().token, &settings);
-    }
-
-    ctx.say(format!("Added `{}` as authorized user.", target_name))
-        .await?;
-    log_info_event!(
-        "discord_user_access_added",
-        channel_id = ctx.channel_id().get(),
-        user_id = target_id,
-        user_name = %target_name,
-        status = "added",
-    );
-    Ok(())
-}
-
-/// /removeuser @user — Remove a user's access (owner only)
-#[poise::command(slash_command, rename = "removeuser")]
-pub(in crate::services::discord) async fn cmd_removeuser(
-    ctx: Context<'_>,
-    #[description = "User to remove"] user: serenity::User,
-) -> Result<(), Error> {
-    let author_id = ctx.author().id;
-    let author_name = &ctx.author().name;
-    if !check_auth(
-        author_id,
-        author_name,
-        &ctx.data().shared,
-        &ctx.data().token,
-    )
-    .await
-    {
-        return Ok(());
-    }
-    if !check_owner(author_id, &ctx.data().shared).await {
-        ctx.say("Only the owner can remove users.").await?;
-        return Ok(());
-    }
-
-    let target_id = user.id.get();
-    let target_name = &user.name;
-
-    log_command_received!(ctx.channel_id().get(), author_name, "/removeuser", target_user = %target_name);
-
-    {
-        let mut settings = ctx.data().shared.settings.write().await;
-        let before_len = settings.allowed_user_ids.len();
-        settings.allowed_user_ids.retain(|&id| id != target_id);
-        if settings.allowed_user_ids.len() == before_len {
-            ctx.say(format!("`{}` is not in the authorized list.", target_name))
-                .await?;
-            return Ok(());
-        }
-        save_bot_settings(&ctx.data().token, &settings);
-    }
-
-    ctx.say(format!("Removed `{}` from authorized users.", target_name))
-        .await?;
-    log_info_event!(
-        "discord_user_access_removed",
-        channel_id = ctx.channel_id().get(),
-        user_id = target_id,
-        user_name = %target_name,
-        status = "removed",
-    );
-    Ok(())
-}
-
-/// /allowall <enabled> — Allow every Discord user to use the bot (owner only)
+/// /allowall <on|off|status> — Allow every Discord user to use this bot (owner only)
 #[poise::command(slash_command, rename = "allowall")]
 pub(in crate::services::discord) async fn cmd_allowall(
     ctx: Context<'_>,
-    #[description = "Enable public access for all Discord users"] enabled: bool,
+    #[description = "on, off, or status (show the current setting)"] action: AllowAllAction,
 ) -> Result<(), Error> {
     let author_id = ctx.author().id;
     let author_name = &ctx.author().name;
@@ -907,59 +576,58 @@ pub(in crate::services::discord) async fn cmd_allowall(
         ctx.channel_id().get(),
         author_name,
         "/allowall",
-        enabled = enabled
+        action = ?action
     );
 
     let response = {
         let mut settings = ctx.data().shared.settings.write().await;
-        settings.allow_all_users = enabled;
-        save_bot_settings(&ctx.data().token, &settings);
-        if enabled {
-            "Public access enabled. Any Discord user can talk to this bot in allowed channels."
-                .to_string()
-        } else {
-            "Public access disabled. Only the owner and authorized users can talk to this bot."
-                .to_string()
+        match action {
+            AllowAllAction::Status if settings.allow_all_users => {
+                "Public access is enabled. Any Discord user can talk to this bot in allowed channels."
+            }
+            AllowAllAction::Status => {
+                "Public access is disabled. Only the owner and authorized users can talk to this bot."
+            }
+            AllowAllAction::On | AllowAllAction::Off => {
+                let enabled = action == AllowAllAction::On;
+                settings.allow_all_users = enabled;
+                save_bot_settings(&ctx.data().token, &settings);
+                if enabled {
+                    "Public access enabled. Any Discord user can talk to this bot in allowed channels."
+                } else {
+                    "Public access disabled. Only the owner and authorized users can talk to this bot."
+                }
+            }
         }
     };
 
-    // Issue #1005: when toggling public access, remind the operator that
-    // high-risk commands (shell / tool grants / runtime control / credential
-    // surface) stay owner-only regardless of the flag. Surfacing the policy
-    // state here makes it clear that opening the chat to all users does NOT
-    // open the operational kill switches.
-    let policy_note = build_allowall_policy_note();
-    let combined = format!("{response}\n\n{policy_note}");
-    ctx.say(&combined).await?;
-    log_info_event!(
-        "discord_public_access_changed",
-        channel_id = ctx.channel_id().get(),
-        status = if enabled { "enabled" } else { "disabled" },
-    );
+    ctx.say(format!("{response}\n\n{}", build_allowall_policy_note()))
+        .await?;
+    if action != AllowAllAction::Status {
+        log_info_event!(
+            "discord_public_access_changed",
+            channel_id = ctx.channel_id().get(),
+            status = if action == AllowAllAction::On {
+                "enabled"
+            } else {
+                "disabled"
+            },
+        );
+    }
     Ok(())
 }
 
-/// Render the risk-policy reminder appended to `/allowall` responses.
-///
-/// Pulled out so it can be unit tested without standing up the slash-command
-/// machinery. Wording references both `!`-text and `/`-slash variants so the
-/// guarantee is unambiguous: enabling `allow_all_users` does not move any
-/// high-risk gate on either surface.
-pub(in crate::services::discord) fn build_allowall_policy_note() -> String {
-    let high_risk_enabled = super::high_risk_enabled_via_env();
-    let shell_state = if high_risk_enabled {
-        "owner-only, ENABLED"
-    } else {
-        "owner-only, DISABLED (set AGENTDESK_DISCORD_HIGH_RISK_ENABLED=1)"
-    };
-    format!(
-        "**Note (issue #1005):** `allow_all_users` only governs ordinary chat \
-         access. High-risk commands stay owner-only on BOTH the `!` text and \
-         `/` slash surfaces, regardless:\n\
-         • shell/tool-grant (`!shell`/`!allowed`, `/shell`/`/allowed`) — {shell_state}\n\
-         • credential/system (`!allowall`/`!adduser`/`!removeuser`/`!escalation`, `/allowall`/`/adduser`/`/removeuser`) — owner-only"
-    )
+/// Note appended to `/allowall` replies: what public access really grants, and
+/// that it covers only this bot on this node.
+fn build_allowall_policy_note() -> &'static str {
+    "**Note:** this setting applies only to this bot on this node. Agents run with \
+     permission prompts bypassed, so anyone who can chat here can make the agent run \
+     commands on this host. `/allowall` itself stays owner-only."
 }
+
+#[cfg(all(test, unix))]
+mod allowall_tests;
+
 #[cfg(test)]
 mod session_override_cluster_characterization_tests {
     //! #3038 S2-0 — characterization tests for the session-override cluster
@@ -982,7 +650,7 @@ mod session_override_cluster_characterization_tests {
     const AGENTDESK_ROOT_DIR_ENV: &str = "AGENTDESK_ROOT_DIR";
     const AGENTDESK_CONFIG_ENV: &str = "AGENTDESK_CONFIG";
 
-    struct EnvGuard;
+    pub(super) struct EnvGuard;
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
@@ -996,7 +664,7 @@ mod session_override_cluster_characterization_tests {
     /// Pin BOTH the runtime root AND the explicit config path to the temp dir
     /// so `save_bot_settings` (called by the `update_channel_*` helpers under
     /// test) can never fall back to the developer's real cwd/home config.
-    fn isolate_persistence(tmp: &std::path::Path) -> EnvGuard {
+    pub(super) fn isolate_persistence(tmp: &std::path::Path) -> EnvGuard {
         unsafe {
             std::env::set_var(AGENTDESK_ROOT_DIR_ENV, tmp.to_str().unwrap());
             std::env::set_var(
@@ -1011,7 +679,7 @@ mod session_override_cluster_characterization_tests {
     // synchronous `#[test]`: the `test_support` env-lock guard is then never
     // held across an `.await`, keeping the await_holding_lock ratchet flat
     // (same pattern as the S1/S0 queued-placeholder characterization tests).
-    fn test_rt() -> tokio::runtime::Runtime {
+    pub(super) fn test_rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1028,7 +696,7 @@ mod session_override_cluster_characterization_tests {
 
         let shared = make_shared_data_for_tests();
         let channel_id = serenity::ChannelId::new(3_038_400);
-        let provider = ProviderKind::Claude;
+        let provider = ProviderKind::Codex;
         let rt = test_rt();
 
         assert!(!channel_fast_mode_enabled(&shared, channel_id));
@@ -1036,13 +704,17 @@ mod session_override_cluster_characterization_tests {
 
         // Enabling reports a change, flips the enablement set, and marks the
         // provider-scoped session reset as pending.
-        assert!(rt.block_on(update_channel_fast_mode(
-            &shared,
-            "test-token",
-            channel_id,
-            &provider,
-            true,
-        )));
+        assert!(
+            rt.block_on(update_channel_fast_mode(
+                &shared,
+                "test-token",
+                channel_id,
+                &provider,
+                true,
+                channel_id,
+            ))
+            .unwrap()
+        );
         assert!(channel_fast_mode_enabled(&shared, channel_id));
         assert!(fast_mode_reset_pending_for_provider(
             &shared, channel_id, &provider
@@ -1050,13 +722,17 @@ mod session_override_cluster_characterization_tests {
         assert!(any_fast_mode_reset_pending(&shared, channel_id));
 
         // Re-enabling is a no-op: no change is reported.
-        assert!(!rt.block_on(update_channel_fast_mode(
-            &shared,
-            "test-token",
-            channel_id,
-            &provider,
-            true,
-        )));
+        assert!(
+            !rt.block_on(update_channel_fast_mode(
+                &shared,
+                "test-token",
+                channel_id,
+                &provider,
+                true,
+                channel_id,
+            ))
+            .unwrap()
+        );
 
         // The provider-scoped clear reports the pending entry exactly once.
         assert!(clear_fast_mode_reset_pending_for_provider(
@@ -1069,13 +745,17 @@ mod session_override_cluster_characterization_tests {
 
         // Disabling re-marks the provider reset; the channel-wide clear
         // sweeps it (and is a no-op the second time).
-        assert!(rt.block_on(update_channel_fast_mode(
-            &shared,
-            "test-token",
-            channel_id,
-            &provider,
-            false,
-        )));
+        assert!(
+            rt.block_on(update_channel_fast_mode(
+                &shared,
+                "test-token",
+                channel_id,
+                &provider,
+                false,
+                channel_id,
+            ))
+            .unwrap()
+        );
         assert!(!channel_fast_mode_enabled(&shared, channel_id));
         assert!(any_fast_mode_reset_pending(&shared, channel_id));
         assert!(clear_fast_mode_reset_pending_for_channel(
@@ -1097,32 +777,36 @@ mod session_override_cluster_characterization_tests {
         let channel_id = serenity::ChannelId::new(3_038_410);
         let rt = test_rt();
 
-        assert!(rt.block_on(update_channel_fast_mode(
-            &shared,
-            "test-token",
-            channel_id,
-            &ProviderKind::Claude,
-            true,
-        )));
+        assert!(
+            rt.block_on(update_channel_fast_mode(
+                &shared,
+                "test-token",
+                channel_id,
+                &ProviderKind::Codex,
+                true,
+                channel_id,
+            ))
+            .unwrap()
+        );
 
         // The pending entry is keyed `provider:channel`, so the other
         // provider neither observes nor clears it...
         assert!(!fast_mode_reset_pending_for_provider(
             &shared,
             channel_id,
-            &ProviderKind::Codex
+            &ProviderKind::Claude
         ));
         assert!(!clear_fast_mode_reset_pending_for_provider(
             &shared,
             channel_id,
-            &ProviderKind::Codex
+            &ProviderKind::Claude
         ));
         // ...while the channel-wide probe still sees it for the channel.
         assert!(any_fast_mode_reset_pending(&shared, channel_id));
         assert!(fast_mode_reset_pending_for_provider(
             &shared,
             channel_id,
-            &ProviderKind::Claude
+            &ProviderKind::Codex
         ));
     }
 
@@ -1137,21 +821,27 @@ mod session_override_cluster_characterization_tests {
         let rt = test_rt();
 
         assert!(!channel_codex_goals_enabled(&shared, channel_id));
-        assert!(rt.block_on(update_channel_codex_goals(
-            &shared,
-            "test-token",
-            channel_id,
-            true,
-        )));
+        assert!(
+            rt.block_on(update_channel_codex_goals(
+                &shared,
+                "test-token",
+                channel_id,
+                true,
+            ))
+            .unwrap()
+        );
         assert!(channel_codex_goals_enabled(&shared, channel_id));
 
         // Re-enabling is a no-op.
-        assert!(!rt.block_on(update_channel_codex_goals(
-            &shared,
-            "test-token",
-            channel_id,
-            true,
-        )));
+        assert!(
+            !rt.block_on(update_channel_codex_goals(
+                &shared,
+                "test-token",
+                channel_id,
+                true,
+            ))
+            .unwrap()
+        );
 
         // The toggle marked the goals session reset pending exactly once.
         assert!(clear_codex_goals_reset_pending_for_channel(
@@ -1162,12 +852,15 @@ mod session_override_cluster_characterization_tests {
         ));
 
         // Disabling re-marks it.
-        assert!(rt.block_on(update_channel_codex_goals(
-            &shared,
-            "test-token",
-            channel_id,
-            false,
-        )));
+        assert!(
+            rt.block_on(update_channel_codex_goals(
+                &shared,
+                "test-token",
+                channel_id,
+                false,
+            ))
+            .unwrap()
+        );
         assert!(!channel_codex_goals_enabled(&shared, channel_id));
         assert!(clear_codex_goals_reset_pending_for_channel(
             &shared, channel_id
@@ -1190,13 +883,23 @@ mod session_override_cluster_characterization_tests {
             channel_id,
             Some("model-a")
         ));
-        assert!(rt.block_on(update_channel_model_override(
-            &shared,
-            "test-token",
-            channel_id,
-            &provider,
-            Some("model-a".to_string()),
-        )));
+        assert!(
+            rt.block_on(update_channel_model_override(
+                &shared,
+                "test-token",
+                channel_id,
+                &provider,
+                Some("model-a".to_string()),
+            ))
+            .unwrap()
+        );
+        assert!(
+            shared
+                .overrides
+                .model_session_reset_pending
+                .contains(&channel_id)
+        );
+        assert!(shared.overrides.session_reset_pending.contains(&channel_id));
         assert!(!would_channel_model_override_change(
             &shared,
             channel_id,
@@ -1207,24 +910,97 @@ mod session_override_cluster_characterization_tests {
         ));
 
         // Setting the same override again is a no-op.
-        assert!(!rt.block_on(update_channel_model_override(
-            &shared,
-            "test-token",
-            channel_id,
-            &provider,
-            Some("model-a".to_string()),
-        )));
+        assert!(
+            !rt.block_on(update_channel_model_override(
+                &shared,
+                "test-token",
+                channel_id,
+                &provider,
+                Some("model-a".to_string()),
+            ))
+            .unwrap()
+        );
 
         // Clearing restores the no-override state.
-        assert!(rt.block_on(update_channel_model_override(
-            &shared,
-            "test-token",
-            channel_id,
-            &provider,
-            None,
-        )));
+        assert!(
+            rt.block_on(update_channel_model_override(
+                &shared,
+                "test-token",
+                channel_id,
+                &provider,
+                None,
+            ))
+            .unwrap()
+        );
+        assert!(
+            !shared
+                .overrides
+                .model_session_reset_pending
+                .contains(&channel_id)
+        );
+        assert!(!shared.overrides.session_reset_pending.contains(&channel_id));
         assert!(!would_channel_model_override_change(
             &shared, channel_id, None
         ));
+    }
+    #[test]
+    fn truthful_failed_save_does_not_publish_model_or_reset() {
+        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = isolate_persistence(tmp.path());
+        std::fs::create_dir_all(tmp.path().join("config/bot_settings.json")).unwrap();
+        let shared = make_shared_data_for_tests();
+        let channel = serenity::ChannelId::new(6486);
+        let result = test_rt().block_on(update_channel_model_override(
+            &shared,
+            "test-token",
+            channel,
+            &ProviderKind::Codex,
+            Some("model-a".into()),
+        ));
+        assert!(result.is_err());
+        assert!(!shared.overrides.model_overrides.contains_key(&channel));
+        assert!(!shared.overrides.session_reset_pending.contains(&channel));
+    }
+
+    #[test]
+    fn truthful_foreign_owner_cannot_publish_a_setting() {
+        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = isolate_persistence(tmp.path());
+        let _hosts =
+            crate::config::session_hosts::force_for_test(Some("local"), &[(6487, "remote")]);
+        let shared = make_shared_data_for_tests();
+        let channel = serenity::ChannelId::new(6487);
+        let result = test_rt().block_on(update_channel_codex_goals(
+            &shared,
+            "test-token",
+            channel,
+            true,
+        ));
+        assert!(result.is_err());
+        assert!(!shared.overrides.codex_goals_channels.contains(&channel));
+        assert!(!shared.overrides.session_reset_pending.contains(&channel));
+    }
+
+    #[test]
+    fn truthful_claude_tui_fast_does_not_reset_or_publish() {
+        let _lock = crate::services::turn_orchestrator::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = isolate_persistence(tmp.path());
+        let _hosts = provider_settings::local_tui_for_test(6488);
+        let shared = make_shared_data_for_tests();
+        let channel = serenity::ChannelId::new(6488);
+        let result = test_rt().block_on(update_channel_fast_mode(
+            &shared,
+            "test-token",
+            channel,
+            &ProviderKind::Claude,
+            true,
+            channel,
+        ));
+        assert!(result.is_err());
+        assert!(!shared.overrides.fast_mode_channels.contains(&channel));
+        assert!(!shared.overrides.session_reset_pending.contains(&channel));
     }
 }

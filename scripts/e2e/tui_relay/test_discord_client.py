@@ -37,6 +37,101 @@ class _Response:
         return self._payload
 
 
+class DiscordClientTurnActivityRetry(unittest.TestCase):
+    def run_activity_transition(self, *, known_at, budget, status=409, body=None, oversleep=0, latency=0.25):
+        clock = [0.0]
+        health = {"activity": "unknown"}
+        attempts, sleeps = [], []
+        body = body if body is not None else {"reason": "turn_activity_unknown"}
+        raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+
+        def urlopen(request, timeout):
+            self.assertTrue(request.full_url.endswith("/api/agents/smoke/turn/start"))
+            self.assertEqual(json.loads(request.data)["channel_id"], "222")
+            attempts.append((clock[0], timeout))
+            health["activity"] = "idle" if clock[0] >= known_at else "unknown"
+            clock[0] += latency
+            if health["activity"] == "unknown":
+                error = urllib.error.HTTPError(request.full_url, status, "refused", {}, BytesIO(raw))
+                self.addCleanup(error.close)
+                raise error
+            return _Response({"status": "started", "turn_id": "discord:222:1000"})
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds + oversleep
+
+        client = DiscordClient(base_url="http://offline.invalid", timeout_s=budget,
+                               handoff_to_agent="smoke", handoff_from_agent="orchestrator")
+        response, error = None, None
+        with mock.patch("urllib.request.urlopen", side_effect=urlopen), \
+             mock.patch("tui_relay.discord.time.monotonic", side_effect=lambda: clock[0]), \
+             mock.patch("tui_relay.discord.time.sleep", side_effect=sleep):
+            try:
+                response = client.send_prompt("222", "smoke prompt")
+            except RuntimeError as caught:
+                error = caught
+        return response, error, attempts, sleeps, clock[0]
+
+    def test_unknown_activity_retries_until_delayed_idle(self):
+        response, error, attempts, sleeps, elapsed = self.run_activity_transition(known_at=1.5, budget=3)
+        self.assertIsNone(error, "unknown activity must be retried until idle within the budget")
+        self.assertEqual(response["turn_id"], "discord:222:1000")
+        self.assertEqual([at for at, _ in attempts], [0, 1.25, 2.5])
+        self.assertEqual(sleeps, [1, 1])
+        self.assertLess(elapsed, 3)
+        for at, timeout in attempts:
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 3 - at, "request timeout must fit the remaining budget")
+
+    def test_unknown_activity_deadline_fails_without_late_post(self):
+        for known_at, oversleep in ((2, 0), (3, 0), (float("inf"), 0), (2, 2)):
+            with self.subTest(known_at=known_at, oversleep=oversleep):
+                response, error, attempts, sleeps, elapsed = self.run_activity_transition(
+                    known_at=known_at, budget=2, oversleep=oversleep)
+                self.assertIsNone(response, "expired activity wait must never start a late turn")
+                self.assertIsInstance(error, RuntimeError)
+                self.assertIn("turn/start HTTP 409:", str(error))
+                self.assertIn("turn_activity_unknown", str(error))
+                self.assertIsInstance(error.__cause__, urllib.error.HTTPError)
+                self.assertEqual([at for at, _ in attempts], [0] if oversleep else [0, 1.25])
+                self.assertEqual(sleeps, [1] if oversleep else [1, 0.5],
+                                 "activity retry sleep must stop at the deadline")
+                self.assertGreaterEqual(elapsed, 2)
+                if not oversleep:
+                    self.assertEqual(elapsed, 2, "activity wait must not overshoot its budget")
+
+        with self.subTest(budget=2, latency=2.0):
+            response, error, attempts, sleeps, elapsed = self.run_activity_transition(
+                known_at=float("inf"), budget=2, latency=2.0)
+            self.assertEqual(sleeps, [], "exhausted request budget must not schedule a retry sleep")
+            self.assertEqual(len(attempts), 1)
+            self.assertIsNone(response)
+            self.assertIsInstance(error, RuntimeError)
+            self.assertIn("turn/start HTTP 409:", str(error))
+            self.assertIn("turn_activity_unknown", str(error))
+            self.assertIsInstance(error.__cause__, urllib.error.HTTPError)
+            self.assertEqual(elapsed, 2)
+
+    def test_other_refusals_fail_immediately(self):
+        cases = [(409, {"reason": reason}) for reason in
+                 ("external_turn_active", "session_transition", "turn_activity_unknown extra", None,
+                  ["turn_activity_unknown"])]
+        cases += [(409, {"error": "turn_activity_unknown"}), (409, ["turn_activity_unknown"]),
+                  (409, "turn_activity_unknown"), (409, b"{broken turn_activity_unknown"),
+                  (503, {"reason": "turn_activity_unknown"})]
+        for status, body in cases:
+            with self.subTest(status=status, body=body):
+                response, error, attempts, sleeps, elapsed = self.run_activity_transition(
+                    known_at=1, budget=3, status=status, body=body)
+                self.assertIsNone(response, "unrelated refusal must not be retried into a pass")
+                self.assertIsInstance(error, RuntimeError)
+                self.assertIn(f"turn/start HTTP {status}:", str(error))
+                self.assertEqual(len(attempts), 1, "unrelated refusal must fail on its first attempt")
+                self.assertEqual(sleeps, [])
+                self.assertEqual(elapsed, 0.25)
+
+
 class DiscordClientSendPrompt(unittest.TestCase):
     def test_control_marker_uses_notify_bot(self):
         captured = {}
@@ -183,6 +278,25 @@ class DiscordClientSendPrompt(unittest.TestCase):
             "Processing...",
             "final [E2E:EDIT]",
         ])
+
+    def test_wait_returns_first_match_and_observes_poll_tail_edits(self):
+        client = DiscordClient(base_url="http://offline.invalid")
+        pending = {"id": "10", "content": "pending"}
+        old_tail = {"id": "12", "content": "tail-old"}
+        match = {"id": "11", "content": "target"}
+        edited_tail = {"id": "12", "content": "tail-new", "edited_timestamp": "edited"}
+        second_match = {"id": "13", "content": "target-again"}
+        predicate = mock.Mock(side_effect=lambda message: message["content"].startswith("target"))
+        with mock.patch.object(DiscordClient, "fetch_messages", side_effect=[
+                [old_tail, pending], [second_match, edited_tail, match]]) as fetch, \
+                mock.patch("time.sleep") as sleep:
+            found, observed = client.wait_for_message(
+                "41", predicate=predicate, after_id="9", timeout_s=30, poll_interval_s=7)
+        self.assertIs(found, match)
+        self.assertEqual(observed, [pending, old_tail, match, edited_tail, second_match])
+        self.assertEqual(predicate.call_args_list, [mock.call(pending), mock.call(old_tail), mock.call(match)])
+        self.assertEqual(fetch.call_args_list, [mock.call("41", after_id="9", limit=100)] * 2)
+        sleep.assert_called_once_with(7)
 
 
 class DiscordClientFetchMessages(unittest.TestCase):

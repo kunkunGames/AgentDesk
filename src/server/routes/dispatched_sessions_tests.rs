@@ -17,6 +17,19 @@ async fn witness_step<T>(label: &str, future: impl Future<Output = T>) -> T {
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
 }
 
+fn resume_transcript_home(cwd: &std::path::Path, session_id: &str) -> tempfile::TempDir {
+    let home = tempfile::tempdir().expect("resume Claude home");
+    let transcript = crate::services::claude_tui::transcript_tail::claude_transcript_path(
+        cwd,
+        session_id,
+        Some(home.path()),
+    )
+    .expect("resume transcript path");
+    std::fs::create_dir_all(transcript.parent().unwrap()).expect("resume project directory");
+    std::fs::write(transcript, b"{}\n").expect("resume transcript");
+    home
+}
+
 fn install_missing_tmux_probe() -> (tempfile::TempDir, crate::config::TestEnvVarGuard) {
     install_tmux_probe("echo 'no server running on test socket' >&2\nexit 1")
 }
@@ -480,7 +493,7 @@ impl Drop for TmuxEnv {
 }
 
 /// Runs one statement, binding every argument as nullable text.
-async fn exec(pool: &sqlx::PgPool, sql: &str, args: &[Option<&str>]) {
+async fn exec(pool: &sqlx::PgPool, sql: &'static str, args: &[Option<&str>]) {
     let query = args
         .iter()
         .fold(sqlx::query(sql), |query, arg| query.bind(*arg));
@@ -491,7 +504,7 @@ async fn exec(pool: &sqlx::PgPool, sql: &str, args: &[Option<&str>]) {
 async fn snapshot(pool: &sqlx::PgPool, table: &str, column: &str, ids: &[&str]) -> String {
     let query = format!("SELECT jsonb_agg(to_jsonb(t) ORDER BY t.{column})::text FROM {table} t");
     let query = format!("{query} WHERE t.{column} = ANY($1)");
-    let row = sqlx::query_scalar::<_, Option<String>>(&query).bind(ids);
+    let row = sqlx::query_scalar::<_, Option<String>>(sqlx::AssertSqlSafe(query)).bind(ids);
     row.fetch_one(pool).await.unwrap().unwrap_or_default()
 }
 
@@ -1022,115 +1035,118 @@ async fn backlog_revert_refuses_a_card_whose_kill_the_runtime_keeps_pg() {
 
 /// `/resume` of a legacy row whose teardown the runtime keeps, or on a Herdr-configured channel,
 /// refuses before the durable rebind; once a runtime takes the channel the same row resumes.
-#[tokio::test(flavor = "current_thread")]
-async fn resume_refuses_a_session_whose_teardown_the_runtime_keeps_pg() {
+#[test]
+fn resume_refuses_a_session_whose_teardown_the_runtime_keeps_pg() {
     use crate::services::discord::host_teardown_gate::test_support as host;
     use crate::services::session_resume::{
-        ResumePreviousOptions, ResumeRebindError, perform_resume_rebind,
+        ResumePreviousOptions, ResumeRebindError, catalog::scope_claude_home_for_tests,
+        perform_resume_rebind,
     };
     let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let runtime_root = tempfile::TempDir::new().expect("runtime root");
     let set = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock;
     let _root_guard = set("AGENTDESK_ROOT_DIR", runtime_root.path());
-    let _dedupe = crate::services::tui_prompt_dedupe::TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let pg_db = TestPostgresDb::create().await;
-    let pool = pg_db.connect_and_migrate_with_max_connections(4).await;
-    let (shared, registry) = host::runtime(&pool).await;
-    let (old_cwd, target_cwd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let target_sid = "99999999-9999-9999-9999-999999999999";
-    let opts = ResumePreviousOptions {
-        session_id: Some(target_sid.to_string()),
-        cwd: Some(target_cwd.path().to_str().unwrap().to_string()),
-    };
-    for (round, condition) in [LiveServer, MissingBinary, NoServerSocket]
-        .into_iter()
-        .enumerate()
-    {
-        let tmux = TmuxEnv::install(condition);
-        for taken in [false, true] {
-            host::allow_channels(&shared, if taken { &[] } else { &[1] }).await;
-            let name = format!("AgentDesk-claude-resume-verdict-{round}-{taken}");
-            let channel = 1_479_671_301_387_067_000 + round as u64 * 10 + u64::from(taken);
-            let channel = poise::serenity_prelude::ChannelId::new(channel);
-            let key = host::channel_key(&shared, &name);
-            let sql = "INSERT INTO sessions (session_key, provider, status, cwd, claude_session_id,
-                                             raw_provider_session_id, last_heartbeat)
-                       VALUES ($1, 'claude', 'idle', $2, 'old-sid', 'old-sid', NOW())";
-            let cwd = old_cwd.path().to_str();
-            exec(&pool, sql, &[Some(key.as_str()), cwd]).await;
-            tmux.start(&name);
-            let before = snapshot(&pool, "sessions", "session_key", &[&key]).await;
-            let claude = Some(crate::services::provider::ProviderKind::Claude);
-            let resume = perform_resume_rebind(
-                &pool,
-                Some(&registry),
-                &key,
-                claude,
-                Some(channel),
-                &name,
-                &opts,
-            );
-            let resumed = resume.await;
-            if taken {
-                resumed.expect("a teardown the runtime admits resumes");
-                let sid = field(&pool, "sessions", &key, "claude_session_id").await;
-                assert_eq!(sid, target_sid, "{condition:?}: the row is rebound");
-                assert!(
-                    !tmux.alive(&name),
-                    "{condition:?}: the old tmux is torn down"
+    crate::services::tui_prompt_dedupe::run_serial_test(async {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate_with_max_connections(4).await;
+        let (shared, registry) = host::runtime(&pool).await;
+        let (old_cwd, target_cwd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let target_sid = "99999999-9999-9999-9999-999999999999";
+        let claude_home = resume_transcript_home(target_cwd.path(), target_sid);
+        let opts = ResumePreviousOptions {
+            session_id: Some(target_sid.to_string()),
+            cwd: Some(target_cwd.path().to_str().unwrap().to_string()),
+        };
+        for (round, condition) in [LiveServer, MissingBinary, NoServerSocket]
+            .into_iter()
+            .enumerate()
+        {
+            let tmux = TmuxEnv::install(condition);
+            for taken in [false, true] {
+                host::allow_channels(&shared, if taken { &[] } else { &[1] }).await;
+                let name = format!("AgentDesk-claude-resume-verdict-{round}-{taken}");
+                let channel = 1_479_671_301_387_067_000 + round as u64 * 10 + u64::from(taken);
+                let channel = poise::serenity_prelude::ChannelId::new(channel);
+                let key = host::channel_key(&shared, &name);
+                let sql =
+                    "INSERT INTO sessions (session_key, provider, status, cwd, claude_session_id,
+                                                 raw_provider_session_id, last_heartbeat)
+                           VALUES ($1, 'claude', 'idle', $2, 'old-sid', 'old-sid', NOW())";
+                let cwd = old_cwd.path().to_str();
+                exec(&pool, sql, &[Some(key.as_str()), cwd]).await;
+                tmux.start(&name);
+                let before = snapshot(&pool, "sessions", "session_key", &[&key]).await;
+                let claude = Some(crate::services::provider::ProviderKind::Claude);
+                let resume = perform_resume_rebind(
+                    &pool,
+                    Some(&registry),
+                    &key,
+                    claude,
+                    Some(channel),
+                    &name,
+                    &opts,
                 );
-                let _ = tmux.take_calls();
-                continue;
+                let resumed =
+                    scope_claude_home_for_tests(claude_home.path().to_path_buf(), resume).await;
+                if taken {
+                    resumed.expect("a teardown the runtime admits resumes");
+                    let sid = field(&pool, "sessions", &key, "claude_session_id").await;
+                    assert_eq!(sid, target_sid, "{condition:?}: the row is rebound");
+                    assert!(
+                        !tmux.alive(&name),
+                        "{condition:?}: the old tmux is torn down"
+                    );
+                    let _ = tmux.take_calls();
+                    continue;
+                }
+                let refused = matches!(&resumed, Err(ResumeRebindError::HostUnsupported(reason))
+                    if reason.contains("teardown is kept"));
+                assert!(refused, "{condition:?}: {resumed:?}");
+                let after = snapshot(&pool, "sessions", "session_key", &[&key]).await;
+                assert_eq!(after, before, "{condition:?}: no durable rebind");
+                assert!(
+                    !tmux.live || tmux.alive(&name),
+                    "{condition:?}: tmux survives"
+                );
+                assert_eq!(tmux.take_calls(), [""; 0], "{condition:?}: no tmux call");
             }
-            let refused = matches!(&resumed, Err(ResumeRebindError::HostUnsupported(reason))
-                if reason.contains("teardown is kept"));
-            assert!(refused, "{condition:?}: {resumed:?}");
-            let after = snapshot(&pool, "sessions", "session_key", &[&key]).await;
-            assert_eq!(after, before, "{condition:?}: no durable rebind");
-            assert!(
-                !tmux.live || tmux.alive(&name),
-                "{condition:?}: tmux survives"
-            );
-            assert_eq!(tmux.take_calls(), [""; 0], "{condition:?}: no tmux call");
         }
-    }
 
-    // A Herdr-configured channel refuses even where a runtime would admit the teardown.
-    let tmux = TmuxEnv::install(LiveServer);
-    host::allow_channels(&shared, &[]).await;
-    let name = "AgentDesk-claude-resume-verdict-herdr";
-    let channel = poise::serenity_prelude::ChannelId::new(1_479_671_301_387_067_900);
-    let key = host::channel_key(&shared, name);
-    let sql = "INSERT INTO sessions (session_key, provider, status, cwd, claude_session_id,
-                                     raw_provider_session_id, last_heartbeat)
-               VALUES ($1, 'claude', 'idle', $2, 'old-sid', 'old-sid', NOW())";
-    exec(&pool, sql, &[Some(key.as_str()), old_cwd.path().to_str()]).await;
-    tmux.start(name);
-    let before = snapshot(&pool, "sessions", "session_key", &[&key]).await;
-    let configured = [(channel.get(), "mac-mini")];
-    let _hosts = crate::config::session_hosts::force_for_test(Some("mac-mini"), &configured);
-    let claude = Some(crate::services::provider::ProviderKind::Claude);
-    let resume = perform_resume_rebind(
-        &pool,
-        Some(&registry),
-        &key,
-        claude,
-        Some(channel),
-        name,
-        &opts,
-    );
-    let resumed = resume.await;
-    let after = snapshot(&pool, "sessions", "session_key", &[&key]).await;
-    assert_eq!(after, before, "configured: no durable rebind");
-    assert!(tmux.alive(name), "configured: tmux survives");
-    assert_eq!(tmux.take_calls(), [""; 0], "configured: no tmux call");
-    let refused = matches!(&resumed, Err(ResumeRebindError::HostUnsupported(reason))
-        if reason.contains("Herdr"));
-    assert!(refused, "configured: {resumed:?}");
-    pool.close().await;
-    pg_db.drop().await;
+        // A Herdr-configured channel refuses even where a runtime would admit the teardown.
+        let tmux = TmuxEnv::install(LiveServer);
+        host::allow_channels(&shared, &[]).await;
+        let name = "AgentDesk-claude-resume-verdict-herdr";
+        let channel = poise::serenity_prelude::ChannelId::new(1_479_671_301_387_067_900);
+        let key = host::channel_key(&shared, name);
+        let sql = "INSERT INTO sessions (session_key, provider, status, cwd, claude_session_id,
+                                         raw_provider_session_id, last_heartbeat)
+                   VALUES ($1, 'claude', 'idle', $2, 'old-sid', 'old-sid', NOW())";
+        exec(&pool, sql, &[Some(key.as_str()), old_cwd.path().to_str()]).await;
+        tmux.start(name);
+        let before = snapshot(&pool, "sessions", "session_key", &[&key]).await;
+        let configured = [(channel.get(), "mac-mini")];
+        let _hosts = crate::config::session_hosts::force_for_test(Some("mac-mini"), &configured);
+        let claude = Some(crate::services::provider::ProviderKind::Claude);
+        let resume = perform_resume_rebind(
+            &pool,
+            Some(&registry),
+            &key,
+            claude,
+            Some(channel),
+            name,
+            &opts,
+        );
+        let resumed = scope_claude_home_for_tests(claude_home.path().to_path_buf(), resume).await;
+        let after = snapshot(&pool, "sessions", "session_key", &[&key]).await;
+        assert_eq!(after, before, "configured: no durable rebind");
+        assert!(tmux.alive(name), "configured: tmux survives");
+        assert_eq!(tmux.take_calls(), [""; 0], "configured: no tmux call");
+        let refused = matches!(&resumed, Err(ResumeRebindError::HostUnsupported(reason))
+            if reason.contains("Herdr"));
+        assert!(refused, "configured: {resumed:?}");
+        pool.close().await;
+        pg_db.drop().await;
+    });
 }
 
 /// A routine kill or fresh teardown the host guard keeps disconnects nothing: the session row
@@ -1366,70 +1382,74 @@ async fn backlog_revert_refuses_a_card_whose_runtime_runs_another_session_pg() {
 
 /// `/resume` of a legacy row whose channel's runtime runs another session refuses before the
 /// durable rebind and touches neither session.
-#[tokio::test(flavor = "current_thread")]
-async fn resume_refuses_a_session_whose_runtime_runs_another_session_pg() {
+#[test]
+fn resume_refuses_a_session_whose_runtime_runs_another_session_pg() {
     use crate::services::discord::host_teardown_gate::test_support as host;
     use crate::services::session_resume::{
-        ResumePreviousOptions, ResumeRebindError, perform_resume_rebind,
+        ResumePreviousOptions, ResumeRebindError, catalog::scope_claude_home_for_tests,
+        perform_resume_rebind,
     };
     let _env_lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
     let runtime_root = tempfile::TempDir::new().expect("runtime root");
     let set = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock;
     let _root_guard = set("AGENTDESK_ROOT_DIR", runtime_root.path());
-    let _dedupe = crate::services::tui_prompt_dedupe::TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    let pg_db = TestPostgresDb::create().await;
-    let pool = pg_db.connect_and_migrate_with_max_connections(4).await;
-    let (shared, registry) = host::runtime(&pool).await;
-    let (old_cwd, target_cwd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let opts = ResumePreviousOptions {
-        session_id: Some("99999999-9999-9999-9999-999999999999".to_string()),
-        cwd: Some(target_cwd.path().to_str().unwrap().to_string()),
-    };
-    let host_name = crate::services::platform::hostname_short();
-    for (round, condition) in [LiveServer, MissingBinary, NoServerSocket]
-        .into_iter()
-        .enumerate()
-    {
-        let tmux = TmuxEnv::install(condition);
-        for (index, moved) in [Moved::Hosted, Moved::Foreign, Moved::ChannelRow]
+    crate::services::tui_prompt_dedupe::run_serial_test(async {
+        let pg_db = TestPostgresDb::create().await;
+        let pool = pg_db.connect_and_migrate_with_max_connections(4).await;
+        let (shared, registry) = host::runtime(&pool).await;
+        let (old_cwd, target_cwd) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let opts = ResumePreviousOptions {
+            session_id: Some("99999999-9999-9999-9999-999999999999".to_string()),
+            cwd: Some(target_cwd.path().to_str().unwrap().to_string()),
+        };
+        let claude_home =
+            resume_transcript_home(target_cwd.path(), opts.session_id.as_deref().unwrap());
+        let host_name = crate::services::platform::hostname_short();
+        for (round, condition) in [LiveServer, MissingBinary, NoServerSocket]
             .into_iter()
             .enumerate()
         {
-            let name = format!("AgentDesk-claude-resume-ab-{round}-{index}");
-            let channel = 1_479_671_301_387_069_000 + (round * 10 + index) as u64;
-            let channel = poise::serenity_prelude::ChannelId::new(channel);
-            let key = format!("{host_name}:{name}");
-            let sql = "INSERT INTO sessions (session_key, provider, status, cwd, claude_session_id,
-                                             raw_provider_session_id, last_heartbeat)
-                       VALUES ($1, 'claude', 'idle', $2, 'old-sid', 'old-sid', NOW())";
-            exec(&pool, sql, &[Some(key.as_str()), old_cwd.path().to_str()]).await;
-            tmux.start(&name);
-            let other = run_other(&pool, &tmux, &shared, (channel, false), &name, moved).await;
-            let rows = [("sessions", "session_key", key.as_str())];
-            let before = untouched(&pool, &shared, channel, &other, &rows).await;
-            let claude = Some(crate::services::provider::ProviderKind::Claude);
-            let resume = perform_resume_rebind(
-                &pool,
-                Some(&registry),
-                &key,
-                claude,
-                Some(channel),
-                &name,
-                &opts,
-            );
-            let resumed = resume.await;
-            let case = format!("{condition:?} {moved:?}");
-            let refused = matches!(&resumed, Err(ResumeRebindError::HostUnsupported(reason))
-                if reason.contains("teardown is kept"));
-            assert!(refused, "{case}: {resumed:?}");
-            let after = untouched(&pool, &shared, channel, &other, &rows).await;
-            assert_refused_untouched(&tmux, &case, [&name, &other], channel, before, after);
+            let tmux = TmuxEnv::install(condition);
+            for (index, moved) in [Moved::Hosted, Moved::Foreign, Moved::ChannelRow]
+                .into_iter()
+                .enumerate()
+            {
+                let name = format!("AgentDesk-claude-resume-ab-{round}-{index}");
+                let channel = 1_479_671_301_387_069_000 + (round * 10 + index) as u64;
+                let channel = poise::serenity_prelude::ChannelId::new(channel);
+                let key = format!("{host_name}:{name}");
+                let sql =
+                    "INSERT INTO sessions (session_key, provider, status, cwd, claude_session_id,
+                                                 raw_provider_session_id, last_heartbeat)
+                           VALUES ($1, 'claude', 'idle', $2, 'old-sid', 'old-sid', NOW())";
+                exec(&pool, sql, &[Some(key.as_str()), old_cwd.path().to_str()]).await;
+                tmux.start(&name);
+                let other = run_other(&pool, &tmux, &shared, (channel, false), &name, moved).await;
+                let rows = [("sessions", "session_key", key.as_str())];
+                let before = untouched(&pool, &shared, channel, &other, &rows).await;
+                let claude = Some(crate::services::provider::ProviderKind::Claude);
+                let resume = perform_resume_rebind(
+                    &pool,
+                    Some(&registry),
+                    &key,
+                    claude,
+                    Some(channel),
+                    &name,
+                    &opts,
+                );
+                let resumed =
+                    scope_claude_home_for_tests(claude_home.path().to_path_buf(), resume).await;
+                let case = format!("{condition:?} {moved:?}");
+                let refused = matches!(&resumed, Err(ResumeRebindError::HostUnsupported(reason))
+                    if reason.contains("teardown is kept"));
+                assert!(refused, "{case}: {resumed:?}");
+                let after = untouched(&pool, &shared, channel, &other, &rows).await;
+                assert_refused_untouched(&tmux, &case, [&name, &other], channel, before, after);
+            }
         }
-    }
-    pool.close().await;
-    pg_db.drop().await;
+        pool.close().await;
+        pg_db.drop().await;
+    });
 }
 
 /// A routine kill or fresh teardown of a legacy row whose thread's runtime runs another session

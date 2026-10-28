@@ -19,7 +19,7 @@ fn n1a_confirmed_direct_prompt_posts_only_its_notice() {
         let h = RelayE2eHarness::start_with_health_registry().await;
         h.cache_relay_transport();
         h.answer_placeholders_immediately();
-        h.use_mock_notify_bot(Duration::from_secs(5)).await;
+        h.use_mock_provider_bot(Duration::from_secs(5)).await;
         let tmux = "n1a-confirmed-direct-prompt";
         h.attach_tmux_watcher(tmux, "n1a-direct.jsonl");
         let _confirmed = TestConfirmation::new(CHANNEL_ID);
@@ -30,6 +30,7 @@ fn n1a_confirmed_direct_prompt_posts_only_its_notice() {
             None,
         );
         let prompt = ObservedTuiPrompt {
+            hosted_source: None,
             provider: PROVIDER_KEY.into(),
             tmux_session_name: tmux.into(),
             prompt: "N1a direct prompt remains visible".into(),
@@ -262,7 +263,7 @@ fn n1a_confirmed_slash_raw_and_wrapper_post_one_notice() {
         let h = RelayE2eHarness::start_with_health_registry().await;
         h.cache_relay_transport();
         h.answer_placeholders_immediately();
-        h.use_mock_notify_bot(Duration::from_secs(5)).await;
+        h.use_mock_provider_bot(Duration::from_secs(5)).await;
         let tmux = "n1a-confirmed-slash-pair";
         h.attach_tmux_watcher(tmux, "n1a-slash.jsonl");
         let _confirmed = TestConfirmation::new(CHANNEL_ID);
@@ -273,6 +274,7 @@ fn n1a_confirmed_slash_raw_and_wrapper_post_one_notice() {
             super::super::relay_observed_prompt(
                 &h.shared,
                 ObservedTuiPrompt {
+                    hosted_source: None,
                     provider: PROVIDER_KEY.into(),
                     tmux_session_name: tmux.into(),
                     prompt: text.into(),
@@ -306,14 +308,13 @@ fn n1a_confirmed_slash_raw_and_wrapper_post_one_notice() {
 }
 
 #[test]
-fn n1a_confirmed_idle_preserves_footer_reanchor_and_offset_maintenance() {
+fn n1a_confirmed_idle_skips_legacy_footer_and_offset_maintenance() {
     const CHILD: &str = "ADK_N1A_IDLE_MAINTENANCE_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "services::discord::tui_prompt_relay::relay_e2e::n1a_turn_mode::n1a_confirmed_idle_preserves_footer_reanchor_and_offset_maintenance",
-                "--test-threads=1",
+                "services::discord::tui_prompt_relay::relay_e2e::n1a_turn_mode::n1a_confirmed_idle_skips_legacy_footer_and_offset_maintenance",
             ])
             .env(CHILD, "1")
             .env("AGENTDESK_SINGLE_MESSAGE_PANEL", "1")
@@ -340,9 +341,7 @@ fn n1a_confirmed_idle_preserves_footer_reanchor_and_offset_maintenance() {
             .unwrap()
             .cancel
             .store(true, Ordering::Release);
-        let transcript = concat!(
-            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"n1a-live-task\",\"name\":\"Task\",\"input\":{\"description\":\"n1a footer task\",\"prompt\":\"keep running\",\"subagent_type\":\"general-purpose\"}}]}}\n",
-        );
+        let transcript = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"n1a-live-task\",\"name\":\"Task\",\"input\":{\"description\":\"n1a footer task\",\"prompt\":\"keep running\",\"subagent_type\":\"general-purpose\"}}]}}\n";
         std::fs::write(&output, transcript).unwrap();
         let binding = TuiRuntimeBinding {
             runtime_kind: RuntimeHandoffKind::ClaudeTui,
@@ -360,8 +359,8 @@ fn n1a_confirmed_idle_preserves_footer_reanchor_and_offset_maintenance() {
             dedupe::runtime_binding_for_tmux_session(tmux)
                 .unwrap()
                 .last_offset,
-            transcript.len() as u64,
-            "confirmed idle must advance the binding offset"
+            0,
+            "O idle source phase must not advance the Legacy body cursor"
         );
         let footer = h
             .shared
@@ -369,63 +368,8 @@ fn n1a_confirmed_idle_preserves_footer_reanchor_and_offset_maintenance() {
             .placeholder_live_events
             .render_completion_footer(h.channel_id, &ProviderKind::Claude, "*");
         assert!(
-            footer
-                .block
-                .as_deref()
-                .is_some_and(|block| block.contains("n1a footer task")),
-            "confirmed idle must rehydrate live footer slots: {footer:?}"
-        );
-        let generation = std::path::PathBuf::from(crate::services::tmux_common::session_temp_path(
-            tmux,
-            "generation",
-        ));
-        assert!(generation.starts_with(h.root.path()));
-        std::fs::create_dir_all(generation.parent().unwrap()).unwrap();
-        std::fs::write(&generation, "harness-generation").unwrap();
-        let old_end = transcript.len() as u64 + 1000;
-        crate::services::discord::outbound::delivery_record::write_delivered_frontier(
-            &ProviderKind::Claude, CHANNEL_ID, tmux,
-            crate::services::discord::outbound::delivery_record::DeliveredCommit {
-                range: (0, old_end),
-                generation_mtime_ns: crate::services::discord::outbound::delivery_record::current_generation_mtime_ns(tmux),
-                attempts: 1,
-                panel_msg_id: None,
-                panel_channel_id: None,
-            },
-        ).unwrap();
-        let mut stale = binding;
-        stale.last_offset = old_end;
-        dedupe::register_tmux_runtime_binding(tmux, stale);
-        super::super::claude_idle_runtime::relay_idle_claude_bindings(&h.shared).await;
-        assert_eq!(
-            dedupe::runtime_binding_for_tmux_session(tmux)
-                .unwrap()
-                .last_offset,
-            transcript.len() as u64,
-            "confirmed idle must reanchor after compaction"
-        );
-        let frontier = crate::services::discord::outbound::delivery_frontier_probe::delivered_frontier_current_generation(&ProviderKind::Claude, h.channel_id, tmux, Some(transcript.len() as u64)).unwrap();
-        assert_eq!(frontier.range.1, transcript.len() as u64);
-        std::fs::write(&output, format!("{transcript}{{\"type\":\"user\",\"message\":{{\"content\":\"fresh direct prompt\"}}}}\n")).unwrap();
-        super::super::claude_idle_runtime::relay_idle_claude_bindings(&h.shared).await;
-        assert_eq!(
-            dedupe::runtime_binding_for_tmux_session(tmux)
-                .unwrap()
-                .last_offset,
-            std::fs::metadata(&output).unwrap().len()
-        );
-        assert!(
-            !h.relay_lease_present(tmux),
-            "confirmed prompt must not record a synthetic lease"
-        );
-        assert!(
-            inflight::load_inflight_state_read_only(&ProviderKind::Claude, CHANNEL_ID).is_none()
-        );
-        assert!(
-            !super::super::CLAUDE_IDLE_RESPONSE_TAILS
-                .lock()
-                .unwrap()
-                .contains(tmux)
+            footer.block.is_none(),
+            "O skips Legacy footer scanning: {footer:?}"
         );
         assert!(h.unhandled_requests().is_empty());
         dedupe::clear_tmux_runtime_binding(tmux);
@@ -438,7 +382,7 @@ fn n1c_hook_observed_direct_prompt_in_a_confirmed_channel_posts_its_notice_witho
         let h = RelayE2eHarness::start_with_health_registry().await;
         h.cache_relay_transport();
         h.answer_placeholders_immediately();
-        h.use_mock_notify_bot(Duration::from_secs(5)).await;
+        h.use_mock_provider_bot(Duration::from_secs(5)).await;
         let tmux = "n1c-hook-direct-prompt";
         h.attach_tmux_watcher(tmux, "n1c-hook-direct.jsonl");
         let turn = crate::services::tui_o::turn_mode::TurnConfig {
@@ -489,3 +433,8 @@ fn n1c_hook_observed_direct_prompt_in_a_confirmed_channel_posts_its_notice_witho
         assert!(h.unhandled_requests().is_empty());
     });
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+#[path = "claude_idle_o_transition_tests.rs"]
+pub(in crate::services::discord) mod claude_idle_o_transition;

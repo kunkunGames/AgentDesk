@@ -17,13 +17,13 @@ const TIER_DEFINITIONS: &[(&str, &str, i64, &str)] = &[
     ),
     (
         "tick:1min",
-        "onTick1min — [A][C][D][E][L] non-critical timeouts",
+        "onTick1min — [A][C][E][N] non-critical timeouts",
         60_000,
         "1min",
     ),
     (
         "tick:5min",
-        "onTick5min — [R][B][F][G][H][M][O] non-critical reconciliation + idle session cleanup",
+        "onTick5min — [R][B][F][G][H][O] non-critical reconciliation + idle session cleanup",
         300_000,
         "5min",
     ),

@@ -35,6 +35,8 @@ pub(super) struct TerminalCommitEpilogueLocals<'a> {
     pub(super) inflight_state: &'a Option<InflightTurnState>,
     pub(super) inflight_before_relay: &'a Option<InflightTurnState>,
     pub(super) full_response: &'a String,
+    /// An isolated scheduled turn adds nothing to the channel history.
+    pub(super) channel_effects: crate::services::discord::scheduled_turn::ChannelEffects,
     pub(super) watcher_turn_nonce: &'a Option<String>,
     pub(super) resolved_did: &'a Option<String>,
     pub(super) dispatch_ok: bool,
@@ -111,6 +113,26 @@ pub(super) async fn run_terminal_commit_epilogue(
     locals: TerminalCommitEpilogueLocals<'_>,
     state: &mut TerminalCommitEpilogueState<'_>,
 ) -> TerminalCommitEpilogueOutcome {
+    if locals.terminal_output_committed
+        && let Some(key) = watcher_completion_key(
+            context.shared,
+            context.channel_id,
+            locals.inflight_before_relay.as_ref(),
+            context.tmux_session_name,
+            locals.current_offset,
+        )
+        && crate::services::discord::recovery_engine::producer_resume::waiting_for_receipt(
+            context.shared,
+            context.provider_kind,
+            key,
+        )
+    {
+        tracing::warn!(
+            channel_id = context.channel_id.get(),
+            "repaired Codex terminal held until exact receipt commits"
+        );
+        return TerminalCommitEpilogueOutcome::Fallthrough;
+    }
     let shared = context.shared;
     let channel_id = context.channel_id;
     let watcher_provider = context.watcher_provider;
@@ -129,6 +151,7 @@ pub(super) async fn run_terminal_commit_epilogue(
         inflight_state,
         inflight_before_relay,
         full_response,
+        channel_effects,
         watcher_turn_nonce,
         resolved_did,
         dispatch_ok,
@@ -161,6 +184,11 @@ pub(super) async fn run_terminal_commit_epilogue(
     // re-evaluates the gate and finishes the cleanup once the pane
     // actually reports idle.
     if terminal_output_committed && !lifecycle_stage_paused {
+        #[cfg(all(test, unix))]
+        crate::services::discord::recovery_engine::producer_resume::record_epilogue_body(
+            channel_id.get(),
+            watcher_turn_nonce.as_deref(),
+        );
         // #3142: gate the TUI history push on `!completion_is_stale_for_newer_turn`.
         // When stale, the late `inflight_state.user_text` is the NEWER turn's
         // prompt; pairing it with the OLDER `full_response` would poison the
@@ -174,6 +202,7 @@ pub(super) async fn run_terminal_commit_epilogue(
         // `rebind_origin == false`, populated `user_text`) cannot cross-pair
         // its `user_text` with the OLDER `full_response` in the TUI history.
         if has_assistant_response
+            && !channel_effects.suppressed()
             && !completion_is_stale_for_newer_turn
             && !anchor_cleanup_is_stale_for_newer_turn
             && let Some(state) = inflight_state.as_ref().filter(|state| !state.rebind_origin)

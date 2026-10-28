@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "pre_emit_guard/replay.rs"]
+mod replay;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -167,10 +170,10 @@ pub(super) async fn run_pre_emit_guard(
             provider: watcher_provider,
             placeholder_msg_id,
             response_sent_offset,
-            last_edit_text: last_edit_text,
+            last_edit_text,
             inflight_state: None,
             has_active_turn: false,
-            tmux_session_name: tmux_session_name,
+            tmux_session_name,
             task_notification_kind: None,
             reattach_offset_match: matched_reattach.is_some(),
         };
@@ -293,6 +296,9 @@ pub(super) async fn run_pre_emit_guard(
     // Detect stale session resume failure in watcher output
     let is_stale_resume = stale_resume_detected;
     if is_stale_resume {
+        if replay::blocked(context).await {
+            return PreEmitGuardOutcome::ContinueWatcherLoop;
+        }
         clear_provider_overload_retry_state(channel_id);
         let ts = chrono::Local::now().format("%H:%M:%S");
         tracing::warn!(
@@ -325,17 +331,8 @@ pub(super) async fn run_pre_emit_guard(
                 tmux_session_name,
                 "stale session resume detected — forcing fresh session before auto-retry",
             );
-            let stale_sid = {
-                let mut data = shared.core.lock().await;
-                let old = data
-                    .sessions
-                    .get(&channel_id)
-                    .and_then(|s| s.session_id.clone());
-                if let Some(session) = data.sessions.get_mut(&channel_id) {
-                    session.clear_provider_session();
-                }
-                old
-            };
+            let stale_sid =
+                surrender_stale_channel_session(shared, watcher_provider, channel_id).await;
             // Clear DB session_id
             {
                 let hostname = crate::services::platform::hostname_short();
@@ -464,3 +461,31 @@ fn session_bound_terminal_ack_can_reconcile(
     )
     .is_some_and(|claim| Arc::ptr_eq(&claim.cancel, ctx.cancel))
 }
+
+/// Clears and returns the channel's provider session for a stale resume. An
+/// isolated scheduled turn never resumed it, so that session is kept.
+async fn surrender_stale_channel_session(
+    shared: &SharedData,
+    provider: &ProviderKind,
+    channel_id: ChannelId,
+) -> Option<String> {
+    let inflight =
+        crate::services::discord::inflight::load_inflight_state(provider, channel_id.get());
+    let effects = crate::services::discord::scheduled_turn::channel_effects(
+        shared.pg_pool.as_ref(),
+        &[inflight.as_ref()],
+    )
+    .await;
+    if effects.suppressed() {
+        return None;
+    }
+    let mut data = shared.core.lock().await;
+    let session = data.sessions.get_mut(&channel_id)?;
+    let old = session.session_id.clone();
+    session.clear_provider_session();
+    old
+}
+
+#[cfg(test)]
+#[path = "pre_emit_guard_scheduled_tests.rs"]
+mod scheduled_tests;

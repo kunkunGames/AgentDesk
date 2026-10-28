@@ -1,5 +1,7 @@
 use super::super::*;
 
+pub(in crate::services::discord) mod retry_prompt_context;
+
 /// Shared Agent Knowledge placement for a turn.
 ///
 /// #5168: this used to also carry the memento `external_recall` / file-backend
@@ -111,7 +113,10 @@ pub(super) fn build_headless_trigger_context(
     source: Option<&str>,
     metadata: Option<&serde_json::Value>,
 ) -> Option<String> {
-    let source = source.map(str::trim).filter(|value| !value.is_empty());
+    // An iMessage prompt carries its own `[아이메시지 요청 · …]` header, so the source line only repeats it.
+    let source = source
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "imessage");
     let metadata = metadata.filter(|value| !value.is_null());
     if source.is_none() && metadata.is_none() {
         return None;
@@ -153,45 +158,16 @@ pub(super) fn build_system_discord_context(
     }
 }
 
-fn normalize_turn_author_name(request_owner_name: &str, request_owner: UserId) -> String {
-    let collapsed = request_owner_name
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let base = if collapsed.is_empty() {
-        format!("user {}", request_owner.get())
-    } else {
-        collapsed
-    };
-    let sanitized = base
-        .chars()
-        .map(|ch| match ch {
-            '\r' | '\n' => ' ',
-            '[' | '{' => '(',
-            ']' | '}' => ')',
-            _ => ch,
-        })
-        .collect::<String>();
-    sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 pub(super) fn wrap_user_prompt_with_author(
     request_owner_name: &str,
     request_owner: UserId,
     sanitized_prompt: String,
 ) -> String {
-    let author = normalize_turn_author_name(request_owner_name, request_owner);
-    let prefix = format!("[User: {author} (ID: {})]", request_owner.get());
-    let normalized_prompt = sanitized_prompt.replace("\r\n", "\n").replace('\r', "\n");
-    if normalized_prompt.is_empty() {
-        prefix
-    } else if normalized_prompt.contains('\n') {
-        format!("{prefix}\n{normalized_prompt}")
-    } else {
-        // Keep ordinary Discord messages on one terminal line so TUI input can
-        // use literal send-keys instead of multiline paste-buffer submission.
-        format!("{prefix} {normalized_prompt}")
-    }
+    crate::services::tui_input::human_frame::idle(
+        request_owner_name,
+        &request_owner.to_string(),
+        &sanitized_prompt,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

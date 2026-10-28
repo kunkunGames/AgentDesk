@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "footer_retirement_tests.rs"]
+mod footer_retirement_tests;
+
 pub(in crate::services::discord) use crate::utils::format::floor_char_boundary;
 
 #[cfg(test)]
@@ -13,7 +17,7 @@ pub(super) fn char_count(s: &str) -> usize {
 /// no observed-delivery evidence that establishes one. The production-call
 /// inventory is: `formatting::delivery::{split_message, needs_multiple_messages}`;
 /// the streaming split, snapshot, and status truncation helpers in this module;
-/// `outbound::decision::decide_length`;
+/// `outbound::decision::decide_length`; `outbound::manual_delivery`'s oversize routing;
 /// `outbound::delivery::{truncate_with_marker, split_content}`;
 /// `single_message_panel::{compose_completion_footer_text,
 /// clamp_footer_status_block}`; `placeholder_live_events::status_panel`;
@@ -95,13 +99,17 @@ fn build_streaming_placeholder_snapshot(current_portion: &str, status_block: &st
     ));
     let body_budget = DISCORD_MSG_LIMIT
         .saturating_sub(discord_message_units(&footer) + STREAMING_PLACEHOLDER_MARGIN);
-    // An exhausted body budget renders only the bounded footer.
+    // Keep the old reservation, but never expose its rich block as an empty anchor.
     if body_budget == 0 {
-        return footer;
+        return super::super::footer_retirement::visible_anchor(&footer).to_string();
     }
     let normalized = normalize_empty_lines(current_portion);
     let body = tail_with_ellipsis_discord_units(&normalized, body_budget);
-    format!("{}{}", body, footer)
+    if super::super::footer_retirement::retired() {
+        body
+    } else {
+        format!("{}{}", body, footer)
+    }
 }
 
 pub(in crate::services::discord) fn plan_streaming_rollover(
@@ -131,7 +139,9 @@ pub(in crate::services::discord) fn build_streaming_placeholder_text(
     status_block: &str,
 ) -> String {
     if current_portion.is_empty() {
-        clamp_placeholder_status_block(status_block)
+        clamp_placeholder_status_block(super::super::footer_retirement::visible_anchor(
+            status_block,
+        ))
     } else {
         build_streaming_placeholder_snapshot(current_portion, status_block)
     }
@@ -827,7 +837,7 @@ pub(in crate::services::discord) fn build_status_panel_streaming_edit_text(
     provider: &crate::services::provider::ProviderKind,
 ) -> String {
     if current_portion.is_empty() {
-        return status_block.to_string();
+        return super::super::footer_retirement::visible_anchor(status_block).to_string();
     }
     let formatted = format_for_discord_with_status_panel(current_portion, provider);
     build_streaming_placeholder_text(&formatted, status_block)

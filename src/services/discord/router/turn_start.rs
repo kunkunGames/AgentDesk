@@ -14,6 +14,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) struct HeadlessTurnStartOutcome {
     pub turn_id: String,
     pub status: HeadlessTurnStartStatus,
+    pub owned_session_key: Option<String>,
+}
+
+impl HeadlessTurnStartOutcome {
+    pub(crate) fn started(turn_id: String, owned_session_key: Option<String>) -> Self {
+        Self {
+            turn_id,
+            status: HeadlessTurnStartStatus::Started,
+            owned_session_key,
+        }
+    }
+
+    pub(crate) fn consumed(turn_id: String) -> Self {
+        Self {
+            turn_id,
+            status: HeadlessTurnStartStatus::Consumed,
+            owned_session_key: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,12 +215,7 @@ pub(in crate::services::discord) async fn claim_reserved_headless_turn(
     Ok((transition, cancel_token))
 }
 
-// NOTE(#3588, #3591): idle 기반 + 턴수 기반(100턴) 세션 리셋이 모두 제거됨.
-// idle/턴수와 무관하게 provider session(claude resume id)을 보존해 다음 턴에
-// `--resume`으로 transcript를 이어간다. 컨텍스트 폭주는 auto-compact가 관리한다.
-// in-memory/tmux 메모리 회수는 `maybe_cleanup_sessions`/idle-kill이 담당하되
-// resume id는 남긴다. 명시적 초기화는 idle recap의 `새 세션 시작` 버튼
-// (idle_recap:clear) 또는 `/clear`로만 한다.
+// idle/턴수와 무관하게 resume id를 보존한다. 명시적 초기화는 !clear 또는 /clear로 한다.
 
 pub(super) fn dispatch_reset_lifecycle_code(
     reset_provider_state: bool,
@@ -279,31 +293,24 @@ pub(super) fn put_back_session_retry_context(
     }
 }
 
-/// #4307 PR-B: one-shot take of the voluntary tool_feedback reminder stashed at
-/// the previous turn's end (provider-scoped key — see
-/// `recovery_text::voluntary_feedback_reminder_key`). Mirrors
-/// `take_session_retry_context`; the take deletes the stash so the reminder is
-/// injected into exactly one turn.
+/// Borrow the provider-scoped reminder; confirmed completion consumes the durable stash.
 pub(super) fn take_voluntary_feedback_reminder(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> Option<String> {
-    super::super::turn_bridge::recovery_text::take_voluntary_feedback_reminder(
+    let store = super::response_format::retry_prompt_context::store::peek;
+    store(
         shared.pg_pool.as_ref(),
-        provider,
-        channel_id.get(),
+        &super::response_format::retry_prompt_context::store::key(
+            "voluntary_feedback_reminder",
+            provider,
+            channel_id.get(),
+        ),
     )
 }
 
-/// #4307 PR-B: take the reminder stashed at the previous turn's end and fold its
-/// formatted block into `reply_context`, so it reaches the next prompt (via the
-/// intake `context_chunks`) AND is carried forward inside `reply_context.clone()`
-/// if this turn is re-queued for a TUI-busy retry. Returns the owned reminder
-/// (for the refusal-branch put-back) alongside the augmented reply context.
-///
-/// Extracted from `intake_turn.rs` (rather than inlined like the sibling
-/// session-retry take) to keep that frozen giant file from re-inflating.
+/// Select one reminder for prompt assembly without removing its durable owner.
 pub(super) fn take_and_merge_feedback_reminder(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -320,28 +327,24 @@ pub(super) fn take_and_merge_feedback_reminder(
     (feedback_reminder, reply_context)
 }
 
-/// #4196: one-shot take of the turn-end WIP warning stashed at the previous
-/// turn's end (provider-scoped key — see `recovery_text::turn_end_wip_warning`).
-/// Mirrors `take_voluntary_feedback_reminder`; the take deletes the stash so the
-/// warning is injected into exactly one turn.
+/// Borrow the provider-scoped WIP warning until input and answer delivery are confirmed.
 pub(super) fn take_turn_end_wip_warning(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
     channel_id: ChannelId,
 ) -> Option<String> {
-    super::super::turn_bridge::recovery_text::take_turn_end_wip_warning(
+    let store = super::response_format::retry_prompt_context::store::peek;
+    store(
         shared.pg_pool.as_ref(),
-        provider,
-        channel_id.get(),
+        &super::response_format::retry_prompt_context::store::key(
+            "turn_end_wip_warning",
+            provider,
+            channel_id.get(),
+        ),
     )
 }
 
-/// #4196: take the WIP warning stashed at the previous turn's end and fold its
-/// formatted block into `reply_context`, so it reaches the next prompt (via the
-/// intake `context_chunks`) AND is carried forward inside `reply_context.clone()`
-/// if this turn is re-queued for a TUI-busy retry. Returns the owned warning
-/// (for the refusal-branch put-back) alongside the augmented reply context.
-/// Mirrors `take_and_merge_feedback_reminder`.
+/// Select one WIP warning; requeue returns raw context while the stash keeps ownership.
 pub(super) fn take_and_merge_wip_warning(
     shared: &Arc<SharedData>,
     provider: &ProviderKind,
@@ -530,6 +533,11 @@ pub(super) async fn log_session_strategy_diagnostic(
     recovery_context_present: bool,
     memento_context_loaded: bool,
 ) {
+    crate::services::tui_o::cutover::mark_codex_turn_admitted(
+        channel_id.get(),
+        provider,
+        provider_session_id,
+    );
     let tmux_alive = if let Some(tmux_name) = tmux_session_name
         .map(str::trim)
         .filter(|value| !value.is_empty())

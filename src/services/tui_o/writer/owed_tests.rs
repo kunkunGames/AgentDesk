@@ -33,9 +33,13 @@ const CHANNEL: u64 = 584_521;
 
 #[derive(Default)]
 pub(crate) struct Port {
+    history_override: Mutex<Option<Vec<SeenMessage>>>,
+    history_reads: std::sync::atomic::AtomicUsize,
     posts: Mutex<Vec<String>>,
     /// Runs inside each POST's first poll, under the gate and any record lock.
     on_post: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Each POST answers only after this long.
+    delay: Mutex<Option<std::time::Duration>>,
 }
 
 impl Port {
@@ -66,11 +70,26 @@ impl DiscordPort for Port {
             author_id,
             content,
         };
-        async move { PostOutcome::Created(message) }
+        let delay = *self.delay.lock().unwrap();
+        async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            PostOutcome::Created(message)
+        }
     }
 
     /// A readable channel where only another author spoke after `after`.
     async fn history_after(&self, _channel: u64, after: u64) -> Result<Vec<SeenMessage>, String> {
+        self.history_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(history) = &*self.history_override.lock().unwrap() {
+            return Ok(history
+                .iter()
+                .filter(|message| message.id > after)
+                .cloned()
+                .collect());
+        }
         let (id, author_id, content) = (after + 1, 7, "chatter".to_owned());
         Ok(vec![SeenMessage {
             id,
@@ -86,11 +105,16 @@ impl DiscordPort for Port {
 
 pub(crate) struct Lease;
 
+thread_local! {
+    /// While set, every lease on this thread is held elsewhere.
+    pub(crate) static LEASE_BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl DeliveryLease for Lease {
     type Held = ();
 
     fn try_acquire(&self, _channel: u64, _serial: u64) -> Option<()> {
-        Some(())
+        (!LEASE_BUSY.get()).then_some(())
     }
 }
 
@@ -529,7 +553,7 @@ async fn the_running_actor_posts_the_same_and_leaves_the_sidecar_alone() {
         );
         seen.push(port.posts());
     }
-    assert_eq!(seen[0], ["first"]);
+    assert_eq!(seen[0], ["first", "-# ✅ 완료"]);
     assert!(seen.iter().all(|posts| *posts == seen[0]), "{seen:?}");
 }
 

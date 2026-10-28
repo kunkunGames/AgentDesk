@@ -35,6 +35,7 @@ use crate::services::discord::restart_report::{
     RESTART_REPORT_CHANNEL_ENV, RESTART_REPORT_PROVIDER_ENV,
 };
 use crate::services::process::{kill_child_tree, shell_escape};
+use crate::services::provider::session_prompt;
 use crate::services::provider::{
     CancelToken, ProviderKind, ReadOutputResult, SessionProbe, cancel_requested,
     cancel_token_claude_interrupt::{
@@ -44,13 +45,14 @@ use crate::services::provider::{
 };
 use crate::services::provider_hosting::ProviderSessionDriver;
 use crate::services::remote::RemoteProfile;
+#[cfg(unix)]
+use crate::services::session_backend::read_claude_tui_output_file_until_result_with_harvest as read_output_file_until_result_with_harvest;
 use crate::services::session_backend::{
     ReadHarvestStats, StreamLineState, emit_status_events_from_stream_json,
     insert_process_session_and_mark_active_turn, mark_process_session_active_turn,
     observe_stream_context, parse_assistant_extra_tool_uses, parse_stream_message_with_state,
     process_session_available_for_followup, process_session_probe, read_output_file_until_result,
-    read_output_file_until_result_with_harvest, remove_process_session, send_process_session_input,
-    terminate_process_handle,
+    remove_process_session, send_process_session_input, terminate_process_handle,
 };
 mod active_usage;
 #[cfg(unix)]
@@ -226,7 +228,7 @@ mod launch_env_tests {
 #[cfg(unix)]
 use crate::services::tmux_common::{tmux_owner_path, write_tmux_owner_marker};
 
-/// Global runtime debug flag — togglable via `/debug` command or COKACDIR_DEBUG=1 env var.
+/// Global runtime debug flag — set by COKACDIR_DEBUG=1 at startup.
 static DEBUG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Initialize debug flag from environment variable (call once at startup).
@@ -237,13 +239,6 @@ pub fn init_debug_from_env() {
     if enabled {
         DEBUG_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-}
-
-/// Toggle debug mode at runtime. Returns the new state.
-pub fn toggle_debug() -> bool {
-    let prev = DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
-    DEBUG_ENABLED.store(!prev, std::sync::atomic::Ordering::Relaxed);
-    !prev
 }
 
 /// Debug logging helper — active when DEBUG_ENABLED is true.
@@ -606,11 +601,6 @@ pub fn execute_command_streaming(
             report_channel_id,
         );
     session_selection.log_start("claude.execute_command_streaming");
-    crate::services::claude_tui::submit_canary::require_profile(
-        entrypoint_supports_tui_hosting
-            && session_selection.driver
-                == crate::services::provider_hosting::ProviderSessionDriver::TuiHosting,
-    )?;
 
     let default_system_prompt = r#"You are a terminal file manager assistant. Be concise. Focus on file operations. Respond in the same language as the user.
 
@@ -694,9 +684,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 if let Some(hook_endpoint) =
                     crate::services::claude_tui::hook_server::current_hook_endpoint()
                 {
-                    if !crate::services::claude_tui::submit_canary::enabled() {
-                        cleanup_process_backend_before_tmux(tmux_name);
-                    }
+                    cleanup_process_backend_before_tmux(tmux_name);
                     debug_log(&format!("Claude TUI hosting session: {}", tmux_name));
                     return execute_streaming_local_tui_tmux(
                         prompt,
@@ -713,7 +701,6 @@ IMPORTANT: Format your responses using Markdown for better readability:
                         hook_endpoint,
                     );
                 }
-                crate::services::claude_tui::submit_canary::require_profile(false)?;
                 tracing::warn!(
                     tmux_session_name = tmux_name,
                     "claude tui_hosting requested but hook endpoint is unavailable; falling back to legacy prompt driver"
@@ -794,8 +781,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
                     sender,
                     cancel_token,
                     tmux_name,
-                    compact_percent,
-                    compact_lower_bound_tokens,
+                    (compact_percent, compact_lower_bound_tokens),
                 );
             }
         }
@@ -811,8 +797,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 sender,
                 cancel_token,
                 tmux_name,
-                compact_percent,
-                compact_lower_bound_tokens,
+                (compact_percent, compact_lower_bound_tokens),
             );
         }
     }
@@ -843,14 +828,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
             debug_log(&format!("  arg[{}]: {}", i, arg));
         }
     }
-    debug_log("Env: CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000");
-    debug_log("Env: BASH_DEFAULT_TIMEOUT_MS=86400000");
-    debug_log("Env: BASH_MAX_TIMEOUT_MS=86400000");
 
     let spawn_start = std::time::Instant::now();
-    // Binary resolution (PATH) + gateway launch env applied by-construction.
-    // Resolve the launch env once so the same gateway decision drives both the
-    // #4591 auto-compact-window computation and the #4559 gateway guard.
+    // Use one resolved launch environment for the compact window and gateway guard.
     let auto_compact_window = launch_auto_compact_window_for_session(
         &format!(
             "claude-direct-{}",
@@ -879,12 +859,16 @@ IMPORTANT: Format your responses using Markdown for better readability:
         if let Some(provider) = report_provider {
             command.env(RESTART_REPORT_PROVIDER_ENV, provider.as_str());
         }
-        // Compact-window overlay (#4591): pin the freshly resolved immutable
-        // threshold on top of the chokepoint's by-construction gateway env (or
-        // clear any stale inherited value when there is none).
+        // Pin the resolved compact window over the gateway environment.
         apply_auto_compact_window_to_command(command, auto_compact_window);
+        crate::services::process::configure_child_process_group(command);
     }
     let mut command = builder.into_command();
+    let overlay = crate::services::discord::org_schema::spawn_auth_overlay(
+        ProviderKind::Claude,
+        report_channel_id,
+    )?;
+    crate::services::provider_auth_profile::apply_overlay_to_command(&mut command, &overlay);
 
     let mut child = command.spawn().map_err(|e| {
         debug_log(&format!(
@@ -900,11 +884,10 @@ IMPORTANT: Format your responses using Markdown for better readability:
         child.id()
     ));
 
-    // Store child PID in cancel token so the caller can kill it externally
+    session_prompt::claude_args(&args);
     register_child_pid(cancel_token.as_deref(), child.id());
     let _cancel_watchdog = spawn_cancel_watchdog(cancel_token.clone(), "claude-direct-stream");
 
-    // Write prompt to stdin
     if let Some(mut stdin) = child.stdin.take() {
         debug_log(&format!(
             "Writing prompt to stdin ({} bytes)...",
@@ -917,7 +900,6 @@ IMPORTANT: Format your responses using Markdown for better readability:
             write_start.elapsed(),
             write_result.is_ok()
         ));
-        // stdin is dropped here, which closes it - this signals end of input to claude
         debug_log("stdin handle dropped (closed)");
     } else {
         debug_log("WARNING: Could not get stdin handle!");
@@ -1346,7 +1328,6 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 String::new(),
             )
         };
-
         debug_log(&format!(
             "Sending error: message={}, exit_code={:?}",
             message,
@@ -1360,6 +1341,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
         };
         #[cfg(not(unix))]
         let exit_signal: Option<i32> = None;
+        tap.error(&message, &stderr_msg);
         let send_ok = sender
             .send(StreamMessage::Error {
                 message: message.clone(),
@@ -1368,7 +1350,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
                 exit_code,
             })
             .is_ok();
-        tap.finish(send_ok, drained);
+        tap.finish_error(send_ok, drained, &message, &stderr_msg);
         log_producer_exit(
             "child_exit_error",
             last_session_id.as_deref(),
@@ -1684,10 +1666,8 @@ fn execute_streaming_local_tui_tmux(
     system_prompt: Option<&str>,
     hook_endpoint: String,
 ) -> Result<(), String> {
-    host_gate::tmux_turn_admitted(tmux_session_name)
-        .map_err(crate::services::claude_tui::submit_canary::hold_error)?;
-    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)
-        .map_err(crate::services::claude_tui::submit_canary::hold_error)?;
+    host_gate::tmux_turn_admitted(tmux_session_name)?;
+    crate::services::tmux_common::require_tmux_hosting_admission(tmux_session_name)?;
     debug_log(&format!(
         "=== execute_streaming_local_tui_tmux START: {} ===",
         tmux_session_name
@@ -1695,12 +1675,10 @@ fn execute_streaming_local_tui_tmux(
     let auth_overlay = crate::services::discord::org_schema::overlay_from_tmux_session(
         ProviderKind::Claude,
         tmux_session_name,
-    )
-    .map_err(crate::services::claude_tui::submit_canary::hold_error)?;
+    )?;
     let auth_env_lines =
         crate::services::provider_auth_profile::overlay_shell_env_lines(&auth_overlay);
-    let session_exists = host_gate::session_exists(tmux_session_name)
-        .map_err(crate::services::claude_tui::submit_canary::hold_error)?;
+    let session_exists = host_gate::session_exists(tmux_session_name)?;
     let profile_matches = crate::services::tmux_common::tmux_session_auth_profile_matches(
         tmux_session_name,
         &auth_overlay.profile_id,
@@ -1712,21 +1690,12 @@ fn execute_streaming_local_tui_tmux(
     let turn_lock =
         crate::services::claude_tui::composer_lock::session_turn_lock(tmux_session_name);
     let _turn_guard = turn_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let _receipt_end = guarded_outcome::seal_on_exit(tmux_session_name);
     debug_log(&format!(
         "Claude TUI session turn lock acquired: {}",
         tmux_session_name
     ));
 
-    let (session_exists, profile_matches) = crate::services::claude_tui::submit_canary::preflight(
-        tmux_session_name,
-        report_channel_id,
-        &auth_overlay.profile_id,
-        (session_exists, profile_matches),
-        || {
-            cleanup_process_backend_before_tmux(tmux_session_name);
-        },
-    )
-    .map_err(SubmissionError::into_legacy)?;
     let session_id = profile_matches.then_some(session_id).flatten();
     let working_dir_path = std::path::Path::new(working_dir);
     let session_resolution =
@@ -1763,11 +1732,6 @@ fn execute_streaming_local_tui_tmux(
         resume = recovered.resume;
     }
 
-    crate::services::claude_tui::submit_canary::require_warm(
-        session_exists,
-        has_live_pane,
-        resume,
-    )?;
     if session_exists && has_live_pane && resume {
         match guarded_outcome::warm_owned(|| {
             try_claude_tui_warm_followup(
@@ -1846,18 +1810,13 @@ fn execute_streaming_local_tui_tmux(
         &owner_path,
     )
 }
-
-/// Dispatch a fresh Claude TUI turn and resolve its terminal outcome.
-///
-/// Verbatim extraction of the orchestrator's fresh-turn dispatch + completion
-/// gate: skip-stale-bytes offset capture, the ready-retry fresh-turn run, and
-/// the three terminal outcomes — fresh-turn start failure, `SessionDied` before
-/// completion, and successful delivery (watcher handoff + producer-exit log).
-/// Every original `return Ok/Err` is preserved as this fn's return value, and
-/// the two failure paths perform the identical audit + exit-reason + kill +
-/// owner-marker cleanup before returning `Err`. `owner_path` is the owner-marker
-/// path returned by `prepare_and_create_claude_tui_session`, removed on either
-/// failure path exactly as the inline block did.
+#[cfg(unix)]
+mod first_input;
+#[cfg(unix)]
+#[path = "claude_tui/hosting/fresh_lifecycle.rs"]
+mod fresh_lifecycle;
+#[cfg(all(test, unix))]
+pub(crate) use fresh_lifecycle::fresh_hold_for_tests;
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn run_claude_tui_fresh_turn_and_finalize(
@@ -1872,98 +1831,22 @@ fn run_claude_tui_fresh_turn_and_finalize(
     prompt: &str,
     owner_path: &str,
 ) -> Result<(), String> {
-    // Skip any transcript bytes that predate this launch. Resume and fresh
-    // turns both need this guard because a reused/colliding session_id can
-    // leave stale JSONL on disk even when the launch is intentionally fresh.
-    let fresh_turn_start_offset = claude_tui_fresh_turn_start_offset(transcript_path);
-    let fresh_turn_result = run_claude_tui_fresh_turn_with_ready_retry(
+    fresh_lifecycle::run(fresh_lifecycle::FreshTurn {
+        transcript_path,
         transcript_path_string,
-        fresh_turn_start_offset,
-        sender.clone(),
+        sender,
         cancel_token,
         tmux_session_name,
+        teardown,
         resolved_session_id,
-        prompt,
-    );
-    let (read_result, harvest, turn_read_start_offset) = match fresh_turn_result {
-        Ok(result) => result,
-        Err(SubmissionError::Guarded(run)) => {
-            return Err(SubmissionError::Guarded(run).into_legacy());
-        }
-        // The prompt never reached the pane: keep the session and its owner marker.
-        Err(SubmissionError::Legacy(error))
-            if crate::services::claude_tui::submission_fence::refusal().is_some() =>
-        {
-            return Err(error);
-        }
-        Err(SubmissionError::Legacy(error)) => {
-            let reason = format!("claude tui fresh turn failed: {error}");
-            let component = "claude_tui_provider";
-            if teardown_tmux(
-                teardown,
-                tmux_session_name,
-                component,
-                "fresh_turn_start_failed",
-                &reason,
-            )
-            .is_ok()
-            {
-                let _ = std::fs::remove_file(owner_path);
-            }
-            return Err(error);
-        }
-    };
-    if matches!(read_result, ReadOutputResult::SessionDied { .. }) {
-        let reason = "claude tui session died before turn completion";
-        let component = "claude_tui_provider";
-        if teardown_tmux(
-            teardown,
-            tmux_session_name,
-            component,
-            "fresh_session_died",
-            reason,
-        )
-        .is_ok()
-        {
-            let _ = std::fs::remove_file(owner_path);
-        }
-        return Err(reason.to_string());
-    }
-    emit_claude_tui_watcher_handoff(
-        &sender,
-        transcript_path_string,
-        tmux_session_name,
-        transcript_path,
-    );
-    let transcript_len = std::fs::metadata(transcript_path)
-        .map(|meta| meta.len())
-        .unwrap_or(0);
-    if tui_delivered_zero_harvest(&read_result, &harvest) {
-        emit_claude_tui_zero_harvest(
-            "claude_tui_zero_harvest_turn_delivered",
-            report_channel_id,
-            tmux_session_name,
-            transcript_path_string,
-            turn_read_start_offset,
-            transcript_len,
-        );
-    }
-    log_producer_exit(
-        "tui_turn_delivered",
-        Some(resolved_session_id),
         report_channel_id,
-        // #3281: real forwarded-message count (was a hardcoded 0).
-        usize::try_from(harvest.forwarded_messages).unwrap_or(usize::MAX),
-        serde_json::json!({
-            "tmux_session_name": tmux_session_name,
-            "transcript_path": transcript_path_string,
-            "assistant_text_bytes": harvest.assistant_text_bytes,
-            "start_offset": turn_read_start_offset,
-            "transcript_len": transcript_len,
-            "read_result_kind": read_output_result_kind(&read_result),
-        }),
-    );
-    Ok(())
+        prompt,
+        owner_path,
+    })
+}
+#[cfg(unix)]
+fn remove_claude_tui_owner_marker_after_teardown(owner_path: &str) {
+    let _ = std::fs::remove_file(owner_path);
 }
 
 /// Tears down a stale Claude TUI tmux session before it is recreated, only under the
@@ -1977,89 +1860,6 @@ fn cleanup_stale_claude_tui_session(
     let reason = "stale claude tui session cleanup before recreate";
     let (component, code) = ("claude_tui_provider", "stale_session_recreate");
     teardown_tmux(teardown, tmux_session_name, component, code, reason)
-}
-
-/// On success returns the read result, the harvest counters, and the actual
-/// turn-read start offset (the timestamp-scan adjusted offset, #3281) so the
-/// producer-exit log can report real values instead of a hardcoded `lines=0`.
-#[cfg(unix)]
-fn run_claude_tui_fresh_turn_with_ready_retry(
-    transcript_path_string: &str,
-    fresh_turn_start_offset: u64,
-    sender: Sender<StreamMessage>,
-    cancel_token: Option<std::sync::Arc<CancelToken>>,
-    tmux_session_name: &str,
-    resolved_session_id: &str,
-    prompt: &str,
-) -> Result<(ReadOutputResult, ReadHarvestStats, u64), SubmissionError> {
-    for attempt in 1..=CLAUDE_TUI_FRESH_PROMPT_MAX_READY_ATTEMPTS {
-        let hook_rx = crate::services::claude_tui::hook_server::subscribe_hook_events();
-        let turn_started_at = chrono::Utc::now();
-        match crate::services::claude_tui::input::send_prompt_with_readiness(
-            tmux_session_name,
-            prompt,
-            crate::services::claude_tui::input::PromptReadinessKind::FreshTurn,
-            cancel_token.as_deref(),
-        ) {
-            Ok(()) => {
-                let hook_events_after = chrono::Utc::now();
-                let start_offset = claude_tui_turn_start_offset_after_timestamp(
-                    std::path::Path::new(transcript_path_string),
-                    turn_started_at,
-                    fresh_turn_start_offset,
-                );
-                return read_claude_tui_transcript_until_done(
-                    transcript_path_string,
-                    start_offset,
-                    sender.clone(),
-                    cancel_token.clone(),
-                    tmux_session_name,
-                    resolved_session_id,
-                    hook_rx,
-                    hook_events_after,
-                )
-                .map(|(read_result, harvest)| (read_result, harvest, start_offset))
-                .map_err(SubmissionError::from);
-            }
-            Err(SubmissionError::Guarded(run)) => return Err(SubmissionError::Guarded(run)),
-            Err(SubmissionError::Legacy(error))
-                if should_retry_claude_tui_fresh_prompt_ready(&error, attempt) =>
-            {
-                let backoff = claude_tui_fresh_prompt_ready_backoff(attempt);
-                debug_log(&format!(
-                    "Claude TUI fresh prompt readiness timed out on attempt {}/{}; retrying after {}s",
-                    attempt,
-                    CLAUDE_TUI_FRESH_PROMPT_MAX_READY_ATTEMPTS,
-                    backoff.as_secs()
-                ));
-                tracing::warn!(
-                    tmux_session_name = %tmux_session_name,
-                    attempt = attempt,
-                    max_attempts = CLAUDE_TUI_FRESH_PROMPT_MAX_READY_ATTEMPTS,
-                    backoff_secs = backoff.as_secs(),
-                    error = %error,
-                    "claude_tui fresh prompt readiness retry scheduled"
-                );
-                std::thread::sleep(backoff);
-            }
-            Err(SubmissionError::Legacy(error)) => {
-                if crate::services::claude_tui::input::is_prompt_ready_timeout_error(&error) {
-                    return Err(format!(
-                        "{}; fresh prompt readiness attempts exhausted ({} attempts)",
-                        error, CLAUDE_TUI_FRESH_PROMPT_MAX_READY_ATTEMPTS
-                    )
-                    .into());
-                }
-                return Err(error.into());
-            }
-        }
-    }
-
-    Err(format!(
-        "claude tui fresh prompt readiness attempts exhausted ({} attempts)",
-        CLAUDE_TUI_FRESH_PROMPT_MAX_READY_ATTEMPTS
-    )
-    .into())
 }
 
 #[cfg(unix)]
@@ -2397,7 +2197,7 @@ mod claude_tui_ready_probe_tests {
             kind: crate::services::claude_tui::hook_server::HookEventKind::Stop,
             received_at: chrono::Utc::now(),
             payload: serde_json::json!({}),
-            fanout: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -2423,7 +2223,7 @@ mod claude_tui_ready_probe_tests {
             kind: crate::services::claude_tui::hook_server::HookEventKind::Stop,
             received_at: hook_events_after - chrono::Duration::milliseconds(1),
             payload: serde_json::json!({}),
-            fanout: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -2799,6 +2599,7 @@ fn execute_streaming_local_tmux(
         ));
     }
 
+    session_prompt::claude_args(args);
     emit_fresh_session_watcher_handoff(&sender, output_path, input_fifo_path, tmux_session_name);
     log_producer_exit(
         "fresh_session_watcher_owned_handoff",
@@ -3177,7 +2978,7 @@ mod local_tmux_lifecycle_tests {
         std::fs::write(temp.path(), b"{\"type\":\"assistant\"}\n").unwrap();
         let transcript_path = temp.path().display().to_string();
         let (sender, receiver) = std::sync::mpsc::channel();
-
+        let _root = crate::config::TestRuntimeRootGuard::new();
         emit_claude_tui_watcher_handoff(&sender, &transcript_path, "claude-tui-test", temp.path());
 
         let message = receiver.recv().unwrap();
@@ -4078,233 +3879,6 @@ mod claude_tui_session_resolution_tests {
     }
 }
 
-#[cfg(test)]
-#[cfg(unix)]
-mod guarded_owner_tests {
-    use super::*;
-    use crate::services::claude_tui::guarded_outcome;
-    use crate::services::claude_tui::host_input::{LegacyTmuxGate, guarded_submission};
-    use crate::services::claude_tui::submission_fence::{
-        self, PreSubmitPersistenceRefused, SubmissionFence,
-    };
-    use crate::services::tui_input::submission_tmux::guarded::transport_tests::Fixture;
-    use guarded_submission::executor_tests::{install_shim, renderer, screen};
-    use std::rc::Rc;
-    use std::sync::Arc;
-
-    #[test]
-    fn cg_d1_upper_driver_hold_precedes_stale_cleanup_with_valid_clearance() {
-        let _root = crate::config::TestRuntimeRootGuard::new();
-        let f = Fixture::after_shared_test_env_lock();
-        install_shim(&f);
-        let config = f.root.path().join("cg-d1-fixture-config.yaml");
-        std::fs::write(&config, "server: {}\n").unwrap();
-        let _config = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
-            "AGENTDESK_CONFIG",
-            &config,
-        );
-        let _home = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
-            "CLAUDE_CONFIG_DIR",
-            f.root.path(),
-        );
-        let fake = f.root.path().join("claude-fixture");
-        std::fs::write(&fake, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '2.1.0 (Claude Code)'; exit 0; fi\nexit 1\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let _binary = crate::config::TestEnvVarGuard::set_path_after_shared_test_env_lock(
-            "AGENTDESK_CLAUDE_PATH",
-            &fake,
-        );
-        let name = "cg-d1-held-stale";
-        let pane = renderer(&f, name, "own", &screen(""), &screen("own"), &screen(""));
-        let calls = f.root.path().join("d1-upper-calls");
-        let shim = f.root.path().join("tmux");
-        let script = std::fs::read_to_string(&shim).unwrap();
-        std::fs::write(
-            &shim,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{}",
-                calls.display(),
-                script.strip_prefix("#!/bin/sh\n").unwrap()
-            ),
-        )
-        .unwrap();
-        let turn = crate::services::claude_tui::composer_lock::session_turn_lock(name);
-        let turn_guard = turn.lock().unwrap_or_else(|p| p.into_inner());
-        let working_dir = f.root.path().display().to_string();
-        let worker = std::thread::spawn(move || {
-            let (tx, _) = std::sync::mpsc::channel();
-            execute_streaming_local_tui_tmux(
-                "own",
-                None,
-                &working_dir,
-                tx,
-                None,
-                name,
-                Some(&TeardownClearance::Unkeyed),
-                None,
-                None,
-                None,
-                None,
-                "http://127.0.0.1:9".into(),
-            )
-        });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !std::fs::read_to_string(&calls)
-            .unwrap_or_default()
-            .contains("has-session")
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "upper driver did not reach its pre-lock observation"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        std::fs::write(f.root.path().join("exec-mode"), "drop_payload").unwrap();
-        let ((input, stopped), _) =
-            guarded_submission::test_support::with_request(name, Rc::new(LegacyTmuxGate), || {
-                guarded_outcome::capture(|| {
-                    crate::services::claude_tui::input::send_fresh_prompt(name, "own", None)
-                })
-            });
-        assert!(
-            input.is_err()
-                && matches!(
-                    stopped,
-                    Some(
-                        crate::services::claude_tui::host_input::InputRun::Indeterminate {
-                            confirmed: 0,
-                            ..
-                        }
-                    )
-                )
-        );
-        while f.received(name) != b"own" {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the hold must follow a real payload"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let previous_payload = f.received(name);
-        drop(turn_guard);
-        let result = worker.join().unwrap();
-        guarded_outcome::forget_test_hold(name);
-        assert!(result.is_err());
-        assert_eq!(
-            crate::services::platform::tmux::session_presence(name),
-            crate::services::platform::tmux::SessionPresence::Present,
-            "a valid teardown clearance must not erase a held session"
-        );
-        assert_eq!(
-            f.tmux(&["display-message", "-p", "-t", &pane, "#{pane_id}"]),
-            pane
-        );
-        assert_eq!(
-            f.received(name),
-            previous_payload,
-            "the next upper entry must not send or clear the held payload"
-        );
-        let held_calls = std::fs::read_to_string(&calls).unwrap();
-        assert!(
-            !held_calls.contains("kill-session") && !held_calls.contains("new-session"),
-            "{held_calls}"
-        );
-        // With the same valid clearance and no hold, stale cleanup and creation really run.
-        let token = std::sync::Arc::new(CancelToken::new());
-        token
-            .cancelled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let (tx, _) = std::sync::mpsc::channel();
-        let _ = execute_streaming_local_tui_tmux(
-            "own",
-            None,
-            f.root.path().to_str().unwrap(),
-            tx,
-            Some(token),
-            name,
-            Some(&TeardownClearance::Unkeyed),
-            None,
-            None,
-            None,
-            None,
-            "http://127.0.0.1:9".into(),
-        );
-        let control_calls = std::fs::read_to_string(calls).unwrap();
-        let control_calls = &control_calls[held_calls.len()..];
-        assert!(
-            control_calls.contains("kill-session") && control_calls.contains("new-session"),
-            "positive control must reach stale cleanup and fresh launch: {control_calls}"
-        );
-    }
-
-    struct CancelFence(Arc<CancelToken>);
-    impl SubmissionFence for CancelFence {
-        fn before_first_payload(&self) -> Result<(), PreSubmitPersistenceRefused> {
-            self.0
-                .cancelled
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        }
-        fn refusal(&self) -> Option<PreSubmitPersistenceRefused> {
-            None
-        }
-    }
-
-    #[test]
-    fn cg_b2c_fresh_finalize_preserves_the_typed_post_fence_stop() {
-        let _root = crate::config::TestRuntimeRootGuard::new();
-        let f = Fixture::after_shared_test_env_lock();
-        install_shim(&f);
-        let _dedupe = crate::services::tui_prompt_dedupe::TEST_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let name = "fresh-owner-fence-cancel";
-        renderer(&f, name, "own", &screen(""), &screen("own"), &screen(""));
-        let transcript = f.root.path().join("fresh.jsonl");
-        std::fs::write(&transcript, "").unwrap();
-        let owner = f.root.path().join("owner-marker");
-        std::fs::write(&owner, "owner").unwrap();
-        let token = Arc::new(CancelToken::new());
-        let (tx, rx) = std::sync::mpsc::channel();
-        let ((result, stopped), _) =
-            submission_fence::with_scope(Some(Arc::new(CancelFence(Arc::clone(&token)))), || {
-                guarded_submission::test_support::with_request(
-                    name,
-                    Rc::new(LegacyTmuxGate),
-                    || {
-                        guarded_outcome::capture(|| {
-                            run_claude_tui_fresh_turn_and_finalize(
-                                &transcript,
-                                &transcript.display().to_string(),
-                                tx,
-                                Some(token),
-                                name,
-                                Some(&TeardownClearance::Unkeyed),
-                                "fresh-owner",
-                                None,
-                                "own",
-                                owner.to_str().unwrap(),
-                            )
-                        })
-                    },
-                )
-            });
-        assert!(result.is_err());
-        assert!(owner.exists());
-        assert!(f.received(name).is_empty());
-        assert!(rx.try_recv().is_err());
-        assert!(
-            matches!(
-                stopped,
-                Some(
-                    crate::services::claude_tui::host_input::InputRun::Indeterminate {
-                        confirmed: 0,
-                        ..
-                    }
-                )
-            ),
-            "{stopped:?}"
-        );
-    }
-}
+#[cfg(all(test, unix))]
+#[path = "claude_tui/hosting/fresh_hold_tests.rs"]
+mod fresh_hold_tests;

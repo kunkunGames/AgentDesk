@@ -552,12 +552,7 @@ fn strict_reading(probe: &Probe) -> Reading {
         CHANNEL,
         probe.target.clone(),
     );
-    Reading {
-        observed,
-        stamp,
-        watch: Some(probe.watch.clone()),
-        unbound: None,
-    }
+    Reading::bound(observed, stamp, Some(probe.watch.clone()), Some(SESSION))
 }
 
 #[test]
@@ -597,7 +592,13 @@ fn b2_generic_observer_keeps_its_existing_unknown_policy() {
         probe.target.clone(),
     );
     assert_eq!(unknown.0.activity, Activity::Unknown);
-    assert_eq!(busy.1, unknown.1);
+    // Ageing alone leaves the watch position; only the stamp's per-answer notice differs.
+    let position = |stamp: &Option<Stamp>| {
+        stamp
+            .as_ref()
+            .map(|s| (s.key.clone(), s.generation, s.revision, s.source.clone()))
+    };
+    assert_eq!(position(&busy.1), position(&unknown.1));
 }
 
 #[test]
@@ -758,6 +759,7 @@ fn pending_rejected_and_resolved_binds_are_read_one_seq_at_a_time() {
             claude,
             BindingRecord::Rejected {
                 detail: "late".into(),
+                closes: None,
             },
         ),
         event(
@@ -921,12 +923,7 @@ fn a_reading_publishes_only_while_its_watch_is_unmoved() {
             probe.target.clone(),
         );
         let watch = Some(probe.watch.clone());
-        Reading {
-            observed,
-            stamp,
-            watch,
-            unbound: None,
-        }
+        Reading::bound(observed, stamp, watch, Some(SESSION))
     };
     let fresh = read();
     assert_eq!(fresh.session(), Some(SESSION));
@@ -1048,7 +1045,6 @@ pub(crate) fn bind_turn_mode_transcript(
     path: &Path,
 ) -> crate::services::tui_o::turn_mode::TestConfirmation {
     use crate::services::discord::TmuxWatcherHandle;
-    use crate::services::tui_prompt_dedupe::binding_events as p5;
     shared.tmux_watchers.insert(
         ChannelId::new(channel),
         TmuxWatcherHandle {
@@ -1062,6 +1058,19 @@ pub(crate) fn bind_turn_mode_transcript(
             last_heartbeat_ts_ms: Arc::new(chrono::Utc::now().timestamp_millis().into()),
         },
     );
+    log_turn_source(provider, channel, session, "turn-presence-test", path);
+    crate::services::tui_o::turn_mode::TestConfirmation::new(channel)
+}
+
+/// The channel's binding log as one record of execution `nonce` naming `path` as `session`'s source.
+pub(crate) fn log_turn_source(
+    provider: &ProviderKind,
+    channel: u64,
+    session: &str,
+    nonce: &str,
+    path: &Path,
+) {
+    use crate::services::tui_prompt_dedupe::binding_events as p5;
     let source = source_id_for("parent", path).unwrap();
     let now = chrono::Utc::now();
     let event = p5::BindingEvent {
@@ -1069,7 +1078,7 @@ pub(crate) fn bind_turn_mode_transcript(
         channel_id: channel,
         provider: provider.as_str().into(),
         tmux_session: session.into(),
-        execution_nonce: Some("turn-presence-test".into()),
+        execution_nonce: Some(nonce.into()),
         old: None,
         new: p5::BindingTarget::Source(source),
         cause: p5::BindingCause::Startup,
@@ -1084,7 +1093,6 @@ pub(crate) fn bind_turn_mode_transcript(
     std::fs::create_dir_all(&root).unwrap();
     let line = format!("{}\n", serde_json::to_string(&event).unwrap());
     std::fs::write(root.join(format!("{channel}.log")), line).unwrap();
-    crate::services::tui_o::turn_mode::TestConfirmation::new(channel)
 }
 
 /// The reason effect points read once the channel's rebuild finished.
@@ -1101,6 +1109,206 @@ pub(crate) async fn settled_reason(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("channel {channel} never finished catching up");
+}
+
+/// Waits for the live binding-log worker, then returns a fresh effect-point reading.
+pub(crate) async fn companion_settled_activity(shared: &Arc<SharedData>, channel: u64) -> Observed {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let observed =
+                activity_now(shared, &ProviderKind::Codex, ChannelId::new(channel)).await;
+            if !matches!(observed.reason, "catching_up" | "facts_resumed") {
+                return observed;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("actual Codex binding-log worker did not finish")
+}
+
+/// Advances the production watch's monotonic age without a ten-minute wall-clock sleep.
+pub(crate) fn companion_age_open_watch(channel: u64, age: Duration) {
+    let watch = lock(&WATCHES)
+        .get(&channel)
+        .cloned()
+        .expect("the actual activity reader must have installed its watch first");
+    let mut watch = lock(&watch);
+    assert!(matches!(
+        watch.outcome,
+        Outcome::Source { .. } | Outcome::Tail(_)
+    ));
+    watch.grew_at = Instant::now() - age;
+}
+
+/// A live watcher over the caller's existing log; this never creates or rewrites binding records.
+pub(crate) fn companion_attach_log_watcher(
+    shared: &SharedData,
+    channel: u64,
+    tmux: &str,
+    path: &Path,
+) {
+    shared.tmux_watchers.insert(
+        ChannelId::new(channel),
+        crate::services::discord::TmuxWatcherHandle {
+            tmux_session_name: tmux.into(),
+            output_path: path.display().to_string(),
+            paused: Arc::new(false.into()),
+            resume_offset: Arc::new(Mutex::new(None)),
+            cancel: Arc::new(false.into()),
+            pause_epoch: Arc::new(0.into()),
+            turn_delivered: Arc::new(false.into()),
+            last_heartbeat_ts_ms: Arc::new(chrono::Utc::now().timestamp_millis().into()),
+        },
+    );
+}
+
+/// Lets non-Discord host tests inspect their exact settled log through the live activity reader.
+pub(crate) async fn companion_activity_for_log_for_tests(
+    channel: u64,
+    tmux: &str,
+    path: &Path,
+) -> (&'static str, bool) {
+    let shared = crate::services::discord::make_shared_data_for_tests();
+    let _confirmation = crate::services::tui_o::turn_mode::TestConfirmation::new(channel);
+    companion_attach_log_watcher(&shared, channel, tmux, path);
+    let observed = companion_settled_activity(&shared, channel).await;
+    (observed.reason, observed.activity == Activity::Idle)
+}
+
+/// The actual Unbound collector's verdict before its public reason is aggregated.
+pub(in crate::services::discord) async fn unbound_verdict_for_tests(
+    shared: &Arc<SharedData>,
+    provider: &ProviderKind,
+    channel: ChannelId,
+) -> Result<String, String> {
+    super::unbound::live::tests::verdict_for_tests(shared, provider, channel).await
+}
+
+async fn companion_next_incarnation_keeps_terminal_meaning(channel: u64, unfinished: bool) {
+    use crate::services::discord::router::message_handler::codex_resume_companion_queue_tests::Fixture;
+    use crate::services::tui_prompt_dedupe::binding_context::PreparedIncarnation;
+    use crate::services::tui_prompt_dedupe::{self as dedupe, binding_events as p5};
+    let mut fixture = Fixture::new(channel, true).await;
+    fixture.recover();
+    fixture.attach();
+    fixture.assert_activity(Activity::Idle, "closed").await;
+    let previous = fixture.context.clone();
+    if unfinished {
+        let claim = p5::codex::Claim {
+            session_id: previous.expected_native_session_id.clone().unwrap(),
+            path: Some(fixture.native.clone()),
+            evidence: p5::codex::ClaimEvidence::NativeHook {
+                event: "session_start".into(),
+                source: Some("clear".into()),
+                first_prompt_digest: None,
+            },
+        };
+        let fold =
+            p5::codex::commit_claim(&previous, &claim, p5::codex::Decision::Pending, || Ok(()))
+                .unwrap();
+        assert_eq!(
+            fold.pending.len(),
+            1,
+            "the control must leave a truly unterminated old Pending"
+        );
+    }
+    let mut next = previous.clone();
+    next.execution_nonce = uuid::Uuid::new_v4().simple().to_string();
+    let id = "019e660d-4859-7522-9cee-8ba7c4e7c744";
+    next.expected_native_session_id = Some(id.into());
+    next.created_at = chrono::Utc::now();
+    let native = next
+        .provider_root
+        .as_ref()
+        .unwrap()
+        .join(format!("rollout-{id}.jsonl"));
+    let metadata = json!({"type":"session_meta","timestamp":next.created_at.to_rfc3339(),
+        "payload":{"id":id,"timestamp":next.created_at.to_rfc3339(),"cwd":fixture.root,
+            "source":"cli","originator":"codex-tui"}});
+    let rows = [
+        metadata,
+        codex("task_started", "N2"),
+        codex("task_complete", "N2"),
+    ];
+    std::fs::write(
+        &native,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    PreparedIncarnation::create(next.clone()).unwrap();
+    std::fs::write(
+        crate::services::tmux_common::session_temp_path(&next.tmux_session, "spawn_nonce"),
+        &next.execution_nonce,
+    )
+    .unwrap();
+    dedupe::set_codex_delivery_permission_for_tests(
+        &next,
+        dedupe::CodexDeliveryPermissionForTests::Allowed,
+    );
+    assert!(dedupe::codex_verified::record_executed_resume(&next, id, &native, 0).unwrap());
+    let current = p5::codex::read_ownership(&next).unwrap();
+    assert!(current.pending.is_empty() && !current.conflicted);
+    assert_eq!(current.verified.unwrap().source.session_id, id);
+    let events = ChannelBindingLog::new(channel, ShadowProvider::Codex)
+        .binding_events_since(channel, 0)
+        .unwrap();
+    for seq in fixture.pending {
+        assert!(
+            events.iter().any(|event| matches!(&event.record,
+            BindingRecord::Rejected { closes: Some(closed), .. } if *closed == seq)),
+            "historical source denial must retain exact terminal {seq}"
+        );
+    }
+    fixture.context = next;
+    fixture.native = native;
+    fixture.attach();
+    if unfinished {
+        fixture
+            .assert_activity(Activity::Unknown, "binding_pending")
+            .await;
+        fixture.assert_automatic_held().await;
+    } else {
+        fixture.admit_once().await;
+    }
+}
+
+#[test]
+fn codex_historical_terminals_remain_closed_in_next_incarnation() {
+    let support = crate::services::discord::tmux::watcher_install_fixture::isolated;
+    if !support(
+        module_path!(),
+        "codex_historical_terminals_remain_closed_in_next_incarnation",
+    ) {
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(companion_next_incarnation_keeps_terminal_meaning(
+            7_061_741, false,
+        ));
+}
+
+#[test]
+fn codex_unterminated_historical_pending_keeps_next_incarnation_queue_held() {
+    let support = crate::services::discord::tmux::watcher_install_fixture::isolated;
+    if !support(
+        module_path!(),
+        "codex_unterminated_historical_pending_keeps_next_incarnation_queue_held",
+    ) {
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(companion_next_incarnation_keeps_terminal_meaning(
+            7_061_751, true,
+        ));
 }
 
 /// The boot and full-reconcile loop arms the backstop for a turn-mode channel it could not start,
@@ -1490,12 +1698,7 @@ async fn s1_read_now_unbound_invalidates_the_same_bound_watch_before_core_await(
         channel.get(),
         probe.target.clone(),
     );
-    let old = Reading {
-        observed,
-        stamp,
-        watch: Some(probe.watch.clone()),
-        unbound: None,
-    };
+    let old = Reading::bound(observed, stamp, Some(probe.watch.clone()), Some(SESSION));
     assert_eq!(probe.fake.spawns.load(Ordering::SeqCst), 1);
     lock(&WATCHES).insert(channel.get(), probe.watch.clone());
     let core = shared.core.lock().await;
@@ -1517,12 +1720,7 @@ async fn s1_read_now_unbound_invalidates_the_same_bound_watch_before_core_await(
         channel.get(),
         probe.target.clone(),
     );
-    let next = Reading {
-        observed,
-        stamp,
-        watch: Some(probe.watch.clone()),
-        unbound: None,
-    };
+    let next = Reading::bound(observed, stamp, Some(probe.watch.clone()), Some(SESSION));
     let jobs = std::mem::take(&mut *lock(&probe.fake.jobs));
     assert_eq!(jobs.len(), 2);
     let mut jobs = jobs.into_iter();
@@ -1609,4 +1807,80 @@ impl HandoffMutation {
     pub(crate) fn calls(&self) -> usize {
         self.0.calls()
     }
+}
+
+/// Runs the production judge/rebuild/install path while the test owns worker completion.
+pub(in crate::services::discord) struct NoticeReaderProbe {
+    probe: Probe,
+    channel: u64,
+}
+
+impl NoticeReaderProbe {
+    pub(in crate::services::discord) fn new(channel: u64) -> Self {
+        let mut probe = Probe::new(ShadowProvider::Claude, Vec::new());
+        probe.target = Target::Bound(format!("notice-reader-{channel}"));
+        *lock(&probe.fake.events) = Err("binding log unreadable".into());
+        Self { probe, channel }
+    }
+
+    pub(in crate::services::discord) fn read(&self) -> Reading {
+        let ports: Arc<dyn Ports> = self.probe.fake.clone();
+        let (observed, stamp) = judge_presence(
+            &self.probe.watch,
+            &ports,
+            self.probe.provider,
+            self.channel,
+            self.probe.target.clone(),
+        );
+        let Target::Bound(label) = &self.probe.target else {
+            unreachable!()
+        };
+        Reading::bound(observed, stamp, Some(self.probe.watch.clone()), Some(label))
+    }
+
+    pub(in crate::services::discord) fn unreadable_seq(&self) {
+        *lock(&self.probe.fake.seq) = Err("unreadable seq".into());
+    }
+
+    pub(in crate::services::discord) fn force_retry_due(&self) {
+        let mut watch = lock(&self.probe.watch);
+        let Outcome::Unreadable { retry_at } = &mut watch.outcome else {
+            panic!("the actual reader must have installed Unreadable before retry")
+        };
+        *retry_at = Instant::now();
+    }
+
+    pub(in crate::services::discord) fn run_jobs(&self) -> usize {
+        self.probe.run_jobs()
+    }
+    pub(in crate::services::discord) fn counts(&self) -> (usize, usize) {
+        self.probe.counts()
+    }
+
+    pub(in crate::services::discord) fn pending(&self) {
+        let Target::Bound(label) = &self.probe.target else {
+            unreachable!()
+        };
+        let target = BindingTarget::Pending {
+            payload_session_id: "pending".into(),
+            payload_transcript_path: std::path::PathBuf::from("/notice-pending.jsonl"),
+        };
+        let mut binding = event(1, label, self.probe.provider, record(target));
+        binding.channel_id = self.channel;
+        *lock(&self.probe.fake.events) = Ok(vec![binding]);
+        *lock(&self.probe.fake.seq) = Ok(1);
+    }
+}
+
+pub(super) fn resumed_notice_observations(
+    root: &Path,
+) -> (NoticeObservation, usize, NoticeObservation) {
+    let (probe, path) = codex_probe(root, &[codex("task_started", "A")]);
+    assert_eq!(probe.settle(), (Activity::Busy, "open"));
+    let blocked = json!({"type":"response_item","payload":{"type":"unknown_item","id":"x"}});
+    write(&path, &[blocked, codex("turn_aborted", "B")]);
+    let resumed = strict_reading(&probe).notice_observation();
+    let jobs = probe.run_jobs();
+    let boundary = strict_reading(&probe).notice_observation();
+    (resumed, jobs, boundary)
 }

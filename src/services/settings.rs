@@ -30,10 +30,11 @@ const RETIRED_CONFIG_KEYS: &[&str] = &[
     "context_clear_idle_minutes",
     "counter_model_review_enabled",
     "narrate_progress",
-    // #5993: the human-alert channel was retired; operator signals are WARN
-    // lines and observability events. Deleting the row at boot also leaves the
-    // remaining frozen reader with no target.
+    // Retired rows deleted at boot: the human-alert channel, the PM decision gate
+    // toggle, and the escalation routing override.
     "kanban_human_alert_channel_id",
+    "pm_decision_gate_enabled",
+    "escalation-settings-override",
 ];
 
 const RUNTIME_CONFIG_KEYS: &[&str] = &[
@@ -106,13 +107,6 @@ const CONFIG_KEYS: &[(&str, &str, &str, &str, Option<&str>)] = &[
         "최대 리뷰 라운드",
         "Max Review Rounds",
         Some("3"),
-    ),
-    (
-        "pm_decision_gate_enabled",
-        "pipeline",
-        "PM 판단 게이트",
-        "PM Decision Gate",
-        None,
     ),
     ("server_port", "system", "서버 포트", "Server Port", None),
     (
@@ -512,7 +506,6 @@ fn yaml_section_value(config: &crate::config::Config, key: &str) -> Option<Strin
         "kanban_relay_alert_threshold" => stringified_number(config.kanban.relay_alert_threshold),
         "review_enabled" => stringified_bool(config.review.enabled),
         "max_review_rounds" => stringified_number(config.review.max_rounds),
-        "pm_decision_gate_enabled" => stringified_bool(config.kanban.pm_decision_gate_enabled),
         "requested_timeout_min" => stringified_number(config.runtime.requested_timeout_min),
         "in_progress_stale_min" => stringified_number(config.runtime.in_progress_stale_min),
         "context_compact_percent" => stringified_number(config.runtime.context_compact_percent),
@@ -1422,20 +1415,6 @@ mod tests {
     }
 
     #[test]
-    fn delivery_journal_mode_stays_yaml_only() {
-        assert!(
-            !RUNTIME_CONFIG_KEYS.contains(&"delivery_journal_mode"),
-            "delivery-journal mode is YAML-only; if this key enters RUNTIME_CONFIG_KEYS, update the Authority contract comment and cutover design together"
-        );
-        assert!(
-            RUNTIME_CONFIG_KEYS
-                .iter()
-                .all(|key| !key.starts_with("deliveryJournal")),
-            "all deliveryJournal* keys are YAML-only; keep cohort and internal-channel gates out of runtime-config"
-        );
-    }
-
-    #[test]
     fn runtime_config_write_plan_has_one_blob_authority_and_cleanup_only() {
         let plan = runtime_config_write_plan(r#"{"maxEntryRetries":7}"#.to_string());
 
@@ -1800,9 +1779,8 @@ mod retired_key_tests {
         readers
     }
 
-    /// #5993: the retired human-alert key is deleted at boot, never seeded or
-    /// listed as a config entry, and referenced by no code outside the listed
-    /// follow-up slice.
+    /// The retired human-alert key is deleted at boot, never seeded or listed
+    /// as a config entry, and named by no code outside this file.
     #[test]
     fn retired_human_alert_channel_key_is_deleted_and_unread() {
         let key = concat!("kanban_", "human_alert_channel_id");
@@ -1815,13 +1793,10 @@ mod retired_key_tests {
         assert!(!actions.iter().any(|action| matches!(action, KvSeedAction::Put { key: k, .. } | KvSeedAction::PutIfAbsent { key: k, .. } if k == key)));
         assert!(CONFIG_KEYS.iter().all(|(k, ..)| *k != key));
 
-        // The frozen watcher reader (#6210) is the only remaining follow-up.
+        // Only the boot delete list and this test name the key; nothing reads it.
         assert_eq!(
             repo_files_containing(&[key]),
-            [
-                "src/services/discord/watchers/lifecycle/ready_failure.rs",
-                "src/services/settings.rs",
-            ],
+            ["src/services/settings.rs"],
             "new or removed references to the retired key"
         );
     }

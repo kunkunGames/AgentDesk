@@ -2,17 +2,22 @@
 //! `o_era`, the delivery ledger, and the raw spool with cursors. Damage halts; it never re-inits.
 
 pub mod cleanup_witness;
+pub(crate) mod clear_end;
+#[cfg(unix)]
+pub(crate) mod codex_end;
 pub(crate) mod codex_provenance;
+#[cfg(unix)]
+pub(crate) mod delivery_evidence;
 mod durable;
 pub mod ledger;
-mod operator_resume;
-pub use operator_resume::{OPERATOR_RESUME_FLOOR, ResumeRecord};
 pub mod rotation;
 pub mod spool;
+pub(crate) mod tool_card_switch;
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -54,6 +59,16 @@ pub struct Initialized {
     pub initial_anchor: u64,
     pub build_digest: String,
     pub at: DateTime<Utc>,
+}
+
+/// How a channel's `init` came to be, kept beside its fields; one written without it is `Fresh`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitOrigin {
+    #[default]
+    Fresh,
+    /// A Codex takeover of the rollout Legacy was running, whose turn turn mode waits for.
+    LateCodexTakeover,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +152,20 @@ pub(super) fn damage(detail: impl Into<String>) -> StoreError {
     StoreError::halt(HaltReason::StoreDamage, detail.into())
 }
 
+/// Whether no store of `channel` was ever laid out under `runtime_root`: only a `NotFound` counts,
+/// since no production path removes a channel directory once made.
+pub fn no_channel_store(runtime_root: &Path, channel: u64) -> bool {
+    not_found(&runtime_root.join(STORE_DIR_NAME).join(channel.to_string()))
+}
+
+fn not_found(path: &Path) -> bool {
+    let entry = std::fs::symlink_metadata(path);
+    matches!(entry, Err(error) if error.kind() == io::ErrorKind::NotFound)
+}
+
+/// Serializes a first activation's init and era seal with an open that finishes an interrupted one.
+static SEALING: Mutex<()> = Mutex::new(());
+
 /// `<runtime_root>/o_store`; the enabled flag is the only way to obtain one.
 pub struct OStore {
     root: PathBuf,
@@ -163,7 +192,49 @@ impl OStore {
         let root = runtime_root.join(STORE_DIR_NAME);
         durable::ensure_dir(&root)?;
         durable::sweep_tmp(&root)?;
-        Ok(Some(Self { root }))
+        let store = Self { root };
+        store.seal_interrupted_takeover();
+        Ok(Some(store))
+    }
+
+    /// Seals the era a late takeover's `begin_era_as` left unsealed: only when its `init` is the
+    /// store's sole one and the channel recovers under that era. Anything else is left to hold.
+    fn seal_interrupted_takeover(&self) {
+        let _sealing = SEALING.lock().unwrap_or_else(PoisonError::into_inner);
+        let Ok(None) = self.read_era() else { return };
+        let Ok(channels) = self.channels_with_init() else {
+            return;
+        };
+        let [channel] = channels.into_iter().collect::<Vec<_>>()[..] else {
+            return;
+        };
+        let origin = self.read_init_origin(channel);
+        let Ok(InitOrigin::LateCodexTakeover) = origin else {
+            return;
+        };
+        let Ok(Some(init)) = self.read_init(channel) else {
+            return;
+        };
+        let era = OEra {
+            switch_at: init.at,
+            initial_channels: vec![channel],
+        };
+        let sealed = match self.open_channel(&era, channel) {
+            Ok(Some(_)) => self.seal(&era),
+            Ok(None) => Err(damage("init vanished")),
+            Err(halt) => Err(StoreError::Halt(halt)),
+        };
+        match sealed {
+            Ok(()) => tracing::warn!(channel, "[tui_o] sealed the era a takeover left unsealed"),
+            Err(error) => {
+                tracing::warn!(channel, ?error, "[tui_o] a takeover init stays without era")
+            }
+        }
+    }
+
+    fn seal(&self, era: &OEra) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(era)?;
+        Ok(durable::create_once(&self.root.join(ERA_FILE), &bytes)?)
     }
 
     /// The store as an operator tool reads it: nothing is created or swept.
@@ -179,8 +250,7 @@ impl OStore {
     /// Whether anything of the channel's store may exist, even without its `init`; an unreadable
     /// entry counts.
     pub fn has_channel_dir(&self, channel: u64) -> bool {
-        let entry = std::fs::symlink_metadata(self.channel_dir(channel));
-        !matches!(entry, Err(error) if error.kind() == io::ErrorKind::NotFound)
+        !not_found(&self.channel_dir(channel))
     }
 
     /// Channels whose directory holds an `init` entry, readable or not. Only canonical ids count,
@@ -215,9 +285,30 @@ impl OStore {
         }
     }
 
+    /// The origin `init` records; `Fresh` when it records none or there is no `init`.
+    pub fn read_init_origin(&self, channel: u64) -> Result<InitOrigin, StoreError> {
+        #[derive(Deserialize)]
+        struct Recorded {
+            #[serde(default)]
+            origin: InitOrigin,
+        }
+        let init: Option<Recorded> =
+            durable::read_json(&self.channel_dir(channel).join(INIT_FILE))?;
+        Ok(init.map(|init| init.origin).unwrap_or_default())
+    }
+
     /// Lays out the channel and an empty ledger, then publishes `init` exactly once.
     /// An era channel is never initialized again, even when its `init` is gone.
     pub fn init_channel(&self, init: &Initialized) -> Result<(), StoreError> {
+        self.init_channel_as(init, InitOrigin::Fresh)
+    }
+
+    /// As `init_channel`, recording `origin`; a `Fresh` init keeps its old bytes.
+    pub fn init_channel_as(
+        &self,
+        init: &Initialized,
+        origin: InitOrigin,
+    ) -> Result<(), StoreError> {
         let sealed = self.read_era()?.map(|era| era.initial_channels);
         if sealed.is_some_and(|channels| channels.contains(&init.channel)) {
             return Err(damage("era channel cannot be initialized again"));
@@ -227,10 +318,32 @@ impl OStore {
         durable::ensure_dir(&dir.join(SPOOL_DIR))?;
         durable::ensure_dir(&dir.join(CURSOR_DIR))?;
         ledger::create_empty(&dir.join(LEDGER_FILE))?;
-        Ok(durable::create_once(
-            &dir.join(INIT_FILE),
-            &serde_json::to_vec(init)?,
-        )?)
+        let bytes = match origin {
+            InitOrigin::Fresh => serde_json::to_vec(init)?,
+            origin => {
+                let mut recorded = serde_json::to_value(init)?;
+                recorded["origin"] = serde_json::to_value(origin)?;
+                serde_json::to_vec(&recorded)?
+            }
+        };
+        Ok(durable::create_once(&dir.join(INIT_FILE), &bytes)?)
+    }
+
+    /// A first activation's `init`: a later channel of a sealed era, or else the channel the era is
+    /// sealed over. Opening the store finishes a takeover's seal a crash cut off after its `init`.
+    pub fn begin_era_as(&self, init: &Initialized, origin: InitOrigin) -> Result<(), StoreError> {
+        let _sealing = SEALING.lock().unwrap_or_else(PoisonError::into_inner);
+        let sealed = self.read_era()?.is_some();
+        self.init_channel_as(init, origin)?;
+        if sealed {
+            return Ok(());
+        }
+        #[cfg(test)]
+        durable::fault::strike(&self.root.join(ERA_FILE), durable::fault::Step::Write)?;
+        self.seal(&OEra {
+            switch_at: init.at,
+            initial_channels: vec![init.channel],
+        })
     }
 
     /// First writer start: initializes only channels still lacking `init`, then seals `o_era` once.
@@ -346,7 +459,7 @@ impl ChannelStore {
         self.segment_max = max;
     }
 
-    /// Delivery entries only; GC and operator approvals require their dedicated guarded writers.
+    /// Delivery entries only; GC uses its guarded writer and retained approvals are replayed.
     pub fn append_ledger(&mut self, entry: LedgerEntry) -> Result<(), StoreError> {
         if matches!(
             entry,
@@ -384,9 +497,6 @@ impl ChannelStore {
 }
 
 #[cfg(test)]
-mod operator_resume_tests;
-
-#[cfg(test)]
 #[cfg(windows)]
 mod windows_tests {
     use super::*;
@@ -415,6 +525,70 @@ mod windows_tests {
 #[cfg(unix)]
 mod tests {
     use super::*;
+
+    impl OStore {
+        pub(crate) fn seed_boundary_resolved(
+            &self,
+            channel: u64,
+            source: &SourceId,
+            from: u64,
+        ) -> Result<(SourceId, u64), StoreError> {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(self.channel_dir(channel).join(LEDGER_FILE))?;
+            let at = Utc::now();
+            ledger::append_to(
+                &mut file,
+                at,
+                &LedgerEntry::BoundaryResolved {
+                    source: source.clone(),
+                    from,
+                    excluded_range: 0..from,
+                    operator: "replay-fixture".into(),
+                    at,
+                    evidence: None,
+                },
+            )?;
+            Ok((source.clone(), from))
+        }
+
+        /// Seeds a durable approval for writer replay tests without an operator command.
+        pub(crate) fn record_operator_resume(
+            &self,
+            channel: u64,
+            rejected_serial: u64,
+            operator: &str,
+            reason: &str,
+        ) -> Result<ledger::ResumeApproval, StoreError> {
+            let path = self.channel_dir(channel).join(LEDGER_FILE);
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)?;
+            let init = self
+                .read_init(channel)?
+                .ok_or_else(|| damage("missing init"))?;
+            let mut state = ledger::read_only(&mut file, init.initial_anchor)?;
+            if let Some(approval) = state.approval(rejected_serial) {
+                return Ok(approval.clone());
+            }
+            let at = Utc::now();
+            let entry = LedgerEntry::OperatorResume {
+                rejected_serial,
+                approval_id: uuid::Uuid::new_v4(),
+                operator: operator.into(),
+                reason: reason.into(),
+                at,
+            };
+            ledger::append_to(&mut file, at, &entry)?;
+            state.apply(at, entry);
+            state
+                .approval(rejected_serial)
+                .cloned()
+                .ok_or_else(|| damage("test approval was not applied"))
+        }
+    }
+
     use crate::services::tui_o::shadow::{ShadowProvider, UnitKey, UnitKind};
 
     pub(super) fn enabled(runtime: &Path) -> OStore {
@@ -594,6 +768,36 @@ mod tests {
         assert!(store.init_channel(&initialized(1, Vec::new())).is_err());
         assert!(!dir(1).join(INIT_FILE).exists());
         assert!(store.open_channel(&era, 9).unwrap().is_none());
+    }
+
+    #[test]
+    fn opening_seals_the_era_only_over_a_sole_takeover_init_that_recovers() {
+        let runtime = tempfile::tempdir().unwrap();
+        let dir = |channel: u64| {
+            runtime
+                .path()
+                .join(STORE_DIR_NAME)
+                .join(channel.to_string())
+        };
+        let store = enabled(runtime.path());
+        let takeover = InitOrigin::LateCodexTakeover;
+        let init = initialized(1, Vec::new());
+        store.init_channel_as(&init, takeover).unwrap();
+        store
+            .init_channel_as(&initialized(2, Vec::new()), takeover)
+            .unwrap();
+        assert_eq!(
+            enabled(runtime.path()).read_era().unwrap(),
+            None,
+            "two inits"
+        );
+        std::fs::remove_dir_all(dir(2)).unwrap();
+        std::fs::write(dir(1).join(LEDGER_FILE), b"damaged\n").unwrap();
+        assert_eq!(enabled(runtime.path()).read_era().unwrap(), None, "damaged");
+        std::fs::write(dir(1).join(LEDGER_FILE), b"").unwrap();
+        let era = enabled(runtime.path()).read_era().unwrap().unwrap();
+        assert_eq!((era.switch_at, era.initial_channels), (init.at, vec![1]));
+        assert_eq!(store.read_init(1).unwrap(), Some(init));
     }
 
     #[test]

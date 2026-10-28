@@ -16,16 +16,15 @@ use std::time::Duration;
 use super::contract::{DoctorProfile, FixSafety, RunContext, SecurityExposure, Severity};
 use super::{health, mailbox};
 
+mod api_exposure;
 mod config_dir_checks;
+mod configuration_audit;
 use crate::cli::dcserver;
 use crate::config;
-use crate::services::operator_connectors::{
-    OptionalConnectorState, OptionalConnectorStatus, optional_connector_statuses,
-};
+use crate::services::operator_connectors as connectors;
 use crate::services::provider::{ProviderKind, ProviderRuntimeProbe};
 use serde::Serialize;
 use serde_json::{Value, json};
-
 #[derive(Clone, Debug)]
 pub(crate) struct DoctorOptions {
     pub(crate) fix: bool,
@@ -846,31 +845,8 @@ fn provider_check_id(provider: &ProviderKind) -> &'static str {
     provider.doctor_check_id()
 }
 
-fn build_core_checks(cfg: &config::Config, snapshot: &HealthSnapshot) -> Vec<Check> {
-    let mut checks = vec![
-        check_server_running(snapshot),
-        check_discord_bot(snapshot),
-        check_degraded_reasons(snapshot),
-        check_health_db_dashboard(snapshot),
-        check_dispatch_outbox(snapshot),
-        check_config_audit(snapshot),
-        check_runtime_root(),
-        config_dir_checks::check_data_dir(cfg),
-        config_dir_checks::check_policies_dir(cfg),
-        config_dir_checks::check_routine_script_registration(cfg),
-        check_tmux(),
-        check_service_manager(),
-        check_postgres_connection(cfg),
-        check_db_integrity(cfg),
-        check_stale_zero_byte_db_files(cfg),
-        check_github_repo_registry(cfg),
-        check_disk_usage(),
-    ];
-    #[cfg(target_os = "macos")]
-    checks.push(check_file_descriptor_headroom());
-    checks.extend(check_mailbox_consistency(snapshot));
-    checks
-}
+mod herdr_policy;
+use herdr_policy::build_core_checks;
 
 fn build_provider_checks(cfg: &config::Config, snapshot: &HealthSnapshot) -> Vec<Check> {
     let configured = configured_provider_names(cfg, snapshot);
@@ -1051,89 +1027,6 @@ fn check_health_db_dashboard(snapshot: &HealthSnapshot) -> Check {
         .with_path(health_detail_endpoint(&snapshot.base))
         .with_expected_actual("db/dashboard fields present", detail)
         .with_evidence(evidence),
-    }
-}
-
-fn check_dispatch_outbox(snapshot: &HealthSnapshot) -> Check {
-    let Some(body) = snapshot.body.as_ref() else {
-        return Check::fail(
-            "dispatch_outbox",
-            CheckGroup::Core,
-            "Dispatch Outbox",
-            "health payload unavailable",
-            "Cannot read dispatch outbox health.",
-        )
-        .with_subsystem("dispatch_outbox")
-        .with_fix_safety(FixSafety::NotFixable);
-    };
-    let stats = body.get("dispatch_outbox");
-    let pending = stats
-        .and_then(|v| v.get("pending"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let retrying = stats
-        .and_then(|v| v.get("retrying"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let permanent_failures = stats
-        .and_then(|v| v.get("permanent_failures"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let oldest_pending_age = stats
-        .and_then(|v| v.get("oldest_pending_age"))
-        .and_then(Value::as_i64)
-        .or_else(|| body.get("outbox_age").and_then(Value::as_i64))
-        .unwrap_or(0);
-    let detail = format!(
-        "pending={pending} retrying={retrying} permanent_failures={permanent_failures} oldest_pending_age={oldest_pending_age}s"
-    );
-    let evidence = json!({
-        "dispatch_outbox": {
-            "pending": pending,
-            "retrying": retrying,
-            "permanent_failures": permanent_failures,
-            "oldest_pending_age": oldest_pending_age
-        }
-    });
-
-    if permanent_failures > 0 {
-        Check::fail(
-            "dispatch_outbox",
-            CheckGroup::Core,
-            "Dispatch Outbox",
-            detail.clone(),
-            "There are permanent dispatch outbox failures. Check the delivery/follow-up paths.",
-        )
-        .with_subsystem("health")
-        .with_severity(Severity::Error)
-        .with_path(health_detail_endpoint(&snapshot.base))
-        .with_expected_actual("no permanent outbox failures", detail)
-        .with_evidence(evidence)
-        .with_security_exposure(SecurityExposure::OperationalMetadata)
-    } else if oldest_pending_age >= 60 || pending > 0 || retrying > 0 {
-        Check::warn(
-            "dispatch_outbox",
-            CheckGroup::Core,
-            "Dispatch Outbox",
-            detail.clone(),
-            "Pending/retrying outbox items remain. If oldest age increases, check the delivery worker.",
-        )
-        .with_subsystem("health")
-        .with_path(health_detail_endpoint(&snapshot.base))
-        .with_expected_actual("empty or fresh outbox", detail)
-        .with_evidence(evidence)
-        .with_security_exposure(SecurityExposure::OperationalMetadata)
-    } else {
-        Check::ok(
-            "dispatch_outbox",
-            CheckGroup::Core,
-            "Dispatch Outbox",
-            detail.clone(),
-        )
-        .with_subsystem("health")
-        .with_path(health_detail_endpoint(&snapshot.base))
-        .with_expected_actual("outbox healthy", detail)
-        .with_evidence(evidence)
     }
 }
 
@@ -1427,13 +1320,13 @@ fn build_all_checks(cfg: &config::Config, snapshot: &HealthSnapshot) -> Vec<Chec
 }
 
 fn build_optional_connector_checks() -> Vec<Check> {
-    optional_connector_statuses()
+    connectors::optional_connector_statuses()
         .into_iter()
         .map(optional_connector_check)
         .collect()
 }
 
-fn optional_connector_check(status: OptionalConnectorStatus) -> Check {
+fn optional_connector_check(status: connectors::OptionalConnectorStatus) -> Check {
     let (id, name) = optional_connector_check_identity(status.id);
     let evidence = json!({
         "connector": status.id,
@@ -1446,14 +1339,14 @@ fn optional_connector_check(status: OptionalConnectorStatus) -> Check {
         "setup_actions": &status.setup_actions,
     });
     let check = match status.state {
-        OptionalConnectorState::Ready
-        | OptionalConnectorState::Skipped
-        | OptionalConnectorState::MissingConfig => {
+        connectors::OptionalConnectorState::Ready
+        | connectors::OptionalConnectorState::Skipped
+        | connectors::OptionalConnectorState::MissingConfig => {
             Check::ok(id, CheckGroup::OptionalConnectors, name, status.detail.clone())
         }
-        OptionalConnectorState::MissingPath
-        | OptionalConnectorState::MissingProvider
-        | OptionalConnectorState::InvalidConfig => Check::warn(
+        connectors::OptionalConnectorState::MissingPath
+        | connectors::OptionalConnectorState::MissingProvider
+        | connectors::OptionalConnectorState::InvalidConfig => Check::warn(
             id,
             CheckGroup::OptionalConnectors,
             name,
@@ -2052,9 +1945,11 @@ fn apply_service_fix(snapshot: &HealthSnapshot, options: &DoctorOptions) -> Vec<
     Vec::new()
 }
 
+mod dispatch_outbox;
+mod managed_herdr_config;
 mod repair_response;
 mod report_display;
-
+use dispatch_outbox::check_dispatch_outbox;
 mod observation_checks;
 use observation_checks::check_mailbox_consistency;
 #[cfg(test)]
@@ -3674,14 +3569,14 @@ pub(crate) fn run_doctor_report(options: DoctorOptions) -> Result<DoctorReport, 
     let cfg = config::load_graceful();
     let mut actions = Vec::new();
     if options.fix {
-        actions = apply_safe_fixes(&cfg, &options);
+        actions = managed_herdr_config::fixed(&cfg, apply_safe_fixes(&cfg, &options));
         let pre_fix_snapshot = fetch_health_snapshot(&options);
         actions.extend(apply_service_fix(&pre_fix_snapshot, &options));
         actions.extend(apply_stale_mailbox_fixes(&pre_fix_snapshot, &options));
     }
 
     let snapshot = fetch_health_snapshot(&options);
-    let mut checks = build_all_checks(&cfg, &snapshot);
+    let mut checks = managed_herdr_config::checked(&cfg, build_all_checks(&cfg, &snapshot));
     if let Some(profile) = options.profile {
         checks.retain(|check| doctor_profile_includes_check(profile, check));
     }

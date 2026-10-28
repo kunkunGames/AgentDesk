@@ -226,10 +226,12 @@ async fn operator_source_correction_refuses_unknown_outcomes_live_owners_and_pub
     );
     for table in ["campaign_goal_revisions", "campaign_graph_reconciliations"] {
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table}"
+            )))
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
             0
         );
     }

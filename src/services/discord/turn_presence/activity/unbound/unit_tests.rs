@@ -333,7 +333,7 @@ fn u_candidate_conflicts() {
             &[],
             &BTreeMap::new()
         ),
-        Verdict::Hold("identity_unresolved")
+        Verdict::Hold("candidate_conflict")
     );
     let c = candidates(
         Some("current"),
@@ -376,12 +376,12 @@ fn u_candidate_conflicts() {
     );
     assert_eq!(
         decide(Ok(inflight), &[], &BTreeMap::new()),
-        Verdict::Hold("identity_unresolved")
+        Verdict::Hold("candidate_inflight")
     );
     assert_eq!(
         decide(
             candidates(Some("current"), &[], vec![], None),
-            &["unowned"],
+            &["AgentDesk-claude-unowned"],
             &BTreeMap::new()
         ),
         Verdict::Hold("owner_unresolved")
@@ -416,9 +416,51 @@ fn u_candidate_conflicts() {
                 &Inventory::Sessions(vec![]),
                 &BTreeMap::new()
             ),
-            Verdict::Hold("identity_unresolved")
+            Verdict::Hold("scope_mismatch")
         );
     }
+}
+
+/// A host session outside AgentDesk's namespace, or one a routine ran in another channel, is not
+/// this channel's; the same name still holds once this channel's own evidence names or owns it.
+#[test]
+fn u_outside_or_elsewhere_sessions_never_hide_own_evidence() {
+    let routine = "AgentDesk-claude-routine-brief---counsel";
+    let owned = |owner: u64| [(routine.to_string(), Some(owner))].into_iter().collect();
+    let current = || candidates(Some("current"), &[], vec![], None);
+    let observed = [
+        decide(current(), &["claude"], &BTreeMap::new()),
+        decide(current(), &["claude", routine], &owned(CHANNEL + 1)),
+        decide(current(), &[routine], &BTreeMap::new()),
+        decide(
+            current(),
+            &["claude", "AgentDesk-codex-x"],
+            &BTreeMap::new(),
+        ),
+        decide(current(), &[routine], &owned(CHANNEL)),
+        decide(
+            candidates(Some("current"), &[], vec![event(1, "claude", 1)], None),
+            &["claude"],
+            &BTreeMap::new(),
+        ),
+        decide(
+            candidates(Some("current"), &[], vec![], Some(row(CHANNEL, "claude"))),
+            &["claude"],
+            &BTreeMap::new(),
+        ),
+    ];
+    assert_eq!(
+        observed,
+        [
+            Verdict::Absent(Absence::LocalInventory),
+            Verdict::Absent(Absence::LocalInventory),
+            Verdict::Hold("owner_unresolved"),
+            Verdict::Hold("owner_unresolved"),
+            Verdict::Hold("watcher_unbound"),
+            Verdict::Hold("watcher_unbound"),
+            Verdict::Hold("candidate_inflight"),
+        ]
+    );
 }
 
 #[test]
@@ -488,7 +530,7 @@ fn u_legacy_inflight_read_only() {
             &[],
             &BTreeMap::new()
         ),
-        Verdict::Hold("identity_unresolved")
+        Verdict::Hold("candidate_inflight")
     );
     assert_eq!(std::fs::read(&path).unwrap(), before);
     let after = std::fs::metadata(&path).unwrap();
@@ -536,6 +578,8 @@ fn scope(
     marker: HostKindMarker,
     row: &Result<Option<InflightTurnState>, String>,
 ) -> Scope {
+    // Hosting is read from the boot section, so boot with this config's.
+    let _hosts = crate::config::session_hosts::force_config_for_test(config);
     host_scope(HostReads {
         channel: owner.channel_id.parse().unwrap(),
         provider: &ProviderKind::Claude,
@@ -546,6 +590,7 @@ fn scope(
         exact_key: key,
         exact,
         canonical,
+        legacy_absence: false,
         evidence,
         marker,
         inflight: row,
@@ -605,7 +650,7 @@ async fn u_local_row_identity_pg() {
             HostKindMarker::Absent,
             &Ok(None)
         ),
-        Scope::Hold("identity_unresolved")
+        Scope::Hold("exact_canonical_mismatch")
     );
     let other_key = format!("claude/{TOKEN}/foreign:other");
     inflight::seed_session_row_keyed(&pool, &other_key, CHANNEL + 1, None).await;
@@ -620,7 +665,7 @@ async fn u_local_row_identity_pg() {
             HostKindMarker::Absent,
             &Ok(None)
         ),
-        Scope::Hold("identity_unresolved")
+        Scope::Hold("exact_canonical_mismatch")
     );
     sqlx::query("UPDATE sessions SET hosted_execution = $2 WHERE session_key = $1")
         .bind(&key)
@@ -644,7 +689,7 @@ async fn u_local_row_identity_pg() {
             HostKindMarker::Absent,
             &Ok(None)
         ),
-        Scope::Hold("identity_unresolved")
+        Scope::Hold("exact_canonical_mismatch")
     );
     let missing = HostedLookup::Missing;
     let no_row = evidence(&missing, &key, &owner.logical_key);

@@ -31,19 +31,38 @@ pub(crate) const KEY: &str = "mini";
 pub(crate) const SESSION: &str = "agentdesk";
 pub(crate) const SHELL: u32 = 10;
 pub(crate) const PROVIDER: u32 = 20;
+/// The root shell a restarted server gives the pane in place of the launch's.
+pub(crate) const NEW_SHELL: u32 = 11;
 
-/// The process reads the gate sees; empty until a test names the running provider.
+/// The process reads the gate sees; empty until a test names the running provider. A pid a test
+/// set answers whether it exists as set, any other as the named OS does; every such read is counted.
 #[derive(Default)]
-struct LateOs(Mutex<Option<Arc<dyn ProcessOs>>>);
+struct LateOs {
+    os: Mutex<Option<Arc<dyn ProcessOs>>>,
+    exists: Mutex<HashMap<u32, bool>>,
+    exists_reads: AtomicUsize,
+    started_at: Mutex<Option<std::time::SystemTime>>,
+}
 
 impl LateOs {
     fn now(&self) -> Result<Arc<dyn ProcessOs>, RestoreUnverified> {
-        let os = self.0.lock().unwrap().clone();
+        let os = self.os.lock().unwrap().clone();
         os.ok_or(RestoreUnverified::ProcessUnreadable)
+    }
+    fn set(&self, os: FakeOs) {
+        *self.started_at.lock().unwrap() = Some(std::time::SystemTime::now());
+        *self.os.lock().unwrap() = Some(Arc::new(os));
     }
 }
 
 impl ProcessOs for LateOs {
+    fn exists(&self, pid: u32) -> Result<bool, RestoreUnverified> {
+        self.exists_reads.fetch_add(1, Ordering::SeqCst);
+        match self.exists.lock().unwrap().get(&pid).copied() {
+            Some(exists) => Ok(exists),
+            None => self.now()?.exists(pid),
+        }
+    }
     fn parent(&self, pid: u32) -> Result<u32, RestoreUnverified> {
         self.now()?.parent(pid)
     }
@@ -59,13 +78,35 @@ impl ProcessOs for LateOs {
 }
 
 /// Results a test put in place of the default reply, by method.
-type Answers = Arc<Mutex<HashMap<String, Value>>>;
+type Answers = Arc<Mutex<HashMap<String, VecDeque<Value>>>>;
 
 /// What a pane write's params do to the pane before the server answers it.
 type OnSend = Arc<Mutex<Option<Box<dyn FnMut(&Value) + Send>>>>;
 
 /// Prefixes an answer that takes its method's place once a pane write arrives.
 const AFTER_SEND: &str = "after-send:";
+
+/// A launched pane's processes that also answer whether each exists: the provider as `alive`
+/// says, every other one present.
+struct Seen(FakeOs, bool);
+
+impl ProcessOs for Seen {
+    fn exists(&self, pid: u32) -> Result<bool, RestoreUnverified> {
+        Ok(pid != PROVIDER || self.1)
+    }
+    fn parent(&self, pid: u32) -> Result<u32, RestoreUnverified> {
+        self.0.parent(pid)
+    }
+    fn start(&self, pid: u32) -> Result<ProcessStart, RestoreUnverified> {
+        self.0.start(pid)
+    }
+    fn environ(&self, pid: u32) -> Result<Vec<String>, RestoreUnverified> {
+        self.0.environ(pid)
+    }
+    fn exec_path(&self, pid: u32) -> Option<String> {
+        self.0.exec_path(pid)
+    }
+}
 
 pub(crate) struct HerdrRig {
     path: PathBuf,
@@ -91,7 +132,12 @@ fn start(seconds: u64) -> ProcessStart {
 
 fn reply(request: &Value, answers: &Answers) -> Value {
     let method = request["method"].as_str().unwrap_or("");
-    if let Some(result) = answers.lock().unwrap().get(method) {
+    if let Some(results) = answers.lock().unwrap().get_mut(method) {
+        let result = if results.len() > 1 {
+            results.pop_front().unwrap()
+        } else {
+            results.front().unwrap().clone()
+        };
         return json!({"id": request["id"], "result": result});
     }
     let result = match method {
@@ -197,28 +243,73 @@ impl HerdrRig {
 
     /// This node's registry over the rig, installed on the calling thread until dropped.
     pub(crate) fn registry_on_this_thread(&self) -> ForcedRegistry {
-        let endpoint = HerdrEndpoint::new(NODE, KEY, &self.path, SESSION)
-            .and_then(|endpoint| endpoint.with_herdr_home(Path::new("/adk/herdr")))
-            .unwrap();
-        let config = HerdrSocketConfig {
-            io_timeout: Duration::from_millis(500),
-            read_deadline: Duration::from_millis(500),
-            retry_backoff: Duration::from_millis(50),
-            max_frame_bytes: MAX_FRAME_BYTES,
-        };
-        let servers = self.servers.clone();
-        let socket = HerdrSocketTransport::new(&endpoint, config, LineJsonFraming)
-            .with_peer_reader(Box::new(move |_| {
-                let mut servers = servers.lock().unwrap();
-                let pid = match servers.len() {
-                    1 => servers[0],
-                    _ => servers.pop_front().unwrap(),
-                };
-                Ok((pid, start(1_000)))
-            }));
-        let registry = HerdrRegistry::with_transport(endpoint, Arc::new(socket));
-        let os: Arc<dyn ProcessOs> = self.os.clone();
-        herdr_registry::force_for_test(registry.with_reads((off_where_dialled, os)))
+        self.registry_as_on_this_thread(NODE, KEY, &self.path, SESSION)
+    }
+
+    /// The registry of `node`'s endpoint `key` at `at`, as a channel's config names it, with every
+    /// dial reaching the rig; installed on the calling thread until dropped.
+    pub(crate) fn registry_as_on_this_thread(
+        &self,
+        node: &str,
+        key: &str,
+        at: &Path,
+        session: &str,
+    ) -> ForcedRegistry {
+        herdr_registry::force_for_test(self.registry_builder(node, key, at, session)())
+    }
+
+    /// Installs the same fake endpoint on each async worker and blocking executor thread.
+    pub(crate) fn thread_installer(
+        &self,
+        node: &str,
+        key: &str,
+        at: &Path,
+        session: &str,
+    ) -> impl Fn() + Send + Sync + 'static {
+        let build = self.registry_builder(node, key, at, session);
+        move || std::mem::forget(herdr_registry::force_for_test(build()))
+    }
+
+    fn registry_builder(
+        &self,
+        node: &str,
+        key: &str,
+        at: &Path,
+        session: &str,
+    ) -> impl Fn() -> HerdrRegistry + Send + Sync + 'static {
+        let (node, key, at, session) = (
+            node.to_owned(),
+            key.to_owned(),
+            at.to_owned(),
+            session.to_owned(),
+        );
+        let (path, servers, os) = (self.path.clone(), self.servers.clone(), self.os.clone());
+        move || {
+            let endpoint = |socket: &Path| {
+                HerdrEndpoint::new(&node, &key, socket, &session)
+                    .and_then(|endpoint| endpoint.with_herdr_home(Path::new("/adk/herdr")))
+                    .unwrap()
+            };
+            let config = HerdrSocketConfig {
+                io_timeout: Duration::from_millis(500),
+                read_deadline: Duration::from_millis(500),
+                retry_backoff: Duration::from_millis(50),
+                max_frame_bytes: MAX_FRAME_BYTES,
+            };
+            let servers = servers.clone();
+            let socket = HerdrSocketTransport::new(&endpoint(&path), config, LineJsonFraming)
+                .with_peer_reader(Box::new(move |_| {
+                    let mut servers = servers.lock().unwrap();
+                    let pid = match servers.len() {
+                        1 => servers[0],
+                        _ => servers.pop_front().unwrap(),
+                    };
+                    Ok((pid, start(1_000)))
+                }));
+            let registry = HerdrRegistry::with_transport(endpoint(&at), Arc::new(socket));
+            let os: Arc<dyn ProcessOs> = os.clone();
+            registry.with_reads((off_where_dialled, os))
+        }
     }
 
     /// Writes launch context `nonce`'s file, as a launch does, and returns its path.
@@ -235,18 +326,52 @@ impl HerdrRig {
         } else {
             os
         };
-        *self.os.0.lock().unwrap() = Some(Arc::new(os));
+        self.os.set(os);
+    }
+
+    /// The pane runs the launch at `context`, and its provider process is seen to exist or not.
+    pub(crate) fn provider_seen(&self, context: &Path, alive: bool) {
+        let os = Seen(FakeOs::launched(env_naming(context)), alive);
+        *self.os.os.lock().unwrap() = Some(Arc::new(os));
     }
 
     /// The pane's root shell was restarted after the launch recorded it; the provider is the same.
     pub(crate) fn restart_shell(&self, context: &Path) {
-        let os = FakeOs::launched(env_naming(context)).starting(SHELL, &[start(1_009)]);
-        *self.os.0.lock().unwrap() = Some(Arc::new(os));
+        self.os
+            .set(FakeOs::launched(env_naming(context)).starting(SHELL, &[start(1_009)]));
+    }
+
+    /// A restarted server restored the pane as shell `NEW_SHELL` alone.
+    pub(crate) fn restore_as_new_shell(&self, context: &Path) {
+        let os = FakeOs::launched(env_naming(context));
+        self.os.set(os.starting(NEW_SHELL, &[start(1_100)]));
+        let info = json!({"pane_id": PANE, "shell_pid": NEW_SHELL,
+            "foreground_process_group_id": NEW_SHELL,
+            "foreground_processes": [{"pid": NEW_SHELL}]});
+        let info = json!({"type": "pane_process_info", "process_info": info});
+        self.answer("pane.process_info", info);
+    }
+
+    /// Every later read of whether `pid` exists answers `exists`.
+    pub(crate) fn exists(&self, pid: u32, exists: bool) {
+        self.os.exists.lock().unwrap().insert(pid, exists);
+    }
+
+    /// How many reads of whether a pid exists the gate has made.
+    pub(crate) fn exists_reads(&self) -> usize {
+        self.os.exists_reads.load(Ordering::SeqCst)
     }
 
     /// Replies with `result` to every later `method` request.
     pub(crate) fn answer(&self, method: &str, result: Value) {
-        self.answers.lock().unwrap().insert(method.into(), result);
+        self.answer_sequence(method, [result]);
+    }
+
+    /// Replies in order, then repeats the last response for every later request.
+    pub(crate) fn answer_sequence(&self, method: &str, results: impl IntoIterator<Item = Value>) {
+        let results: VecDeque<_> = results.into_iter().collect();
+        assert!(!results.is_empty(), "a scripted response must not be empty");
+        self.answers.lock().unwrap().insert(method.into(), results);
     }
 
     /// Replies with `result` to every `method` request after the next pane write.
@@ -285,6 +410,17 @@ impl HerdrRig {
             "pane.process_info",
             json!({"type": "pane_process_info", "process_info": info}),
         );
+    }
+
+    /// The next pane read lists `first` in the foreground, every later one `then`.
+    pub(crate) fn foreground_then(&self, first: &[u32], then: &[u32]) {
+        let info = |listed: &[u32]| {
+            let pids: Vec<Value> = listed.iter().map(|pid| json!({"pid": pid})).collect();
+            let info = json!({"pane_id": PANE, "shell_pid": SHELL,
+                "foreground_process_group_id": listed.first(), "foreground_processes": pids});
+            json!({"type": "pane_process_info", "process_info": info})
+        };
+        self.answer_sequence("pane.process_info", [info(first), info(then)]);
     }
 
     /// The server pid each later dial reaches, in order; the last one repeats.
@@ -491,3 +627,64 @@ pub(crate) fn native_server_child() -> bool {
     }
     true
 }
+
+/// Shared scripted OS observations for the gate and the production socket launch adapter.
+struct SharedRigOs(Arc<LateOs>);
+impl ProcessOs for SharedRigOs {
+    fn exists(&self, pid: u32) -> Result<bool, RestoreUnverified> {
+        self.0.exists(pid)
+    }
+    fn parent(&self, pid: u32) -> Result<u32, RestoreUnverified> {
+        self.0.parent(pid)
+    }
+    fn start(&self, pid: u32) -> Result<ProcessStart, RestoreUnverified> {
+        let mut start = self.0.start(pid)?;
+        start.wall_clock = self
+            .0
+            .started_at
+            .lock()
+            .unwrap()
+            .ok_or(RestoreUnverified::ProcessUnreadable)?;
+        Ok(start)
+    }
+    fn environ(&self, pid: u32) -> Result<Vec<String>, RestoreUnverified> {
+        self.0.environ(pid)
+    }
+    fn exec_path(&self, pid: u32) -> Option<String> {
+        self.0.exec_path(pid)
+    }
+}
+impl HerdrRig {
+    /// As thread_installer, retaining the production launch/create/evidence adapter over this socket.
+    pub(crate) fn thread_installer_with_launch(
+        &self,
+        node: &str,
+        key: &str,
+        session: &str,
+    ) -> impl Fn() + Send + Sync + 'static {
+        let build = self.registry_builder(node, key, &self.path, session);
+        let (node, key, session, socket, os) = (
+            node.to_owned(),
+            key.to_owned(),
+            session.to_owned(),
+            self.path.clone(),
+            self.os.clone(),
+        );
+        move || {
+            let endpoint = HerdrEndpoint::new(&node, &key, &socket, &session)
+                .unwrap()
+                .with_herdr_home(Path::new("/adk/herdr"))
+                .unwrap();
+            let host = super::SocketHerdrLaunchHost::socket_rig_for_test(
+                endpoint,
+                Box::new(SharedRigOs(os.clone())),
+            );
+            std::mem::forget(herdr_registry::force_for_test(
+                build().with_launch_host(host),
+            ));
+        }
+    }
+}
+
+#[path = "herdr_t14_client_tests.rs"]
+pub(crate) mod t14_client;

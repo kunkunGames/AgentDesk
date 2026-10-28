@@ -8,6 +8,7 @@ use super::common::{
     tool_prefix,
 };
 use super::*;
+use crate::config::ToolActivityDisplay::Class;
 use serde_json::json;
 
 #[test]
@@ -58,11 +59,9 @@ fn tool_prefix_is_a_closed_static_label_set() {
 
 #[test]
 fn raw_codex_exec_command_reaches_single_message_footer_as_bash() {
-    use std::sync::mpsc;
-
     use crate::services::agent_protocol::StreamMessage;
     use crate::services::codex_tui::rollout_tail::replay_rollout_file;
-
+    use std::sync::mpsc;
     let raw_command = "printf parser-bridge-secret";
     let rollout = tempfile::NamedTempFile::new().expect("raw Codex rollout fixture");
     std::fs::write(
@@ -76,8 +75,7 @@ fn raw_codex_exec_command_reaches_single_message_footer_as_bash() {
     let (tx, rx) = mpsc::channel();
     replay_rollout_file(rollout.path(), 0, &tx).expect("parse raw Codex rollout");
     drop(tx);
-
-    let events = PlaceholderLiveEvents::default();
+    let events = PlaceholderLiveEvents::with_tool_activity_display(Class);
     let channel_id = ChannelId::new(4_892_401);
     let mut bridged_tool_uses = 0;
     for message in rx {
@@ -111,7 +109,6 @@ fn raw_codex_exec_command_reaches_single_message_footer_as_bash() {
         bridged_tool_uses, 1,
         "raw rollout must produce exactly one bridgeable ToolUse"
     );
-
     let panel = events.render_status_panel(channel_id, &ProviderKind::Codex, 1_700_000_000);
     let footer = super::super::single_message_panel::compose_footer_status_block("⠸", &panel);
     assert!(
@@ -463,13 +460,12 @@ fn events_from_json_keeps_genuine_cancelled_prefixed_tool_error() {
 
 #[test]
 fn status_panel_renders_derived_tool_state_under_limit() {
-    let events = PlaceholderLiveEvents::default();
+    let events = PlaceholderLiveEvents::with_tool_activity_display(Class);
     let channel_id = ChannelId::new(77);
     events.push_status_events(
         channel_id,
         status_events_from_tool_use("Bash", &json!({"command": "cargo test"}).to_string()),
     );
-
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     assert!(rendered.contains("마지막 도구"));
     assert!(rendered.contains("[Bash]"));
@@ -483,7 +479,7 @@ fn status_panel_renders_derived_tool_state_under_limit() {
 
 #[test]
 fn status_panel_recent_compacts_raw_command_details() {
-    let events = PlaceholderLiveEvents::default();
+    let events = PlaceholderLiveEvents::with_tool_activity_display(Class);
     let channel_id = ChannelId::new(78);
     let raw_command = "cargo test --lib placeholder_live_events -- --nocapture";
     let tool_args = json!({"command": raw_command}).to_string();
@@ -492,7 +488,6 @@ fn status_panel_recent_compacts_raw_command_details() {
         channel_id,
         RecentPlaceholderEvent::tool_use("Bash", &tool_args).unwrap(),
     );
-
     let rendered = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     // #3983 item 5a: the footer no longer echoes the compact 🖥️ Recent block;
     // #4892 shows only the tool class and keeps arguments on explicit debug surfaces.
@@ -504,7 +499,6 @@ fn status_panel_recent_compacts_raw_command_details() {
             && !rendered.contains(r"cargo test --lib placeholder\_live\_events -- --nocapture"),
         "normal status panel must not render raw command detail: {rendered}"
     );
-
     let raw_debug_block = events.render_raw_block_for_tests(channel_id).unwrap();
     assert!(
         raw_debug_block.contains(raw_command),
@@ -514,7 +508,7 @@ fn status_panel_recent_compacts_raw_command_details() {
 
 #[test]
 fn characterize_rollover_seed_has_no_status_panel_content_s0() {
-    let events = PlaceholderLiveEvents::default();
+    let events = PlaceholderLiveEvents::with_tool_activity_display(Class);
     let channel_id = ChannelId::new(3089);
     let tool_args = json!({"command": "cargo test --lib placeholder_live_events"}).to_string();
     events.push_status_events(channel_id, status_events_from_tool_use("Bash", &tool_args));
@@ -522,24 +516,19 @@ fn characterize_rollover_seed_has_no_status_panel_content_s0() {
         channel_id,
         RecentPlaceholderEvent::tool_use("Bash", &tool_args).unwrap(),
     );
-
     let panel = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
     assert!(panel.contains("마지막 도구"));
     assert!(panel.contains("[Bash]"));
     assert!(!panel.contains("cargo test --lib placeholder_live_events"));
     assert!(!panel.contains(r"cargo test --lib placeholder\_live\_events"));
-
     let status_block = build_processing_status_block("⠸");
     let current_portion = "relay body ".repeat(250);
     let plan = plan_streaming_rollover(&current_portion, &status_block)
         .expect("representative relay body should roll over");
     let rollover_seed = build_streaming_placeholder_text("", &status_block);
 
-    assert_eq!(rollover_seed, status_block);
-    assert!(
-        plan.display_snapshot
-            .ends_with(&format!("\n\n{status_block}"))
-    );
+    assert_eq!(rollover_seed, "⠋ 계속 처리 중");
+    assert!(!plan.display_snapshot.contains(&status_block));
     for status_panel_fragment in [
         "마지막 도구",
         "[Bash]",
@@ -593,7 +582,7 @@ fn status_panel_turn_completed_renders_foreground_completion() {
 fn status_panel_absorbs_stale_and_final_into_the_activity_emoji() {
     // #3983 items 2 + B: the separate 신뢰도 line is retired; the freshness class is
     // absorbed into the activity emoji, and the following fields carry stable times.
-    let events = PlaceholderLiveEvents::default();
+    let events = PlaceholderLiveEvents::with_tool_activity_display(Class);
     let channel_id = ChannelId::new(38120);
 
     // Running turn → 🟢 activity + `마지막 업데이트`/`턴 시작` time line, no 신뢰도.
@@ -632,7 +621,7 @@ fn status_panel_absorbs_stale_and_final_into_the_activity_emoji() {
 
 #[test]
 fn status_panel_codex_active_omits_processing_tail_after_recent_block() {
-    let events = PlaceholderLiveEvents::default();
+    let events = PlaceholderLiveEvents::with_tool_activity_display(Class);
     let channel_id = ChannelId::new(175);
     events.push_status_events(
         channel_id,
@@ -4166,7 +4155,7 @@ fn background_bash_slots_are_footer_flag_gated() {
 
 #[test]
 fn background_bash_command_only_slot_hides_raw_command_3806() {
-    let events = PlaceholderLiveEvents::default();
+    let events = PlaceholderLiveEvents::with_tool_activity_display(Class);
     let channel_id = ChannelId::new(3_806_002);
     let raw_command = "codex exec --skip-git-repo-check -m gpt-5.5";
     events.push_status_events(
@@ -6671,7 +6660,7 @@ fn status_panel_keeps_latest_task_tool_entries_under_cap() {
 
 #[test]
 fn status_panel_renders_plan_but_hides_subagents_for_codex() {
-    let events = PlaceholderLiveEvents::default();
+    let events = PlaceholderLiveEvents::with_tool_activity_display(Class);
     let channel_id = ChannelId::new(80);
     events.push_status_events(
         channel_id,
@@ -6704,7 +6693,7 @@ fn status_panel_renders_plan_but_hides_subagents_for_codex() {
 
 #[test]
 fn codex_task_class_stays_hidden_after_subagent_terminal_result() {
-    let events = PlaceholderLiveEvents::default();
+    let events = PlaceholderLiveEvents::with_tool_activity_display(Class);
     let channel_id = ChannelId::new(4_892_301);
     events.push_status_events(
         channel_id,
@@ -6732,7 +6721,7 @@ fn codex_task_class_stays_hidden_after_subagent_terminal_result() {
 
 #[test]
 fn codex_task_class_stays_hidden_after_background_launch_ack() {
-    let events = PlaceholderLiveEvents::default();
+    let events = PlaceholderLiveEvents::with_tool_activity_display(Class);
     let channel_id = ChannelId::new(4_892_302);
     events.push_status_events(
         channel_id,
@@ -6842,18 +6831,24 @@ fn status_events_from_json_keeps_tool_result_visibility() {
         }
     }));
 
-    assert_eq!(events, vec![StatusEvent::ToolEnd { success: false }]);
+    assert_eq!(events[0], StatusEvent::ToolEnd { success: false });
 }
 
 #[test]
 fn status_tool_result_closes_subagent_only_for_task_tools() {
     assert_eq!(
         status_events_from_tool_result(Some("Read"), false),
-        vec![StatusEvent::ToolEnd { success: true }]
+        vec![
+            StatusEvent::ToolEnd { success: true },
+            super::tool_activity::observation(Some("Read"), None, None, Some(true))
+        ]
     );
     assert_eq!(
         status_events_from_tool_result(Some("TaskCreate"), false),
-        vec![StatusEvent::ToolEnd { success: true }]
+        vec![
+            StatusEvent::ToolEnd { success: true },
+            super::tool_activity::observation(Some("TaskCreate"), None, None, Some(true))
+        ]
     );
     // A FAILED Task tool_result is terminal (the launch errored — the subagent
     // never ran), so it is NOT ack-only: the panel must finalize the slot (✗)
@@ -6869,7 +6864,8 @@ fn status_tool_result_closes_subagent_only_for_task_tools() {
                 tool_use_id: None,
                 summary: None,
                 ack_only: false
-            }
+            },
+            super::tool_activity::observation(Some("Task"), None, None, Some(false))
         ]
     );
     // A SUCCESSFUL Task tool_result is the (possibly background) launch ack →
@@ -6885,7 +6881,8 @@ fn status_tool_result_closes_subagent_only_for_task_tools() {
                 tool_use_id: None,
                 summary: None,
                 ack_only: true
-            }
+            },
+            super::tool_activity::observation(Some("Task"), None, None, Some(true))
         ]
     );
 }
@@ -9035,24 +9032,16 @@ fn rehydration_bound_skips_records_before_compact_boundary() {
     );
 }
 
-// ===========================================================================
-// #4093 + #4367: the live (turn-in-progress) status panel HIDES completed
-// Tasks/Subagents outright (superseding #3404's terminal-slot compaction, now
-// removed — see completion_footer.rs).
-// ===========================================================================
+// Live Tasks/Subagents sections hide completed slots. The separate tool
+// activity list can still show those tools' completion history.
 
 // Representative "several completed" backlog size for the hide-completed tests.
 // (Formerly aliased the removed #3404 `LIVE_PANEL_TERMINAL_RENDER_CAP`; the live
 // panel no longer caps terminal rows, so this is now just an arbitrary count.)
 const COMPLETED_SAMPLE: usize = 3;
 
-// #4093 (supersedes #3404 for the Tasks section): during a long turn the LIVE
-// panel used to accumulate completed Tasks — #3404 capped the display at a few
-// completions plus a `… (+N completed)` summary. #4093 goes further: completed
-// Task slots are hidden from the live panel entirely so they can never mask or
-// crowd out in-progress work, while every running entry and the section header
-// stay. (The completion footer still renders the ✓ result summary.) #4093 후속
-// removed the #3404 compactor outright — see completion_footer.rs.
+// Completed Tasks cannot crowd out running slots. Keep the section header and
+// every running title while excluding completed titles from that section.
 #[test]
 fn live_panel_hides_completed_tasks_keeping_running_and_header() {
     let events = PlaceholderLiveEvents::default();
@@ -9066,20 +9055,9 @@ fn live_panel_hides_completed_tasks_keeping_running_and_header() {
     push_background_bash_task(&events, channel_id, "Still running", "toolu_3404_run");
 
     let panel = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert_eq!(
-        panel.matches('✓').count(),
-        0,
-        "live panel must hide all completed tasks: {panel}"
-    );
-    assert!(
-        !panel.contains("completed)"),
-        "no compaction summary when completed tasks are hidden: {panel}"
-    );
+    assert!(!panel.contains("completed)"), "{panel}");
     assert!(panel.contains("Tasks"), "Tasks header survives: {panel}");
-    assert!(
-        panel.contains("Still running"),
-        "the running entry is always shown: {panel}"
-    );
+    assert!(panel.contains("Still running"), "{panel}");
     assert!(
         panel
             .lines()
@@ -9087,10 +9065,11 @@ fn live_panel_hides_completed_tasks_keeping_running_and_header() {
             .all(|line| line.starts_with("-# ")),
         "separate live-panel output must keep every Tasks line in subtext: {panel}"
     );
-    assert!(
-        !panel.contains("Completed job"),
-        "no completed task line renders in the live panel: {panel}"
-    );
+    let tasks = panel
+        .split("\n\n")
+        .find(|section| section.contains("Tasks"))
+        .unwrap_or("");
+    assert!(!tasks.contains("Completed job"), "{panel}");
 }
 
 // #4367 (supersedes #3404 for the Subagents section, mirroring #4093 for Tasks):
@@ -9202,9 +9181,8 @@ fn live_panel_render_preserves_state_for_footer_eviction() {
     );
 }
 
-// #4093 (supersedes #3404 for the Tasks section): even a small backlog of
-// completed tasks (at or under the old compaction cap) is now hidden entirely —
-// no ✓ marks and no `… (+N completed)` summary render in the live panel.
+// Even a small completed backlog is hidden from Tasks; the separate activity
+// list may show tool success without restoring those completed task slots.
 #[test]
 fn live_panel_hides_completed_tasks_even_under_cap() {
     let events = PlaceholderLiveEvents::default();
@@ -9215,15 +9193,13 @@ fn live_panel_hides_completed_tasks_even_under_cap() {
         complete_background_bash_task(&events, channel_id, &id);
     }
     let panel = events.render_status_panel(channel_id, &ProviderKind::Claude, 1_700_000_000);
-    assert_eq!(
-        panel.matches('✓').count(),
-        0,
-        "completed tasks are hidden from the live panel: {panel}"
-    );
-    assert!(
-        !panel.contains("completed)"),
-        "no summary when completed tasks are hidden: {panel}"
-    );
+    let tasks = panel
+        .split("\n\n")
+        .find(|section| section.contains("Tasks"))
+        .unwrap_or("");
+    assert!(!tasks.contains("Job "), "{panel}");
+    assert!(panel.contains("✓ Bash  Job 00"), "{panel}");
+    assert!(!panel.contains("completed)"), "{panel}");
 }
 
 // ===========================================================================

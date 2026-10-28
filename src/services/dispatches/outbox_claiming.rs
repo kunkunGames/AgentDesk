@@ -149,13 +149,10 @@ pub(crate) async fn claim_pending_dispatch_outbox_batch_with_cluster_config_pg(
                     routing_origin,
                     &routing_decision,
                 );
-                record_routing_diagnostics_pg(
-                    &mut tx,
-                    candidate.id,
-                    &candidate.dispatch_id,
-                    &diagnostics,
-                )
-                .await;
+                let Ok(()) = record_routing_diagnostics_pg(&mut tx, &candidate, &diagnostics).await
+                else {
+                    return Vec::new();
+                };
                 continue;
             }
         } else if routing_constraints_configured_for_unqualified_dispatch(cluster_config) {
@@ -199,13 +196,10 @@ pub(crate) async fn claim_pending_dispatch_outbox_batch_with_cluster_config_pg(
                     routing_origin,
                     &routing_decision,
                 );
-                record_routing_diagnostics_pg(
-                    &mut tx,
-                    candidate.id,
-                    &candidate.dispatch_id,
-                    &diagnostics,
-                )
-                .await;
+                let Ok(()) = record_routing_diagnostics_pg(&mut tx, &candidate, &diagnostics).await
+                else {
+                    return Vec::new();
+                };
                 continue;
             }
         }
@@ -218,9 +212,9 @@ pub(crate) async fn claim_pending_dispatch_outbox_batch_with_cluster_config_pg(
                         outbox_id = candidate.id,
                         dispatch_id = candidate.dispatch_id,
                         error = %error,
-                        "[dispatch-outbox] failed to claim postgres outbox row"
+                        "[dispatch-outbox] failed to claim postgres outbox row; dropping the batch"
                     );
-                    continue;
+                    return Vec::new();
                 }
             };
 
@@ -829,19 +823,7 @@ mod tests {
         );
     }
 
-    // #4979 B0: PG 테스트를 `*_pg_tests` 하위 모듈로 이관해 `just test-postgres`의
-    // `_pg` 선택자에 걸리게 한다. 아래 `#[cfg(test)]`는 컴파일상 중복이지만
-    // 지우면 안 된다 — `check_test_lane_coverage.py`가 test fn을 가장 안쪽
-    // `cfg(test)` 모듈에 귀속시키므로, 빼면 PG 2건이 부모 `…::tests`로 귀속되고
-    // 그 부모는 `--skip _pg` 탓에 어떤 curated 호출로도 커버되지 않게 된다.
-    // 이름 계약은 두 층으로 갈린다. `*_pg_tests`라는 **접미사 형태**는 어떤
-    // 게이트도 강제하지 않는 사람 규약이고(bare `pg_tests` 모듈이 이미 4건
-    // 있다), 실제로 강제되는 것은 정규화된 테스트 경로가 `_pg`·`pg_`·`postgres`
-    // 중 하나를 부분문자열로 포함해야 한다는 것뿐이다 — `justfile`의
-    // `cargo test --lib -- _pg pg_ postgres`(rule1)와 비PG 레인의 `--skip _pg
-    // --skip pg_ --skip postgres`(rule2)에서 나오며, 둘 다 one-way ratchet이라
-    // 위반하면 CI가 red다. 즉 `mod db_backed_tests` 같은 이름은 규약 위반이
-    // 아니라 게이트 위반이다.
+    // PostgreSQL이 필요한 outbox claiming 시험이다. 순수 시험은 부모 모듈에 남는다.
     #[cfg(test)]
     mod outbox_claiming_pg_tests {
         use super::*;
@@ -1282,6 +1264,100 @@ mod tests {
                 },
                 "an offline owner whose only peer is at capacity must still skip and wait"
             );
+
+            pool.close().await;
+            pg_db.drop().await;
+        }
+
+        /// Claims `dispatch-a`, then lets `trigger_sql` fail one statement for `dispatch-b`.
+        /// Returns the claimed ids and `dispatch-a`'s status after the round.
+        async fn claim_round_with_failure_for_b(
+            pool: &PgPool,
+            b_capabilities: serde_json::Value,
+            trigger_sql: &'static str,
+        ) -> (Vec<String>, String) {
+            sqlx::raw_sql(
+                "DROP TRIGGER IF EXISTS inject_failure ON dispatch_outbox;
+                 DROP TRIGGER IF EXISTS inject_failure ON task_dispatches;
+                 DELETE FROM dispatch_outbox;
+                 DELETE FROM worker_nodes;",
+            )
+            .execute(pool)
+            .await
+            .expect("reset claim round");
+            seed_worker_node(pool, "mac-mini-release", json!(["mac-mini"]), 0).await;
+            let eligible = json!({"required": {"providers": ["codex"]}});
+            seed_pending_outbox_row(pool, "dispatch-a", eligible).await;
+            seed_pending_outbox_row(pool, "dispatch-b", b_capabilities).await;
+            sqlx::raw_sql(trigger_sql)
+                .execute(pool)
+                .await
+                .expect("install failure trigger");
+
+            let claimed = claim_pending_dispatch_outbox_batch_with_cluster_config_pg(
+                pool,
+                "mac-mini-release",
+                &crate::config::ClusterConfig::default(),
+            )
+            .await;
+            let status_a: String = sqlx::query_scalar(
+                "SELECT status FROM dispatch_outbox WHERE dispatch_id = 'dispatch-a'",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("read dispatch-a status");
+            (claimed.into_iter().map(|row| row.1).collect(), status_a)
+        }
+
+        // A failed statement aborts the claim transaction, so no claim of the batch may be
+        // handed out: COMMIT on an aborted transaction rolls everything back.
+        #[tokio::test]
+        async fn a_failed_statement_in_the_claim_batch_hands_out_no_claims() {
+            let Some(pg_db) = TestPostgresDb::create().await else {
+                return;
+            };
+            let pool = pg_db.connect_and_migrate().await;
+            sqlx::raw_sql(
+                "CREATE FUNCTION inject_failure() RETURNS trigger LANGUAGE plpgsql AS
+                 $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$;",
+            )
+            .execute(&pool)
+            .await
+            .expect("create failure function");
+            let mismatch = json!({"required": {"labels": ["linux"]}});
+            let eligible = json!({"required": {"providers": ["codex"]}});
+
+            let outbox_diagnostics = claim_round_with_failure_for_b(
+                &pool,
+                mismatch.clone(),
+                "CREATE TRIGGER inject_failure BEFORE UPDATE OF routing_diagnostics ON dispatch_outbox
+                 FOR EACH ROW WHEN (NEW.dispatch_id = 'dispatch-b') EXECUTE FUNCTION inject_failure();",
+            )
+            .await;
+            let dispatch_diagnostics = claim_round_with_failure_for_b(
+                &pool,
+                mismatch,
+                "CREATE TRIGGER inject_failure BEFORE UPDATE ON task_dispatches
+                 FOR EACH STATEMENT EXECUTE FUNCTION inject_failure();",
+            )
+            .await;
+            let claim = claim_round_with_failure_for_b(
+                &pool,
+                eligible,
+                "CREATE TRIGGER inject_failure BEFORE UPDATE OF status ON dispatch_outbox
+                 FOR EACH ROW WHEN (NEW.dispatch_id = 'dispatch-b') EXECUTE FUNCTION inject_failure();",
+            )
+            .await;
+            let rolled_back = (Vec::new(), "pending".to_string());
+            assert_eq!(
+                outbox_diagnostics, rolled_back,
+                "outbox diagnostics UPDATE failed"
+            );
+            assert_eq!(
+                dispatch_diagnostics, rolled_back,
+                "task_dispatches diagnostics UPDATE failed"
+            );
+            assert_eq!(claim, rolled_back, "claim UPDATE failed");
 
             pool.close().await;
             pg_db.drop().await;

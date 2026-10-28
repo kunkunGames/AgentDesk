@@ -1,5 +1,7 @@
 use super::*;
 mod backstop;
+#[cfg(test)]
+pub(crate) mod retained_notice;
 pub(in crate::services) use backstop::BackstopSlot;
 pub(in crate::services::discord) use backstop::spawn_turn_completion_idle_queue_listener;
 pub(super) use backstop::{
@@ -28,7 +30,7 @@ mod turn_admission;
 use queue_dispatch::kickoff::{KickoffLane, kickoff_queue_channel};
 use transport::QueueTransport;
 pub(super) use turn_admission::{
-    INPUT_PENDING_NOTICE, input_refusal_notice, mailbox_enqueue_observed_intervention,
+    input_persistence_refusal_notice, mailbox_enqueue_observed_intervention,
     mailbox_recovery_kickoff, mailbox_try_start_turn_adopting, mailbox_try_start_turn_behind_queue,
     mailbox_try_start_turn_kinded_with_feedback, mailbox_try_start_turn_unless_released,
 };

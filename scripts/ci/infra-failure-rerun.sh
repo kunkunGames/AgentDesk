@@ -10,9 +10,9 @@ REAL_FAILURE_PREDICATE="$SCRIPT_DIR/real-failure-predicate.sh"
 source "$REAL_FAILURE_PREDICATE"
 TMP_DIR="$(mktemp -d)"
 SUMMARY_ROWS="$TMP_DIR/summary-rows.md"
-PG_JOB_NAMES_TEXT="$(python3 "$REPO_ROOT/scripts/check_pg_test_lane_membership.py" --pg-job-names)"
-PG_JOB_NAMES=(); while IFS= read -r l; do PG_JOB_NAMES+=("$l"); done <<< "$PG_JOB_NAMES_TEXT"
-PG_JOB_NAME="${PG_JOB_NAMES[0]}"
+# The nextest worker jobs are the only retry candidates; the capture is the worker index.
+WORKER_JOB_REGEX='^Rust tests \(worker (0|[1-9][0-9]?)\)$'
+WORKER_JOB_NAME="Rust tests (worker 0)"
 WINDOWS_ADVISORY_JOB_NAME="Fast check + non-PG tests (windows-latest)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -155,41 +155,7 @@ INFRA_ACTION_TIMEOUT_REGEX="the action '.+' has timed out after [0-9]+ minutes"
 #                          Service Unavailable` is `Error: ` followed by a bare
 #                          reason phrase, i.e. the V2 shape. Claim scope: TRUE
 #                          ON V2, UNPROVEN ON V1 — not "true of every runner".
-#
-# REMOVED in r4 for want of provenance — both were r3 inventions of the same
-# kind the rule at REPO_CONFIG_FAULT_REGEX was written to stop:
-#   temporarily unavailable  NOT an HTTP reason phrase, so the mechanical
-#     derivation above does not reach it, and a GitHub-wide search found it in
-#     this slot zero times.
-#   too many requests / 429  UNREACHABLE ON THIS LINE ON THE V2 RESOLVER PATH,
-#     proven from source: LaunchHttpClient.cs:68-73 — inside
-#     `GetResolveActionsDownloadInfoAsyncV2` — throws
-#     `NonRetryableActionDownloadInfoException` for 429, and
-#     ActionManager.cs:1084-1086 prints the `Failed to resolve action download
-#     info. Error: …` line ONLY when the exception is neither that type nor
-#     `UnresolvableActionDownloadInfoException`. On V2 the prefix this regex
-#     requires is therefore never emitted for a 429.
-#     #5207 (r5, D2) — THAT PROOF IS PATH-SCOPED. LaunchServer.cs:47-54 routes
-#     to V2 only when `actions_display_helpful_actions_download_errors` is on
-#     (ActionManager.cs:1067, default `?? false`); the V1 entry point
-#     (LaunchHttpClient.cs:33-38) runs none of that code, so on V1 the 429
-#     handling is not established here. The removal still holds for the logs
-#     this regex is aimed at, because the observed outage line is the V2 shape
-#     (`Error: ` + a bare reason phrase).
-#     #5207 (r5, D2) — NO COVERAGE IS LOST BY THE REMOVAL, EITHER WAY. A 429
-#     aborts action resolution inside `Set up job`, so the job dies before any
-#     step this repo defines runs: `executed_steps` is 0, `job_ran_no_repo_steps`
-#     accepts it, and `job_is_infra_failure` still returns true via the
-#     zero-step path. The retry decision is bit-identical; only the summary
-#     label moves, `infra-shutdown` -> `infra-no-steps`. Do NOT re-add this
-#     alternation on the belief that 429 would otherwise go unclassified.
-#     The r3 `F5` comment argued the
-#     alternation was "kept, deliberately" and reasoned about rate-limit
-#     containment; that premise was false — the state it protected cannot occur.
-#     Containment itself is unaffected and never depended on it: at most two
-#     automatic attempts (`ci-pr-infra-retry.yml` gates on `run_attempt < 3`,
-#     `run_classifier` returns `no-op:attempt-cap` at `RUN_ATTEMPT >= 3`), one
-#     job per rerun.
+# `temporarily unavailable` and `429` stay out: no cited log here; a 429 dies in `Set up job` (zero-step path).
 INFRA_ACTION_DOWNLOAD_REGEX='failed to resolve action download info.*(service unavailable|bad gateway|gateway time-?out|internal server error)'
 
 # #5207 (F1): repo-configuration faults that kill a job before any repo step.
@@ -277,7 +243,7 @@ INFRA_ACTION_DOWNLOAD_REGEX='failed to resolve action download info.*(service un
 # unknown job dependency), missing hosted-runner images, Docker login and
 # container init all reach `infra-no-steps` today. Bounded cost, measured: one
 # wasted rerun plus a wrong label in the summary table. A DETERMINISTIC config
-# fault fails again on the retry and then hits the `run_attempt >= 3` cap, so
+# fault fails again on the retry and then hits the `run_attempt >= 2` cap, so
 # no deterministically broken repo is auto-retried into a pass.
 #
 # #5207 (r4): that conclusion is deliberately NOT stated as a universal. A
@@ -316,14 +282,8 @@ log_has_repo_config_fault() {
 #
 # Narrowness: bare `abandoned` is an ordinary English word, so each alternation
 # binds it to the mirror's `<X>_RESULT:` echo or its quoted result message.
-# #5207 (r3, P3-2): `_result:[[:space:]]+abandoned` also matches any other
-# `<x>_result:  abandoned` echo, e.g. `session_result:  abandoned`. No producer
-# of such a line exists in this repo today; if one appears, tighten the prefix.
-# #5207 (r3, P3-1): on the PG job this label is unreachable by construction —
-# `run_classifier` overwrites it with `unclassified-pg-failure` (steps >= 1) or
-# `infra-no-steps` (steps == 0). That is intended: the label diagnoses the
-# required-check MIRROR jobs, and the PG job's own label must stay tied to the
-# retry decision. Nothing is lost — the mirror jobs still carry it.
+# `_result:` also matches any `<x>_result:  abandoned` echo; none exists today. A worker
+# job's own label is overwritten by the retry decision, so this only labels judge jobs.
 UPSTREAM_ABANDONED_REGEX="result (is unexpected: |is |was )'abandoned'|_result:[[:space:]]+abandoned"
 
 log_has_upstream_abandoned() {
@@ -472,17 +432,43 @@ classify_job() {
   fi
 }
 
-is_pg_job() {
-  local candidate
-  for candidate in "${PG_JOB_NAMES[@]}"; do
-    [[ "$1" != "$candidate" ]] || return 0
+is_worker_job() {
+  [[ "$1" =~ $WORKER_JOB_REGEX ]]
+}
+
+# A failure the test step logged (nextest verdict or the runner's exit-100 line) vetoes even without an artifact.
+worker_log_has_test_failure() {
+  LC_ALL=C awk '/##\[group\]Run /{step=0} /cargo nextest run --archive-file/{step=1} step && (/(^|[^[:alnum:]-])LEAK-FAIL([^[:alnum:]-]|$)/ || /error: test run failed/ ||
+    /^([0-9][0-9T:.-]*Z )?##\[error\]Process completed with exit code 100\.[[:space:]]*$/) {hit=1; exit} END {exit !hit}' "$1"
+}
+
+# Log evidence alone never retries: classify-worker reads the worker artifacts, and any
+# recorded test failure, unreadable result or failed download vetoes every worker.
+worker_artifacts_allow_retry() {
+  local repo="$1" run_id="$2" attempt="$3" dir="$TMP_DIR/artifacts" listing="$TMP_DIR/artifacts.json" name index
+  local -a names=(nextest-plan) args=(--run-attempt "$attempt" --github-output "$TMP_DIR/artifacts/class.out")
+  shift 3
+  mkdir -p "$dir"
+  for index in "$@"; do
+    names+=("nextest-worker-${index%:*}-attempt-$attempt")
+    args+=(--worker "${index%:*}")
+    [[ "$index" != *:infra ]] || args+=(--infra-evidence "${index%:*}")
   done
-  return 1
+  gh api "repos/$repo/actions/runs/$run_id/artifacts?per_page=100" >"$listing" 2>/dev/null || return 1
+  jq -e '.total_count == (.artifacts | length)' "$listing" >/dev/null || return 1
+  for name in "${names[@]}"; do
+    ! jq -e --arg n "$name" 'any(.artifacts[]; .name == $n and .expired != false)' "$listing" >/dev/null || return 1
+    jq -e --arg n "$name" 'any(.artifacts[]; .name == $n and .expired == false)' "$listing" >/dev/null || continue
+    gh run download "$run_id" --repo "$repo" --name "$name" --dir "$dir/$name" >/dev/null 2>&1 || return 1
+  done
+  python3 "$SCRIPT_DIR/nextest_ci.py" classify-worker --plan "$dir/nextest-plan/plan/plan.json" \
+    --artifacts "$dir" "${args[@]}" >&2 || return 1
+  grep -qx 'retryable=true' "$dir/class.out"
 }
 
 decide_retry() {
-  local pg_failed_count="$1"
-  local pg_classified_count="$2"
+  local worker_failed_count="$1"
+  local worker_classified_count="$2"
   local regression_count="$3"
   local unknown_count="$4"
 
@@ -490,10 +476,10 @@ decide_retry() {
     printf 'no-op:unknown'
   elif (( regression_count > 0 )); then
     printf 'no-op:regression'
-  elif (( pg_failed_count == 0 )); then
-    printf 'no-op:no-pg-failure'
-  elif (( pg_classified_count == 0 )); then
-    printf 'no-op:unclassified-pg-failure'
+  elif (( worker_failed_count == 0 )); then
+    printf 'no-op:no-worker-failure'
+  elif (( worker_classified_count == 0 )); then
+    printf 'no-op:unclassified-worker-failure'
   else
     printf 'would-rerun:infra'
   fi
@@ -563,7 +549,7 @@ run_classifier() {
     return 0
   fi
 
-  # Only the initial failed attempt may request one retry workflow attempt.
+  # Only the initial failed attempt may request one retry per worker.
   if (( run_attempt >= 2 )); then
     decision="no-op:attempt-cap"
     write_summary "$run_id" "$run_attempt" "$decision"
@@ -603,16 +589,14 @@ run_classifier() {
     return 0
   fi
 
-  local pg_failed_count=0
-  local pg_classified_count=0
+  local worker_failed_count=0
+  local worker_classified_count=0
   local regression_count=0
   local unknown_count=0
-  local pg_retry_count=0
-  local unsafe_bulk_count=0
-  local -a pg_job_ids=()
+  local -a worker_job_ids=() worker_entries=()
   # Newline-delimited name set: bash 3.2 (macOS prepush) has no associative arrays.
-  local seen_pg_names=$'\n'
-  local job_id job_name log_path job_class executed_steps
+  local seen_worker_names=$'\n'
+  local job_id job_name log_path job_class executed_steps worker_index
 
   while IFS=$'\t' read -r job_id executed_steps job_name; do
     [[ -n "$job_id" ]] || continue
@@ -631,16 +615,19 @@ run_classifier() {
       regression_count=$((regression_count + 1))
     fi
 
-    if is_pg_job "$job_name"; then
-      if [[ "$seen_pg_names" == *$'\n'"$job_name"$'\n'* ]]; then
+    if is_worker_job "$job_name"; then
+      worker_index="${BASH_REMATCH[1]}"
+      if [[ "$seen_worker_names" == *$'\n'"$job_name"$'\n'* ]]; then
         unknown_count=$((unknown_count + 1))
       fi
-      seen_pg_names+="$job_name"$'\n'
-      pg_failed_count=$((pg_failed_count + 1))
-      if job_is_infra_failure "$log_path" "$executed_steps"; then
-        pg_classified_count=$((pg_classified_count + 1))
-        pg_job_ids+=("$job_id")
-        pg_retry_count=$((pg_retry_count + 1))
+      seen_worker_names+="$job_name"$'\n'
+      worker_failed_count=$((worker_failed_count + 1))
+      if worker_log_has_test_failure "$log_path"; then
+        regression_count=$((regression_count + 1)) job_class="nextest-test-failure"
+      elif job_is_infra_failure "$log_path" "$executed_steps"; then
+        worker_classified_count=$((worker_classified_count + 1))
+        worker_job_ids+=("$job_id")
+        worker_index+=":infra"
         if [[ "$job_class" != "regression" ]]; then
           if grep -a -E -i -q -- "$INFRA_ACTION_TIMEOUT_REGEX" "$log_path"; then
             job_class="infra-timeout"
@@ -654,26 +641,21 @@ run_classifier() {
         # A regression is a complete classification, but the separate global
         # regression-count guard must block it before the retry decision. This
         # conjunctive shape makes that guard independently load-bearing while
-        # still requiring every non-regression PG log to match infra.
-        pg_classified_count=$((pg_classified_count + 1))
+        # still requiring every non-regression worker log to match infra.
+        worker_classified_count=$((worker_classified_count + 1))
       else
-        job_class="unclassified-pg-failure"
+        job_class="unclassified-worker-failure"
       fi
-    elif [[ "$job_name" != "Fast targeted tests (ubuntu-latest)" ]] ||
-      log_has_real_failure "$log_path" || log_has_repo_config_fault "$log_path" ||
-      ! grep -a -F -q -- "pg_db=true requires test_fast to succeed; result was 'failure'" "$log_path"; then
-      # --failed also retries other failed jobs. Permit only the PG result
-      # mirror whose failure is explicitly caused by those shards; unrelated
-      # or advisory failures must not widen this PG-only retry policy.
-      unsafe_bulk_count=$((unsafe_bulk_count + 1))
+      worker_entries+=("$worker_index")
     fi
 
     append_summary_row "$job_id" "$job_class"
   done < <(failed_job_rows "$jobs_payload")
 
-  decision="$(decide_retry "$pg_failed_count" "$pg_classified_count" "$regression_count" "$unknown_count")"
-  if [[ "$decision" == "would-rerun:infra" ]] && (( pg_retry_count > 1 && unsafe_bulk_count > 0 )); then
-    decision="no-op:unsafe-bulk-rerun"
+  decision="$(decide_retry "$worker_failed_count" "$worker_classified_count" "$regression_count" "$unknown_count")"
+  if [[ "$decision" == "would-rerun:infra" ]] &&
+    ! worker_artifacts_allow_retry "$repo" "$run_id" "$run_attempt" "${worker_entries[@]}"; then
+    decision="no-op:worker-artifact-veto"
   fi
   if [[ "$decision" != "would-rerun:infra" ]]; then
     write_summary "$run_id" "$run_attempt" "$decision"
@@ -683,7 +665,7 @@ run_classifier() {
 
   if [[ "$dry_run" == "1" ]]; then
     write_summary "$run_id" "$run_attempt" "$decision"
-    echo "decision=$decision pg_job_ids=${pg_job_ids[*]}"
+    echo "decision=$decision worker_job_ids=${worker_job_ids[*]}"
     return 0
   fi
 
@@ -694,21 +676,22 @@ run_classifier() {
     return 0
   fi
 
-  # Starting one rerun advances the workflow attempt, invalidating all other
-  # job IDs from this attempt. Submit multiple eligible shards atomically.
-  local -a rerun_args=(--job "${pg_job_ids[0]}")
-  if (( pg_retry_count > 1 )); then
-    rerun_args=(--failed)
-  fi
-  if ! gh run rerun "$run_id" --repo "$repo" "${rerun_args[@]}"; then
-    decision="no-op:rerun-request-failed"
-    write_summary "$run_id" "$run_attempt" "$decision"
-    echo "decision=$decision pg_job_ids=${pg_job_ids[*]}" >&2
-    return 1
-  fi
+  for job_id in ${worker_job_ids[@]+"${worker_job_ids[@]}"}; do
+    if ! python3 "$SCRIPT_DIR/pr_head_current.py" "$repo" "$attempt_payload"; then
+      write_summary "$run_id" "$run_attempt" "no-op:stale-head"
+      echo "decision=no-op:stale-head"
+      return 0
+    fi
+    if ! gh run rerun "$run_id" --repo "$repo" --job "$job_id"; then
+      decision="no-op:rerun-request-failed"
+      write_summary "$run_id" "$run_attempt" "$decision"
+      echo "decision=$decision worker_job_id=$job_id" >&2
+      return 1
+    fi
+  done
   decision="rerun-requested:infra"
   write_summary "$run_id" "$run_attempt" "$decision"
-  echo "decision=$decision pg_job_ids=${pg_job_ids[*]}"
+  echo "decision=$decision worker_job_ids=${worker_job_ids[*]}"
 }
 
 assert_equal() {
@@ -759,10 +742,10 @@ run_self_test() {
   assert_equal "would-rerun:infra" "$(decide_retry 1 1 0 0)" "infra-only rerun"
   assert_equal "no-op:regression" "$(decide_retry 1 1 1 0)" "mixed regression guard"
   assert_equal "no-op:unknown" "$(decide_retry 1 1 0 1)" "unknown log guard"
-  assert_equal "no-op:no-pg-failure" "$(decide_retry 0 0 0 0)" "vacuous truth guard"
-  assert_equal "would-rerun:infra" "$(decide_retry 2 2 0 0)" "two independent infra shards"
-  assert_equal "would-rerun:infra" "$(decide_retry 2 1 0 0)" "only the infra shard is retried"
-  assert_equal "no-op:unclassified-pg-failure" "$(decide_retry 1 0 0 0)" "unclassified guard"
+  assert_equal "no-op:no-worker-failure" "$(decide_retry 0 0 0 0)" "vacuous truth guard"
+  assert_equal "would-rerun:infra" "$(decide_retry 2 2 0 0)" "two independent infra workers"
+  assert_equal "would-rerun:infra" "$(decide_retry 2 1 0 0)" "only infra workers reach the artifact veto"
+  assert_equal "no-op:unclassified-worker-failure" "$(decide_retry 1 0 0 0)" "unclassified guard"
 
   local historical_regression_count=0
   if job_log_has_blocking_regression "$WINDOWS_ADVISORY_JOB_NAME" "$run_29067936620_windows_log"; then
@@ -773,13 +756,13 @@ run_self_test() {
     "$(decide_retry 1 1 "$historical_regression_count" 0)" \
     "run 29067936620 advisory regression reclassification"
 
-  local pg_regression_count=0
-  if job_log_has_blocking_regression "$PG_JOB_NAME" "$regression_log"; then
-    pg_regression_count=$((pg_regression_count + 1))
+  local worker_regression_count=0
+  if job_log_has_blocking_regression "$WORKER_JOB_NAME" "$regression_log"; then
+    worker_regression_count=$((worker_regression_count + 1))
   fi
   assert_equal \
     "no-op:regression" \
-    "$(decide_retry 1 1 "$pg_regression_count" 0)" \
+    "$(decide_retry 1 1 "$worker_regression_count" 0)" \
     "PG regression remains fail-closed"
 
   run_action_download_assertions
@@ -816,7 +799,7 @@ run_real_failure_assertions() {
       exit 1
     }
     assert_equal "regression" \
-      "$(classify_job "$PG_JOB_NAME" "$log_path" 0)" \
+      "$(classify_job "$WORKER_JOB_NAME" "$log_path" 0)" \
       "#5210 $case_name outranks infrastructure and zero steps"
   done <<'CASES'
 clippy|error: could not compile `agentdesk` (lib) due to 1 previous error
@@ -895,7 +878,7 @@ run_upstream_abandoned_assertions() {
     "$(classify_job 'Fast check cross OS required context (ubuntu-latest)' "$mirror_log" 5)" \
     "an abandoned upstream is reported as upstream infrastructure"
   assert_equal "unrelated-failure" \
-    "$(classify_job "$PG_JOB_NAME" "$word_log" 5)" \
+    "$(classify_job "$WORKER_JOB_NAME" "$word_log" 5)" \
     "the bare word 'abandoned' is not an infrastructure fingerprint"
 
   # Containment: diagnosing the mirror must never make it rerunnable, or the
@@ -940,7 +923,7 @@ run_action_download_assertions() {
     exit 1
   }
   assert_equal "infra-unrelated" \
-    "$(classify_job "$PG_JOB_NAME" "$outage_log" 0)" \
+    "$(classify_job "$WORKER_JOB_NAME" "$outage_log" 0)" \
     "action download outage classifies as infra"
   if log_has_infra_failure "$bare_server_error_log"; then
     echo "assertion failed: bare 'Service Unavailable' must NOT be infrastructure" >&2
@@ -955,7 +938,7 @@ run_action_download_assertions() {
   # pinned a state that cannot occur and let the zero-step path re-admit the
   # very log the anchor above excludes.
   assert_equal "unrelated-failure" \
-    "$(classify_job "$PG_JOB_NAME" "$missing_action_log" 0)" \
+    "$(classify_job "$WORKER_JOB_NAME" "$missing_action_log" 0)" \
     "unresolvable action stays non-infrastructure at its real step count of 0"
 
   # #5207 (r3, P2-1): the RETRY PREDICATE, not only the label — no `classify_job`
@@ -987,13 +970,13 @@ run_zero_step_assertions() {
   printf '%s\n' 'Error: The operation could not be completed.' >"$quiet_log"
 
   assert_equal "infra-no-steps" \
-    "$(classify_job "$PG_JOB_NAME" "$quiet_log" 0)" \
+    "$(classify_job "$WORKER_JOB_NAME" "$quiet_log" 0)" \
     "zero executed repo steps classifies as infra"
   assert_equal "unrelated-failure" \
-    "$(classify_job "$PG_JOB_NAME" "$quiet_log" 13)" \
+    "$(classify_job "$WORKER_JOB_NAME" "$quiet_log" 13)" \
     "a job that executed steps must not take the zero-step path"
   assert_equal "unrelated-failure" \
-    "$(classify_job "$PG_JOB_NAME" "$quiet_log" unknown)" \
+    "$(classify_job "$WORKER_JOB_NAME" "$quiet_log" unknown)" \
     "absent step data must fail closed, not read as zero"
 
   job_ran_no_repo_steps 0 || {
@@ -1026,11 +1009,11 @@ run_regression_precedence_assertions() {
     exit 1
   }
   assert_equal "regression" \
-    "$(classify_job "$PG_JOB_NAME" "$regression_with_outage_log" 0)" \
+    "$(classify_job "$WORKER_JOB_NAME" "$regression_with_outage_log" 0)" \
     "regression outranks both the R1 pattern and the R3 zero-step signal"
 
   local mixed_regression_count=0
-  if job_log_has_blocking_regression "$PG_JOB_NAME" "$regression_with_outage_log"; then
+  if job_log_has_blocking_regression "$WORKER_JOB_NAME" "$regression_with_outage_log"; then
     mixed_regression_count=$((mixed_regression_count + 1))
   fi
   assert_equal "no-op:regression" \

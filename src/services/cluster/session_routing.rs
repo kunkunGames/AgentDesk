@@ -12,7 +12,7 @@ fn normalize_api_base_url(raw: &str) -> Option<String> {
     }
 }
 
-fn resolve_worker_api_base_url(config: &ClusterConfig) -> Option<String> {
+pub(crate) fn resolve_worker_api_base_url(config: &ClusterConfig) -> Option<String> {
     if let Some(raw) = config.api_base_url.as_deref() {
         return normalize_api_base_url(raw);
     }
@@ -39,18 +39,8 @@ pub(crate) fn cluster_capabilities_with_worker_api(config: &ClusterConfig) -> Va
     Value::Object(capabilities)
 }
 
-/// [`cluster_capabilities_with_worker_api`] plus the holder stop receiver, advertised only where
-/// channel-home delegation is on, so an off node looks exactly as before.
 pub(crate) fn node_capabilities(config: &crate::config::Config) -> Value {
-    let mut capabilities = cluster_capabilities_with_worker_api(&config.cluster);
-    let api = capabilities.get_mut("agentdesk_api");
-    if let Some(api) = api.and_then(Value::as_object_mut)
-        && config.runtime.channel_home_delegation_enabled == Some(true)
-    {
-        let capability = crate::services::session_forwarding::home_stop::CAPABILITY;
-        api.insert(capability.to_string(), Value::Bool(true));
-    }
-    capabilities
+    cluster_capabilities_with_worker_api(&config.cluster)
 }
 
 pub(crate) fn worker_api_base_url_from_capabilities(capabilities: &Value) -> Option<String> {
@@ -237,8 +227,6 @@ pub(crate) fn summarize_session_owner_routing(sessions: &[Value]) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::{
         attach_active_session_counts_to_worker_nodes, cluster_capabilities_with_worker_api,
         session_owner_routing_status, summarize_session_owner_routing,
@@ -246,8 +234,6 @@ mod tests {
     };
     use crate::config::ClusterConfig;
     use serde_json::json;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvRestore {
         previous: Option<String>,
@@ -303,7 +289,7 @@ mod tests {
 
     #[test]
     fn env_api_base_url_fallback_is_published_when_config_is_empty() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let _restore = EnvRestore::new();
         unsafe {
             std::env::set_var(

@@ -10,10 +10,15 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, QueryBuilder, Row, Transaction};
 use uuid::Uuid;
 
 mod agent;
+mod attachments;
+mod image_lifecycle;
+use attachments::{IMAGE_COLUMNS, LIST_IMAGE_COLUMNS};
+pub use attachments::{MAX_IMAGE_BYTES, ScheduledMessageImage, ScheduledMessageImageAttachment};
+pub use image_lifecycle::{get_scheduled_message_metadata_pg, reclaim_terminal_images_pg};
 mod api_json;
 mod discord_mentions;
 mod external_delivery;
@@ -28,7 +33,7 @@ pub use agent::{
 use discord_mentions::declare_discord_mention_consumer_v1_tx;
 pub use discord_mentions::discord_mentions_rollout_ready_pg;
 pub use external_delivery::{
-    ClaimedExternalDelivery, ExternalDeliveryFinish, ExternalDeliveryRow, NewExternalDelivery,
+    ClaimedExternalDelivery, ExternalDeliveryFinish, NewExternalDelivery,
     claim_external_deliveries_pg, enqueue_external_delivery_tx, finish_external_delivery_pg,
     list_external_deliveries_pg, mark_external_dispatch_started_pg,
     recover_external_delivery_leases_pg, retry_external_delivery_pg,
@@ -36,6 +41,8 @@ pub use external_delivery::{
 pub use outbox::outbox_statuses_for_deliveries_pg;
 pub use writes::{insert_scheduled_message_pg, insert_scheduled_message_tx};
 
+#[cfg(test)]
+mod attachments_pg_tests;
 #[cfg(test)]
 mod postgres_tests;
 
@@ -68,6 +75,8 @@ pub const ON_CONTEXT_FAILURE_FRESH: &str = "fresh";
 
 #[derive(Clone, sqlx::FromRow)]
 pub struct ScheduledMessageRow {
+    #[sqlx(flatten, try_from = "attachments::ImageColumns")]
+    pub image_attachment: Option<ScheduledMessageImage>,
     pub id: String,
     pub content: String,
     /// Discord-only user IDs rendered before the canonical content. External
@@ -135,6 +144,7 @@ pub struct ClaimedFire {
 
 #[derive(Clone)]
 pub struct NewScheduledMessage {
+    pub image_attachment: Option<ScheduledMessageImageAttachment>,
     pub content: String,
     pub discord_mention_user_ids: Vec<String>,
     pub title: Option<String>,
@@ -163,6 +173,7 @@ pub struct NewScheduledMessage {
 
 #[derive(Clone, Default)]
 pub struct ScheduledMessagePatch {
+    pub image_attachment: Option<Option<ScheduledMessageImageAttachment>>,
     pub content: Option<String>,
     pub discord_mention_user_ids: Option<Vec<String>>,
     pub title: Option<Option<String>>,
@@ -200,13 +211,14 @@ pub fn is_unique_violation(error: &sqlx::Error) -> bool {
     )
 }
 
+#[cfg(test)]
 pub async fn get_scheduled_message_pg(
     pool: &PgPool,
     id: &str,
 ) -> Result<Option<ScheduledMessageRow>, sqlx::Error> {
-    sqlx::query_as::<_, ScheduledMessageRow>(&format!(
-        "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages WHERE id = $1"
-    ))
+    sqlx::query_as::<_, ScheduledMessageRow>(AssertSqlSafe(format!(
+        "SELECT {DEFINITION_COLUMNS}, {IMAGE_COLUMNS} FROM scheduled_messages WHERE id = $1"
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -216,11 +228,11 @@ pub async fn find_active_by_dedupe_key_pg(
     pool: &PgPool,
     dedupe_key: &str,
 ) -> Result<Option<ScheduledMessageRow>, sqlx::Error> {
-    sqlx::query_as::<_, ScheduledMessageRow>(&format!(
-        "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages
+    sqlx::query_as::<_, ScheduledMessageRow>(AssertSqlSafe(format!(
+        "SELECT {DEFINITION_COLUMNS}, {LIST_IMAGE_COLUMNS} FROM scheduled_messages
          WHERE dedupe_key = $1 AND status IN ('scheduled', 'firing')
          LIMIT 1"
-    ))
+    )))
     .bind(dedupe_key)
     .fetch_optional(pool)
     .await
@@ -231,7 +243,7 @@ pub async fn list_scheduled_messages_pg(
     filters: &ListFilters,
 ) -> Result<Vec<ScheduledMessageRow>, sqlx::Error> {
     let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(format!(
-        "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages WHERE 1=1"
+        "SELECT {DEFINITION_COLUMNS}, {LIST_IMAGE_COLUMNS} FROM scheduled_messages WHERE 1=1"
     ));
     if let Some(status) = &filters.status {
         builder.push(" AND status = ").push_bind(status);
@@ -312,11 +324,14 @@ pub async fn update_scheduled_message_pg(
         builder.push(", expires_at = ").push_bind(expires_at);
     }
     external_delivery::apply_definition_patch(&mut builder, patch);
+    attachments::apply_definition_patch(&mut builder, patch);
     builder
         .push(" WHERE id = ")
         .push_bind(id)
         .push(" AND status = 'scheduled' RETURNING ")
-        .push(DEFINITION_COLUMNS);
+        .push(DEFINITION_COLUMNS)
+        .push(", ")
+        .push(LIST_IMAGE_COLUMNS);
     builder.build_query_as().fetch_optional(pool).await
 }
 
@@ -446,8 +461,8 @@ pub async fn claim_due_fires_pg(
     now: DateTime<Utc>,
 ) -> Result<Vec<ClaimedFire>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let due = sqlx::query_as::<_, ScheduledMessageRow>(&format!(
-        "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages
+    let due = sqlx::query_as::<_, ScheduledMessageRow>(AssertSqlSafe(format!(
+        "SELECT {DEFINITION_COLUMNS}, {IMAGE_COLUMNS} FROM scheduled_messages
          WHERE status = 'scheduled' AND scheduled_at <= $1
            -- Rolling upgrades: a legacy worker cannot open sealed delivery plans.
            -- to_jsonb also supports databases without the newer optional column.
@@ -469,7 +484,7 @@ pub async fn claim_due_fires_pg(
          ORDER BY scheduled_at
          LIMIT $3
          FOR UPDATE SKIP LOCKED"
-    ))
+    )))
     .bind(now)
     .bind(delivery_runtime_available)
     .bind(batch)
@@ -478,11 +493,12 @@ pub async fn claim_due_fires_pg(
 
     let mut claimed = Vec::with_capacity(due.len());
     for message in due {
+        let scheduled_at = message.scheduled_at;
         let Some(fire) = arm_delivery_slot_tx(
             &mut tx,
-            &message,
-            message.scheduled_at,
-            message.scheduled_at,
+            message,
+            scheduled_at,
+            scheduled_at,
             claim_owner,
             lease_secs,
             now,
@@ -503,7 +519,7 @@ pub async fn claim_due_fires_pg(
 /// case the parent is finalized directly so it stops matching the due scan.
 async fn arm_delivery_slot_tx(
     tx: &mut Transaction<'_, Postgres>,
-    message: &ScheduledMessageRow,
+    mut message: ScheduledMessageRow,
     fire_scheduled_at: DateTime<Utc>,
     resume_scheduled_at: DateTime<Utc>,
     claim_owner: &str,
@@ -594,10 +610,9 @@ async fn arm_delivery_slot_tx(
     .execute(&mut **tx)
     .await?;
 
-    let mut claimed_message = message.clone();
-    claimed_message.scheduled_at = resume_scheduled_at;
+    message.scheduled_at = resume_scheduled_at;
     Ok(Some(ClaimedFire {
-        message: claimed_message,
+        message,
         delivery_id: armed_id,
         claim_token,
         fire_scheduled_at,
@@ -614,11 +629,11 @@ pub async fn trigger_now_pg(
     lease_secs: i64,
 ) -> Result<Option<ClaimedFire>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let message = sqlx::query_as::<_, ScheduledMessageRow>(&format!(
-        "SELECT {DEFINITION_COLUMNS} FROM scheduled_messages
+    let message = sqlx::query_as::<_, ScheduledMessageRow>(AssertSqlSafe(format!(
+        "SELECT {DEFINITION_COLUMNS}, {IMAGE_COLUMNS} FROM scheduled_messages
          WHERE id = $1 AND status = 'scheduled'
          FOR UPDATE SKIP LOCKED"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&mut *tx)
     .await?;
@@ -633,7 +648,7 @@ pub async fn trigger_now_pg(
     let now = Utc::now();
     let claimed = arm_delivery_slot_tx(
         &mut tx,
-        &message,
+        message,
         now,
         original_scheduled_at,
         claim_owner,

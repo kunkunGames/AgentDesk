@@ -1,4 +1,5 @@
-//! The sweeper task loop and the tick it runs: the row pass, then the durable drains.
+//! The sweeper task loop and the tick it runs: the row pass, then the durable drains. Orphan
+//! message deletes are drained by every execution runtime's own retry task, not here.
 
 use std::sync::Arc;
 
@@ -36,13 +37,12 @@ pub(in crate::services::discord) fn spawn_placeholder_sweeper(
             if should_log_sweep_report(tick.pass, sweeps_since_heartbeat) || tick.drained_any() {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 tracing::info!(
-                    "  [{ts}] 🧹 placeholder sweeper ({}): scanned={} stalled={} abandoned={} reclaimed_panels={} drained_orphans={} drained_abort_markers={} drained_abandon_requests={} swept_busy_retry_bindings={} swept_orphan_anchors={}",
+                    "  [{ts}] 🧹 placeholder sweeper ({}): scanned={} stalled={} abandoned={} reclaimed_panels={} drained_abort_markers={} drained_abandon_requests={} swept_busy_retry_bindings={} swept_orphan_anchors={}",
                     provider.as_str(),
                     tick.pass.scanned,
                     tick.pass.stalled,
                     tick.pass.abandoned,
                     tick.pass.reclaimed_panels,
-                    tick.drained_orphans,
                     tick.drained_abort_markers,
                     tick.drained_abandon_requests,
                     tick.swept_busy_retry_bindings,
@@ -58,7 +58,6 @@ pub(in crate::services::discord) fn spawn_placeholder_sweeper(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct TickReport {
     pass: SweepPassReport,
-    drained_orphans: usize,
     drained_abort_markers: usize,
     swept_orphan_anchors: usize,
     drained_abandon_requests: usize,
@@ -67,8 +66,7 @@ pub(super) struct TickReport {
 
 impl TickReport {
     fn drained_any(&self) -> bool {
-        self.drained_orphans > 0
-            || self.drained_abort_markers > 0
+        self.drained_abort_markers > 0
             || self.drained_abandon_requests > 0
             || self.swept_busy_retry_bindings > 0
             || self.swept_orphan_anchors > 0
@@ -83,12 +81,6 @@ pub(super) async fn run_placeholder_sweeper_tick(
     stalled_tracker: &mut StalledEditTracker,
 ) -> TickReport {
     let pass = run_placeholder_sweep_pass(http, shared, provider, stalled_tracker).await;
-    // #3003: retry any durably-queued orphan status-panel deletes whose
-    // inline reclaim failed transiently (and whose inflight row is gone, so
-    // there is no per-turn handle left). Independent of inflight lifecycle.
-    let drained_orphans =
-        super::super::status_panel_orphan_store::drain(http, shared, provider, &shared.token_hash)
-            .await;
     // #3296: reconcile durable aborted-anchor markers — retry the ✅ for
     // markers a terminal commit already covered, and apply the TTL'd
     // `⏳ → ⚠` fallback for anchors nothing ever covered (held while a
@@ -111,20 +103,14 @@ pub(super) async fn run_placeholder_sweeper_tick(
     // A busy-notice binding left without a turn ages out here; spent retry budgets and
     // unreadable records are kept, so age never re-arms a retry.
     let swept_busy_retry_bindings = super::super::busy_followup_retry_store::sweep_expired();
-    super::super::health::transcript_turn::observe_durable_residue(provider, &shared.token_hash);
     TickReport {
         pass,
-        drained_orphans,
         drained_abort_markers,
         swept_orphan_anchors,
         drained_abandon_requests,
         swept_busy_retry_bindings,
     }
 }
-
-#[cfg(test)]
-#[path = "tick_cleanup_tests.rs"]
-mod cleanup_tests;
 
 #[cfg(test)]
 mod tests {
@@ -139,13 +125,11 @@ mod tests {
     use crate::services::discord::abandon_request_store::{
         self, AbandonEpisodeIdentity, AbandonRecord,
     };
-    use crate::services::discord::health::legacy_supervision::RetiredForTest;
-    use crate::services::discord::health::legacy_supervision::test_support::{
-        Answer, MockDiscord, RetireLater, age_file, message_json, seed_backfill_row,
-        tree_fingerprint,
+    use crate::services::discord::health::test_support::{
+        Answer, MockDiscord, age_file, message_json, seed_backfill_row, tree_fingerprint,
     };
     use crate::services::discord::inflight::{InflightTurnState, save_inflight_state};
-    use crate::services::discord::{SharedData, runtime_store, status_panel_orphan_store};
+    use crate::services::discord::{SharedData, runtime_store};
     use crate::services::provider::ProviderKind;
 
     const PROVIDER: ProviderKind = ProviderKind::Codex;
@@ -234,9 +218,9 @@ mod tests {
         }
     }
 
-    /// Seeds the row-pass, orphan-panel, abort-marker and abandon fixtures on one channel
-    /// group (`base + 1..=6`); returns the channels touched.
-    fn seed_group(shared: &SharedData, base: u64) -> [u64; 5] {
+    /// Seeds the row-pass, abort-marker and abandon fixtures on one channel group
+    /// (`base + 1..=5`); returns the channels touched.
+    fn seed_group(shared: &SharedData, base: u64) -> [u64; 4] {
         let token = shared.token_hash.as_str();
         // Row pass: a stalled placeholder row.
         let row_channel = base + 1;
@@ -247,16 +231,6 @@ mod tests {
             &crate::services::discord::inflight::inflight_state_path(&root, &PROVIDER, row_channel),
             600,
         );
-        // Orphan panels: a pending bind and a stranded delete.
-        let panel_channel = base + 2;
-        status_panel_orphan_store::enqueue_pending_bind(
-            &PROVIDER,
-            token,
-            panel_channel,
-            panel_channel * 10 + 1,
-            None,
-        );
-        status_panel_orphan_store::enqueue(&PROVIDER, token, panel_channel, panel_channel * 10 + 4);
         // Abort marker store: a corrupt marker.
         let marker_channel = base + 3;
         write_corrupt_abort_marker(marker_channel);
@@ -278,88 +252,42 @@ mod tests {
         newer.full_response = "streamed".into();
         seed_backfill_row(&newer);
         abandon_request_store::enqueue(&PROVIDER, token, owner_channel, abandon(msg, 77)).unwrap();
-        for dir in ["discord_status_panel_orphans", "discord_abandon_requests"] {
-            for entry in walk(&runtime_store::runtime_root().unwrap().join(dir)) {
-                age_file(&entry, 3_600);
-            }
+        for entry in walk(
+            &runtime_store::runtime_root()
+                .unwrap()
+                .join("discord_abandon_requests"),
+        ) {
+            age_file(&entry, 3_600);
         }
-        [
-            row_channel,
-            panel_channel,
-            marker_channel,
-            abandon_channel,
-            owner_channel,
-        ]
+        [row_channel, marker_channel, abandon_channel, owner_channel]
     }
 
     fn walk(dir: &Path) -> Vec<PathBuf> {
         tree_fingerprint(dir).into_keys().collect()
     }
 
-    /// Two ticks over a retired and a Legacy channel group: the retired group's records keep
-    /// bytes, existence and mtime with zero Discord calls, while the Legacy group converges.
+    /// Two ticks over one Legacy channel group: every durable store converges, and each
+    /// Discord effect lands once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn retired_channels_skip_every_tick_effect_while_legacy_channels_converge() {
+    async fn tick_converges_every_legacy_store() {
         let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let _env =
             TestEnvVarGuard::set_path_after_shared_test_env_lock("AGENTDESK_ROOT_DIR", temp.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
         let discord = MockDiscord::start_with(probe_answer()).await;
-        let retired = seed_group(&shared, 6_325_400_100);
-        let legacy = seed_group(&shared, 6_325_400_200);
-        let _marks: Vec<_> = retired
-            .iter()
-            .map(|c| RetiredForTest::new("codex", *c))
-            .collect();
+        let [row, marker, abandon_ch, owner] = seed_group(&shared, 6_325_400_200);
         let runtime = runtime_store::runtime_root().unwrap();
-        let before: Vec<_> = retired
-            .iter()
-            .map(|c| channel_records(&runtime, *c))
-            .collect();
-        assert!(before.iter().all(|records| !records.is_empty()));
 
         let mut tracker = StalledEditTracker::default();
         for _ in 0..2 {
             run_placeholder_sweeper_tick(&discord.http, &shared, &PROVIDER, &mut tracker).await;
         }
 
-        for (channel, before) in retired.iter().zip(&before) {
-            assert_eq!(
-                discord.calls_for(*channel),
-                Vec::<String>::new(),
-                "retired {channel}"
-            );
-            let after = channel_records(&runtime, *channel);
-            assert!(
-                &after == before,
-                "retired {channel} records: {:?}",
-                after.keys()
-            );
-        }
-        let [row, panel, marker, abandon_ch, owner] = legacy;
         let calls = discord.calls_for(row);
         assert!(
             calls.iter().any(|c| c.starts_with("PATCH")),
             "stalled edit: {calls:?}"
-        );
-        assert_eq!(
-            discord.calls_for(panel),
-            vec![format!(
-                "DELETE /api/v10/channels/{panel}/messages/{}",
-                panel * 10 + 4
-            )]
-        );
-        let pending_bind = std::fs::read_to_string(
-            runtime
-                .join("discord_status_panel_orphans/codex")
-                .join(&shared.token_hash)
-                .join(format!("{panel}.json")),
-        )
-        .unwrap();
-        assert!(
-            pending_bind.contains("\"pending_bind_drain_cycles\": 2"),
-            "{pending_bind}"
         );
         assert!(
             channel_records(&runtime, marker).is_empty(),
@@ -389,66 +317,51 @@ mod tests {
         );
     }
 
-    /// A channel retired while a probe awaits Discord is neither edited nor consumed: the
-    /// row pass and the abandon drain both re-judge after their probe.
+    /// A record replaced while its probe awaits Discord is neither edited nor consumed: the
+    /// abandon drain re-checks its queued record after the probe.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tick_rejudges_after_each_probe_await() {
+    async fn abandon_drain_rejudges_its_record_after_the_probe_await() {
         let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let _env =
             TestEnvVarGuard::set_path_after_shared_test_env_lock("AGENTDESK_ROOT_DIR", temp.path());
         let shared = crate::services::discord::make_shared_data_for_tests();
-        let (row_channel, abandon_channel) = (6_325_400_301u64, 6_325_400_302u64);
-        let retire = RetireLater::default();
-        let on_probe = (retire.clone(), RetireLater::default());
+        let channel = 6_325_400_302u64;
+        let msg = channel * 10 + 1;
+        let token = shared.token_hash.clone();
+        // A newer episode takes the same message while the drain's probe is in flight.
         let discord = MockDiscord::start_with(Arc::new(move |method: &Method, path: &str| {
-            if method == Method::GET && path.contains(&format!("/channels/{row_channel}/")) {
-                on_probe.0.retire("codex", row_channel);
-            }
-            if method == Method::GET && path.contains(&format!("/channels/{abandon_channel}/")) {
-                on_probe.1.retire("codex", abandon_channel);
+            if method == Method::GET && path.contains(&format!("/channels/{channel}/")) {
+                abandon_request_store::enqueue(&PROVIDER, &token, channel, abandon(msg, 78))
+                    .unwrap();
             }
             None
         }))
         .await;
-        save_inflight_state(&placeholder_row(row_channel, row_channel * 10 + 1)).unwrap();
-        let inflight = runtime_store::discord_inflight_root().unwrap();
-        age_file(
-            &crate::services::discord::inflight::inflight_state_path(
-                &inflight,
-                &PROVIDER,
-                row_channel,
-            ),
-            600,
-        );
-        for suffix in [1, 5] {
-            abandon_request_store::enqueue(
-                &PROVIDER,
-                &shared.token_hash,
-                abandon_channel,
-                abandon(abandon_channel * 10 + suffix, 77),
-            )
+        abandon_request_store::enqueue(&PROVIDER, &shared.token_hash, channel, abandon(msg, 77))
             .unwrap();
-        }
         let runtime = runtime_store::runtime_root().unwrap();
         for path in walk(&runtime.join("discord_abandon_requests")) {
             age_file(&path, 3_600);
         }
-        let before = [
-            channel_records(&runtime, row_channel),
-            channel_records(&runtime, abandon_channel),
-        ];
 
         let mut tracker = StalledEditTracker::default();
         run_placeholder_sweeper_tick(&discord.http, &shared, &PROVIDER, &mut tracker).await;
 
-        let probe = |c: u64| format!("GET /api/v10/channels/{c}/messages/{}", c * 10 + 1);
-        for (channel, before) in [row_channel, abandon_channel].into_iter().zip(&before) {
-            assert_eq!(discord.calls_for(channel), vec![probe(channel)]);
-            assert!(
-                &channel_records(&runtime, channel) == before,
-                "{channel} records kept"
-            );
-        }
+        assert_eq!(
+            discord.calls_for(channel),
+            vec![format!("GET /api/v10/channels/{channel}/messages/{msg}")]
+        );
+        let queued = abandon_request_store::load_pending(&PROVIDER, &shared.token_hash);
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(
+            (
+                queued[0].0,
+                queued[0].1.msg_id,
+                queued[0].1.episode.user_msg_id
+            ),
+            (channel, msg, 78),
+            "the replacement survives untouched"
+        );
     }
 }

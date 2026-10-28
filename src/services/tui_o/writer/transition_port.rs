@@ -11,13 +11,15 @@ use super::rotation::transition::Watch;
 use super::transition_cleanup::scope::ScopeApproval;
 pub(crate) use super::transition_cleanup::scope::ScopeDigest;
 use super::transition_cleanup::{Judged, Summary};
-pub(crate) use super::transition_cleanup::{Request, Termination};
-use crate::services::cluster::channel_home::CommandPermit;
+pub(crate) use super::transition_cleanup::{Request, Termination, Verdict};
 use crate::services::tui_o::ownership::OwnershipGate;
 use crate::services::tui_o::shadow::SourceId;
 
 /// Envelopes a run's mailbox holds before its actor takes one.
 const MAILBOX: usize = 4;
+
+/// The actor Inspect budget, shared with the read-only sweep deadline.
+pub(crate) const INSPECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The wall clock the actor's probes stamp, read on the worker as each probe starts.
 pub(crate) type Wall = Arc<dyn Fn() -> SystemTime + Send + Sync>;
@@ -28,7 +30,22 @@ pub(crate) enum Operation {
     Inspect(Request),
     /// Retires each source the judgment passes, one per actor poll, while the scope is still the
     /// one whose digest the Inspect gave.
+    #[cfg(test)]
     Apply(Request, ScopeDigest),
+    /// The periodic retention policy applies an inspected scope, with a fresh idle check.
+    AutomaticApply(Request, ScopeDigest, Idle),
+}
+
+type IdleFuture = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
+
+/// A runtime-owned check; a missing or unreachable mailbox never counts as idle.
+#[derive(Clone)]
+pub(crate) struct Idle(pub Arc<dyn Fn() -> IdleFuture + Send + Sync>);
+
+impl std::fmt::Debug for Idle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Idle")
+    }
 }
 
 /// The operation a job runs.
@@ -43,12 +60,9 @@ pub(crate) struct Context {
     /// The pane and spawn nonce of the execution the request was checked against.
     pub tmux: String,
     pub nonce: String,
-    /// The epoch of the registered home the request was admitted under; `None` without one.
-    pub home_epoch: Option<i64>,
     /// The channel's session transition lock, taken only around each retirement.
     pub lock: Arc<tokio::sync::Mutex<()>>,
-    /// The home's command admission, kept until the job ends however the requester left.
-    pub permit: Option<CommandPermit>,
+    pub codex: Option<Arc<dyn super::codex_snapshot::Observer>>,
 }
 
 pub(crate) struct Envelope {
@@ -74,6 +88,14 @@ pub(crate) enum Refused {
     Unread(String),
 }
 
+/// The automatic retention policy that kept a source readable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) enum PolicyHold {
+    Young,
+    AgeUnknown,
+    NotIdle,
+}
+
 /// Why nothing was written for a source.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) enum Hold {
@@ -81,6 +103,8 @@ pub(crate) enum Hold {
     Stale,
     TransitionBusy,
     SourceBusy,
+    /// Age or runtime activity prevented automatic cleanup.
+    Policy(PolicyHold),
     /// A cleanup is recorded for it already, by another job or before it grew back.
     PriorCleanup,
     /// Past the candidate, hashing or time limit of one job.
@@ -138,6 +162,9 @@ pub(crate) struct Diagnostics {
     pub history: Result<HistoryView, String>,
     pub overlaps: Vec<Overlap>,
     pub candidates: Vec<Candidate>,
+    pub codex: Option<super::codex_snapshot::Observation>,
+    pub observation_id: Option<Result<String, String>>,
+    pub reading: usize,
 }
 
 /// An old source of the judgment by its spool key, with the pane its hop resolves to, if any.
@@ -184,6 +211,8 @@ impl Reply {
 /// The sending side of one run's mailbox.
 #[derive(Clone)]
 pub(crate) struct TransitionPort {
+    provider: Option<crate::services::tui_o::shadow::ShadowProvider>,
+    suspension: super::suspension::Suspension,
     generation: u64,
     run: Arc<()>,
     send: mpsc::Sender<Envelope>,
@@ -193,7 +222,7 @@ pub(crate) struct Receiver {
     generation: u64,
     run: Arc<()>,
     receive: mpsc::Receiver<Envelope>,
-    /// The writer's gate, which owns a channel without a registered home.
+    /// The writer's channel ownership gate.
     pub(super) gate: Arc<OwnershipGate>,
     pub(super) wall: Wall,
     /// The host's stop, raised before the actor's own stop reaches it.
@@ -201,6 +230,35 @@ pub(crate) struct Receiver {
 }
 
 impl TransitionPort {
+    pub(crate) fn with_provider(
+        mut self,
+        provider: crate::services::tui_o::shadow::ShadowProvider,
+    ) -> Self {
+        #[cfg(test)]
+        if super::deliver::bo_mutant("provider_wiring") {
+            return self;
+        }
+        self.provider = Some(provider);
+        self
+    }
+
+    pub(crate) fn provider(&self) -> Option<crate::services::tui_o::shadow::ShadowProvider> {
+        self.provider
+    }
+
+    pub(crate) fn with_suspension(mut self, suspension: super::suspension::Suspension) -> Self {
+        self.suspension = suspension;
+        self
+    }
+
+    pub(crate) fn sources_unsuspended(&self) -> bool {
+        #[cfg(test)]
+        if crate::services::claude_tui::source_verify::n2b_mutant("b1b-transition") {
+            return true;
+        }
+        self.suspension.is_empty()
+    }
+
     pub(crate) fn new(
         generation: u64,
         gate: Arc<OwnershipGate>,
@@ -209,6 +267,8 @@ impl TransitionPort {
     ) -> (Self, Receiver) {
         let (run, (send, receive)) = (Arc::new(()), mpsc::channel(MAILBOX));
         let port = Self {
+            provider: None,
+            suspension: Default::default(),
             generation,
             run: Arc::clone(&run),
             send,
@@ -234,7 +294,7 @@ impl TransitionPort {
     }
 
     /// Dropped before the mailbox takes the envelope, nothing is applied; dropped after, the job
-    /// runs to its end with the permit, and only the reply is lost.
+    /// runs to its end, and only the reply is lost.
     pub(crate) async fn request(
         &self,
         operation: Operation,
@@ -250,6 +310,9 @@ impl TransitionPort {
         operation: Operation,
         context: Context,
     ) -> Result<Reply, String> {
+        if !self.sources_unsuspended() {
+            return Err("suspended_sources".into());
+        }
         let (reply, answer) = oneshot::channel();
         let envelope = Envelope {
             generation: named.generation,
@@ -260,9 +323,23 @@ impl TransitionPort {
         };
         let sent = self.send.send(envelope).await;
         sent.map_err(|_| "actor ended".to_owned())?;
-        answer
+        let reply = answer
             .await
-            .map_err(|_| "actor reply unavailable".to_owned())
+            .map_err(|_| "actor reply unavailable".to_owned())?;
+        if !self.sources_unsuspended() {
+            return Err("suspended_sources".into());
+        }
+        Ok(reply)
+    }
+}
+
+impl Operation {
+    pub(super) fn request_ref(&self) -> &Request {
+        match self {
+            Self::Inspect(request) | Self::AutomaticApply(request, _, _) => request,
+            #[cfg(test)]
+            Self::Apply(request, _) => request,
+        }
     }
 }
 
@@ -275,9 +352,7 @@ impl Receiver {
             Err(closed) => return Err(closed),
         };
         if envelope.generation != self.generation || !Arc::ptr_eq(&envelope.run, &self.run) {
-            let job = match &envelope.operation {
-                Operation::Inspect(request) | Operation::Apply(request, _) => &request.job_id,
-            };
+            let job = &envelope.operation.request_ref().job_id;
             let _ = (envelope.reply).send(Reply::refused(job, Refused::ForeignRun));
             return Ok(None);
         }

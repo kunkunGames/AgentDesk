@@ -1,4 +1,4 @@
-//! The actor's side of an operator's transition cleanup. It takes one job at a time from its run's
+//! Scoped transition cleanup takes one job at a time from the running actor's
 //! mailbox, probes each candidate twice off the actor, and retires at most one source per poll.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -23,16 +23,15 @@ use crate::services::tui_o::writer::transition_cleanup::{
     Judged, Request, Termination, Unclear, Verdict, judge,
 };
 use crate::services::tui_o::writer::transition_port::{
-    Context, Envelope, Hold, Hop, Kind, Operation, Outcome, Receiver, Refused, Reply, Wall,
+    Context, Envelope, Hold, Hop, INSPECT_DEADLINE as DEADLINE, Kind, Operation, Outcome, Receiver,
+    Refused, Reply, Wall,
 };
 
-/// Candidates one job probes; the rest wait for a later job.
+/// Candidates one inspection probes; automatic jobs inspect every pending source.
 const CANDIDATES: usize = 64;
 /// Sources one worker probes before the actor takes its results.
 const BATCH: usize = 4;
-/// Probing past this holds every source not probed twice by then.
-const DEADLINE: Duration = Duration::from_secs(60);
-/// Prefix bytes one job may hash: two probes of every candidate at 32 MiB each.
+/// Prefix bytes one inspection may hash: two probes of every candidate at 32 MiB each.
 const HASH_BUDGET: u64 = 2 * CANDIDATES as u64 * (32 << 20);
 
 pub(super) struct Transitions {
@@ -40,11 +39,23 @@ pub(super) struct Transitions {
     job: Option<Job>,
     /// The actor's stop, read again just before each retirement write.
     stop: watch::Receiver<bool>,
-    /// Which receipt takes the candidate kept for one, in turns across this run's jobs.
+    /// Rotates the reserved receipt across inspection jobs.
     turn: usize,
 }
 
 impl Transitions {
+    #[cfg(all(test, unix))]
+    pub(super) fn has_job(&self) -> bool {
+        self.job.is_some()
+    }
+
+    pub(super) fn has_apply_job(&self) -> bool {
+        #[cfg(test)]
+        if super::super::deliver::bo_mutant("inspect_rescope") {
+            return self.job.is_some();
+        }
+        self.job.as_ref().is_some_and(|job| job.apply)
+    }
     pub(super) fn new(receiver: Option<Receiver>, stop: watch::Receiver<bool>) -> Self {
         let job = None;
         Self {
@@ -69,29 +80,30 @@ enum Stage {
     Apply(VecDeque<String>),
 }
 
-type Worker = mpsc::Receiver<Vec<(String, Observation)>>;
+type Worker = mpsc::Receiver<Vec<(String, Observation, Option<std::time::SystemTime>)>>;
 
-struct Job {
-    request: Request,
+pub(super) struct Job {
+    pub(super) request: Request,
     apply: bool,
+    pub(super) automatic: Option<super::super::transition_port::Idle>,
     /// The scope an Apply was admitted for, never replaced while it runs.
-    scope: Option<ScopeApproval>,
+    pub(super) scope: Option<ScopeApproval>,
     /// The host's stop, read with the actor's before each retirement write.
     stopping: watch::Receiver<bool>,
     context: Context,
     reply: oneshot::Sender<Reply>,
     gate: Arc<OwnershipGate>,
-    wall: Wall,
+    pub(super) wall: Wall,
     common: Common,
     /// The judgment the job started from.
     first: Vec<Judged>,
-    probes: BTreeMap<String, Probe>,
+    pub(super) probes: BTreeMap<String, Probe>,
     queue: VecDeque<String>,
     stage: Stage,
     worker: Option<Worker>,
     deadline: Instant,
     hashed: u64,
-    outcomes: BTreeMap<String, Outcome>,
+    pub(super) outcomes: BTreeMap<String, Outcome>,
 }
 
 impl Job {
@@ -126,6 +138,7 @@ impl Job {
 fn conflicts<'a>(mut cursors: impl Iterator<Item = &'a Cursor>, request: &Request) -> bool {
     let ended = match &request.termination {
         Some(Termination::Confirmed(end)) => Some(end),
+        Some(Termination::Retention(claim)) => Some(&claim.end),
         _ => None,
     };
     cursors.any(|cursor| {
@@ -134,7 +147,12 @@ fn conflicts<'a>(mut cursors: impl Iterator<Item = &'a Cursor>, request: &Reques
                 && (done.operator != request.operator
                     || done.reason != request.reason
                     || done.cutoff != request.cutoff
-                    || Some(&done.ended) != ended)
+                    || Some(&done.ended) != ended
+                    || done.retention.as_ref().map(|evidence| &evidence.claim)
+                        != match &request.termination {
+                            Some(Termination::Retention(claim)) => Some(claim.as_ref()),
+                            _ => None,
+                        })
         })
     })
 }
@@ -159,7 +177,31 @@ fn path_unchanged(source: &SourceId, later: Option<&Observation>) -> bool {
 
 impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, L, A, B> {
     /// Takes requests only once the sources are restored: at most one envelope and one step a poll.
-    pub(super) fn poll_transition(&mut self, resumed: bool, unsettled: &Unsettled) {
+    pub(super) async fn poll_transition(&mut self, resumed: bool, unsettled: &Unsettled) {
+        let suspended = !self.writer.suspension.is_empty();
+        #[cfg(test)]
+        let suspended = suspended
+            && !crate::services::claude_tui::source_verify::n2b_mutant("b1b-poll-transition");
+        if suspended {
+            let discard = true;
+            #[cfg(test)]
+            let discard = discard && !super::super::deliver::bo_mutant("inspect_job_cleanup");
+            if discard && let Some(job) = self.transitions.job.take() {
+                debug_assert!(!job.apply);
+                let _ = job
+                    .reply
+                    .send(Reply::refused(&job.request.job_id, Refused::CodexDeferred));
+            }
+            if let Some(receiver) = &mut self.transitions.receiver
+                && let Ok(Some(envelope)) = receiver.try_next()
+            {
+                let id = &envelope.operation.request_ref().job_id;
+                let _ = envelope
+                    .reply
+                    .send(Reply::refused(id, Refused::CodexDeferred));
+            }
+            return;
+        }
         if !resumed || self.writer.is_stopped() {
             return;
         }
@@ -167,7 +209,7 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
         let Some(mut job) = self.transitions.job.take() else {
             return;
         };
-        if self.step(&mut job, unsettled) {
+        if self.step(&mut job, unsettled).await {
             self.finish(job);
         } else {
             self.transitions.job = Some(job);
@@ -197,9 +239,13 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
             reply,
             ..
         } = envelope;
-        let (apply, request, expected) = match operation {
-            Operation::Inspect(request) => (false, request, None),
-            Operation::Apply(request, digest) => (true, request, Some(digest)),
+        let (apply, request, expected, automatic) = match operation {
+            Operation::Inspect(request) => (false, request, None, None),
+            #[cfg(test)]
+            Operation::Apply(request, digest) => (true, request, Some(digest), None),
+            Operation::AutomaticApply(request, digest, idle) => {
+                (true, request, Some(digest), Some(idle))
+            }
         };
         let refused = match &self.transitions.job {
             Some(job) if job.request.job_id == request.job_id => {
@@ -209,7 +255,9 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
                     at: job.request.at,
                     ..request.clone()
                 };
-                let same = apply == job.apply && asked == job.request;
+                let same = apply == job.apply
+                    && automatic.is_some() == job.automatic.is_some()
+                    && asked == job.request;
                 if same && !conflicts(self.writer.store().cursors(), &request) {
                     let _ = reply.send(job.receipt());
                     return;
@@ -217,7 +265,11 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
                 Some(Refused::JobConflict)
             }
             Some(_) => Some(Refused::Busy),
-            None if self.sources.transition_provider() == ShadowProvider::Codex => {
+            None if apply
+                && self.sources.transition_provider() == ShadowProvider::Codex
+                && (automatic.is_none()
+                    || !matches!(request.termination, Some(Termination::Retention(_)))) =>
+            {
                 Some(Refused::CodexDeferred)
             }
             None if conflicts(self.writer.store().cursors(), &request) => {
@@ -254,8 +306,7 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
             .map(|c| (source_key(&c.source), c))
             .collect();
         let unprobed = |hop: &&Judged| hop.verdict == Verdict::Unknown(Unclear::NotObserved);
-        // Sources still to retire take the candidates first, receipts already written after them;
-        // a full budget of the former keeps its last candidate for a receipt, in turns.
+        // Pending sources come first; inspections reserve room for an existing receipt.
         let pending = |hop: &&Judged| {
             cursors
                 .get(&hop.key)
@@ -263,7 +314,14 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
         };
         let (mut unprobed, mut receipts): (Vec<&Judged>, Vec<&Judged>) =
             first.iter().filter(unprobed).partition(pending);
-        if unprobed.len() >= CANDIDATES && !receipts.is_empty() {
+        let limited = automatic.is_none();
+        #[cfg(test)]
+        let limited = limited
+            || test_hooks::retention_mutant("budget_receipt")
+            || test_hooks::retention_mutant("budget_panes");
+        if !limited {
+            receipts.clear();
+        } else if unprobed.len() >= CANDIDATES && !receipts.is_empty() {
             let turn = self.transitions.turn % receipts.len();
             self.transitions.turn = self.transitions.turn.wrapping_add(1);
             unprobed.insert(CANDIDATES - 1, receipts.remove(turn));
@@ -271,7 +329,10 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
         unprobed.extend(receipts);
         let (mut probes, mut outcomes) = (BTreeMap::new(), BTreeMap::new());
         for (index, hop) in unprobed.into_iter().enumerate() {
-            let Some(cursor) = cursors.get(&hop.key).filter(|_| index < CANDIDATES) else {
+            let Some(cursor) = cursors
+                .get(&hop.key)
+                .filter(|_| !limited || index < CANDIDATES)
+            else {
                 outcomes.insert(hop.key.clone(), Outcome::Held(Hold::Limit));
                 continue;
             };
@@ -282,12 +343,14 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
                     token,
                     earlier,
                     later,
+                    last_dialogue: None,
                 },
             );
         }
         self.transitions.job = Some(Job {
             request,
             apply,
+            automatic,
             scope,
             stopping,
             context,
@@ -307,12 +370,12 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
     }
 
     /// One step of `job`; true once it has nothing left to do.
-    fn step(&mut self, job: &mut Job, unsettled: &Unsettled) -> bool {
+    async fn step(&mut self, job: &mut Job, unsettled: &Unsettled) -> bool {
         if let Stage::Apply(queue) = &mut job.stage {
             let Some(key) = queue.pop_front() else {
                 return true;
             };
-            let outcome = self.retire_one(job, &key, unsettled);
+            let outcome = self.retire_one(job, &key, unsettled).await;
             let rest = match outcome {
                 Outcome::Unknown => Some(Outcome::Held(Hold::NotTried)),
                 Outcome::Held(Hold::Stopping | Hold::InspectScopeChanged) => Some(outcome.clone()),
@@ -361,10 +424,12 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
             };
             job.worker = None;
             let first = matches!(job.stage, Stage::First);
-            // The clock is read once the probes are taken, so probes taken past the deadline stay
-            // unrecorded, however close to it they came back.
-            let late = now() >= job.deadline;
-            for (key, seen) in seen {
+            // Inspection probes taken past their deadline stay unrecorded.
+            let late = job.automatic.is_none() && now() >= job.deadline;
+            for (key, seen, last_dialogue) in seen {
+                if !first && let Some(probe) = job.probes.get_mut(&key).filter(|_| !late) {
+                    probe.last_dialogue = last_dialogue;
+                }
                 if let Some(probe) = job.probes.get_mut(&key).filter(|_| !late) {
                     *(if first {
                         &mut probe.earlier
@@ -375,7 +440,7 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
             }
         }
         let now = now();
-        if now >= job.deadline {
+        if job.automatic.is_none() && now >= job.deadline {
             return true;
         }
         match job.stage {
@@ -406,10 +471,12 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
             && let Some(key) = job.queue.pop_front()
         {
             let cursor = job.probes[&key].token.cursor.clone();
-            if job.hashed + cursor.captured_through > HASH_BUDGET {
-                continue;
+            if job.automatic.is_none() {
+                if job.hashed + cursor.captured_through > HASH_BUDGET {
+                    continue;
+                }
+                job.hashed += cursor.captured_through;
             }
-            job.hashed += cursor.captured_through;
             batch.push((key, cursor));
         }
         if batch.is_empty() {
@@ -417,12 +484,25 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
         }
         let (send, worker) = mpsc::channel();
         let wall = Arc::clone(&job.wall);
+        let automatic = job.automatic.is_some();
+        let provider = self.sources.transition_provider();
+        let root = match job.common.codex() {
+            Some(super::super::codex_snapshot::Observation::Complete(snapshot)) => {
+                snapshot.context.provider_root.clone()
+            }
+            _ => None,
+        };
         #[cfg(test)]
         let done = test_hooks::worker_started();
         tokio::task::spawn_blocking(move || {
-            let seen = batch
-                .into_iter()
-                .map(|(key, cursor)| (key, observe(&cursor, wall())));
+            let seen = batch.into_iter().map(|(key, cursor)| {
+                let age = automatic
+                    .then(|| {
+                        super::automatic_age::last_dialogue_for(&cursor, provider, root.as_deref())
+                    })
+                    .flatten();
+                (key, observe(&cursor, wall()), age)
+            });
             let _ = send.send(seen.collect());
             #[cfg(test)]
             done.store(true, std::sync::atomic::Ordering::Release);
@@ -432,22 +512,74 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
 
     /// Holds the session transition lock and the pane's source authority across one retirement,
     /// both taken and released within this call.
-    fn retire_one(&mut self, job: &Job, key: &str, unsettled: &Unsettled) -> Outcome {
+    async fn retire_one(&mut self, job: &mut Job, key: &str, unsettled: &Unsettled) -> Outcome {
         let Ok(_transition) = Arc::clone(&job.context.lock).try_lock_owned() else {
             return Outcome::Held(Hold::TransitionBusy);
         };
+        if let Err(reason) = super::automatic::ready(job, key).await {
+            return Outcome::Held(Hold::Policy(reason));
+        }
+        let fresh = if self.sources.transition_provider() == ShadowProvider::Codex {
+            let Some(observer) = &job.context.codex else {
+                return Outcome::Held(Hold::InspectScopeChanged);
+            };
+            #[cfg(not(test))]
+            let skip = false;
+            #[cfg(test)]
+            let skip = super::codex_retention::mutant("skip_refresh");
+            let refreshed = if skip {
+                Ok(Arc::clone(observer))
+            } else {
+                observer.refresh().await
+            };
+            let Ok(observer) = refreshed else {
+                return Outcome::Held(Hold::InspectScopeChanged);
+            };
+            Some(Context {
+                tmux: job.context.tmux.clone(),
+                nonce: job.context.nonce.clone(),
+                lock: Arc::clone(&job.context.lock),
+                codex: Some(observer),
+            })
+        } else {
+            None
+        };
+        let legacy = fresh
+            .as_ref()
+            .map(|_| self.sources.legacy_candidates(&mut self.writer));
         let tmux = job.context.tmux.clone();
-        let admitted =
-            try_with_tmux_source_authority(&tmux, |_| self.retire_admitted(job, key, unsettled));
+        let admitted = try_with_tmux_source_authority(&tmux, |authority| {
+            self.retire_admitted(
+                job,
+                key,
+                unsettled,
+                authority,
+                fresh.as_ref().unwrap_or(&job.context),
+                legacy,
+            )
+        });
         admitted.unwrap_or(Outcome::Held(Hold::SourceBusy))
     }
 
-    fn retire_admitted(&mut self, job: &Job, key: &str, unsettled: &Unsettled) -> Outcome {
+    fn retire_admitted(
+        &mut self,
+        job: &Job,
+        key: &str,
+        unsettled: &Unsettled,
+        authority: &crate::services::tmux_common::TmuxSourceAuthority<'_>,
+        context: &Context,
+        prepared_legacy: Option<super::transition_snapshot::LegacyHops>,
+    ) -> Outcome {
         let Some(probe) = job.probes.get(key) else {
             return Outcome::Unchanged;
         };
-        let Ok((snapshot, common)) = self.build_snapshot(&job.context, &job.gate, &job.probes)
-        else {
+        let Ok((snapshot, common)) = self.build_snapshot_under(
+            context,
+            &job.gate,
+            &job.probes,
+            Some(authority),
+            prepared_legacy,
+        ) else {
             return Outcome::Held(Hold::Stale);
         };
         let approved = |scope: &ScopeApproval| {
@@ -465,12 +597,19 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
             return Outcome::Held(Hold::Stale);
         }
         let mut judged = judge(&snapshot, &job.request).hops.into_iter();
-        let audit = match judged.find(|hop| hop.key == key).map(|hop| hop.verdict) {
+        let mut audit = match judged.find(|hop| hop.key == key).map(|hop| hop.verdict) {
             Some(Verdict::AlreadyDone) => return Outcome::AlreadyDone,
             Some(Verdict::Eligible(audit)) if cursor.transition_cleanup.is_none() => *audit,
             Some(Verdict::Eligible(_)) => return Outcome::Held(Hold::PriorCleanup),
             _ => return Outcome::Unchanged,
         };
+        if snapshot.provider == ShadowProvider::Codex {
+            let Some(retention) = super::automatic::codex_evidence(job, key, &snapshot, cursor)
+            else {
+                return Outcome::Held(Hold::InspectScopeChanged);
+            };
+            audit.retention = Some(retention);
+        }
         // A stop raised while this poll awaited delivery is read again here, before the write; the
         // host's is read too, as its own stop may not have reached the actor yet.
         if *self.transitions.stop.borrow() || *job.stopping.borrow() {
@@ -479,7 +618,11 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
         #[cfg(test)]
         test_hooks::at_retire();
         unsettled.send_replace(None);
-        match self.writer.store().retire_transition(cursor, audit) {
+        match self
+            .writer
+            .store()
+            .retire_transition(cursor, audit, snapshot.provider)
+        {
             Ok(()) => {}
             Err(StoreError::Rejected(_)) => return Outcome::Held(Hold::Stale),
             Err(error) => {
@@ -504,6 +647,7 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
 
     /// Answers the job with the judgment of the actor's state now and the projection after it.
     fn finish(&mut self, job: Job) {
+        super::automatic::log(&job);
         let operation = Some(job.kind());
         let Job {
             request,
@@ -551,15 +695,36 @@ impl<P: DiscordPort, L: DeliveryLease, A: AlarmSink, B: BindingEvents> Actor<P, 
             unsettled: if stopped { None } else { self.unsettled() },
             diagnostics,
         });
-        drop(context.permit);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "scoped_transition_tests.rs"]
+pub(super) mod scoped_tests;
 
 #[cfg(test)]
 pub(crate) mod test_hooks {
     //! Lets a test wait for the probe workers, count the snapshots, and look in just before a
     //! retirement is written.
     use std::cell::{Cell, RefCell};
+    thread_local! {
+        static SNAPSHOT_AUTHORITY: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn snapshot_authority_held() -> bool {
+        SNAPSHOT_AUTHORITY.with(Cell::get)
+    }
+
+    pub(crate) fn snapshot_authority_scope(held: bool) -> impl Drop {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                SNAPSHOT_AUTHORITY.with(|slot| slot.set(self.0));
+            }
+        }
+        Restore(SNAPSHOT_AUTHORITY.with(|slot| slot.replace(slot.get() || held)))
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -569,6 +734,10 @@ pub(crate) mod test_hooks {
         static SNAPSHOTS: Cell<usize> = const { Cell::new(0) };
         static AT_RETIRE: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
         static SKEW: Cell<(Option<Duration>, Duration)> = const { Cell::new((None, Duration::ZERO)) };
+    }
+
+    pub(crate) fn retention_mutant(tag: &str) -> bool {
+        std::env::var("AGENTDESK_OTRANSITION_MUTANT").is_ok_and(|value| value == tag)
     }
 
     pub(super) fn receiving() {

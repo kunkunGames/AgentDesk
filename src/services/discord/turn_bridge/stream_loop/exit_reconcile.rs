@@ -16,6 +16,14 @@ pub(in crate::services::discord::turn_bridge) fn held_before_submit(
 ) -> bool {
     if creator_state
         .managed_submission_capability()
+        .is_some_and(|attempt| {
+            attempt.matches_attempt(creator_state) && attempt.preparation_hold().is_some()
+        })
+    {
+        return false;
+    }
+    if creator_state
+        .managed_submission_capability()
         .is_some_and(|submission| submission.guarded_hold())
     {
         return true;
@@ -163,6 +171,7 @@ pub(super) struct StreamLoopExitCandidateContext<'context, 'state, G: TurnGatewa
     pub(super) expected_identity:
         &'context crate::services::discord::inflight::InflightTurnIdentity,
     pub(super) pending_current_message_candidate: &'context mut Option<MessageId>,
+    pub(super) captured_nonce: Option<&'context str>,
     pub(super) state: StreamLoopState<'state>,
 }
 
@@ -184,6 +193,7 @@ pub(super) async fn settle_and_reconcile_exit_candidate<G: TurnGateway + ?Sized>
         bridge_created_response_placeholder_msg_id: &mut *context
             .state
             .bridge_created_response_placeholder_msg_id,
+        captured_nonce: context.captured_nonce,
     })
     .await
     {

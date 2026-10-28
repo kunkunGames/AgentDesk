@@ -20,9 +20,7 @@ require("./timeouts/review-auto-accept")(timeouts, helpers);
 require("./timeouts/dispatch-maintenance")(timeouts, helpers);
 require("./timeouts/active-monitor")(timeouts, helpers);
 require("./timeouts/orphan-dispatch")(timeouts, helpers);
-require("./timeouts/workspace-branch-guard")(timeouts, helpers);
 require("./timeouts/idle-kill")(timeouts, helpers);
-require("./timeouts/idle-recap")(timeouts, helpers);
 
 // ── Tiered tick handlers (#127) ──────────────────────────────────
 // Sections are grouped by criticality and cadence.
@@ -44,7 +42,7 @@ timeouts.onTick30s = function(ev) {
   agentdesk.log.debug("[tick30s] total " + (Date.now() - start) + "ms");
 };
 
-// 1min tier: [A] [C] [D] [E] (non-critical timeouts)
+// 1min tier: [A] [C] [E] [N] (non-critical timeouts)
 // [K] moved to 30s tier for critical-path isolation (#127)
 timeouts.onTick1min = function(ev) {
   var start = Date.now();
@@ -53,8 +51,6 @@ timeouts.onTick1min = function(ev) {
   agentdesk.log.debug("[tick1min][A] " + (Date.now() - t) + "ms");
   t = Date.now(); try { timeouts._section_C(); } catch(e) { agentdesk.log.warn("[tick1min] C error: " + e); }
   agentdesk.log.debug("[tick1min][C] " + (Date.now() - t) + "ms");
-  t = Date.now(); try { timeouts._section_D(); } catch(e) { agentdesk.log.warn("[tick1min] D error: " + e); }
-  agentdesk.log.debug("[tick1min][D] " + (Date.now() - t) + "ms");
   t = Date.now(); try { timeouts._section_E(); } catch(e) { agentdesk.log.warn("[tick1min] E error: " + e); }
   agentdesk.log.debug("[tick1min][E] " + (Date.now() - t) + "ms");
   t = Date.now(); try { timeouts._section_N(); } catch(e) { agentdesk.log.warn("[tick1min] N error: " + e); }
@@ -62,7 +58,7 @@ timeouts.onTick1min = function(ev) {
   agentdesk.log.debug("[tick1min] total " + (Date.now() - start) + "ms");
 };
 
-// 5min tier: [B] [G] [M] [O] + TTL cleanup (non-critical reconciliation)
+// 5min tier: [B] [G] [O] + TTL cleanup (non-critical reconciliation); branch guard runs at dcserver startup
 // [I] moved to 30s tier for critical-path isolation (#127)
 timeouts.onTick5min = function(ev) {
   var start = Date.now();
@@ -77,12 +73,8 @@ timeouts.onTick5min = function(ev) {
   agentdesk.log.debug("[tick5min][B] " + (Date.now() - t) + "ms");
   t = Date.now(); try { timeouts._section_G(); } catch(e) { agentdesk.log.warn("[tick5min] G error: " + e); }
   agentdesk.log.debug("[tick5min][G] " + (Date.now() - t) + "ms");
-  t = Date.now(); try { timeouts._section_M(); } catch(e) { agentdesk.log.warn("[tick5min] M error: " + e); }
-  agentdesk.log.debug("[tick5min][M] " + (Date.now() - t) + "ms");
   t = Date.now(); try { timeouts._section_O(); } catch(e) { agentdesk.log.warn("[tick5min] O error: " + e); }
   agentdesk.log.debug("[tick5min][O] " + (Date.now() - t) + "ms");
-  t = Date.now(); try { timeouts._section_R_idle_recap(); } catch(e) { agentdesk.log.warn("[tick5min] R_idle_recap error: " + e); }
-  agentdesk.log.debug("[tick5min][R_idle_recap] " + (Date.now() - t) + "ms");
   agentdesk.log.debug("[tick5min] total " + (Date.now() - start) + "ms");
 };
 

@@ -12,7 +12,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::time::Duration;
 
 mod fresh_session;
@@ -22,9 +22,7 @@ pub(crate) use system_settings::{QwenSystemSettingsOverride, create_system_setti
 #[allow(clippy::too_many_arguments)]
 mod session_lifecycle;
 
-pub(crate) use fresh_session::{
-    build_stream_exec_args, normalize_resume_strategy, normalize_resume_strategy_for_turn,
-};
+pub(crate) use fresh_session::{build_stream_exec_args, normalize_resume_strategy_for_turn};
 use fresh_session::{should_preserve_live_reused_provider_session, validated_resume_session_id};
 use session_lifecycle::execute_streaming_local_process;
 #[cfg(unix)]
@@ -1536,6 +1534,7 @@ mod qwen_provider_lifecycle_tests {
     #[test]
     fn terminal_error_finishes_live_wrapper_without_synthetic_success() {
         use super::*;
+        use std::sync::mpsc;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live-wrapper.jsonl");
         std::fs::write(
@@ -1547,8 +1546,8 @@ mod qwen_provider_lifecycle_tests {
             ),
         )
         .unwrap();
-        let (sender, receiver) = mpsc::channel();
-        let (finished, completion) = mpsc::channel();
+        let (sender, receiver) = mpsc::channel::<StreamMessage>();
+        let (finished, completion) = mpsc::channel::<Result<ReadOutputResult, String>>();
         let cancel = Arc::new(CancelToken::new());
         let reader_cancel = cancel.clone();
         let reader = std::thread::spawn(move || {
@@ -1674,7 +1673,7 @@ mod child_exit_tests {
         for &mode in cases {
             let fixture = ProviderFixture::new("qwen", mode);
             let normal = matches!(mode, "normal" | "quiet" | "delayed_normal");
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = std::sync::mpsc::channel();
             let result = execute_qwen_streaming_attempt(
                 fixture.cli.to_str().unwrap(),
                 &fixture.resolution(),
@@ -1715,7 +1714,7 @@ mod child_exit_tests {
         let fixture = ProviderFixture::new("qwen", "cancel");
         let token = std::sync::Arc::new(crate::services::provider::CancelToken::new());
         let cancel = fixture.cancel_after_accept(token.clone());
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = std::sync::mpsc::channel();
         let result = execute_qwen_streaming_attempt(
             fixture.cli.to_str().unwrap(),
             &fixture.resolution(),

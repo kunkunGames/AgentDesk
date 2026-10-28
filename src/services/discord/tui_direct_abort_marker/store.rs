@@ -58,12 +58,13 @@ pub(in crate::services::discord) fn record(marker: &AbortedAnchorMarker) -> Resu
     };
     let path = root.join(format!("{}.json", marker.file_stem()));
     let data = serde_json::to_string_pretty(marker).map_err(|e| e.to_string())?;
-    crate::services::discord::runtime_store::critical_atomic_write(
+    crate::services::discord::runtime_store::critical_publish(
         &path,
         &data,
         crate::services::discord::runtime_store::AtomicWriteContext::new("tui_direct_abort_marker")
             .provider(&marker.provider)
-            .channel_id(marker.channel_id),
+            .channel_id(marker.channel_id)
+            .durable_root(root.parent().unwrap_or(&root)),
     )
 }
 
@@ -75,7 +76,9 @@ pub(in crate::services::discord) fn record(marker: &AbortedAnchorMarker) -> Resu
 pub(in crate::services::discord) fn delete(marker: &AbortedAnchorMarker) {
     if let Some(root) = root() {
         let stem = marker.file_stem();
-        let _ = std::fs::remove_file(root.join(format!("{stem}.json")));
+        let marker = root.join(format!("{stem}.json"));
+        let _ = std::fs::remove_file(&marker)
+            .map(|()| crate::services::discord::runtime_store::sync_removed(&marker));
         let _ = std::fs::remove_file(root.join(format!("{stem}.json.lock")));
     }
 }
@@ -138,23 +141,6 @@ pub(in crate::services::discord) fn load_for_channel(
         .collect()
 }
 
-/// Markers recorded for one channel, counted by file name so a corrupt marker still counts.
-pub(in crate::services::discord) fn channel_presence(
-    provider: &str,
-    channel_id: u64,
-) -> crate::services::discord::health::transcript_turn::Presence {
-    let prefix = format!("{}_{channel_id}_", provider.to_ascii_lowercase());
-    crate::services::discord::health::transcript_turn::Presence::of_dir(root(), |path| {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        Ok(usize::from(
-            name.ends_with(".json") && name.to_ascii_lowercase().starts_with(&prefix),
-        ))
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Commit tombstones (codex r2 — durable terminal-commit evidence)
 // ---------------------------------------------------------------------------
@@ -201,29 +187,6 @@ pub(in crate::services::discord) struct CommitTombstone {
     pub committed_at_ms: u64,
 }
 
-/// Persist a terminal-commit tombstone. Best-effort by design (a failed write
-/// degrades to the conservative `⚠`-after-cap path, never a false `✅`); the
-/// stem is keyed on the write instant PLUS a process-monotonic sequence so
-/// same-ms commits on one channel never overwrite earlier still-retained
-/// evidence (codex r3 — the ms-only stem ERASED the first commit's tombstone;
-/// the seq resets per process, but a restart spans more than one ms).
-pub(in crate::services::discord) fn record_commit_tombstone(
-    provider: &str,
-    tmux_session_name: &str,
-    channel_id: u64,
-    committed_user_msg_id: u64,
-    committed_started_at: &str,
-) {
-    record_commit_tombstone_with_offset(
-        provider,
-        tmux_session_name,
-        channel_id,
-        committed_user_msg_id,
-        committed_started_at,
-        None,
-    );
-}
-
 pub(in crate::services::discord) fn record_commit_tombstone_with_offset(
     provider: &str,
     tmux_session_name: &str,
@@ -267,6 +230,7 @@ pub(in crate::services::discord) fn record_commit_tombstone_with_offsets(
     );
 }
 
+#[cfg(test)]
 pub(in crate::services::discord) fn record_commit_tombstone_at(
     now_ms: u64,
     provider: &str,
@@ -286,6 +250,7 @@ pub(in crate::services::discord) fn record_commit_tombstone_at(
     );
 }
 
+#[cfg(test)]
 pub(in crate::services::discord) fn record_commit_tombstone_at_with_offset(
     now_ms: u64,
     provider: &str,
@@ -340,14 +305,15 @@ pub(in crate::services::discord) fn record_commit_tombstone_at_with_offsets(
     let written = serde_json::to_string_pretty(&tombstone)
         .map_err(|e| e.to_string())
         .and_then(|data| {
-            crate::services::discord::runtime_store::critical_atomic_write(
+            crate::services::discord::runtime_store::critical_publish(
                 &path,
                 &data,
                 crate::services::discord::runtime_store::AtomicWriteContext::new(
                     "tui_direct_commit_tombstone",
                 )
                 .provider(provider)
-                .channel_id(channel_id),
+                .channel_id(channel_id)
+                .durable_root(root.parent().unwrap_or(&root)),
             )
         });
     if let Err(error) = written {

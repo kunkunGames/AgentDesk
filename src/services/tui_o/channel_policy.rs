@@ -1,6 +1,5 @@
-//! Validated writer membership is fixed for the lifetime of the process; on the O home each
-//! selected or locally committed channel also carries this process's adoption state, and off it
-//! each selected channel keeps its local store state for a delegated home.
+//! Writer membership is fixed for the process. The configured O home carries adoption state
+//! for selected or locally committed channels; other nodes only report their local store state.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -30,13 +29,12 @@ pub(crate) struct BootChannels {
     dormant_channels: BTreeSet<u64>,
     /// Initial reservations can only be installed before this snapshot is published.
     late_adopt_capable: bool,
+    /// The boot turn selection, which live reloads never change.
+    turn: crate::services::tui_o::turn_mode::TurnConfig,
     kinds: BTreeMap<u64, RuntimeHandoffKind>,
     site: Site,
     configured_id: Option<String>,
     candidates: BTreeMap<u64, Candidate>,
-    /// Off the home, each selected channel's local store state, kept so a delegated home can open
-    /// here without a restart. Holding one opens nothing: the channel's home gate decides.
-    standby: BTreeMap<u64, Candidate>,
 }
 
 /// Membership as configured; the adoption states and kept committed channels are process state.
@@ -227,18 +225,18 @@ impl BootChannels {
             selected: channels.clone(),
             dormant_channels,
             late_adopt_capable: config.tui_o.as_ref().is_some_and(|c| c.writer.late_adopt),
+            turn: (config.tui_o.as_ref()).map_or_else(Default::default, |c| c.turn.clone()),
             channels,
             kinds,
             site,
             configured_id,
             candidates: BTreeMap::new(),
-            standby: BTreeMap::new(),
         })
     }
 
     /// Starts each selected channel's adoption. The store is read only for an enabled writer with
     /// a non-empty selection. The home also keeps every channel its store committed; a non-home
-    /// node adopts nothing, reports local store state and keeps it as standby.
+    /// node adopts nothing and reports local store state.
     pub(crate) fn seeded(
         mut self,
         enabled: bool,
@@ -278,8 +276,6 @@ impl BootChannels {
                 for (&channel, _) in states.iter().filter(|(_, s)| **s != Adoption::Pending) {
                     alarms.raise_at(channel, &alarm, Instant::now());
                 }
-                let standby = |(channel, state)| (channel, self.seed_candidate(channel, state));
-                self.standby = states.into_iter().map(standby).collect();
             }
         }
         Ok(self)
@@ -288,7 +284,7 @@ impl BootChannels {
     fn seed_candidate(&self, channel: u64, state: Adoption) -> Candidate {
         let reserve = self.late_adopt_capable
             && self.selected.contains(&channel)
-            && self.kind(channel) == Some(RuntimeHandoffKind::ClaudeTui)
+            && self.kind(channel).is_some()
             && state == Adoption::Pending;
         if reserve {
             Candidate::reserved_late()
@@ -316,6 +312,10 @@ impl BootChannels {
         self.late_adopt_capable
     }
 
+    pub(crate) fn turn(&self) -> &crate::services::tui_o::turn_mode::TurnConfig {
+        &self.turn
+    }
+
     pub(crate) fn kind(&self, channel: u64) -> Option<RuntimeHandoffKind> {
         self.kinds.get(&channel).copied()
     }
@@ -334,11 +334,6 @@ impl BootChannels {
         self.candidates.get(&channel)
     }
 
-    /// A selected channel's local store state off the home; only a home gate makes it count.
-    pub(crate) fn standby(&self, channel: u64) -> Option<&Candidate> {
-        self.standby.get(&channel)
-    }
-
     /// Every selected channel starts in `state`, as `seeded` would leave it on the home.
     #[cfg(test)]
     pub(crate) fn adopted(mut self, state: Adoption) -> Self {
@@ -355,14 +350,6 @@ impl BootChannels {
         self.site = Site::Foreign { home: home.into() };
         self.channels = self.selected.clone();
         self.candidates.clear();
-        self
-    }
-
-    /// Every selected channel kept as standby in `state`, as `seeded` would leave it off the home.
-    #[cfg(test)]
-    pub(crate) fn standing_by(mut self, state: Adoption) -> Self {
-        let standby = |&channel: &u64| (channel, Candidate::new(state));
-        self.standby = self.selected.iter().map(standby).collect();
         self
     }
 }

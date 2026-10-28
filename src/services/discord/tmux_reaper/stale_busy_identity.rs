@@ -24,7 +24,13 @@ pub(super) fn recorded_inflight_tmux_session_name(
 ) -> Option<String> {
     crate::services::discord::inflight::load_inflight_state(provider, channel_id.get())
         .filter(|state| {
-            state.user_msg_id == user_msg_id.get() && state.turn_nonce.as_deref() == turn_nonce
+            if let (Some(expected), Some(actual)) = (turn_nonce, state.turn_nonce.as_deref()) {
+                expected == actual
+            } else if turn_nonce.is_some() {
+                false
+            } else {
+                state.user_msg_id == user_msg_id.get()
+            }
         })
         .and_then(|state| state.tmux_session_name)
 }

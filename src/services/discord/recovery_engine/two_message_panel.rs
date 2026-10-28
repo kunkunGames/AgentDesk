@@ -15,6 +15,10 @@ use poise::serenity_prelude as serenity;
 
 use super::*;
 
+#[cfg(test)]
+#[path = "footer_retirement_tests.rs"]
+mod footer_retirement_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PersistedPanelState {
     Missing,
@@ -141,7 +145,10 @@ async fn recover_two_message_panel_with_gateway<G: RecoveryPanelGateway + ?Sized
     provider: &ProviderKind,
     state: &mut inflight::InflightTurnState,
 ) -> bool {
-    if !shared.ui.two_message_panel_enabled || !shared.ui.status_panel_v2_enabled {
+    if super::super::footer_retirement::retired()
+        || !shared.ui.two_message_panel_enabled
+        || !shared.ui.status_panel_v2_enabled
+    {
         return false;
     }
     let Some(channel_id) = inflight::opt_channel_id(state.channel_id) else {
@@ -354,6 +361,7 @@ pub(super) async fn recover_two_message_panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::discord::footer_retirement::legacy_for_test;
     use std::sync::Mutex;
 
     #[derive(Clone)]
@@ -458,9 +466,8 @@ mod tests {
 
     #[tokio::test]
     async fn restart_reanchors_stranded_panel_and_persists_new_epoch() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _legacy = legacy_for_test();
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let (_root, _guard) = isolate_runtime_root();
         let shared = shared_with_two_message_enabled();
         let provider = ProviderKind::Claude;
@@ -507,9 +514,8 @@ mod tests {
 
     #[tokio::test]
     async fn restart_recreates_missing_panel_without_duplicate_old_delete() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _legacy = legacy_for_test();
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let (_root, _guard) = isolate_runtime_root();
         let shared = shared_with_two_message_enabled();
         let provider = ProviderKind::Claude;
@@ -536,9 +542,8 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_owner_survives_recovery_send_race() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _legacy = legacy_for_test();
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let (_root, _guard) = isolate_runtime_root();
         let shared = shared_with_two_message_enabled();
         let provider = ProviderKind::Claude;
@@ -573,9 +578,8 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_owner_after_bind_cannot_leak_recovery_panel() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _legacy = legacy_for_test();
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let (_root, _guard) = isolate_runtime_root();
         let shared = shared_with_two_message_enabled();
         let provider = ProviderKind::Claude;
@@ -615,9 +619,8 @@ mod tests {
 
     #[tokio::test]
     async fn replacement_owner_after_final_reload_keeps_recovery_panel_protected() {
-        let _lock = crate::config::shared_test_env_lock()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let _legacy = legacy_for_test();
+        let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
         let (_root, _guard) = isolate_runtime_root();
         let shared = shared_with_two_message_enabled();
         let provider = ProviderKind::Claude;

@@ -21,8 +21,12 @@ use crate::services::provider::CancelToken;
 use crate::services::provider::ProviderKind;
 use crate::services::turn_orchestrator::ActiveTurnKind;
 
+#[path = "idle_inject_echo_e2e_tests.rs"]
+mod idle_echo;
 #[path = "busy_inject_thread_e2e_tests.rs"]
 mod thread;
+#[path = "busy_inject_turn_mode_e2e_tests.rs"]
+mod turn_mode;
 
 const WAIT: Duration = Duration::from_secs(10);
 const QUEUE_UNKNOWN: &str = "⚠️ 메시지 큐 저장 중 오류가 감지되어 접수 표시를 생략했어.";
@@ -84,6 +88,23 @@ async fn busy() -> Busy {
     }
 }
 
+#[test]
+fn postgres_runtime_helpers_keep_bootstrap_futures_off_the_test_stack() {
+    fn future_size<F>(_: impl FnOnce() -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+    let (runtime, busy, announce) = (
+        future_size(runtime),
+        future_size(busy),
+        future_size(busy_with_announce),
+    );
+    eprintln!("bootstrap future bytes: runtime={runtime}, busy={busy}, announce={announce}");
+    assert!(
+        runtime <= 16_384 && busy <= 16_384 && announce <= 16_384,
+        "bootstrap helpers must hold a pinned future: runtime={runtime}, busy={busy}, announce={announce}"
+    );
+}
+
 impl Runtime {
     /// Empties the channel's mailbox and disarms leftover save faults, so no task this scenario
     /// left writes its queue into the next harness's root, which reuses the channel.
@@ -114,7 +135,9 @@ impl Runtime {
     /// Bot posts other than turn placeholders.
     fn notices(&self) -> Vec<String> {
         let messages = self.h.messages().into_iter().map(|(_, text)| text);
-        messages.filter(|text| text != "...").collect()
+        messages
+            .filter(|text| !matches!(text.as_str(), "..." | "⠋ 계속 처리 중"))
+            .collect()
     }
 
     fn starts(&self) -> usize {
@@ -137,14 +160,43 @@ fn in_memory(message: u64) -> Option<InjectionOutcome> {
     disposition::terminal(Some(&ProviderKind::Claude), MessageId::new(message), now)
 }
 
-/// A turn mid-run on the pane takes the text: pasted once, marked 📥, the checkpoint past it,
-/// nothing queued or started, and the injection recorded where a restart finds it.
+/// A busy pane outside turn mode gets a final receipt and leaves no pending hourglass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_busy_pane_takes_a_person_s_text_and_marks_it_taken_pg() {
+    for (nick, global_name) in [
+        (Some("Ops Lead"), Some("Won Chang")),
+        (None, Some("Won Chang")),
+    ] {
+        let busy = busy().await;
+        assert!(
+            crate::services::discord::mailbox_snapshot(
+                &busy.rt.h.shared,
+                ChannelId::new(CHANNEL_ID)
+            )
+            .await
+            .cancel_token
+            .is_none()
+        );
+        let message = fresh_id();
+        let mut sent = user_message(message, "status?");
+        sent.author.global_name = global_name.map(str::to_string);
+        let member = serde_json::json!({ "nick": nick, "roles": [] });
+        sent.member = Some(Box::new(serde_json::from_value(member).unwrap()));
+        busy.rt.h.spawn_message(sent).await.unwrap().unwrap();
+        let buffer = busy.pane.read("buffer").unwrap_or_default();
+        busy.rt.finish().await;
+        let shown = nick.or(global_name).unwrap();
+        assert_eq!(buffer, format!("[User: {shown} (ID: {USER_ID})] status?"));
+    }
     let busy = busy().await;
     let rt = &busy.rt;
     let message = fresh_id();
     rt.h.deliver_user_message(message, "status?").await.unwrap();
+    let buffer = busy.pane.read("buffer").unwrap_or_default();
+    assert_eq!(
+        buffer,
+        format!("[User: queue-user (ID: {USER_ID})] status?")
+    );
     let observed = (
         busy.pane.keys(),
         rt.marks(message),
@@ -157,7 +209,17 @@ async fn a_busy_pane_takes_a_person_s_text_and_marks_it_taken_pg() {
     let disk = Some("\"observed\"".to_string());
     let taken = (keys, vec!["📥".to_string()], Some(message), vec![], 0, disk);
     rt.finish().await;
-    assert_eq!(observed, taken);
+    assert_eq!(
+        observed, taken,
+        "unobserved injection must finish with a final receipt"
+    );
+    assert_eq!(
+        rt.h.shared
+            .turn_view_reconciler
+            .pending_injected_count(ChannelId::new(CHANNEL_ID)),
+        0,
+        "an unobserved channel must not retain pending injection marks"
+    );
 }
 
 /// A message an injection already took ends at the lookup however the channel stands: held
@@ -331,12 +393,12 @@ async fn parked_at_capture(busy: &Busy, message: u64) -> tokio::task::JoinHandle
 }
 
 /// A vetoed paste hands the message back ahead of input queued meanwhile, also past a failed
-/// first write: marked queued, never 📥, the checkpoint past it as a queue commit moves it.
+/// first write: its queue marker and checkpoint reflect the durable queue commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_vetoed_paste_hands_the_message_back_ahead_of_input_sent_meanwhile_pg() {
     let busy = busy().await;
     let rt = &busy.rt;
-    busy.pane.draft();
+    busy.pane.menu();
     let message = fresh_id();
     let request = parked_at_capture(&busy, message).await;
     send_meanwhile(&rt.h.shared, CHANNEL_ID, fresh_id(), "meanwhile").await;
@@ -368,10 +430,26 @@ async fn a_handed_back_message_the_queue_ran_is_not_replayed_by_catch_up_pg() {
     let busy = busy().await;
     let rt = &busy.rt;
     rt.hold_mailbox().await;
-    busy.pane.draft();
+    busy.pane.menu();
     let channel = ChannelId::new(CHANNEL_ID);
     // The turn already running started live on an earlier message, which moved the checkpoint.
     let (earlier, answer) = (fresh_id(), fresh_id());
+    let persistence = crate::services::discord::queue_persistence_context(
+        &rt.h.shared,
+        &ProviderKind::Claude,
+        channel,
+    );
+    rt.h.shared.mailbox(channel).finish_turn(persistence).await;
+    assert!(
+        crate::services::discord::mailbox_try_start_turn(
+            &rt.h.shared,
+            channel,
+            Arc::new(CancelToken::new()),
+            serenity::UserId::new(USER_ID),
+            MessageId::new(earlier)
+        )
+        .await
+    );
     let advance = crate::services::discord::advance_last_message_checkpoint;
     advance(
         &rt.h.shared,
@@ -413,14 +491,71 @@ async fn a_handed_back_message_the_queue_ran_is_not_replayed_by_catch_up_pg() {
     );
 }
 
-/// A handback whose four writes all fail ends the message with the owner's refusal notice: it is
+/// An unclaimed handback lost during teardown remains recoverable without dispatch evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handed_back_message_without_scanner_retirement_is_recovered_pg() {
+    let busy = busy().await;
+    let rt = &busy.rt;
+    rt.hold_mailbox().await;
+    busy.pane.menu();
+    let channel = ChannelId::new(CHANNEL_ID);
+    let (earlier, answer) = (fresh_id(), fresh_id());
+    let persistence = crate::services::discord::queue_persistence_context(
+        &rt.h.shared,
+        &ProviderKind::Claude,
+        channel,
+    );
+    rt.h.shared.mailbox(channel).finish_turn(persistence).await;
+    assert!(
+        crate::services::discord::mailbox_try_start_turn(
+            &rt.h.shared,
+            channel,
+            Arc::new(CancelToken::new()),
+            serenity::UserId::new(USER_ID),
+            MessageId::new(earlier)
+        )
+        .await
+    );
+    crate::services::discord::advance_last_message_checkpoint(
+        &rt.h.shared,
+        &ProviderKind::Claude,
+        channel,
+        MessageId::new(earlier),
+    );
+    let message = fresh_id();
+    rt.h.deliver_user_message(message, "status?").await.unwrap();
+    let handed = rt.queue().await;
+    assert!(!disposition::dispatched::read(&ProviderKind::Claude, channel).contains(&message));
+    crate::services::discord::mailbox_clear_channel(&rt.h.shared, &ProviderKind::Claude, channel)
+        .await;
+    rt.hold_mailbox().await;
+    rt.h.seed_channel_history(&[
+        (earlier, "earlier", false),
+        (answer, "answer", true),
+        (message, "status?", false),
+    ]);
+    rt.h.run_catch_up().await;
+    let recovered = rt.queue().await;
+    let settled = crate::services::discord::outbound::completed_turn_ledger::settled_user_msg_ids(
+        &ProviderKind::Claude,
+        CHANNEL_ID,
+    );
+    assert!(!settled.contains(&message));
+    rt.finish().await;
+    assert_eq!(
+        (handed, recovered),
+        (vec!["status?".to_string()], vec!["status?".to_string()])
+    );
+}
+
+/// A handback whose four writes all fail ends the message with the owner's resend notice: it is
 /// neither queued behind input sent meanwhile nor marked, and the checkpoint stays before it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_handback_that_never_lands_ends_the_message_with_a_notice_pg() {
     let busy = busy().await;
     let rt = &busy.rt;
     rt.hold_mailbox().await;
-    busy.pane.draft();
+    busy.pane.menu();
     let message = fresh_id();
     let request = parked_at_capture(&busy, message).await;
     send_meanwhile(&rt.h.shared, CHANNEL_ID, fresh_id(), "meanwhile").await;
@@ -430,10 +565,9 @@ async fn a_handback_that_never_lands_ends_the_message_with_a_notice_pg() {
     );
     busy.pane.set("go", "");
     request.await.unwrap();
-    let replies =
-        rt.h.messages()
-            .into_iter()
-            .filter(|(to, _)| *to == Some(message));
+    let resend = "입력을 저장하지 못했습니다. 원본을 유지하고 다시 시도해 주세요.";
+    let replies = rt.h.messages().into_iter();
+    let replies = replies.filter(|(to, text)| *to == Some(message) && text == resend);
     let observed = (
         hook::seen(message).outcomes,
         rt.queue().await,
@@ -460,7 +594,7 @@ async fn a_handback_with_an_unknown_answer_is_neither_resent_nor_queued_again_pg
         let busy = busy().await;
         let rt = &busy.rt;
         rt.hold_mailbox().await;
-        busy.pane.draft();
+        busy.pane.menu();
         inject_hook::fault_handback(CHANNEL_ID, fault);
         let message = fresh_id();
         rt.h.deliver_user_message(message, "status?").await.unwrap();
@@ -659,7 +793,13 @@ async fn busy_with_announce() -> Busy {
         db = Some(fixture);
         Some(pool)
     };
-    let h = RelayE2eHarness::start_inner(ProviderStub::Success, true, storage, true).await;
+    let h = Box::pin(RelayE2eHarness::start_inner(
+        ProviderStub::Success,
+        true,
+        storage,
+        true,
+    ))
+    .await;
     let registry = h.health_registry.clone().expect("a health registry");
     registry
         .set_utility_bot_user_id_for_tests(UtilityBotRole::Announce, ANNOUNCE_ID)
@@ -688,11 +828,17 @@ async fn deliver_from_announce(rt: &Runtime, message: u64, text: &str) {
     rt.h.spawn_message(arrival).await.unwrap().unwrap();
 }
 
-/// The announce bot's text on a busy pane is pasted once and marked 📥, nothing queued or started.
+/// The announce bot's text on a busy pane is pasted once and marked ⏳, nothing queued or started.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_busy_pane_takes_the_announce_bot_s_text_pg() {
     let busy = busy_with_announce().await;
     let rt = &busy.rt;
+    assert!(
+        crate::services::discord::mailbox_snapshot(&rt.h.shared, ChannelId::new(CHANNEL_ID))
+            .await
+            .cancel_token
+            .is_none()
+    );
     let message = fresh_id();
     deliver_from_announce(rt, message, "status?").await;
     let observed = (
@@ -717,7 +863,7 @@ async fn a_vetoed_paste_queues_with_the_sender_s_own_marks_pg() {
         let busy = busy_with_announce().await;
         let rt = &busy.rt;
         rt.hold_mailbox().await;
-        busy.pane.draft();
+        busy.pane.menu();
         let message = fresh_id();
         if bot {
             deliver_from_announce(rt, message, "status?").await;

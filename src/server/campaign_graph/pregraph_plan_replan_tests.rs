@@ -265,14 +265,14 @@ async fn pregraph_repair_rejects_lineage_and_profile_drift_without_mutation_pg()
             json!("changed reconciliation evidence"),
         ),
     ] {
-        let select = format!("SELECT {column} FROM {table} WHERE {key}=$1");
-        let original: String = sqlx::query_scalar(&select)
+        let select = sqlx::AssertSqlSafe(format!("SELECT {column} FROM {table} WHERE {key}=$1"));
+        let original: String = sqlx::query_scalar(select)
             .bind(id)
             .fetch_one(&pool)
             .await
             .unwrap();
-        let update = format!("UPDATE {table} SET {column}=$2 WHERE {key}=$1");
-        sqlx::query(&update)
+        let update_sql = format!("UPDATE {table} SET {column}=$2 WHERE {key}=$1");
+        sqlx::query(sqlx::AssertSqlSafe(update_sql.as_str()))
             .bind(id)
             .bind(value.as_str().unwrap())
             .execute(&pool)
@@ -283,7 +283,7 @@ async fn pregraph_repair_rejects_lineage_and_profile_drift_without_mutation_pg()
                 .await
                 .contains("canonical operator reconciliation chain")
         );
-        sqlx::query(&update)
+        sqlx::query(sqlx::AssertSqlSafe(update_sql.as_str()))
             .bind(id)
             .bind(original)
             .execute(&pool)
@@ -393,22 +393,24 @@ async fn pregraph_repair_checks_ancestor_execution_and_complete_audit_set_pg() {
         .await
         .unwrap();
     for table in ["campaign_graph_reconciliations", "campaign_goal_revisions"] {
-        let original: Value = sqlx::query_scalar(&format!(
+        let original: Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT to_jsonb(r) FROM {table} r WHERE campaign_id=$1"
-        ))
+        )))
         .bind(id)
         .fetch_one(&pool)
         .await
         .unwrap();
-        sqlx::query(&format!("DELETE FROM {table} WHERE campaign_id=$1"))
-            .bind(id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE campaign_id=$1"
+        )))
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
         refuse(&pool, &f, &f.request).await;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table},$1)"
-        ))
+        )))
         .bind(original)
         .execute(&pool)
         .await

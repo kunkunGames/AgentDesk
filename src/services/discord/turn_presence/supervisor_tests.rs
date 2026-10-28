@@ -17,19 +17,104 @@ const UNKNOWN: Observed = Observed {
     reason: "facts_halted",
 };
 
+pub(in crate::services::discord) struct LiveSupervisor {
+    inner: Supervisor<LiveEffects>,
+    provider: ProviderKind,
+    channel: u64,
+    _started: Started,
+}
+
+impl LiveSupervisor {
+    pub(in crate::services::discord) const SUPERVISOR_TICK: Duration = super::TICK;
+    pub(in crate::services::discord) const SUPERVISOR_WAKE_EVERY: Duration = super::WAKE_EVERY;
+
+    pub(in crate::services::discord) fn new(
+        shared: Arc<SharedData>,
+        provider: ProviderKind,
+        channel: u64,
+    ) -> Self {
+        register(&provider, &[channel]);
+        let started = Started::new(&provider);
+        let mut inner = Supervisor::new(Arc::new(LiveEffects {
+            shared,
+            provider: provider.clone(),
+        }));
+        inner.presence(channel);
+        Self {
+            inner,
+            provider,
+            channel,
+            _started: started,
+        }
+    }
+
+    pub(in crate::services::discord) async fn tick(&self) {
+        self.inner.tick(Instant::now()).await;
+    }
+
+    /// Ticks as of `at`, so an Unknown first seen then is already past the notice grace now.
+    pub(in crate::services::discord) async fn tick_at(&self, at: Instant) {
+        self.inner.tick(at).await;
+    }
+
+    pub(in crate::services::discord) fn state(&self) -> serde_json::Value {
+        lock(&self.inner.channels[&self.channel]).json()
+    }
+
+    pub(in crate::services::discord) fn last_kick_at(&self) -> Option<Instant> {
+        lock(&self.inner.channels[&self.channel]).last_kick_at
+    }
+
+    pub(in crate::services::discord) fn woken_head(&self) -> Option<u64> {
+        lock(&self.inner.channels[&self.channel])
+            .woken_head
+            .map(|(head, _)| head)
+    }
+}
+
+impl Drop for LiveSupervisor {
+    fn drop(&mut self) {
+        let mut registered = lock(&REGISTERED);
+        if let Some(channels) = registered.get_mut(self.provider.as_str()) {
+            channels.remove(&self.channel);
+            if channels.is_empty() {
+                registered.remove(self.provider.as_str());
+            }
+        }
+        drop(registered);
+        let mut presence = lock(&PRESENCE);
+        if presence
+            .get(&self.channel)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.inner.channels[&self.channel]))
+        {
+            presence.remove(&self.channel);
+        }
+    }
+}
+
 /// Scripted reads and recorded sends, timed from the test's start on tokio's paused clock.
+type Reader = Arc<dyn Fn(u64) -> Reading + Send + Sync>;
+
 struct Fake {
+    root: tempfile::TempDir,
+    reader: Mutex<Option<Reader>>,
     start: Instant,
     channels: Vec<u64>,
     readings: Mutex<HashMap<u64, Observed>>,
     overtaken: AtomicBool,
     token: AtomicBool,
     head: Mutex<Option<u64>>,
+    read_delay: Mutex<HashMap<u64, Duration>>,
+    mailbox_delay: Mutex<HashMap<u64, Duration>>,
     typing_delay: Mutex<HashMap<u64, Duration>>,
+    typing_errors: Mutex<HashMap<u64, String>>,
     typed: Mutex<Vec<(u64, Duration)>>,
+    succeeded: Mutex<Vec<(u64, Duration)>>,
     kicks: Mutex<Vec<(u64, Duration)>>,
     notices: Mutex<Vec<(u64, Duration, String)>>,
     notice_delay: Mutex<Option<Duration>>,
+    notice_error: AtomicBool,
+    notice_ok: Mutex<Vec<u64>>,
     gate_blocked: AtomicBool,
     /// When set, the mailbox answer comes from this runtime's real mailbox and disk markers.
     live_mailbox: Mutex<Option<Arc<SharedData>>>,
@@ -38,17 +123,25 @@ struct Fake {
 impl Fake {
     fn new(channels: &[u64], observed: Observed) -> Arc<Self> {
         Arc::new(Self {
+            root: tempfile::tempdir().unwrap(),
+            reader: Mutex::new(None),
             start: Instant::now(),
             channels: channels.to_vec(),
             readings: Mutex::new(channels.iter().map(|&c| (c, observed)).collect()),
             overtaken: AtomicBool::new(false),
             token: AtomicBool::new(false),
             head: Mutex::new(None),
+            read_delay: Mutex::new(HashMap::new()),
+            mailbox_delay: Mutex::new(HashMap::new()),
             typing_delay: Mutex::new(HashMap::new()),
+            typing_errors: Mutex::new(HashMap::new()),
             typed: Mutex::new(Vec::new()),
+            succeeded: Mutex::new(Vec::new()),
             kicks: Mutex::new(Vec::new()),
             notices: Mutex::new(Vec::new()),
             notice_delay: Mutex::new(None),
+            notice_error: AtomicBool::new(false),
+            notice_ok: Mutex::new(Vec::new()),
             gate_blocked: AtomicBool::new(false),
             live_mailbox: Mutex::new(None),
         })
@@ -90,11 +183,28 @@ impl Fake {
 
 #[async_trait]
 impl Effects for Fake {
+    fn notice_scope(&self, channel: u64) -> notice_store::Scope {
+        notice_store::Scope {
+            root: Some(self.root.path().to_owned()),
+            provider: "claude".into(),
+            token_hash: "test".into(),
+            channel,
+        }
+    }
+
     fn channels(&self) -> Vec<u64> {
         self.channels.clone()
     }
 
     async fn read(&self, channel: u64) -> Reading {
+        let delay = lock(&self.read_delay).get(&channel).copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let reader = lock(&self.reader).clone();
+        if let Some(reader) = reader {
+            return reader(channel);
+        }
         let observed = lock(&self.readings)[&channel];
         if self.overtaken.load(Ordering::SeqCst) {
             return Reading::overtaken_for_tests(observed);
@@ -103,6 +213,10 @@ impl Effects for Fake {
     }
 
     async fn mailbox(&self, channel: u64) -> (bool, Option<u64>) {
+        let delay = lock(&self.mailbox_delay).remove(&channel);
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let live = lock(&self.live_mailbox).clone();
         if let Some(shared) = live {
             return waiting_input(&shared, &ProviderKind::Claude, ChannelId::new(channel)).await;
@@ -116,11 +230,25 @@ impl Effects for Fake {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
+        if let Some(error) = lock(&self.typing_errors).get(&channel).cloned() {
+            return Err(error);
+        }
+        lock(&self.succeeded).push((channel, self.since()));
         Ok(())
     }
 
     fn kickoff(&self, channel: u64) {
         lock(&self.kicks).push((channel, self.since()));
+    }
+
+    fn idle(&self, channel: u64) {
+        if let Some(shared) = lock(&self.live_mailbox).clone() {
+            LiveEffects {
+                shared,
+                provider: ProviderKind::Claude,
+            }
+            .idle(channel);
+        }
     }
 
     async fn legacy_gate_blocked(&self, _: u64) -> bool {
@@ -133,6 +261,10 @@ impl Effects for Fake {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
+        if self.notice_error.load(Ordering::SeqCst) {
+            return Err("notice unavailable".into());
+        }
+        lock(&self.notice_ok).push(self.since().as_secs());
         Ok(())
     }
 
@@ -140,6 +272,12 @@ impl Effects for Fake {
         None
     }
 }
+
+#[path = "supervisor_deadline_tests.rs"]
+mod deadline_tests;
+
+#[path = "supervisor_injected_tests.rs"]
+mod injected_tests;
 
 /// Publishes a presence for `channel` as a running supervisor would.
 pub(crate) fn seed_presence_for_tests(channel: u64, busy: bool) {
@@ -151,6 +289,43 @@ pub(crate) fn seed_presence_for_tests(channel: u64, busy: bool) {
     };
     lock(&PRESENCE).insert(channel, Arc::new(Mutex::new(presence)));
 }
+
+pub(crate) fn seed_long_unknown_for_tests(channel: u64, reason: &'static str, age_secs: u64) {
+    lock(&PRESENCE).remove(&channel);
+    let mut presence = Presence::new();
+    presence.reason = reason;
+    presence.observed_at = Some(Utc::now());
+    let owner = notices::Owner::get(notice_store::Scope {
+        root: crate::services::discord::runtime_store::runtime_root(),
+        provider: "claude".into(),
+        token_hash: "health-test".into(),
+        channel,
+    });
+    let reading = Reading::unwatched_for_tests(
+        Observed {
+            activity: Activity::Unknown,
+            reason,
+        },
+        None,
+        None,
+    );
+    owner.observe(
+        Some(reading.notice_observation()),
+        false,
+        None,
+        Instant::now() - Duration::from_secs(age_secs),
+    );
+    presence.notice = Some(owner);
+    presence.activity_since = Utc::now() - chrono::Duration::seconds(age_secs as i64);
+    lock(&PRESENCE).insert(channel, Arc::new(Mutex::new(presence)));
+}
+
+#[path = "supervisor_notice_tests.rs"]
+mod notice_tests;
+// Uses the unix-only activity test probe (`activity::tests`).
+#[cfg(unix)]
+#[path = "supervisor_reader_notice_tests.rs"]
+mod reader_notice_tests;
 
 /// Runs the supervisor over `fake` for the life of the returned handle.
 fn supervise(fake: &Arc<Fake>) -> tokio::task::JoinHandle<()> {
@@ -168,19 +343,24 @@ fn typing_counts(channel: u64) -> (u64, u64) {
     (count("sent_ok_total"), count("late_ok_total"))
 }
 
-/// Busy types at once, then every 8 seconds exactly, and stops when the channel reads idle.
+/// Busy types at once, refreshes at each deadline, and stops when the channel reads idle.
 #[tokio::test(start_paused = true)]
-async fn busy_types_at_once_then_every_eight_seconds_and_idle_stops_it() {
+async fn busy_types_at_once_then_at_refresh_interval_and_idle_stops_it() {
     let channel = 6_200_001;
     let _confirmed = TestConfirmation::new(channel);
     let fake = Fake::new(&[channel], BUSY);
     let run = supervise(&fake);
-    wait(31).await;
-    assert_eq!(fake.typed_secs(channel), [0, 8, 16, 24]);
+    wait(TYPING_EVERY.as_secs() * 4 + 1).await;
+    let expected = (0..=4)
+        .map(|n| TYPING_EVERY.as_secs() * n)
+        .collect::<Vec<_>>();
+    assert_eq!(fake.typed_secs(channel), expected);
     fake.set(channel, IDLE);
+    wait(TICK.as_secs()).await;
+    assert_eq!(status(channel).unwrap()["activity"], "idle");
     wait(40).await;
     run.abort();
-    assert_eq!(fake.typed_secs(channel), [0, 8, 16, 24, 32]);
+    assert_eq!(fake.typed_secs(channel), expected);
     assert_eq!(typing_counts(channel), (5, 0));
 }
 
@@ -205,7 +385,14 @@ async fn a_send_overtaken_by_idle_counts_nothing_and_schedules_nothing() {
     let read = |observed| Reading::unwatched_for_tests(observed, Some("pane"), Some("/t.jsonl"));
     let mut first = None;
     for observed in [BUSY, IDLE, BUSY] {
-        let actions = apply(&mut presence, channel, now, &read(observed), false, None);
+        let actions = apply(
+            &mut presence,
+            channel,
+            now,
+            &read(observed),
+            (false, None),
+            None,
+        );
         first = first.or(actions.into_iter().find_map(|action| match action {
             Action::Typing(generation) => Some(generation),
             _ => None,
@@ -228,20 +415,22 @@ async fn a_mailbox_token_keeps_presence_from_typing() {
     let fake = Fake::new(&[channel], BUSY);
     fake.token.store(true, Ordering::SeqCst);
     let run = supervise(&fake);
-    wait(41).await;
+    wait(TYPING_EVERY.as_secs() * 5 + 1).await;
+    assert!(fake.typed_secs(channel).is_empty());
     fake.token.store(false, Ordering::SeqCst);
-    wait(10).await;
+    wait(TYPING_EVERY.as_secs()).await;
     run.abort();
-    assert_eq!(fake.typed_secs(channel), [48]);
+    assert_eq!(fake.typed_secs(channel), [TYPING_EVERY.as_secs() * 6]);
 }
 
-/// Unknown for a full minute posts one notice; it does not post again within 30 minutes, even
-/// across a recovery and a new unknown, and may once that half hour has passed.
+/// Waiting input sees one notice after a minute; recovery starts a fresh grace and a
+/// continuous cause then remains suppressed.
 #[tokio::test(start_paused = true)]
-async fn unknown_for_a_minute_notices_once_per_half_hour() {
+async fn unknown_for_a_minute_notices_once_per_cause_spell() {
     let channel = 6_200_004;
     let _confirmed = TestConfirmation::new(channel);
     let fake = Fake::new(&[channel], UNKNOWN);
+    *lock(&fake.head) = Some(7);
     let run = supervise(&fake);
     wait(59).await;
     assert_eq!(fake.notices(), []);
@@ -250,12 +439,91 @@ async fn unknown_for_a_minute_notices_once_per_half_hour() {
     wait(10).await;
     fake.set(channel, UNKNOWN);
     wait(20 * 60).await;
-    assert_eq!(fake.notice_secs(), [60]);
+    assert_eq!(fake.notice_secs(), [60, 132]);
     wait(10 * 60).await;
     run.abort();
-    assert_eq!(fake.notice_secs(), [60, 1860]);
-    assert!(fake.notices()[0].1.contains("(사유: facts_halted)"));
+    assert_eq!(fake.notice_secs(), [60, 132]);
+    assert!(fake.notices()[0].1.contains(r"(사유: facts\_halted)"));
     assert!(status(channel).unwrap()["unknown_notice"]["posted_at"].is_string());
+}
+
+/// Ticks once and waits for the channel's notice drive, which loads and posts off the tick.
+async fn tick_settled(supervisor: &Supervisor<Fake>, channel: u64) {
+    supervisor.tick(Instant::now()).await;
+    let owner = lock(&supervisor.channels[&channel]).notice.clone().unwrap();
+    owner.settled_for_tests().await;
+}
+
+/// An unaffected Unknown posts nothing yet still shows in health; waiting input gets the overdue
+/// notice at once, and the same cause stays at one notice while the input leaves and returns.
+#[tokio::test(start_paused = true)]
+async fn unknown_without_input_notices_only_when_a_waiting_head_is_affected() {
+    let channel = 6_200_031;
+    let _confirmed = TestConfirmation::new(channel);
+    let fake = Fake::new(&[channel], UNKNOWN);
+    let mut supervisor = Supervisor::new(fake.clone());
+    let presence = supervisor.presence(channel);
+    tick_settled(&supervisor, channel).await;
+    tokio::time::advance(NOTICE_EVERY + Duration::from_secs(1)).await;
+    tick_settled(&supervisor, channel).await;
+    assert!(fake.notices().is_empty());
+    assert!(lock(&presence).last_notice_at.is_none());
+    assert!(status(channel).unwrap()["unknown_notice"]["posted_at"].is_null());
+    assert!(
+        super::unknown_snapshots()
+            .iter()
+            .any(|snapshot| snapshot.channel_id == channel),
+        "health reports a held Unknown whether or not input waits"
+    );
+
+    *lock(&fake.head) = Some(7);
+    tick_settled(&supervisor, channel).await;
+    assert_eq!(fake.notice_secs(), [1801]);
+    tokio::time::advance(NOTICE_EVERY).await;
+    tick_settled(&supervisor, channel).await;
+    assert_eq!(fake.notice_secs(), [1801]);
+
+    let last_notice = lock(&presence).last_notice_at;
+    let posted = status(channel).unwrap()["unknown_notice"]["posted_at"].clone();
+    *lock(&fake.head) = None;
+    tokio::time::advance(NOTICE_EVERY).await;
+    tick_settled(&supervisor, channel).await;
+    *lock(&fake.head) = Some(8);
+    tick_settled(&supervisor, channel).await;
+    assert_eq!(fake.notice_secs(), [1801], "the same cause is noticed once");
+    assert_eq!(lock(&presence).last_notice_at, last_notice);
+    assert_eq!(
+        status(channel).unwrap()["unknown_notice"]["posted_at"],
+        posted
+    );
+    assert!(fake.kick_secs().is_empty(), "Unknown never wakes the queue");
+}
+
+/// A token alone is affected input: one notice after the grace, none again for the same cause,
+/// and none once the token is released.
+#[tokio::test(start_paused = true)]
+async fn unknown_with_only_a_token_notices_until_the_token_is_released() {
+    let channel = 6_200_032;
+    let _confirmed = TestConfirmation::new(channel);
+    let fake = Fake::new(&[channel], UNKNOWN);
+    fake.token.store(true, Ordering::SeqCst);
+    let mut supervisor = Supervisor::new(fake.clone());
+    supervisor.presence(channel);
+    tick_settled(&supervisor, channel).await;
+    tokio::time::advance(Duration::from_secs(59)).await;
+    tick_settled(&supervisor, channel).await;
+    assert!(fake.notices().is_empty());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tick_settled(&supervisor, channel).await;
+    assert_eq!(fake.notice_secs(), [60]);
+    tokio::time::advance(NOTICE_EVERY).await;
+    tick_settled(&supervisor, channel).await;
+    assert_eq!(fake.notice_secs(), [60]);
+
+    fake.token.store(false, Ordering::SeqCst);
+    tokio::time::advance(NOTICE_EVERY).await;
+    tick_settled(&supervisor, channel).await;
+    assert_eq!(fake.notice_secs(), [60]);
 }
 
 /// A new supervisor over an idle channel sends nothing, wakes nothing and posts nothing.
@@ -322,6 +590,12 @@ async fn a_queue_two_wakes_did_not_move_is_held_and_noticed_with_its_cause() {
         let notices = fake.notices();
         assert_eq!(notices.len(), 1, "{reason}");
         assert!(notices[0].1.contains(words), "{}", notices[0].1);
+        assert!(
+            notices[0].1.starts_with("-# ⚠️ ")
+                && crate::services::discord::session_notice::is_inline(&notices[0].1),
+            "the held notice must reach the provider effect as one subtext line: {}",
+            notices[0].1
+        );
     }
 }
 
@@ -348,13 +622,14 @@ async fn a_marker_left_on_disk_alone_is_woken_at_once_and_every_half_minute() {
     assert_eq!(fake.kick_secs(), [12, 42, 72]);
 }
 
-/// A notice that takes 30 seconds to post holds neither another channel's typing nor its stop.
+/// A waiting input's notice that takes 30 seconds holds neither another channel's typing nor stop.
 #[tokio::test(start_paused = true)]
 async fn a_slow_notice_holds_only_its_own_channel() {
     let (unknown, busy) = (6_200_014, 6_200_015);
     let _confirmed = (TestConfirmation::new(unknown), TestConfirmation::new(busy));
     let fake = Fake::new(&[unknown, busy], BUSY);
     fake.set(unknown, UNKNOWN);
+    *lock(&fake.head) = Some(7);
     *lock(&fake.notice_delay) = Some(Duration::from_secs(30));
     let run = supervise(&fake);
     wait(70).await;
@@ -362,7 +637,12 @@ async fn a_slow_notice_holds_only_its_own_channel() {
     wait(30).await;
     run.abort();
     assert_eq!(fake.notice_secs(), [60]);
-    assert_eq!(fake.typed_secs(busy), [0, 8, 16, 24, 32, 40, 48, 56, 64]);
+    assert_eq!(
+        fake.typed_secs(busy),
+        (0..70)
+            .step_by(TYPING_EVERY.as_secs() as usize)
+            .collect::<Vec<_>>()
+    );
 }
 
 /// One channel's slow send never delays another channel's typing.
@@ -376,7 +656,12 @@ async fn a_slow_send_holds_only_its_own_channel() {
     wait(20).await;
     run.abort();
     assert_eq!(fake.typed_secs(slow), [0]);
-    assert_eq!(fake.typed_secs(fast), [0, 8, 16]);
+    assert_eq!(
+        fake.typed_secs(fast),
+        (0..20)
+            .step_by(TYPING_EVERY.as_secs() as usize)
+            .collect::<Vec<_>>()
+    );
 }
 
 /// A reading a later poll moved past publishes nothing: no transition, no typing, no wake.
@@ -446,4 +731,30 @@ async fn only_confirmed_channels_are_supervised_and_reported() {
         typing,
         ["last_error", "last_ok_at", "late_ok_total", "sent_ok_total"]
     );
+}
+
+#[test]
+fn injection_hourglass_requires_registration_confirmation_and_a_running_supervisor() {
+    let provider = ProviderKind::Unsupported("injection-observation-contract".into());
+    let channel = 7_269_005;
+    let confirmed = TestConfirmation::new(channel);
+    let started = Started::new(&provider);
+    assert!(
+        !observes(&provider, channel),
+        "confirmation alone must not register a channel"
+    );
+    register(&provider, &[channel]);
+    assert!(observes(&provider, channel));
+    drop(confirmed);
+    assert!(
+        !observes(&provider, channel),
+        "registration alone must not confirm turn mode"
+    );
+    let _confirmed = TestConfirmation::new(channel);
+    drop(started);
+    assert!(
+        !observes(&provider, channel),
+        "a stopped supervisor cannot finish hourglasses"
+    );
+    lock(&REGISTERED).remove(provider.as_str());
 }

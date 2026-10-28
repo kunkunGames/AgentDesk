@@ -95,7 +95,8 @@ fn command_supports_json(command: &Commands) -> bool {
         | Commands::ProviderCli(..)
         | Commands::Health
         | Commands::MachineCompare
-        | Commands::Activity { .. } => true,
+        | Commands::Activity { .. }
+        | Commands::BuildInfo => true,
 
         // Text-only / operational commands — no JSON output path.
         Commands::Dcserver { .. }
@@ -112,13 +113,10 @@ fn command_supports_json(command: &Commands) -> bool {
         | Commands::ResetTmux
         | Commands::Ismcptool { .. }
         | Commands::Addmcptool { .. }
-        | Commands::InstallMementoSessionHook { .. }
         | Commands::Deploy
         | Commands::Migrate { .. }
         | Commands::ReleaseMigratePostgres
-        | Commands::O(..)
         | Commands::Herdr(..)
-        | Commands::ChannelHome(..)
         | Commands::Show { .. } => false,
 
         Commands::TmuxWrapper { .. }
@@ -531,16 +529,6 @@ pub(crate) fn execute(command: Commands, json: bool) -> Result<()> {
             super::utils::handle_addmcptool(&tools);
             Ok(())
         }
-        Commands::InstallMementoSessionHook {
-            settings_path,
-            dry_run,
-            uninstall,
-        } => super::utils::handle_install_memento_session_hook(
-            settings_path.as_deref(),
-            dry_run,
-            uninstall,
-        )
-        .map_err(anyhow::Error::msg),
         Commands::Status => {
             let invoke = super::client::cmd_status(json);
             if json {
@@ -636,6 +624,10 @@ pub(crate) fn execute(command: Commands, json: bool) -> Result<()> {
             }
         }
         Commands::Deploy => exit_for_cli(super::client::cmd_deploy()),
+        Commands::BuildInfo => {
+            super::build_info::handle_build_info();
+            Ok(())
+        }
         Commands::Config { action } => exit_for_cli(match action {
             ConfigAction::Get => super::client::cmd_config_get(),
             ConfigAction::Set { json } => super::client::cmd_config_set(&json),
@@ -705,9 +697,7 @@ pub(crate) fn execute(command: Commands, json: bool) -> Result<()> {
         )),
         Commands::ProviderCli(args) => exit_for_cli(super::provider_cli::cmd_provider_cli(args)),
         Commands::Show { action } => exit_for_cli(handle_show(action)),
-        Commands::O(command) => exit_for_cli(super::o::run(command)),
         Commands::Herdr(command) => exit_for_cli(super::herdr::run(command)),
-        Commands::ChannelHome(command) => exit_for_cli(super::channel_home::run(command)),
         Commands::Health => exit_for_cli(super::client::cmd_health(json)),
         Commands::MachineCompare => exit_for_cli(super::client::cmd_machine_compare(json)),
         Commands::Activity {

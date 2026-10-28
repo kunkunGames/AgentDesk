@@ -378,7 +378,7 @@ class HerdrDegradedWaiver(unittest.TestCase):
         client = Mock()
         client.send_control.return_value = {"id": "100"}
         client.fetch_messages.return_value = []
-        detail = degraded()
+        detail = {**degraded(), "boot_incarnation": "boot-1"}
         detail["herdr"]["reconnect"].update(channels=1, published=1)
         self.http.side_effect = lambda _base, path, **_: (200, detail if path.endswith("/detail") else {"status": "healthy"})
         self.args.herdr_isolated_server = self.args.allow_destructive = True
@@ -457,6 +457,109 @@ REFUSED = "세션을 초기화하지 못했어요: rotation_unsettled(59)"
 
 def bot(message_id, content, **extra):
     return {"id": str(message_id), "content": content, "author": {"id": "7", "bot": True}, **extra}
+
+
+class HerdrProviderHold(unittest.TestCase):
+    PROVIDERS = {"claude": "1474932782395293736", "codex": "1479425196824989758"}
+    OK, LATE = "[E2E:E18:OK]", "[E2E:E18:LATE]"
+
+    def setUp(self):
+        self.args = arguments()
+        self.args.allow_destructive = True
+        self.enterContext(patch.dict("os.environ", {"AGENTDESK_E2E_ALLOW_DESTRUCTIVE": "1"}))
+        self.enterContext(patch("urllib.request.urlopen", side_effect=AssertionError("offline only")))
+        self.enterContext(patch.object(driver, "_read_api_json", return_value=(200, health())))
+        self.enterContext(patch.object(herdr.subprocess, "run", side_effect=lambda *a, **kw: Namespace(
+            stdout=json.dumps(status([{**row(), "provider": driver.cell_provider(self.args.cell)}])))))
+        self.enterContext(patch.object(driver, "post_send_sleep"))
+        self.enterContext(patch.object(herdr.time, "sleep"))
+        self.enterContext(patch.object(driver.assertions, "OUR_BOT_ID", "1479017284805722200"))
+        self.enterContext(patch.dict(driver.assertions.PROVIDER_BOT_IDS, self.PROVIDERS))
+        self.cancel = self.enterContext(patch.object(driver, "cancel_turn"))
+        self.client = Mock()
+        self.client.send_control.return_value = {"id": "100"}
+        self.client.send.return_value = {"id": "101"}
+
+    def capture(self, provider):
+        fixture = Path(__file__).with_name("tests") / "fixtures/e18_claude_herdr_20261021_hold.json"
+        rows = json.loads(fixture.read_text())
+        for message in rows:
+            author = message.pop("author_id")
+            if author == self.PROVIDERS["claude"]:
+                author = self.PROVIDERS[provider]
+            message["author"] = {"id": author, "bot": message.pop("author_bot")}
+        return rows
+
+    def run_hold(self, provider, rows, *, real_wait=False):
+        self.args.cell = provider + "-herdr"
+        self.cancel.reset_mock()
+        self.client.fetch_messages.reset_mock()
+        self.client.fetch_messages.return_value = rows
+        if real_wait:
+            self.client.wait_for_message.side_effect = driver.discord.DiscordClient.wait_for_message.__get__(self.client)
+        else:
+            self.client.wait_for_message.side_effect = lambda _channel, *, predicate, **kw: (
+                next((message for message in rows if predicate(message)), None), rows)
+        scenario = dict(id="E-18", agent_mode="real_live", coverage_class="live", assertions=[], steps=[
+            {"send_provider_hold_prompt": {"ok_marker": self.OK, "late_marker": self.LATE, "hold_seconds": 60}},
+            {"wait_for_provider_hold_state": {"ok_marker": self.OK, "late_marker": self.LATE}},
+            {"cancel_turn": {"force": False}}])
+        with redirect_stdout(io.StringIO()):
+            return driver.run_scenario(scenario, args=self.args, client=self.client, run_id="test")
+
+    def assert_reaches_cancel(self, result):
+        self.assertEqual(result["status"], "unexpected_pass", result)
+        self.cancel.assert_called_once_with(base_url=self.args.base_url, channel_id=self.args.channel_id, force=False)
+
+    def test_captured_prompt_late_marker_does_not_end_provider_hold(self):
+        for provider in self.PROVIDERS:
+            with self.subTest(provider=provider):
+                self.assert_reaches_cancel(self.run_hold(provider, self.capture(provider)))
+
+    def test_other_bots_late_marker_does_not_end_provider_hold(self):
+        for provider in self.PROVIDERS:
+            for author in ("notify", "announce", self.PROVIDERS["codex" if provider == "claude" else "claude"]):
+                with self.subTest(provider=provider, author=author):
+                    rows = self.capture(provider) + [bot(1562545294149943328, self.LATE,
+                                                        author={"id": author, "bot": True})]
+                    self.assert_reaches_cancel(self.run_hold(provider, rows))
+
+    def test_provider_late_marker_refuses_cancel(self):
+        for provider in self.PROVIDERS:
+            for separate in (False, True):
+                with self.subTest(provider=provider, separate=separate):
+                    rows = self.capture(provider)
+                    if separate:
+                        rows.append(bot(1562545294149943328, self.LATE,
+                                        author={"id": self.PROVIDERS[provider], "bot": True}))
+                    else:
+                        rows[-1]["content"] += "\n" + self.LATE
+                    result = self.run_hold(provider, rows)
+                    self.assertEqual(result["status"], "fail", result)
+                    self.assertIn("Herdr hold already ended before operation", result["reason"])
+                    self.cancel.assert_not_called()
+
+    def test_hold_ok_marker_requires_the_cell_provider(self):
+        for provider in self.PROVIDERS:
+            with self.subTest(provider=provider):
+                rows = self.capture(provider)
+                rows[-1]["author"]["id"] = self.PROVIDERS["codex" if provider == "claude" else "claude"]
+                result = self.run_hold(provider, rows)
+                self.assertEqual(result["status"], "fail", result)
+                self.assertIn("Herdr Discord marker timeout: " + self.OK, result["reason"])
+                self.cancel.assert_not_called()
+
+    def test_real_wait_observes_same_poll_late_before_cancel(self):
+        for provider in self.PROVIDERS:
+            with self.subTest(provider=provider):
+                rows = self.capture(provider) + [bot(1562545294149943328, self.LATE,
+                                                    author={"id": self.PROVIDERS[provider], "bot": True})]
+                result = self.run_hold(provider, rows, real_wait=True)
+                self.assertEqual(self.cancel.call_count, 0,
+                                 f"{provider}: cancel_calls={self.cancel.call_count}, status={result['status']}")
+                self.assertEqual(result["status"], "fail", result)
+                self.assertIn("Herdr hold already ended before operation", result["reason"])
+                self.client.fetch_messages.assert_called_once_with(self.args.channel_id, after_id="100", limit=100)
 
 
 class HerdrTextClear(unittest.TestCase):
@@ -578,13 +681,15 @@ class HerdrTextClear(unittest.TestCase):
                     self.assertIn(reason, result["reason"])
                     self.assertEqual(self.client.send.call_count, 1)
 
-    def test_refusal_prefixes_match_the_server_wording(self):
-        # The server answers a refused text !clear with these error strings; keep them in step.
+    def test_clear_wording_matches_the_server(self):
+        # `/clear` no longer refuses; the prefixes only catch servers from older builds and must not match today's replies.
         root = Path(__file__).resolve().parents[3] / "src/services/discord/commands"
-        native, control = ((root / name).read_text(encoding="utf-8") for name in ("control/native.rs", "control.rs"))
+        self.assertIn(f'SESSION_CLEARED_RESPONSE: &str = "{CLEARED}"', (root / "mod.rs").read_text(encoding="utf-8"))
+        sources = [(root / name).read_text(encoding="utf-8") for name in ("control.rs", "control/native.rs", "control/clear_report.rs")]
         for prefix in herdr.CLEAR_REFUSAL_PREFIXES:
-            self.assertIn(f'"{prefix} {{reason}}"', native)
-            self.assertIn(f'"{prefix} ', control)
+            self.assertFalse(CLEARED.startswith(prefix))
+            for source in sources:
+                self.assertNotIn(f'"{prefix}', source)
 
 
 class RestartObserveOnly(unittest.TestCase):
@@ -659,6 +764,26 @@ class RestartObserveOnly(unittest.TestCase):
         self.assertGreaterEqual(restart["elapsed_secs"], 60)
         self.assertTrue(all(c.args[0] == ["agentdesk", "herdr", "status"] for c in self.cli.call_args_list))
         self.assertEqual(self.scenario.call_args.args[0]["id"], "E-19-observe-only")
+
+    def test_changed_boot_incarnation_proves_restart(self):
+        self.http.return_value = (200, {**health(), "boot_incarnation": "boot-1"})
+        self.assertEqual(self.run_mode("mark")[0], 0)
+        self.publishable(None)
+        self.http.return_value[1]["boot_incarnation"] = "boot-2"
+        rc, report = self.run_mode("verify")
+        self.assertEqual(rc, 0, report)
+        restart = report["restart_observation"]
+        self.assertEqual((restart["restart_evidence"], restart["boot_incarnation_before"], restart["boot_incarnation_after"]),
+                         ("boot_incarnation", "boot-1", "boot-2"))
+        self.assertEqual(restart["limitation"], herdr_restart.INCARNATION_NOTE)
+        self.scenario.assert_called_once()
+
+    def test_unchanged_boot_incarnation_refuses_even_when_uptime_looks_restarted(self):
+        self.http.return_value = (200, {**health(), "boot_incarnation": "boot-1"})
+        self.marked(uptime=3)
+        self.http.return_value[1]["boot_incarnation"] = "boot-1"
+        restart = self.assert_refused("boot_incarnation stayed boot-1; restart not observed")["restart_observation"]
+        self.assertEqual(restart["restart_evidence"], "not_observed")
 
     def test_server_uptime_older_than_mark_refuses_followup(self):
         self.run_mode("mark")

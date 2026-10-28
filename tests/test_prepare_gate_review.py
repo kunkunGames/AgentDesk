@@ -25,7 +25,6 @@ class PrepareGateReviewTest(unittest.TestCase):
         commands = [call.args[0][2:] for call in run.call_args_list]
         self.assertEqual(commands, [
             ["--sync-skips"], ["--review-docs-only", "--sync-giant-docs"], [], [],
-            ["--write-lib-inventory-manifest"],
         ])
         self.assertTrue(all(call.kwargs["cwd"] == ROOT for call in run.call_args_list))
         self.assertEqual([Path(call.args[0][1]).name for call in run.call_args_list], [command[0] for command in PREPARE.COMMANDS])
@@ -61,7 +60,7 @@ class PrepareGateReviewTest(unittest.TestCase):
             scripts.mkdir()
             docs = ["ARCHITECTURE.md", "docs/generated/route-inventory.md", "docs/generated/worker-inventory.md",
                     "docs/generated/env-reference.md", "docs/generated/cli-reference.md"]
-            writes = [[], docs[:3], docs[3:4], docs[4:], ["scripts/lib_test_inventory_manifest.txt"]]
+            writes = [[], docs[:3], docs[3:4], docs[4:]]
             for command, outputs in zip(PREPARE.COMMANDS, writes):
                 (scripts / command[0]).write_text(
                     "from pathlib import Path\n" +
@@ -79,40 +78,6 @@ class PrepareGateReviewTest(unittest.TestCase):
             self.assertEqual(untouched.read_text(), "manual\n")
             self.assertEqual(PREPARE.prepare(root), 0)
 
-    def test_official_static_manifest_writer_corrects_drift(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "scripts").mkdir()
-            (root / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
-            (root / "src/lib.rs").write_text('#[cfg(test)]\nmod tests { #[test] fn selected() {} }\n')
-            manifest = root / "scripts/lib_test_inventory_manifest.txt"
-            manifest.write_text("drift\n")
-            argv = [sys.executable, str(ROOT / "scripts/check_test_target_integrity.py"),
-                    "--repo-root", str(root), "--write-lib-inventory-manifest"]
-            result = subprocess.run(argv, capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("tests::selected", manifest.read_text())
-            expected = manifest.read_bytes()
-            self.assertEqual(subprocess.run(argv, capture_output=True).returncode, 0)
-            self.assertEqual(manifest.read_bytes(), expected)
-
-    def test_unclear_static_inventory_refuses_write(self):
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "scripts").mkdir()
-            (root / "Cargo.toml").write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
-            (root / "src/lib.rs").write_text("mod missing;\n")
-            manifest = root / "scripts/lib_test_inventory_manifest.txt"
-            manifest.write_text("preserve\n")
-            result = subprocess.run([sys.executable, str(ROOT / "scripts/check_test_target_integrity.py"),
-                                     "--repo-root", str(root), "--write-lib-inventory-manifest"],
-                                    capture_output=True, text=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("not unambiguous", result.stderr)
-            self.assertEqual(manifest.read_text(), "preserve\n")
-
 
 class SafeAdditiveSkipTest(unittest.TestCase):
     def _fixture(self, root, *, pinned=True, child=True, production=False):
@@ -122,22 +87,27 @@ class SafeAdditiveSkipTest(unittest.TestCase):
         if child:
             (root / "src/harness.rs").write_text("#[test]\nfn fixture() {}\n")
         existing = {"src/harness.rs"} if pinned else set()
-        source = 'PINNED_BASENAME_TEST_FILES = frozenset(\n    {\n    }\n)\nPINNED_RESOLVER_TEST_ONLY_FILES = frozenset(\n    {\n'
+        source = 'PINNED_RESOLVER_TEST_ONLY_FILES = frozenset(\n    {\n'
         if pinned:
             source += '        "src/harness.rs",\n'
         path = root / "scripts/test_only_module_skip_pin.py"
         path.write_text(source + '    }\n)\n')
         pin = SimpleNamespace(_lexical_rust_files=PIN._lexical_rust_files, _INVENTORY=GEN,
-                              PINNED_TEST_ONLY_MODULE_FILES=frozenset(existing))
+                              is_basename_test_file=PIN.is_basename_test_file,
+                              validate_basename_mounts=PIN.validate_basename_mounts,
+                              PINNED_RESOLVER_TEST_ONLY_FILES=frozenset(existing))
         return path, pin
 
     def test_verified_test_only_addition_is_registered(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             path, pin = self._fixture(root, pinned=False)
+            before = path.read_bytes()
             with patch.object(CENSUS.classifier, "_SKIP_PIN", pin):
                 CENSUS.sync_skips(root)
-            self.assertIn('"src/harness.rs",', path.read_text())
+            fragment = root / "scripts/test_only_module_skip_pin.d" / CENSUS.registry.auto_fragment("src/harness.rs")
+            self.assertEqual(fragment.read_text(), "resolver | src/harness.rs\n")
+            self.assertEqual(path.read_bytes(), before)
 
     def test_deletion_and_production_promotion_are_refused_unchanged(self):
         for kwargs in ({"child": False}, {"production": True}):

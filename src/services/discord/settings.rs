@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -26,7 +25,6 @@ use super::org_schema;
 use super::role_map::{
     is_known_agent as is_known_agent_from_role_map,
     list_registered_channel_bindings as list_registered_channel_bindings_from_role_map,
-    load_peer_agents as load_peer_agents_from_role_map,
     load_shared_prompt_path as load_shared_prompt_path_from_role_map,
     resolve_role_binding as resolve_role_binding_from_role_map,
     resolve_workspace as resolve_workspace_from_role_map,
@@ -40,8 +38,11 @@ pub(super) use content::{
     load_review_tuning_guidance, load_role_prompt, load_shared_prompt_for_profile,
     render_peer_agent_guidance,
 };
-pub(crate) use memory::{memory_settings_for_binding, resolve_memory_settings};
-pub(super) use read::{load_bot_settings, load_last_session_path, save_last_session_runtime};
+pub(crate) use memory::{
+    memory_settings_for_binding, memory_settings_for_role, resolve_agent_memory_settings,
+    resolve_memory_settings,
+};
+pub(super) use read::{load_bot_settings, load_last_session_path};
 pub use read::{
     load_discord_bot_launch_configs, resolve_discord_bot_provider, resolve_discord_token_by_hash,
 };
@@ -131,10 +132,6 @@ fn last_session_path_key(token_hash: &str, channel_id: u64) -> String {
     format!("discord:last_session:{token_hash}:{channel_id}")
 }
 
-fn last_remote_profile_key(token_hash: &str, channel_id: u64) -> String {
-    format!("discord:last_remote:{token_hash}:{channel_id}")
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct RoleBinding {
     pub role_id: String,
@@ -150,8 +147,6 @@ pub(crate) struct RoleBinding {
     pub reasoning_effort: Option<String>,
     /// Whether this role may see peer-agent handoff guidance in the system prompt.
     pub peer_agents_enabled: bool,
-    /// Whether hourly agent quality feedback may be injected into the system prompt.
-    pub quality_feedback_injection_enabled: bool,
     /// Resolved auth profile id (`default` when unset).
     pub auth_profile: String,
     pub memory: ResolvedMemorySettings,
@@ -197,6 +192,7 @@ impl MemoryBackendKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ResolvedMemorySettings {
+    pub memory_group: Option<String>,
     pub backend: MemoryBackendKind,
     /// True only when the resolved `backend` is `File` because memento was the
     /// requested/configured backend but is degraded (unreachable). Lets the
@@ -211,6 +207,7 @@ pub(crate) struct ResolvedMemorySettings {
 impl Default for ResolvedMemorySettings {
     fn default() -> Self {
         Self {
+            memory_group: None,
             backend: MemoryBackendKind::File,
             memento_fallback: false,
             recall_timeout_ms: DEFAULT_MEMORY_RECALL_TIMEOUT_MS,
@@ -247,105 +244,7 @@ pub struct DiscordBotLaunchConfig {
 }
 
 fn config_path_for_write() -> Option<PathBuf> {
-    let explicit = std::env::var_os("AGENTDESK_CONFIG")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty());
-    let runtime_root = crate::config::runtime_root();
-    let cwd = std::env::current_dir().ok();
-    let home_dir = dirs::home_dir();
-
-    Some(resolve_config_path_for_write(
-        explicit,
-        runtime_root,
-        cwd,
-        home_dir,
-    ))
-}
-
-fn resolve_config_path_for_write(
-    explicit: Option<PathBuf>,
-    runtime_root: Option<PathBuf>,
-    cwd: Option<PathBuf>,
-    home_dir: Option<PathBuf>,
-) -> PathBuf {
-    if let Some(path) = explicit {
-        if path.exists() {
-            return path;
-        }
-
-        let mut candidates = Vec::new();
-        if let Some(root) = runtime_root.as_ref() {
-            let canonical = runtime_layout::config_file_path(root);
-            let legacy = runtime_layout::legacy_config_file_path(root);
-            if path == legacy {
-                candidates.push(canonical);
-            } else if path == canonical {
-                candidates.push(legacy);
-            }
-        }
-
-        if path.file_name() == Some(OsStr::new("agentdesk.yaml")) {
-            if let Some(parent) = path.parent() {
-                if parent.file_name() == Some(OsStr::new("config")) {
-                    if let Some(root) = parent.parent() {
-                        let legacy = root.join("agentdesk.yaml");
-                        if legacy != path {
-                            candidates.push(legacy);
-                        }
-                    }
-                } else {
-                    let canonical = parent.join("config").join("agentdesk.yaml");
-                    if canonical != path {
-                        candidates.push(canonical);
-                    }
-                }
-            }
-        }
-
-        if let Some(candidate) = candidates.into_iter().find(|candidate| candidate.exists()) {
-            return candidate;
-        }
-        return path;
-    }
-
-    if let Some(root) = runtime_root.as_ref() {
-        for path in [
-            runtime_layout::config_file_path(root),
-            runtime_layout::legacy_config_file_path(root),
-        ] {
-            if path.exists() {
-                return path;
-            }
-        }
-    }
-
-    if let Some(dir) = cwd.as_ref() {
-        for path in [
-            dir.join("config").join("agentdesk.yaml"),
-            dir.join("agentdesk.yaml"),
-        ] {
-            if path.exists() {
-                return path;
-            }
-        }
-    }
-
-    if let Some(home) = home_dir.as_ref() {
-        let release_root = home.join(".adk").join("release");
-        for path in [
-            runtime_layout::config_file_path(&release_root),
-            runtime_layout::legacy_config_file_path(&release_root),
-        ] {
-            if path.exists() {
-                return path;
-            }
-        }
-    }
-
-    runtime_root
-        .map(|root| runtime_layout::config_file_path(&root))
-        .or_else(|| cwd.map(|dir| dir.join("config").join("agentdesk.yaml")))
-        .unwrap_or_else(|| PathBuf::from("config").join("agentdesk.yaml"))
+    Some(crate::config::resolved_config_path())
 }
 
 fn resolved_config_bot_name(config: &crate::config::Config, token: &str) -> Option<String> {

@@ -10,8 +10,6 @@ behaviour; it records the production call sites that exist before the move.
 WHAT IS PINNED. The scope is deliberately the legacy
 `crate::db::intake_outbox::mark_done` writer, the delivery-proof
 `crate::db::intake_outbox_delivery_proof::mark_done_from_delivery_proof`
-writer, and the receipt-backed
-`crate::db::intake_outbox_delivery_proof::settle_intake_done_from_receipt`
 writer.
 EPIC #5071 says the worker's `Ok` stamp becomes `dispatched` and that only the
 terminal-receipt holder drives `done`; it does not move `claimed`, `accepted`,
@@ -36,10 +34,11 @@ It also does not prove a call is reachable, successful, or the right lifecycle
 action. Conversely, a same-spelled free function in a file importing this
 writer could be over-counted. Comments, strings, pinned whole-file test modules,
 and `#[cfg(test)]` regions are excluded, but other cfgs are counted without
-target evaluation. Whole-file skips use the single lexical pin in
-`scripts/test_only_module_skip_pin.py`; non-`.rs` regular files are rejected
-before classification, `src/` symlinks are rejected, and the skipped census
-must equal the pin count. Symlink rejection is lexical rather than atomic
+target evaluation. Whole-file skips use the basename rule with production
+module mounts rejected, plus the resolver pin in `scripts/test_only_module_skip_pin_paths.py` plus `.d/` fragments.
+Non-`.rs` regular files and `src/` symlinks are rejected before classification;
+the skipped census must equal basename count plus resolver pin count.
+Symlink rejection is lexical rather than atomic
 against a post-enumeration replacement; CI assumes a static checkout while
 the gate runs.
 
@@ -76,7 +75,6 @@ PROOF_OWNER = "src/services/discord/runtime_bootstrap/intake_delivery_reconciler
 SYMBOL_MODULES = {
     "mark_done": "intake_outbox",
     "mark_done_from_delivery_proof": "intake_outbox_delivery_proof",
-    "settle_intake_done_from_receipt": "intake_outbox_delivery_proof",
 }
 CFG_EXCLUSIVELY_TEST_RE = re.compile(
     r"#\[\s*cfg\s*\(\s*(?:test\s*\)|all\s*\(\s*test\s*(?:,|\)))"
@@ -103,7 +101,7 @@ PINNED_TEST_ONLY_MODULE_FILES = _SKIP_PIN.PINNED_TEST_ONLY_MODULE_FILES
 
 
 def is_test_file(name: str) -> bool:
-    return name == "tests.rs" or name.endswith("_tests.rs")
+    return _SKIP_PIN.is_basename_test_file(name)
 
 
 def strip_source(text: str) -> str:
@@ -208,9 +206,6 @@ def expected_call_sites(root: Path) -> dict[str, dict[str, int]]:
         "mark_done_from_delivery_proof": (
             {PROOF_OWNER: 1} if (root / PROOF_OWNER).is_file() else {}
         ),
-        "settle_intake_done_from_receipt": {
-            "src/services/discord/turn_bridge/intake_settlement.rs": 1
-        },
     }
 
 
@@ -221,7 +216,8 @@ LIMITS = (
     "NOT seen (cargo fmt --check rejects the line-break call form); same-spelled free functions "
     "may be over-counted; direct protected-symbol aliases are rejected; only braced cfg(test) "
     "and cfg(all(test,...)) items are stripped, while other cfg/cfg_attr forms remain scanned; the "
-    "whole-file skips use one lexical pin, reject src symlinks, and check their census; "
+    "whole-file skips use the basename rule plus resolver pin, reject production basename "
+    "module mounts and src symlinks, and check their census; "
     "non-.rs regular files fail closed before classification; symlink rejection is "
     "non-atomic outside a static CI checkout; the scan root is `src/`; call sites in files "
     "reached by `#[path]`/`include!` targets resolving outside `src/` are not seen; "

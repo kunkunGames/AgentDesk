@@ -88,7 +88,7 @@ multi-GB `target/debug/incremental` per-worktree hit is pure waste.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `SCCACHE_DIR` | `$HOME/.cache/sccache` | Cache location |
-| `SCCACHE_CACHE_SIZE` | `40G` | Adjustable local disk-cache ceiling |
+| `SCCACHE_CACHE_SIZE` | `15G` | Adjustable local disk-cache ceiling |
 | `SCCACHE_IDLE_TIMEOUT` | `0` | Disable idle daemon exit; retain counters between builds |
 | `RUSTC_WRAPPER` | resolved `sccache` binary | Signals Cargo to wrap rustc |
 | `PATH` | inherited path, with `/opt/homebrew/bin` conditionally prepended (§1) | Exported when that discovery branch runs, before later success/failure |
@@ -105,10 +105,10 @@ different precedence rule. See §2.4.
 
 For cache size and idle timeout, unset or empty values use the defaults; nonempty
 caller values are passed through, including `10G`, `20G`, `900`, or idle `0`.
-These helpers do not validate nonempty values. The 40G ceiling allows up to 30G
-more local disk use than the previous 10G ceiling without preallocating it.
-It aims to reduce cache eviction; a build-speed or hit-rate improvement has not
-been measured for this change.
+These helpers do not validate nonempty values. The ceiling was lowered from 40G
+to 15G on 2026-10-23: the lane builds observed that day bypassed sccache, and
+38G of the 40G cache had not been used for a day while the MacBook ran short of
+disk. The ceiling does not preallocate space.
 
 Size and idle settings take effect when the daemon starts. Exporting them does
 not resize or reconfigure an already running daemon. A deliberate restart in a
@@ -145,7 +145,7 @@ On successful activation, `apply_sccache_env` writes five keys on
 the child environment only, on POSIX only (after the `win32` early return):
 `RUSTC_WRAPPER`, `SCCACHE_DIR`, `SCCACHE_CACHE_SIZE`, `SCCACHE_IDLE_TIMEOUT`, and
 `PATH`. The defaults match the shell helper: resolved absolute `sccache`,
-`$HOME/.cache/sccache`, `40G`, and `0`; `PATH` carries the `/opt/homebrew/bin`
+`$HOME/.cache/sccache`, `15G`, and `0`; `PATH` carries the `/opt/homebrew/bin`
 prepend of §1 under the same condition.
 
 Its precedence rule is deliberately **not** `setup_sccache_env`'s. That helper is
@@ -194,28 +194,24 @@ harness assignment/clearing sites:
 |----------|------------------------|
 | `.cargo/config.toml:27` | `rustc-wrapper = ""`: Cargo configuration baseline, no wrapper (§2.1). |
 | `scripts/_defaults.sh:33`, `scripts/_defaults.sh:44-47` | Conditional Homebrew `PATH` prepend; exports `SCCACHE_DIR`, `SCCACHE_CACHE_SIZE`, `SCCACHE_IDLE_TIMEOUT`, and resolved `RUSTC_WRAPPER` (§2.2). |
-| `scripts/build-release.sh:71-74` | Defaults `SCCACHE_CACHE_SIZE` to `40G`; helper failure exports empty `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER`. |
+| `scripts/build-release.sh:71-74` | Defaults `SCCACHE_CACHE_SIZE` to `15G`; helper failure exports empty `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER`. |
 | `scripts/deploy-release.sh:2128-2138` | Same size default and empty wrapper pair on helper failure. |
 | `scripts/build_token.py:622-631` | Eligible POSIX child only: writes `PATH`, `SCCACHE_DIR`, `SCCACHE_CACHE_SIZE`, `SCCACHE_IDLE_TIMEOUT`, and `RUSTC_WRAPPER` (§2.4). |
 | `scripts/ci/run-writer-namespace-windows-targets.sh:8` | Defaults `SCCACHE_IDLE_TIMEOUT` to `0`, preserving nonempty overrides. |
 | `.github/workflows/ci-main.yml:22-25` | Workflow env: `RUSTC_WRAPPER=sccache`, size `10G`, GHA enabled, GHA mode `READ_WRITE`. |
 | `.github/workflows/ci-nightly.yml:20-23` | Same workflow env defaults as `ci-main.yml`. |
 | `.github/workflows/ci-pr.yml:23-28` | Same wrapper, size, and GHA enablement; GHA mode is `READ_ONLY` for PRs and `READ_WRITE` otherwise. |
-| `.github/workflows/ci-pr.yml:919-920`, `.github/workflows/ci-pr.yml:997-998` | Hosted macOS jobs write empty `RUSTC_WRAPPER` and `SCCACHE_GHA_ENABLED` to `$GITHUB_ENV`. |
+| `.github/workflows/ci-pr.yml:504-505`, `.github/workflows/ci-pr.yml:579-580` | Hosted macOS jobs write empty `RUSTC_WRAPPER` and `SCCACHE_GHA_ENABLED` to `$GITHUB_ENV`. |
 | `.github/workflows/ci-nightly.yml:108-109` | Hosted macOS job writes the same empty pair to `$GITHUB_ENV`. |
-| `.github/workflows/ci-macos-trusted.yml:61-62` | Hosted macOS job writes the same empty pair to `$GITHUB_ENV`. |
-| `.github/workflows/ci-pr.yml:2010` | H2 module-map step env sets `RUSTC_WRAPPER=""`. |
-| `scripts/ci/h2_env.py:12-13`, `scripts/ci/h2_env.py:42`, `scripts/ci/h2_env.py:59-60` | H2 child env and emitted shell commands clear all four `WRAPPERS` keys, including `RUSTC_WRAPPER` and `CARGO_BUILD_RUSTC_WRAPPER`. |
 | `scripts/run_relay_authority_mutations.sh:204` | Mutation build command unsets `RUSTC_WRAPPER` with `env -u`. |
 
 Search hits in `tests/` and the dry observer's fixture environment
 (`scripts/check_release_token_wiring.py:67-68`) isolate test children; they are
 not build defaults. `scripts/check-ci-runner-hardening.sh` validates expected
-workflow env rather than setting it. `scripts/ci/h2_session.py:100` reads Cargo
-configuration, and `scripts/install.sh` calls the shared helper (§2.2) without
-its own wrapper assignment. Comments and documentation are not setters. The
-Mozilla action's installed binary and runtime-provided cache environment
-(§2.3) are outside this census of checked-in assignments.
+workflow env rather than setting it, and `scripts/install.sh` calls the shared
+helper (§2.2) without its own wrapper assignment. Comments and documentation
+are not setters. The Mozilla action's installed binary and runtime-provided
+cache environment (§2.3) are outside this census of checked-in assignments.
 
 ---
 
@@ -225,10 +221,10 @@ Mozilla action's installed binary and runtime-provided cache environment
 |-------|-----------------|-------------|---------------|----------------------|------------------------|--------|
 | Local dev (bare `cargo build`) | none by default | disabled | n/a | n/a | n/a | `.cargo/config.toml` |
 | Local dev (manual opt-in) | `sccache` | disabled | inherited or sccache platform default | inherited or upstream `10G` | inherited or upstream `600` | shell env |
-| Campaign worktree build (activation eligible) | resolved `sccache` path | disabled | `$HOME/.cache/sccache` | `40G` | `0` | `build_token.py :: apply_sccache_env` (§2.4) |
-| `scripts/build-release.sh` | resolved `sccache` path | disabled | `$HOME/.cache/sccache` | `40G` | `0` | `.cargo/config.toml` + `setup_sccache_env` |
-| `scripts/deploy-release.sh` | resolved `sccache` path | disabled | `$HOME/.cache/sccache` | `40G` | `0` | `.cargo/config.toml` + `setup_sccache_env` |
-| Installer source build (helper available) | resolved `sccache` path | disabled | `$HOME/.cache/sccache` | `40G` | `0` | `scripts/install.sh` + `setup_sccache_env` |
+| Campaign worktree build (activation eligible) | resolved `sccache` path | disabled | `$HOME/.cache/sccache` | `15G` | `0` | `build_token.py :: apply_sccache_env` (§2.4) |
+| `scripts/build-release.sh` | resolved `sccache` path | disabled | `$HOME/.cache/sccache` | `15G` | `0` | `.cargo/config.toml` + `setup_sccache_env` |
+| `scripts/deploy-release.sh` | resolved `sccache` path | disabled | `$HOME/.cache/sccache` | `15G` | `0` | `.cargo/config.toml` + `setup_sccache_env` |
+| Installer source build (helper available) | resolved `sccache` path | disabled | `$HOME/.cache/sccache` | `15G` | `0` | `scripts/install.sh` + `setup_sccache_env` |
 | CI Linux/Windows (`ci-*.yml`) | `sccache` | disabled | provided by `sccache-action` | workflow `10G` | inherited/upstream | workflow env + action |
 | CI Windows exact targets (`ci-pr.yml` `check_fast_cross_os_targets`) | `sccache` | disabled | provided by `sccache-action` | workflow `10G` | `0` unless set | `scripts/ci/run-writer-namespace-windows-targets.sh` |
 | CI macOS hosted | none | disabled | n/a | n/a | n/a | workflow clears `RUSTC_WRAPPER` + `SCCACHE_GHA_ENABLED` |
@@ -258,10 +254,13 @@ Key rows:
   have built the same deps.
 - `Non-cacheable calls` — build scripts, linker invocations, etc. These do not
   count against hit rate.
-- All-zero counters right after a build mean the stats query reached a fresh
-  server: the previous one exited on its idle timer (600s by default, reset only
-  by new requests). The Windows exact-targets runner defaults
-  `SCCACHE_IDLE_TIMEOUT=0` because its lib-test compile and test runs outlast it.
+- An all-zero block only shows that the queried server has recorded no requests
+  since its stats were last reset; it does not establish why an earlier server
+  exited or whether the build used that server. Capture stats in the same job
+  immediately after the build, and check that the build's wrapper and server
+  configuration point to that server.
+  The Windows exact-targets runner defaults `SCCACHE_IDLE_TIMEOUT=0` because
+  its lib-test compile and test runs outlast the usual 600s idle timeout.
 
 Reset stats between measurements:
 

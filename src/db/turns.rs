@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::db::session_agent_resolution::resolve_agent_id_for_session_pg;
+use crate::db::timestamps::parse_timestamp;
+
+#[cfg(all(test, unix))]
+#[path = "turns/timestamp_tests.rs"]
+mod timestamp_tests;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnTokenUsage {
@@ -81,8 +86,8 @@ pub struct PersistTurnOwned {
     pub provider: Option<String>,
     pub session_id: Option<String>,
     pub dispatch_id: Option<String>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub finished_at: Option<DateTime<Utc>>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
     pub duration_ms: Option<i64>,
     pub token_usage: TurnTokenUsage,
 }
@@ -112,10 +117,16 @@ async fn upsert_turn_owned_pg(pool: &PgPool, entry: &PersistTurnOwned) -> Result
     let provider = normalized_opt(entry.provider.as_deref());
     let session_id = normalized_opt(entry.session_id.as_deref());
     let dispatch_id = normalized_opt(entry.dispatch_id.as_deref());
-    // Bind instants directly. Parsing a local clock string inside PostgreSQL
+    // Bind parsed instants directly. Parsing a local clock string inside PostgreSQL
     // would reinterpret it using the connection's TimeZone.
-    let started_at = entry.started_at.unwrap_or_else(Utc::now);
-    let finished_at = entry.finished_at.unwrap_or_else(Utc::now);
+    let started_at = normalized_opt(entry.started_at.as_deref())
+        .map(|value| parse_timestamp(&value))
+        .transpose()?
+        .unwrap_or_else(Utc::now);
+    let finished_at = normalized_opt(entry.finished_at.as_deref())
+        .map(|value| parse_timestamp(&value))
+        .transpose()?
+        .unwrap_or_else(Utc::now);
     let agent_id = resolve_agent_id_for_session_pg(
         pool,
         entry.agent_id.as_deref(),
@@ -147,8 +158,7 @@ async fn upsert_turn_owned_pg(pool: &PgPool, entry: &PersistTurnOwned) -> Result
             output_tokens
          ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9,
-            $10,
-            $11,
+            $10, $11,
             $12, $13, $14, $15, $16
          )
          ON CONFLICT(turn_id) DO UPDATE SET

@@ -9,7 +9,6 @@ pub(in crate::services::discord) struct WatcherToolState {
     pub current_tool_line: Option<String>,
     /// Previous distinct tool/thinking status for 2-line trail rendering.
     pub prev_tool_status: Option<String>,
-    /// Whether we are currently inside a thinking block
     pub in_thinking: bool,
     /// Whether any tool_use block has been seen in this turn
     pub any_tool_used: bool,
@@ -26,6 +25,7 @@ pub(in crate::services::discord) struct WatcherToolState {
     graph_events: graph_progress::GraphEvents,
     codex_rollout: crate::services::codex_tui::rollout_tail::RolloutRecordDecoder,
     native_codex_enabled: bool,
+    pub summary_outcome: crate::services::discord::turn_end_summary::WatcherOutcome,
 }
 
 impl WatcherToolState {
@@ -43,6 +43,7 @@ impl WatcherToolState {
             graph_events: Default::default(),
             codex_rollout: Default::default(),
             native_codex_enabled: false,
+            summary_outcome: Default::default(),
         }
     }
 
@@ -207,9 +208,7 @@ pub(in crate::services::discord) use native_codex::{
     is_native_codex_payload, read_native_codex_state, watcher_source_witness,
 };
 
-/// Process buffered lines for the tmux watcher.
-/// Extracts text content, tracks tool status, and detects result events.
-/// Returns true if a "result" event was found.
+/// Process buffered watcher lines, tracking text, tools, and terminal events.
 pub(in crate::services::discord) fn process_watcher_lines(
     buffer: &mut String,
     state: &mut StreamLineState,
@@ -284,6 +283,7 @@ pub(in crate::services::discord) fn process_watcher_lines_for_turn(
                 }
                 continue;
             }
+            tool_state.summary_outcome.observe(&val);
             if event_type == "user" && watcher_user_event_is_prompt_boundary(&val) {
                 if outcome.soft_terminal_candidate || !full_response.trim().is_empty() {
                     if !outcome.soft_terminal_candidate {
@@ -334,14 +334,17 @@ pub(in crate::services::discord) fn process_watcher_lines_for_turn(
                                     .unwrap_or(0),
                             );
                         }
-                        // Text content from assistant message
+                        // Visible content from assistant message
                         if let Some(content) = message.get("content") {
                             if let Some(arr) = content.as_array() {
                                 for block in arr {
                                     let block_type = block.get("type").and_then(|t| t.as_str());
-                                    if block_type == Some("text") {
+                                    if block_type == Some("text")
+                                        || (block_type == Some("thinking")
+                                            && crate::services::claude_tui::transcript_tail::visible_assistant_block_text(block).is_some())
+                                    {
                                         if let Some(text) =
-                                            block.get("text").and_then(|t| t.as_str())
+                                            crate::services::claude_tui::transcript_tail::visible_assistant_block_text(block)
                                         {
                                             // #4275: the watcher/jsonl path emits each
                                             // assistant text block as a discrete event
@@ -740,6 +743,10 @@ fn strip_leading_tui_response_chrome_in_place(
 #[cfg(test)]
 #[path = "tmux_output_stream/tests/compact_summary_tests.rs"]
 mod compact_summary_tests;
+
+#[cfg(test)]
+#[path = "tmux_output_stream/tests/section_replay_tests.rs"]
+mod section_replay_tests;
 
 #[cfg(test)]
 mod tests {

@@ -16,6 +16,7 @@ mod part_08;
 mod part_09;
 mod part_10;
 mod part_11;
+mod public_surfaces;
 mod session_evidence;
 
 pub(super) fn all() -> Vec<EndpointDoc> {
@@ -34,6 +35,7 @@ pub(super) fn all() -> Vec<EndpointDoc> {
     endpoints.extend(campaign_graph::endpoints());
     endpoints.extend(campaign_operations::endpoints());
     endpoints.extend(managed_checks::endpoints());
+    endpoints.extend(public_surfaces::endpoints());
     endpoints.extend(cluster_execution::endpoints());
     endpoints.extend(kakao_calendar::endpoints());
     endpoints.extend(session_evidence::endpoints());

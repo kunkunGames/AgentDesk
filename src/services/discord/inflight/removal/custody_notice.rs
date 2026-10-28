@@ -3,7 +3,6 @@
 
 use super::boot_custody::sha;
 use crate::services::discord::bot_role::UtilityBotRole;
-use crate::services::discord::input_runtime::fence::{self, BootTarget};
 use crate::services::discord::outbound::DISCORD_SAFE_LIMIT_CHARS;
 use crate::services::discord::{ProviderKind, runtime_store};
 use crate::services::message_outbox::{
@@ -15,13 +14,14 @@ use sqlx::PgPool;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub(super) mod retention;
+
 const FAILED: &str =
     "보존 실패: 일부 사본을 남기지 못했습니다. 보존본의 manifest에 원본 위치와 오류가 있습니다.";
 
 /// One custody episode's notice: its outbox target, session key, sending bot and text.
 #[derive(Debug)]
 pub(super) struct Notice {
-    pub(super) channel: u64,
     pub(super) target: String,
     pub(super) session: String,
     pub(super) bot: String,
@@ -41,12 +41,19 @@ pub(super) fn spawn_boot_custody_notice(provider: &ProviderKind, pool: Option<Pg
     });
 }
 
-/// Enqueues every notice in `custody` and returns how many PostgreSQL holds; failures only log.
+/// Recovers undelivered notices and retires expired delivered custody; failures only log.
 pub(super) async fn enqueue_custody_notices(
     custody: &Path,
     provider: &ProviderKind,
     pool: Option<&PgPool>,
 ) -> usize {
+    let _lock = match retention::lock(custody, false) {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(provider = provider.as_str(), %error, "custody notices wait for custody lock");
+            return 0;
+        }
+    };
     let notices = notices(custody, provider);
     let Some(pool) = pool else {
         if !notices.is_empty() {
@@ -58,12 +65,34 @@ pub(super) async fn enqueue_custody_notices(
         }
         return 0;
     };
-    let mut enqueued = 0;
+    let (mut enqueued, mut removed, mut bytes) = (0, 0, 0u64);
     for notice in &notices {
-        if notice_input_protected(provider, notice.channel) {
-            continue;
-        }
         let (session, dir) = (notice.session.as_str(), notice.dir.display());
+        match retention::terminal(pool, notice).await {
+            Ok(Some(sent_at)) => {
+                if let Some(sent_at) = sent_at {
+                    match retention::remove_expired(
+                        &notice.dir,
+                        sent_at.into(),
+                        std::time::SystemTime::now(),
+                    ) {
+                        Ok(Some(size)) => {
+                            removed += 1;
+                            bytes += size;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(%dir, %error, "terminal custody retained after cleanup error")
+                        }
+                    }
+                }
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%session, %error, "custody delivery state unknown");
+            }
+        }
         let message = OutboxMessage {
             target: &notice.target,
             content: &notice.text,
@@ -82,34 +111,19 @@ pub(super) async fn enqueue_custody_notices(
         };
         enqueued += 1;
         tracing::info!(provider = provider.as_str(), %session, %dir, "custody notice held by the outbox");
-        #[cfg(test)]
-        AFTER_ENQUEUE.with(|hook| {
-            if let Some(hook) = hook.borrow_mut().take() {
-                hook();
-            }
-        });
-        if notice_input_protected(provider, notice.channel) {
-            continue;
-        }
         if notice.bot != UtilityBotRole::Notify.alias() {
             readdress(pool, id, &notice.bot).await;
         }
     }
+    if removed != 0 {
+        tracing::info!(
+            provider = provider.as_str(),
+            removed,
+            bytes,
+            "custody retention removed"
+        );
+    }
     enqueued
-}
-
-fn notice_input_protected(provider: &ProviderKind, channel: u64) -> bool {
-    let target = if channel == 0 {
-        BootTarget::Unknown
-    } else {
-        BootTarget::Channel(provider, channel)
-    };
-    fence::boot_skip(target)
-}
-
-#[cfg(test)]
-thread_local! {
-    pub(super) static AFTER_ENQUEUE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Moves a row a copy-less pass staged for the notify bot to the provider bot while no worker has
@@ -142,6 +156,9 @@ pub(super) fn notices(custody: &Path, provider: &ProviderKind) -> Vec<Notice> {
     dirs.sort();
     let mut notices = Vec::new();
     for dir in dirs {
+        if !fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
+            continue;
+        }
         match episode_notice(&dir, provider) {
             Ok(notice) => notices.extend(notice),
             Err((step, cause)) => {
@@ -159,7 +176,11 @@ fn episode_notice(
     dir: &Path,
     provider: &ProviderKind,
 ) -> Result<Option<Notice>, (&'static str, String)> {
-    let marker = fs::read(dir.join("episode.json"));
+    let marker = dir.join("episode.json");
+    if !fs::symlink_metadata(&marker).is_ok_and(|meta| meta.is_file()) {
+        return Err(("read episode.json", "not a regular file".to_string()));
+    }
+    let marker = fs::read(marker);
     let marker = marker.map_err(|error| ("read episode.json", error.to_string()))?;
     let marker = serde_json::from_slice::<Value>(&marker);
     let marker = marker.map_err(|error| ("parse episode.json", error.to_string()))?;
@@ -185,7 +206,6 @@ fn episode_notice(
     let (bot, dir) = (bot.into_owned(), dir.to_path_buf());
     let text = notice_text(provider.as_str(), &dir);
     Ok(Some(Notice {
-        channel,
         target,
         session,
         bot,
@@ -196,11 +216,18 @@ fn episode_notice(
 
 /// `field` of the episode's first row or pending-start copy that names it.
 fn copied(dir: &Path, field: &str) -> Option<String> {
-    let revisions = fs::read_dir(dir).into_iter().flatten().flatten();
+    let revisions = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|rev| rev.file_type().is_ok_and(|kind| kind.is_dir()));
     let copies = revisions.flat_map(|rev| fs::read_dir(rev.path()).into_iter().flatten().flatten());
     let mut copies: Vec<PathBuf> = copies.map(|copy| copy.path()).collect();
     let routed = |name: &str| name.ends_with("-row.json") || name.ends_with("-pending_start.json");
-    copies.retain(|copy| routed(&copy.to_string_lossy()));
+    copies.retain(|copy| {
+        routed(&copy.to_string_lossy())
+            && fs::symlink_metadata(copy).is_ok_and(|meta| meta.is_file())
+    });
     copies.sort();
     copies.iter().find_map(|copy| {
         let copy: Value = serde_json::from_slice(&fs::read(copy).ok()?).ok()?;
@@ -226,9 +253,13 @@ fn notice_text(provider: &str, dir: &Path) -> String {
 
 /// Whether the newest published custody revision copied everything it attempted.
 fn preserved_completely(dir: &Path) -> bool {
-    let revisions = fs::read_dir(dir).into_iter().flatten().flatten();
+    let revisions = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|rev| rev.file_type().is_ok_and(|kind| kind.is_dir()));
     let mut manifests: Vec<PathBuf> = revisions.map(|r| r.path().join("manifest.json")).collect();
-    manifests.retain(|manifest| manifest.is_file());
+    manifests.retain(|manifest| fs::symlink_metadata(manifest).is_ok_and(|meta| meta.is_file()));
     manifests.sort();
     let newest = manifests.last().and_then(|m| fs::read(m).ok());
     let newest = newest.and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());

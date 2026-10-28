@@ -78,7 +78,7 @@ async fn reconciliation_candidates(pool: &PgPool) -> Result<Vec<String>> {
               WHERE review.owner_campaign_id=s.campaign_id AND review.status='failed' AND ({review_task}) AND ({unsettled_review}))
          ORDER BY s.last_reconciled_at NULLS FIRST,s.campaign_id LIMIT 32",
     );
-    Ok(sqlx::query_scalar::<_, String>(&query)
+    Ok(sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(query))
         .fetch_all(pool)
         .await?)
 }

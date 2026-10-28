@@ -1,11 +1,11 @@
 //! A managed writer stops with its actor and admitted POST joined, and only then frees its channel
-//! for the next writer; a supervisor runs one writer generation of a channel at a time.
+//! for the next writer.
 
 use super::*;
-use crate::services::cluster::home_supervisor::{
-    Generation, HomeBundle, Phase, Refused, Settled, StopReason, Supervisor,
-};
 use crate::services::tui_o::writer::host::{ManagedWriterHandle, WriterStopped, start_managed};
+
+#[path = "restart_replay_host_tests.rs"]
+mod restart_replay;
 
 #[tokio::test(start_paused = true)]
 async fn operator_resume_managed_restart_joins_old_generation_and_runs_approved_retry() {
@@ -30,7 +30,6 @@ async fn operator_resume_managed_restart_joins_old_generation_and_runs_approved_
             .has(CHANNEL, &WriterAlarm::Blocked { status: 403 })
     );
     let old = handles.pop().unwrap();
-    let generation = old.generation();
     old.stop_and_join().await.unwrap();
     assert!(!ready.is_hosted(CHANNEL) && !ready.accepts(CHANNEL));
     let mut unapproved = managed(&harness, &io, &ready);
@@ -54,6 +53,13 @@ async fn operator_resume_managed_restart_joins_old_generation_and_runs_approved_
         .open(&ledger)
         .unwrap();
     held.try_lock().unwrap();
+    let era = harness.store.read_era().unwrap().unwrap();
+    let locked_recovery = harness.store.open_channel(&era, CHANNEL).err().unwrap();
+    assert_eq!(
+        locked_recovery.io,
+        Some(std::io::ErrorKind::WouldBlock),
+        "the held ledger lock makes recovery transiently fail"
+    );
     let mut locked = managed(&harness, &io, &ready);
     assert_eq!(
         locked.len(),
@@ -61,17 +67,22 @@ async fn operator_resume_managed_restart_joins_old_generation_and_runs_approved_
         "a host really attempts recovery under the CLI lock"
     );
     polls(3).await;
-    assert!(io.alarms.0.lock().unwrap().iter().any(|(_, alarm)|
-        matches!(alarm, WriterAlarm::Halted { detail } if detail.contains("WouldBlock"))));
+    assert!(ready.is_hosted(CHANNEL));
+    assert!(
+        io.alarms.halted().is_empty(),
+        "a passing boot lock must not hold the writer"
+    );
     assert_eq!(std::fs::read(&ledger).unwrap(), before);
     assert_eq!(harness.port.posts(), ["original bytes"]);
     assert!(!ready.accepts(CHANNEL));
-    locked.pop().unwrap().stop_and_join().await.unwrap();
     drop(held);
-    let mut approved = managed(&harness, &io, &ready);
-    assert_eq!(approved.len(), 1);
-    assert_ne!(approved[0].generation(), generation);
+    tokio::time::advance(crate::services::tui_o::writer::resume::FIRST_WAIT).await;
     polls(3).await;
+    polls(3).await;
+    assert!(
+        ready.is_hosted(CHANNEL),
+        "the locked host resumes after unlock"
+    );
     assert_eq!(harness.port.posts(), ["original bytes", "original bytes"]);
     let channel = harness.channel();
     assert_eq!(
@@ -94,64 +105,8 @@ async fn operator_resume_managed_restart_joins_old_generation_and_runs_approved_
         harness.port.posts(),
         ["original bytes", "original bytes", "later"]
     );
-    approved.pop().unwrap().stop_and_join().await.unwrap();
+    locked.pop().unwrap().stop_and_join().await.unwrap();
     assert!(!ready.accepts(CHANNEL));
-}
-
-// `agentdesk o resume` only records the approval; the next managed writer sends the refused piece
-// once, then later output, and a repeated command reports the consumed approval.
-#[tokio::test(start_paused = true)]
-async fn operator_resume_cli_approval_is_sent_once_by_the_next_managed_writer() {
-    let _selected = test_override::force_candidates(&[(CHANNEL, ClaudeTui)]);
-    let (harness, path) = fresh(startup);
-    harness.gate.acquired();
-    let (io, ready) = (TestIo::over(&harness), Arc::new(Readiness::default()));
-    let refusal = Reply::Refused(403);
-    harness.port.replies.lock().unwrap().push_back(refusal);
-    let mut refused = managed(&harness, &io, &ready);
-    assert_eq!(refused.len(), 1);
-    polls(3).await;
-    append(&path, &row("refused", "original bytes"));
-    polls(3).await;
-    refused.pop().unwrap().stop_and_join().await.unwrap();
-    let (root, channel) = (root(&harness), CHANNEL.to_string());
-    let status = ["o", "status", "--channel", &channel];
-    let (code, shown, _) = crate::cli::o::tests::run_cli(&root, &status);
-    assert_eq!(code, Some(0));
-    assert!(shown.contains("approval absent"), "{shown}");
-    let resume = [
-        "o",
-        "resume",
-        "--channel",
-        &channel,
-        "--rejected-serial",
-        "0",
-    ];
-    let approve = |reason| [&resume[..], &["--reason", reason]].concat();
-    let (code, _, error) = crate::cli::o::tests::run_cli(&root, &approve("restored"));
-    assert_eq!(code, Some(0), "{error}");
-    assert_eq!(
-        harness.port.posts(),
-        ["original bytes"],
-        "the CLI posts nothing"
-    );
-    let mut approved = managed(&harness, &io, &ready);
-    assert_eq!(approved.len(), 1, "a writer really started after the CLI");
-    polls(3).await;
-    assert_eq!(harness.port.posts(), ["original bytes", "original bytes"]);
-    append(&path, &row("following", "later"));
-    polls(3).await;
-    let sent = ["original bytes", "original bytes", "later"];
-    assert_eq!(harness.port.posts(), sent);
-    approved.pop().unwrap().stop_and_join().await.unwrap();
-    let (code, _, error) = crate::cli::o::tests::run_cli(&root, &approve("again"));
-    assert_eq!(code, Some(3), "{error}");
-    assert!(error.contains("(consumed by serial 1)"), "{error}");
-    let (_, shown, _) = crate::cli::o::tests::run_cli(&root, &status);
-    assert!(
-        shown.contains("approval consumed by serial 1 Posted("),
-        "{shown}"
-    );
 }
 
 fn managed(
@@ -413,8 +368,6 @@ async fn a_stop_during_port_wait_releases_the_claim_without_starting_an_actor() 
     }
 }
 
-struct Writers(Vec<ManagedWriterHandle>);
-
 #[tokio::test(start_paused = true)]
 async fn dropping_a_managed_handle_stops_its_writer_and_keeps_the_legacy_adapter_detached() {
     let _selected = test_override::force_candidates(&[(CHANNEL, ClaudeTui)]);
@@ -436,73 +389,4 @@ async fn dropping_a_managed_handle_stops_its_writer_and_keeps_the_legacy_adapter
     );
     detached.abort();
     let _ = detached.await;
-}
-
-impl HomeBundle for Writers {
-    async fn stop_and_join(self, _: StopReason) -> Settled {
-        for writer in self.0 {
-            if let Err(detail) = writer.stop_and_join().await {
-                return Settled::Stuck(detail);
-            }
-        }
-        Settled::Joined
-    }
-}
-
-// Overlapping starts of a channel build one writer generation; a replacement joins the old writer
-// before the new one is built, and a stale generation's stop leaves the current one running.
-#[tokio::test(start_paused = true)]
-async fn a_supervised_channel_runs_one_writer_generation_at_a_time() {
-    let _selected = test_override::force_candidates(&[(CHANNEL, ClaudeTui)]);
-    let (harness, path) = fresh(startup);
-    harness.gate.acquired();
-    p5::set_test_root(Some(harness._runtime.path()));
-    let (io, ready) = (TestIo::over(&harness), Arc::new(Readiness::default()));
-    let supervisor = Arc::new(Supervisor::<Writers>::default());
-    // Each build records whether the channel was still hosted when it began.
-    let builds = Arc::new(Mutex::new(Vec::new()));
-    let build = || {
-        let (io, ready, builds) = (Arc::clone(&io), Arc::clone(&ready), Arc::clone(&builds));
-        let (root, gate) = (root(&harness), Arc::clone(&harness.gate));
-        move |generation: Generation| async move {
-            builds
-                .lock()
-                .unwrap()
-                .push((generation, ready.is_hosted(CHANNEL)));
-            let parts = || HostParts {
-                io,
-                runtime_root: Some(root),
-                gate,
-                readiness: ready,
-            };
-            let owned = cutover::boot_ownership();
-            let writers = start_managed(ShadowProvider::Claude, true, owned, parts);
-            let hosted = writers.len() == 1;
-            hosted
-                .then_some(Writers(writers))
-                .ok_or("not hosted".into())
-        }
-    };
-
-    let first = supervisor.start(CHANNEL, build());
-    let second = supervisor.start(CHANNEL, build());
-    assert_eq!(first.await, Ok(1));
-    assert_eq!(second.await, Err(Refused::Busy(Phase::Starting(1))));
-    polls(3).await;
-    append(&path, &row("m1", "first"));
-    polls(3).await;
-
-    assert_eq!(supervisor.start(CHANNEL, build()).await, Ok(2));
-    assert_eq!(*builds.lock().unwrap(), [(1, false), (2, false)]);
-    let stale = supervisor.stop(CHANNEL, Some(1), StopReason::RowGone).await;
-    assert_eq!(stale, Some(Phase::Running(2)));
-    polls(3).await;
-    append(&path, &row("m2", "second"));
-    polls(3).await;
-    assert_eq!(harness.port.posts(), ["first", "second"]);
-    assert!(ready.accepts(CHANNEL), "the current generation still runs");
-
-    let stopped = supervisor.stop(CHANNEL, None, StopReason::Sigterm).await;
-    assert_eq!(stopped, None);
-    assert!(!ready.is_hosted(CHANNEL));
 }

@@ -82,6 +82,7 @@ pub(super) struct RuntimeHandoffLoopContext<'a> {
     pub(super) done: bool,
     pub(super) persisted_inflight_baseline: &'a InflightTurnState,
     pub(super) adk_session_name: &'a Option<String>,
+    pub(super) captured_nonce: Option<&'a str>,
 }
 
 pub(super) struct RuntimeHandoffLoopState<'a> {
@@ -155,6 +156,15 @@ pub(super) async fn handle_runtime_handoff_loop_message(
     let channel_id = ctx.channel_id;
     let done = ctx.done;
     let adk_session_name = ctx.adk_session_name;
+    // Every stamp below reads its nonce from this local, so it must still be the actor's episode.
+    if !state.inflight_state.owned_by_turn_nonce(ctx.captured_nonce) {
+        return RuntimeHandoffLoopOutcome {
+            guarded_save_outcome: Some(
+                crate::services::discord::inflight::GuardedSaveOutcome::SuccessorOwned,
+            ),
+            retry_message: None,
+        };
+    }
 
     let mut terminal_control_ready_observed = *state.terminal_control_ready_observed;
     let mut tmux_last_offset = *state.tmux_last_offset;
@@ -905,7 +915,8 @@ pub(super) async fn handle_runtime_handoff_loop_message(
                 &inflight_state,
                 adk_session_name.as_deref(),
                 &mut last_activity_heartbeat_at,
-            );
+            )
+            .await;
             state_dirty = true;
         }
     }
@@ -965,3 +976,6 @@ pub(super) async fn handle_runtime_handoff_loop_message(
         guarded_save_outcome,
     }
 }
+
+#[cfg(all(test, unix))]
+pub(in crate::services::discord) use tests::codex_replacement::adopt_codex_replacement_for_test;

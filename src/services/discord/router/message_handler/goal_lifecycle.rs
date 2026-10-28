@@ -132,9 +132,12 @@ pub(super) async fn send_codex_goal_lifecycle_notice(
     command: GoalLifecycleCommand,
     active_turn: bool,
 ) {
-    let notice = codex_goal_lifecycle_notice(command, active_turn);
+    let notice = crate::services::discord::session_notice::subtext(
+        "ℹ️",
+        codex_goal_lifecycle_notice(command, active_turn),
+    );
     rate_limit_wait(shared, channel_id).await;
-    if let Err(error) = channel_id.say(http, notice).await {
+    if let Err(error) = channel_id.say(http, &notice).await {
         tracing::warn!(
             channel_id = channel_id.get(),
             command = command.as_str(),
@@ -148,7 +151,7 @@ pub(super) async fn send_codex_goal_lifecycle_notice(
             &target,
             session_key.as_deref(),
             codex_goal_lifecycle_reason_code(command, active_turn),
-            notice,
+            &notice,
         );
     }
 }
@@ -161,30 +164,7 @@ pub(super) async fn consume_codex_goal_lifecycle_command(
     command: GoalLifecycleCommand,
     stale_session_id: Option<String>,
 ) {
-    let permit = if matches!(command, GoalLifecycleCommand::Clear) {
-        match crate::services::cluster::channel_home::admit_command(
-            &channel_id.get().to_string(),
-            provider.as_str(),
-        ) {
-            Ok(permit) => permit,
-            Err(reason) => {
-                super::super::super::admin_host_guard::ManagedReset::Refused(reason.to_string())
-                    .report(http, channel_id, "/goal clear")
-                    .await;
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    #[cfg(test)]
-    let permit = if crate::services::cluster::channel_home::command_mutant("goal_permit_removed") {
-        drop(permit);
-        None
-    } else {
-        permit
-    };
-    crate::services::cluster::channel_home::command_scope(permit, async {
+    {
         let active_turn = shared
             .mailbox(channel_id)
             .has_active_turn()
@@ -205,16 +185,13 @@ pub(super) async fn consume_codex_goal_lifecycle_command(
             if reset.report(http, channel_id, "/goal clear").await {
                 return;
             }
-            #[cfg(test)]
-            super::super::super::commands::control::home_fence::pause("goal_stale").await;
             if let Some(session_id) = stale_session_id.as_deref() {
                 let _ = super::super::super::internal_api::clear_stale_session_id(session_id).await;
             }
         }
 
         send_codex_goal_lifecycle_notice(http, shared, channel_id, command, active_turn).await;
-    })
-    .await;
+    };
 }
 
 pub(super) async fn record_fresh_session_context_boundary(
@@ -267,56 +244,84 @@ mod codex_goal_lifecycle_unit_tests {
         );
     }
 
-    fn durable_boundary_call() -> String {
-        format!("{}{}", "record_fresh_session_", "context_boundary(")
+    const INTAKE_TURN: &str = include_str!("intake_turn.rs");
+    const HEADLESS_TURN: &str = include_str!("headless_turn.rs");
+    const GOAL_LIFECYCLE: &str = include_str!("goal_lifecycle.rs");
+    const INTAKE_BRANCH: &str =
+        "let force_fresh_provider_session = matches!(turn_goal_kind, GoalCommandKind::FreshStart);";
+    const HEADLESS_BRANCH: &str =
+        "let goal_fresh = matches!(headless_goal_kind, GoalCommandKind::FreshStart);";
+    const BOUNDARY: &str = "record_fresh_session_context_boundary(";
+    const PROVIDER_CLEAR: &str = "clear_codex_goal_start_provider_session(";
+    const HELPER: &str = "pub(super) async fn record_fresh_session_context_boundary(";
+    const DB_BOUNDARY: &str = "crate::db::session_transcripts::record_channel_clear_boundary(";
+
+    /// Classification 2: after the goal-fresh branch, the durable boundary is called as
+    /// written before the provider clear, comments excluded. A lexical tripwire.
+    fn boundary_before_clear_gaps(source: &str, branch_start: &str) -> Vec<String> {
+        use crate::services::discord::router::source_guard_support::Lexed;
+        let source = Lexed::new(source);
+        let Some(branch) = source.find(branch_start) else {
+            return vec![format!("missing goal-fresh branch: {branch_start}")];
+        };
+        match (
+            source.find_after(branch, BOUNDARY),
+            source.find_after(branch, PROVIDER_CLEAR),
+        ) {
+            (Some(boundary), Some(clear)) if boundary < clear => Vec::new(),
+            found => vec![format!(
+                "durable boundary must precede provider clear: {found:?}"
+            )],
+        }
     }
 
-    fn assert_goal_fresh_records_before_provider_clear(source: &str, branch_start: &str) {
-        let branch = source
-            .find(branch_start)
-            .unwrap_or_else(|| panic!("missing goal-fresh branch: {branch_start}"));
-        let boundary = source[branch..]
-            .find(&durable_boundary_call())
-            .map(|offset| branch + offset)
-            .expect("goal-fresh branch must record a durable transcript boundary");
-        let provider_clear = source[branch..]
-            .find("clear_codex_goal_start_provider_session(")
-            .map(|offset| branch + offset)
-            .expect("goal-fresh branch must clear the provider session");
-
-        assert!(
-            boundary < provider_clear,
-            "durable /goal fresh boundary must be recorded before provider state is cleared"
-        );
+    /// The helper body itself, not a later item, persists the durable channel boundary.
+    fn helper_gaps(source: &str) -> Vec<String> {
+        use crate::services::discord::router::source_guard_support::Lexed;
+        match Lexed::new(source).block(HELPER) {
+            Some(helper) if helper.contains(DB_BOUNDARY) => Vec::new(),
+            _ => vec!["fresh-session helper must persist the durable channel boundary".into()],
+        }
     }
 
     #[test]
     fn goal_fresh_intake_and_headless_paths_record_durable_boundary_before_clear() {
-        assert_goal_fresh_records_before_provider_clear(
-            include_str!("intake_turn.rs"),
-            "let force_fresh_provider_session = matches!(turn_goal_kind, GoalCommandKind::FreshStart);",
+        let none = Vec::<String>::new();
+        assert_eq!(boundary_before_clear_gaps(INTAKE_TURN, INTAKE_BRANCH), none);
+        assert_eq!(
+            boundary_before_clear_gaps(HEADLESS_TURN, HEADLESS_BRANCH),
+            none
         );
-        assert_goal_fresh_records_before_provider_clear(
-            include_str!("headless_turn.rs"),
-            "let goal_fresh = matches!(headless_goal_kind, GoalCommandKind::FreshStart);",
-        );
+        assert_eq!(helper_gaps(GOAL_LIFECYCLE), none);
+    }
 
-        let helper_source = include_str!("goal_lifecycle.rs");
-        let helper_start = format!(
-            "{}{}",
-            "pub(super) async fn record_fresh_session_", "context_boundary("
-        );
-        let helper = helper_source
-            .find(&helper_start)
-            .expect("fresh-session boundary helper exists");
-        let db_boundary_call = format!(
-            "{}{}",
-            "crate::db::session_transcripts::record_channel_", "clear_boundary("
-        );
-        assert!(
-            helper_source[helper..].contains(&db_boundary_call),
-            "fresh-session helper must persist the durable channel boundary"
-        );
+    #[test]
+    fn goal_fresh_guards_reject_commented_and_reordered_boundaries() {
+        use crate::services::discord::router::source_guard_support::{forge, swap};
+        use crate::test_support::CommentForgery;
+        for forgery in CommentForgery::ALL {
+            for (source, branch) in [
+                (INTAKE_TURN, INTAKE_BRANCH),
+                (HEADLESS_TURN, HEADLESS_BRANCH),
+            ] {
+                for needle in [branch, BOUNDARY, PROVIDER_CLEAR] {
+                    let forged = forge(source, needle, forgery);
+                    assert!(forged.contains(needle));
+                    let gaps = boundary_before_clear_gaps(&forged, branch);
+                    assert!(!gaps.is_empty(), "{forgery:?} `{needle}` passes");
+                }
+            }
+            for needle in [HELPER, DB_BOUNDARY] {
+                let forged = forge(GOAL_LIFECYCLE, needle, forgery);
+                assert!(forged.contains(needle));
+                assert!(
+                    !helper_gaps(&forged).is_empty(),
+                    "{forgery:?} `{needle}` passes"
+                );
+            }
+        }
+        let clear_first = swap(INTAKE_TURN, BOUNDARY, PROVIDER_CLEAR);
+        assert!(!boundary_before_clear_gaps(&clear_first, INTAKE_BRANCH).is_empty());
     }
 }
 
@@ -453,67 +458,5 @@ mod host_guard_tests {
             crate::services::session_backend::remove_process_session(&name);
         }
         db.drop().await;
-    }
-}
-
-#[cfg(test)]
-mod d2b_tests {
-    use super::*;
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn d2b_goal_clear_holds_home_through_stale_cleanup() {
-        use crate::services::discord::admin_host_guard::tests::{Recorder, api_child};
-        if !api_child(
-            "services::discord::router::message_handler::goal_lifecycle::d2b_tests::d2b_goal_clear_holds_home_through_stale_cleanup",
-        ) {
-            return;
-        }
-        let api = Recorder::start().await;
-        crate::services::discord::internal_api::init(api.port, None);
-        let http = api.http.clone();
-
-        let root = tempfile::tempdir().unwrap();
-        let _env = crate::config::TestEnvVarGuard::set_path("AGENTDESK_ROOT_DIR", root.path());
-        use crate::services::cluster::channel_home;
-        use crate::services::discord::commands::control::home_fence::PAUSE;
-        let shared = crate::services::discord::make_shared_data_for_tests_with_storage(None);
-        let channel = ChannelId::new(9200000000000114);
-        let home = channel_home::register_for_test(
-            channel.get(),
-            Some(crate::db::o_channel_homes::HomeState::Worker),
-        );
-        let barrier = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
-        PAUSE.with(|slot| *slot.borrow_mut() = Some(("goal_stale", barrier.clone())));
-        let owner = shared.clone();
-        let work = tokio::spawn(async move {
-            consume_codex_goal_lifecycle_command(
-                &http,
-                &owner,
-                &ProviderKind::Gemini,
-                channel,
-                GoalLifecycleCommand::Clear,
-                Some("d2b-stale".into()),
-            )
-            .await;
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(10), barrier.0.notified())
-            .await
-            .expect("effect boundary reached");
-        home.close_intake();
-        assert_eq!(
-            home.commands_in_flight(),
-            1,
-            "reset returned but stale cleanup is still outstanding"
-        );
-        barrier.1.notify_one();
-        work.await.unwrap();
-        assert_eq!(home.commands_in_flight(), 0);
-        assert!(
-            api.take()
-                .iter()
-                .any(|call| call.contains("clear-stale-session-id") && call.contains("d2b-stale")),
-            "stale DB route actually reached"
-        );
-        PAUSE.with(|slot| *slot.borrow_mut() = None);
     }
 }

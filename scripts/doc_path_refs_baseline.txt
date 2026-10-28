@@ -1,0 +1,2 @@
+# doc<TAB>ref pairs that scripts/check_doc_path_refs.py reports without failing.
+# It only shrinks (BASELINE_MAX_ENTRIES); fix the doc instead of adding a line.

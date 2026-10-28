@@ -465,7 +465,7 @@ async fn v26_campaign_migrations_and_named_guards_are_installed_pg() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(latest_version, 146);
+    assert_eq!(latest_version, 158);
     assert_eq!(failed_count, 0);
     assert!(
         crate::db::postgres::applied_migration_checksum_mismatch_details(&pool)

@@ -20,8 +20,9 @@
   [Mac mini operations record](../24x7-native-v5/MAC-MINI-OPERATIONS-2026-09-28.md)
   records the existing Qwen/OpenCode routine migration and actual run outcomes.
 - [`api-friction-extraction-plan.md`](api-friction-extraction-plan.md) —
-  subdomain map and ordered extraction issues for splitting the giant
-  `src/services/api_friction.rs` service module (#1789).
+  subdomain map and ordered extraction issues for splitting the former giant
+  `src/services/api_friction.rs` (removed) service module into
+  `src/services/api_friction/` (#1789).
 - [`auto-queue-db-extraction-plan.md`](auto-queue-db-extraction-plan.md) —
   subdomain map and ordered extraction issues for splitting the giant
   `src/db/auto_queue/` persistence module family (#1783).
@@ -33,9 +34,17 @@
 - [`dispatch-mod-extraction-plan.md`](dispatch-mod-extraction-plan.md) —
   subdomain map and ordered extraction issues for shrinking
   `src/dispatch/mod.rs` into a facade (#1785).
+- [`herdr-runbook.md`](herdr-runbook.md) — Herdr operations runbook (#5340):
+  hosting limits, admission and O-readiness conditions, and operator checks.
+- [`herdr-user-default.md`](herdr-user-default.md) — `mode: user_default`
+  herdr server configuration, which attaches to the node user's existing herdr
+  server instead of a dedicated one.
+- [`idle-kill-owner-recovery.md`](idle-kill-owner-recovery.md) — how idle-kill
+  skips and later recovers remote session owners whose origin or heartbeat is
+  missing.
 - [`kanban-extraction-plan.md`](kanban-extraction-plan.md) — subdomain map and
-  ordered extraction issues for shrinking `src/kanban.rs` into a facade
-  (#1787).
+  ordered extraction issues for shrinking the former `src/kanban.rs` (removed)
+  into the `src/kanban/` facade (#1787).
 - [`discord-outbound-migration.md`](discord-outbound-migration.md) — five
   production callsite families for Discord outbound (#1006). Each row marks
   `migrated | legacy | unknown`. New sends MUST use the v3 outbound; legacy
@@ -52,6 +61,9 @@
   moving AgentDesk from one dcserver node to leader/worker execution, including
   single-node assumptions, side-effect ownership, invariants, and #876-#884
   test gates.
+- [`multinode-two-node-smoke.md`](multinode-two-node-smoke.md) — two-node
+  smoke that separates CI-reproducible multinode invariants from the physical
+  two-machine runtime check.
 - [`opencode-usability-spec.md`](opencode-usability-spec.md) — implementation
   contract for raising OpenCode's Discord-facing usability toward Claude/Codex
   parity, including prompt/output safety, SSE text handling, and MCP sync.
@@ -66,10 +78,11 @@
 
 ## Generated Companions (read-only)
 
-- `docs/generated/module-inventory.md` ([generation policy](../generated/README.md)) —
-  an untracked checkout-local view of every Rust module with line count and giant-file flag.
-  Generate it with the command below before reading it. Source of truth for
-  the giant-file list in `change-surfaces.md`.
+- `docs/generated/module-inventory.md` — every Rust module with line count
+  and giant-file flag. Source of truth for the giant-file list in
+  `change-surfaces.md`. It is an untracked checkout-local view (see
+  [`docs/generated/README.md`](../generated/README.md)); build it with the
+  command below before reading it.
 - [`docs/generated/route-inventory.md`](../generated/route-inventory.md) — HTTP
   routes and the file/line where each is registered.
 - [`docs/generated/worker-inventory.md`](../generated/worker-inventory.md) —
@@ -82,8 +95,7 @@ python3 scripts/generate_inventory_docs.py
 ```
 
 The generator reads giant-file issue state from the checked-in
-`scripts/giant_file_issue_metadata.json` snapshot. **Refresh that snapshot at
-least every 30 days** with:
+`scripts/giant_file_issue_metadata.json` snapshot. Refresh stale planning information when useful with:
 
 ```bash
 python3 scripts/refresh_giant_file_issue_metadata.py
@@ -91,10 +103,8 @@ git add scripts/giant_file_issue_metadata.json
 git commit -m "chore(ci): refresh giant-file issue snapshot"
 ```
 
-**Snapshots older than 30 days are fatal** — CI will fail with a ParseError
-until the snapshot is manually re-verified and refreshed. This ensures the
-gate does not silently pass stale issue state; operators must actively confirm
-GitHub-checked-in state matches at least once per month.
+Snapshots older than 30 days warn. Stale issue state, overdue deadlines and
+missing planning fields do not require bookkeeping changes for CI to pass.
 
 Manually maintained (not emitted by `generate_inventory_docs.py`):
 
@@ -126,23 +136,27 @@ presence check only; reviewers still confirm the content was refreshed. CI runs
 this gate in `--warning-only` mode during the initial rollout for #1432; remove
 that flag when the quiet-week promotion is approved.
 
+## Doc Path Reference Gate
+
+`python3 scripts/check_doc_path_refs.py` fails when a hand-written doc (any
+tracked `*.md` outside `docs/generated/`) names a repo path that does not exist
+or a `path:line` past the end of the file. CI runs it through
+`tests/test_doc_path_refs.sh`. In these pages, name code as `path` plus a symbol
+(`src/kanban/hooks.rs` (`fire_dynamic_hooks`)) rather than `path:line`. Mark a
+path that is intentionally gone or not yet created with `(removed)` /
+`(proposed)` after it, or declare it once per doc; `--help` lists the markers.
+
 ## Maintainability Hard Gates
 
-CI runs `python3 scripts/audit_maintainability.py --check` and blocks on these
-four checks:
-
-- `new_direct_discord_send_outside_allowed_exclusion`
-  (`direct_discord_sends`) — no direct Discord send/edit call outside the
-  outbound dispatcher baseline.
-- `new_runtime_sqlite_or_legacy_db_reference` (`legacy_sqlite_refs`) — no new
-  runtime SQLite or legacy DB reference outside the compat/migration paths.
-- `new_source_of_truth_alias_write` (`source_of_truth_alias_writes`) — no new
-  write to an alias path from `docs/source-of-truth.md`.
-- `new_giant_file_without_change_surface_doc` (`giant_files`) — no production
-  Rust file at or above 1000 lines unless `change-surfaces.md` names it.
-
-`route_srp_violations`, `manual_json_row_mapping`, and
-`limit_clamp_duplication` intentionally remain warning-only.
+CI runs `python3 scripts/audit_maintainability.py --check`. Operational rules
+such as direct Discord writes, runtime SQLite references and source-of-truth
+alias writes retain their configured error gates. Giant size growth, threshold
+crossings, and missing change-surface documentation produce warnings. Growth
+warnings include the file and raw delta in CI/prepush logs and PR step summaries.
+No giant admission, decomposition deadline, or numeric growth allowance is needed.
+Review a split when introducing an independent responsibility; existing cohesive
+responsibilities may grow for fixes and clarification. The hotfile check also
+warns on raw growth for every tracked file, regardless of production line count.
 
 For new tuple-style JSON route handlers, prefer the light helpers in
 `crate::utils::api` for common simple responses and API query bounds:

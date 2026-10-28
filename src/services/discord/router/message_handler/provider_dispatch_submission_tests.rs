@@ -4,7 +4,6 @@
 
 use super::super::*;
 use crate::services::discord::inflight::{SubmissionPhase, fault};
-use crate::services::discord::input_runtime::fence;
 use crate::services::discord::tui_prompt_relay::relay_e2e::discord_mock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,8 +78,6 @@ async fn run_turn(
         session.current_path = Some(workspace.display().to_string());
         session.session_id = cell.warm.then(|| "zp1-existing-session".to_string());
     }
-    let gate = fence::Gate::protect(ProviderKind::Claude, channel.get()).unwrap();
-    let _health = fence::test_health::Clear::new(&gate);
     if cell.refuse {
         fault::arm(channel.get(), fault::FenceWriteFault::Write);
     }
@@ -211,9 +208,6 @@ async fn run_turn(
         discord,
     };
     let _ = release.send(());
-    tokio::time::timeout(timeout, gate.close().unwrap().drain())
-        .await
-        .expect("no input effect outlives the turn");
     outcome
 }
 
@@ -440,24 +434,6 @@ pub(super) fn observe_owner(
     }
 }
 
-/// Counts fence requests, so a held retry is shown to stop before any durable boundary.
-#[derive(Default)]
-struct CountingFence(std::sync::atomic::AtomicUsize);
-impl crate::services::claude_tui::submission_fence::SubmissionFence for CountingFence {
-    fn before_first_payload(
-        &self,
-    ) -> Result<(), crate::services::claude_tui::submission_fence::PreSubmitPersistenceRefused>
-    {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    }
-    fn refusal(
-        &self,
-    ) -> Option<crate::services::claude_tui::submission_fence::PreSubmitPersistenceRefused> {
-        None
-    }
-}
-
 /// The cancelled turn still owns its birth row, fenced phase and own mailbox slot, unrequeued.
 async fn assert_kept(
     stage: &str,
@@ -503,16 +479,71 @@ async fn assert_kept(
     );
 }
 
+/// A one-agent config for the real creators, with a fake Claude binary that never starts.
+fn d1_fixture_config(
+    f: &crate::services::tui_input::submission_tmux::guarded::transport_tests::Fixture,
+    ids: &[u64],
+) -> (Vec<crate::config::TestEnvVarGuard>, crate::config::Config) {
+    use crate::config::TestEnvVarGuard as Env;
+    use std::os::unix::fs::PermissionsExt;
+    let path = f.root.path().join("cg-d1-fixture.yaml");
+    let bindings = ids.iter().enumerate().map(|(index, id)| format!("  - id: cg-d1-{index}\n    name: cg-d1-{index}\n    channels:\n      claude: {{id: '{id}', runtime: tui}}\n")).collect::<String>();
+    let data = serde_json::to_string(&f.root.path().join("data")).unwrap();
+    let yaml = format!(
+        "server: {{}}\ndata: {{dir: {data}}}\ncluster: {{instance_id: cg-d1}}\nproviders:\n  claude: {{runtime: tui}}\nagents:\n{bindings}"
+    );
+    std::fs::write(&path, &yaml).unwrap();
+    let fake = f.root.path().join("claude-fixture");
+    std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let env = vec![
+        Env::set_path_after_shared_test_env_lock("AGENTDESK_CONFIG", &path),
+        Env::set_path_after_shared_test_env_lock("CLAUDE_CONFIG_DIR", f.root.path()),
+        Env::set_path_after_shared_test_env_lock("AGENTDESK_CLAUDE_PATH", &fake),
+    ];
+    (env, serde_yaml::from_str(&yaml).unwrap())
+}
+
+/// Stamps the markers and incarnation a spawned Claude pane `name` would carry.
+fn d1_execution_proof(
+    name: &str,
+    channel: u64,
+) -> crate::services::tui_prompt_dedupe::binding_context::PreparedIncarnation {
+    use crate::services::tmux_common as tc;
+    use crate::services::tui_prompt_dedupe::binding_context::PreparedIncarnation;
+    std::fs::create_dir_all(
+        std::path::Path::new(&tc::session_temp_path(name, "proof"))
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    tc::write_tmux_owner_marker(name).unwrap();
+    tc::host_marker::record_tmux_host_marker(name);
+    tc::write_tmux_runtime_kind_marker(
+        name,
+        crate::services::agent_protocol::RuntimeHandoffKind::ClaudeTui,
+    )
+    .unwrap();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let prepared =
+        PreparedIncarnation::prepare("claude", name, Some(channel), Some(&sid), false).unwrap();
+    prepared
+        .finish_spawn(crate::services::discord::stamp_spawn_markers(
+            name,
+            Some(&prepared),
+        ))
+        .unwrap();
+    prepared
+}
+
 async fn actual_creator(creator: Creator) {
-    use crate::services::claude_tui::host_input::guarded_submission::executor_tests::{
-        d1_execution_proof, d1_fixture_config, install_shim, renderer, screen,
+    use crate::services::claude_tui::input::submission::tests::{
+        frame_renderer as renderer, screen,
     };
-    use crate::services::claude_tui::{guarded_outcome, input, submission_fence, submit_canary};
     use crate::services::discord::inflight::{InflightEpisodePin, SubmissionFailure};
     use crate::services::tui_input::submission_tmux::guarded::transport_tests::Fixture as Tmux;
     let _root = crate::config::TestRuntimeRootGuard::new();
     let f = Tmux::after_shared_test_env_lock();
-    install_shim(&f);
     let id = match creator {
         Creator::Headless => 6_809_001,
         Creator::Intake => 6_809_002,
@@ -576,7 +607,7 @@ async fn actual_creator(creator: Creator) {
     let quote =
         |p: &std::path::Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
     let barrier = format!(
-        "if [ \"$payload\" = 1 ]; then\n touch {entered}\n {real} -L {socket} -f /dev/null \"$@\" >/dev/null\n while [ ! -f {release} ]; do sleep .02; done\n exit 0\nfi\n",
+        "if [ \"$2\" = paste-buffer ]; then\n touch {entered}\n {real} -L {socket} -f /dev/null \"$@\" >/dev/null\n while [ ! -f {release} ]; do sleep .02; done\n exit 0\nfi\n",
         real = quote(&f.real),
         socket = f.socket,
         entered = quote(&entered),
@@ -589,8 +620,6 @@ async fn actual_creator(creator: Creator) {
     );
     assert!(script.contains(&old));
     std::fs::write(&shim, script.replace(&old, &(barrier + &old))).unwrap();
-    let gate = fence::Gate::protect(ProviderKind::Claude, id).unwrap();
-    let _health = fence::test_health::Clear::new(&gate);
     let (observed, owner) = tokio::sync::oneshot::channel();
     *D1_OWNER.lock().unwrap() = Some((id, f.root.path().join(&name), observed));
     let (finished, bridge) = tokio::sync::oneshot::channel();
@@ -691,28 +720,23 @@ async fn actual_creator(creator: Creator) {
     .unwrap();
     assert!(
         entered.exists(),
-        "boot selection must reach the real guarded conditional payload, not Legacy"
+        "the real entry must reach the managed paste"
     );
     assert_eq!(
         durable_phase(channel),
         Some(SubmissionPhase::MayHaveSubmitted)
     );
-    // T0: the executor is parked in its first payload, so only selected()'s own begin() can
-    // have made the owner Running; nothing in this test calls begin().
+    // T0: the paste is parked, so only the managed attempt's own begin() can have made the owner
+    // Running; nothing in this test calls begin().
     assert!(
         matches!(cap.classify_failure(), SubmissionFailure::GuardedRunning),
-        "T0: selected() must notify begin before the executor's first payload"
+        "T0: the managed attempt must notify begin before its paste"
     );
     let pane = f.root.path().join(&name);
     let count = |file: &std::path::Path| std::fs::read(file).map_or(0, |bytes| bytes.len());
-    let exec_enters = f.root.path().join("exec-enters");
     assert_eq!(
-        (
-            count(&pane.join("payloads")),
-            count(&pane.join("enters")),
-            count(&exec_enters)
-        ),
-        (1, 0, 0),
+        (count(&pane.join("payloads")), count(&pane.join("enters"))),
+        (1, 0),
         "T0: one payload and no Enter"
     );
     let frame = std::fs::read(pane.join("frame")).unwrap();
@@ -739,11 +763,10 @@ async fn actual_creator(creator: Creator) {
         SubmissionFailure::GuardedRunning
     ));
     assert_eq!(
-        guarded_outcome::held(&name),
-        None,
-        "T1: the executor has not returned before the bridge finished"
+        count(&pane.join("enters")),
+        0,
+        "T1: no Enter before release"
     );
-    assert_eq!(count(&exec_enters), 0);
     assert_eq!(
         std::fs::read(f.root.path().join(&name).join("frame")).unwrap(),
         std::fs::read(f.root.path().join(&name).join("expected")).unwrap()
@@ -764,70 +787,38 @@ async fn actual_creator(creator: Creator) {
         "CG_D1_ACTUAL_CREATOR {creator:?} phase=MayHaveSubmitted owner=Running payload=1 enter=0 requeue=0"
     );
     drop(release_guard);
-    tokio::time::timeout(timeout, gate.close().unwrap().drain())
-        .await
-        .unwrap();
-    // T2: the late executor result is a typed hold kept on the session; the turn stays held.
-    let SubmissionFailure::GuardedStopped(
-        stopped @ crate::services::claude_tui::host_input::InputRun::Indeterminate { .. },
-    ) = cap.classify_failure()
-    else {
-        panic!("T2: a payload already sent must stop as a typed Indeterminate hold");
-    };
-    assert_eq!(guarded_outcome::held(&name), Some(stopped.clone()));
-    assert_kept("T2", &shared, channel, &born, &token).await;
-    // T3: the same effective prompt on a fresh, uncancelled token returns the stored hold.
-    let fence = Arc::new(CountingFence::default());
-    let fresh = crate::services::provider::CancelToken::new();
-    for warm in [false, true] {
-        let again = guarded_outcome::with_owner(Some(cap.observer()), || {
-            submission_fence::with_scope(Some(Arc::clone(&fence) as _), || {
-                submit_canary::with_channel(id, || match warm {
-                    true => input::send_followup_prompt_or_idle_transcript(
-                        &name,
-                        &submitted,
-                        Some(&fresh),
-                        &transcript,
-                    ),
-                    false => input::send_fresh_prompt(&name, &submitted, Some(&fresh)),
-                })
-            })
-        });
-        assert_eq!(
-            again,
-            Err(format!("claude tui guarded submission held: {stopped:?}")),
-            "T3 warm={warm}"
-        );
-    }
-    assert_eq!(fence.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // T2: the released paste is followed by its one Enter, which completes the attempt.
+    tokio::time::timeout(timeout, async {
+        while !matches!(cap.classify_failure(), SubmissionFailure::IdleStashObserved) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
         (
             std::fs::read(pane.join("received")).unwrap(),
+            count(&pane.join("payloads")),
             count(&pane.join("enters")),
-            count(&exec_enters)
         ),
-        (delivered, 0, 0),
-        "T3: no duplicate payload, Enter or cleanup key reached the pane"
+        ([delivered, b"\r".to_vec()].concat(), 1, 1),
+        "T2: one payload and one Enter reached the pane"
     );
-    assert_kept("T3", &shared, channel, &born, &token).await;
-    println!("CG_C32 {creator:?} T2={stopped:?} T3=held(fresh,warm) fence=0 payload=1 enter=0");
-    crate::services::claude_tui::guarded_outcome::forget_test_hold(&name);
+    assert_kept("T2", &shared, channel, &born, &token).await;
+    println!("CG_C32 {creator:?} T2=Applied payload=1 enter=1");
     shared.mailboxes.remove_fixture_for_test(channel);
     server.abort();
 }
 
-fn guarded_creator_child(test: &str) -> bool {
+/// The child inherits this process's environment, so no env fixture may change it meanwhile.
+fn creator_child(test: &str) -> bool {
     let _lock = crate::config::test_env_lock::acquire_shared_test_env_lock();
-    let _guard = crate::config::TestEnvVarGuard::capture_after_shared_test_env_lock(
-        "AGENTDESK_CLAUDE_SUBMIT_GUARD_CHANNEL_IDS",
-    );
-    unsafe { std::env::remove_var("AGENTDESK_CLAUDE_SUBMIT_GUARD_CHANNEL_IDS") };
     crate::services::discord::admin_host_guard::tests::api_child(test)
 }
 
 #[tokio::test]
 async fn cg_d1_headless_actual_begin_preserves_running_cancelled_bridge() {
-    if !guarded_creator_child(concat!(
+    if !creator_child(concat!(
         "services::discord::router::message_handler::provider_dispatch::submission_tests::",
         "cg_d1_headless_actual_begin_preserves_running_cancelled_bridge"
     )) {
@@ -837,7 +828,7 @@ async fn cg_d1_headless_actual_begin_preserves_running_cancelled_bridge() {
 }
 #[tokio::test]
 async fn cg_d1_intake_actual_begin_preserves_running_cancelled_bridge() {
-    if !guarded_creator_child(concat!(
+    if !creator_child(concat!(
         "services::discord::router::message_handler::provider_dispatch::submission_tests::",
         "cg_d1_intake_actual_begin_preserves_running_cancelled_bridge"
     )) {

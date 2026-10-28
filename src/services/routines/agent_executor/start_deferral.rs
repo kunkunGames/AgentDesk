@@ -71,8 +71,26 @@ pub(crate) fn classify_headless_start_error(
 
 /// Wraps a headless start error, keeping busy-mailbox (409) and not-ready runtimes retryable.
 pub(super) fn headless_start_error(agent_id: &str, error: HeadlessTurnStartError) -> anyhow::Error {
-    let message = format!("start routine agent turn for {agent_id}: {error}");
-    match classify_headless_start_error(&error) {
+    classified_start_error(
+        format!("start routine agent turn for {agent_id}: {error}"),
+        &error,
+    )
+}
+
+/// Same classification for a failed DM reservation; the message keeps the DM user for the logs.
+pub(super) fn dm_reservation_error(
+    agent_id: &str,
+    dm_user_id: u64,
+    error: HeadlessTurnStartError,
+) -> anyhow::Error {
+    classified_start_error(
+        format!("reserve routine agent DM turn for {agent_id} and user {dm_user_id}: {error}"),
+        &error,
+    )
+}
+
+fn classified_start_error(message: String, error: &HeadlessTurnStartError) -> anyhow::Error {
+    match classify_headless_start_error(error) {
         Some(kind) => TransientStartError { kind, message }.into(),
         None => anyhow!(message),
     }
@@ -116,6 +134,7 @@ pub(super) struct PendingAgentStart<'a> {
     pub(super) dm_user_id: Option<&'a str>,
     pub(super) checkpoint: &'a Option<Value>,
     pub(super) next_due_at: Option<DateTime<Utc>>,
+    pub(super) execution_mode: execution::AgentExecutionMode,
 }
 
 impl RoutineAgentExecutor {
@@ -140,6 +159,7 @@ impl RoutineAgentExecutor {
         let message = error.to_string();
         let result_json = json!({
             "status": "deferred",
+            "execution_mode": start.execution_mode.as_str(),
             "deferred_reason": kind.reason(),
             "deferred_since": since.to_rfc3339(),
             "next_retry_at": next_retry_at.to_rfc3339(),
@@ -248,6 +268,36 @@ mod tests {
         assert_eq!(transient.kind.reason(), "mailbox_busy");
         assert!(
             error.to_string().contains("agent mailbox is busy"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn dm_reservation_failures_keep_the_dm_user_and_defer_only_transient_causes() {
+        let unready =
+            HeadlessTurnStartError::Internal("provider runtime is not ready for channel 1".into());
+        let error = dm_reservation_error("agent-a", 4242, unready);
+        let transient = error.downcast_ref::<TransientStartError>().expect("typed");
+        assert_eq!(transient.kind, TransientStartKind::ProviderNotReady);
+        assert!(error.to_string().contains("user 4242"), "{error}");
+
+        let busy = HeadlessTurnStartError::Conflict("agent mailbox is busy for channel 1".into());
+        let error = dm_reservation_error("agent-a", 4242, busy);
+        let transient = error.downcast_ref::<TransientStartError>().expect("typed");
+        assert_eq!(transient.kind, TransientStartKind::MailboxBusy);
+
+        let dm_creation = HeadlessTurnStartError::Internal(
+            "DM channel creation failed for user 4242: Unknown User".into(),
+        );
+        let error = dm_reservation_error("agent-a", 4242, dm_creation);
+        assert!(
+            error.downcast_ref::<TransientStartError>().is_none(),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("reserve routine agent DM turn for agent-a and user 4242: "),
             "{error}"
         );
     }

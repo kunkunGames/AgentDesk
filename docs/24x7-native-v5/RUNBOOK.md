@@ -1,5 +1,7 @@
 # 검증 재현 명령과 운영 경계
 
+<!-- doc-path-refs: removed scripts/check_test_target_integrity.py scripts/check_pg_test_lane_membership.py -->
+
 아래 명령은 source checkout에서 실행한다. 실제 실행한 개발 검증과 아직
 검증하지 않은 배포/운영 절차를 구분한다. 운영 서비스의 start/pause/cancel/rollback
 명령은 대상 호스트와 지원 범위를 확인해 적용한다. Mac 기존 Routine의 실제 절차는
