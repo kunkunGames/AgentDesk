@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 const COMPLETED_LITERAL_OWNERS: &[(&str, usize)] = &[
     // Canonical derived writer `finalize_run_if_ready_on_pg_tx`.
     ("src/db/auto_queue/runs.rs", 1),
+    // Campaign workflow completion
+    ("src/db/campaigns/graph/workflow/retirement.rs", 1),
     // Destructive admin resets: run-scoped (1) and global (2 branches).
     ("src/services/auto_queue/command.rs", 3),
 ];

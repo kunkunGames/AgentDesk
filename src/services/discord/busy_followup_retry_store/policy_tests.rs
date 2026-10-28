@@ -455,7 +455,7 @@ fn a_pane_release_preserves_other_holds_and_requires_a_legacy_binding() {
             store::save_in_root(root, &provider, channel, id, state).unwrap();
         }
         let read = |id| store::load(&provider, channel, id).unwrap();
-        let live_ids = std::collections::HashSet::new();
+        let live_ids = std::collections::HashSet::from([1, 2, 3, 4]);
         let pass = store::release_draft_holds(&provider, channel, "pane-a", &live_ids);
         assert_eq!((pass.released, pass.retry), (1, false));
         assert_eq!(read(1), a.released_from_draft());

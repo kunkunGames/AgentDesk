@@ -56,21 +56,23 @@ fn issue_4112_pipe_interrupt_sends_sigint_and_marks_stopped() {
     let _guard = SIGINT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     super::stop_host::tests::run(async {
         let _ = process_table::take_sigint_test_events();
+        let owned = crate::services::session_backend::OwnedTestProcess::new();
+        let pid = owned.pid();
         let session_name = format!("pipe-cancel-{}", uuid::Uuid::new_v4());
         let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         crate::services::session_backend::insert_process_session(
             session_name.clone(),
-            crate::services::session_backend::SessionHandle::TestProcess { pid: 4112, alive },
+            crate::services::session_backend::SessionHandle::TestProcess { pid, alive },
         );
         let token = std::sync::Arc::new(CancelToken::new());
-        token.store_child_pid(4112);
+        token.store_child_pid(pid);
 
         let outcome =
             interrupt_provider_cli_turn(&ProviderKind::Claude, &token, "explicit_stop").await;
 
-        assert_eq!(process_table::take_sigint_test_events(), vec![4112]);
+        assert_eq!(process_table::take_sigint_test_events(), vec![pid]);
         assert_eq!(outcome.tmux_session, None);
-        assert_eq!(outcome.fallback_sigint_pid, Some(4112));
+        assert_eq!(outcome.fallback_sigint_pid, Some(pid));
         assert!(outcome.missing_tmux_session);
         assert!(!outcome.sigint_target_missing);
         assert!(crate::services::session_backend::process_session_was_stopped(&session_name));

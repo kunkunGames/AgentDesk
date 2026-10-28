@@ -24,12 +24,6 @@ pub(super) fn current_attempt_started_at(run: &RunningAgentRoutineRun) -> DateTi
         .unwrap_or(run.started_at)
 }
 pub(crate) fn provider_error_from_completion(completion: &AgentTurnCompletion) -> Option<String> {
-    if is_terminal_failure(completion.terminal_status.as_deref()) {
-        return Some(format!(
-            "agent turn failed ({})",
-            completion.terminal_status.as_deref().unwrap()
-        ));
-    }
     if !completion.evidence.confirms_assistant_delivery() {
         return None;
     }
@@ -64,16 +58,6 @@ pub(super) fn settled_terminal_turn_error(
     .then_some(row.outcome)
 }
 
-pub(super) fn is_terminal_failure(outcome: Option<&str>) -> bool {
-    outcome.is_some_and(|outcome| TERMINAL_TURN_ERROR_OUTCOMES.contains(&outcome))
-}
-
-fn is_pending_delivery(outcome: Option<&str>) -> bool {
-    matches!(
-        outcome,
-        Some("recovery_retry" | "delivery_pending" | "delivery_unresolved")
-    )
-}
 pub(super) fn fresh_provider_session_probe_allowed(
     run: &RunningAgentRoutineRun,
     now: DateTime<Utc>,
@@ -93,37 +77,9 @@ pub(crate) async fn find_headless_turn_completion(
     turn_id: &str,
     since: DateTime<Utc>,
 ) -> sqlx::Result<Option<AgentTurnCompletion>> {
-    let terminal = sqlx::query_as::<_, AgentQualityCompletionRow>(
-        r#"
-        SELECT event_type::text AS event_type,
-               payload #>> '{details,outcome}' AS outcome,
-               CASE WHEN payload #>> '{details,duration_ms}' ~ '^[0-9]{1,18}$'
-                    THEN (payload #>> '{details,duration_ms}')::bigint END AS duration_ms,
-               created_at
-        FROM agent_quality_event
-        WHERE correlation_id = $1 AND source_event_id = $1
-          AND created_at >= $2
-          AND event_type IN ('turn_error'::agent_quality_event_type,
-                             'turn_complete'::agent_quality_event_type)
-        ORDER BY created_at DESC, id DESC LIMIT 1
-        "#,
-    )
-    .bind(turn_id)
-    .bind(since)
-    .fetch_optional(pool)
-    .await?;
-    if let Some(event) = terminal.as_ref() {
-        if event.event_type == "turn_error" && is_terminal_failure(event.outcome.as_deref()) {
-            return Ok(terminal.and_then(terminal_completion_from_quality_event));
-        }
-        if is_pending_delivery(event.outcome.as_deref()) {
-            return Ok(None);
-        }
-    }
     let transcript = sqlx::query_as::<_, AgentTranscriptCompletionRow>(
         r#"
-        SELECT assistant_message, COALESCE(events_json, '[]'::jsonb)::text AS events_json,
-               duration_ms::bigint AS duration_ms, created_at
+        SELECT assistant_message, duration_ms::bigint AS duration_ms, created_at
         FROM session_transcripts
         WHERE turn_id = $1
           AND created_at >= $2
@@ -137,14 +93,6 @@ pub(crate) async fn find_headless_turn_completion(
     .fetch_optional(pool)
     .await?;
     if let Some(transcript) = transcript {
-        let events: Vec<crate::db::session_transcripts::SessionTranscriptEvent> =
-            serde_json::from_str(&transcript.events_json)
-                .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
-        let outcome =
-            crate::db::session_transcripts::SessionTranscriptEvent::recorded_turn_outcome(&events);
-        if is_pending_delivery(outcome) {
-            return Ok(None);
-        }
         let evidence = if assistant_message_is_no_reply(&transcript.assistant_message) {
             AgentTurnCompletionEvidence::NoReplyTranscript
         } else {
@@ -155,9 +103,34 @@ pub(crate) async fn find_headless_turn_completion(
             duration_ms: transcript.duration_ms,
             created_at: transcript.created_at,
             evidence,
-            terminal_status: outcome.map(str::to_owned),
+            terminal_status: None,
         }));
     }
+
+    let terminal = sqlx::query_as::<_, AgentQualityCompletionRow>(
+        r#"
+        SELECT event_type::text AS event_type,
+               payload #>> '{details,outcome}' AS outcome,
+               CASE
+                   WHEN payload #>> '{details,duration_ms}' ~ '^-?[0-9]+$'
+                   THEN (payload #>> '{details,duration_ms}')::bigint
+                   ELSE NULL
+               END AS duration_ms,
+               created_at
+        FROM agent_quality_event
+        WHERE correlation_id = $1
+          AND source_event_id = $1
+          AND created_at >= $2
+          AND event_type = 'turn_error'::agent_quality_event_type
+          AND payload #>> '{details,outcome}' = 'empty_response'
+        ORDER BY created_at ASC, id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(turn_id)
+    .bind(since)
+    .fetch_optional(pool)
+    .await?;
 
     Ok(terminal.and_then(terminal_completion_from_quality_event))
 }
@@ -170,7 +143,7 @@ impl RoutineAgentExecutor {
         let Some(turn_id) = run.turn_id.as_deref() else {
             return Ok(None);
         };
-        find_headless_turn_completion(&self.pool, turn_id, current_attempt_started_at(run))
+        find_headless_turn_completion(&self.pool, turn_id, run.started_at)
             .await
             .map_err(|error| {
                 anyhow!(

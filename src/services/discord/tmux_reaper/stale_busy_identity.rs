@@ -19,13 +19,8 @@ pub(super) fn stale_busy_turn_is_still_reapable(
 pub(super) fn recorded_inflight_tmux_session_name(
     provider: &ProviderKind,
     channel_id: serenity::ChannelId,
-    user_msg_id: serenity::MessageId,
-    turn_nonce: Option<&str>,
 ) -> Option<String> {
     crate::services::discord::inflight::load_inflight_state(provider, channel_id.get())
-        .filter(|state| {
-            state.user_msg_id == user_msg_id.get() && state.turn_nonce.as_deref() == turn_nonce
-        })
         .and_then(|state| state.tmux_session_name)
 }
 

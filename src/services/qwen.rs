@@ -658,7 +658,18 @@ fn qwen_read_output_file_until_result_tracked(
         },
         move |line, state| {
             observe_qwen_user_prompt_line(line, tmux_session_name.as_deref());
-            process_stream_line(line, &line_sender, state)
+            let ok = process_stream_line(line, &line_sender, state);
+            if state.terminal_error {
+                if let Some((message, stdout_raw)) = &state.stdout_error {
+                    let _ = line_sender.send(StreamMessage::Error {
+                        message: message.clone(),
+                        stdout: stdout_raw.clone(),
+                        stderr: String::new(),
+                        exit_code: None,
+                    });
+                }
+            }
+            ok
         },
         StreamLineState::has_terminal_result,
         move |state| {

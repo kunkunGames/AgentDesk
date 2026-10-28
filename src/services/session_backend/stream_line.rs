@@ -250,14 +250,8 @@ fn process_stream_line_with_body_policy(
         }
         StreamMessage::Error { message, .. } => {
             state.stdout_error = Some((message.clone(), line.to_string()));
-            if msg_type == "result" {
-                // A persistent wrapper remains alive after a terminal failure.
-                // Deliver it now; waiting for process death can synthesize a
-                // false success at idle or hold the routine until its timeout.
-                state.terminal_error = true;
-            } else {
-                return true;
-            }
+            state.terminal_error = msg_type == "result";
+            return true;
         }
         _ => {}
     }
