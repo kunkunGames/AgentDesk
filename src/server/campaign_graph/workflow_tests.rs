@@ -1034,7 +1034,10 @@ async fn workflow_goal_completion_waits_for_cleanup_then_skips_unpublished_suffi
         let sql = format!(
             "INSERT INTO auto_queue_run_cleanup_tasks(run_ids,{field}) VALUES('{{}}','{{\"retained\":true}}') RETURNING id"
         );
-        let cleanup: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str())).fetch_one(&pool).await.unwrap();
+        let cleanup: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert!(
             !workflow::store::complete(&pool, &campaign.id, &finish_key)
                 .await

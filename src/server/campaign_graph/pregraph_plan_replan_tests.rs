@@ -400,11 +400,13 @@ async fn pregraph_repair_checks_ancestor_execution_and_complete_audit_set_pg() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table} WHERE campaign_id=$1")))
-            .bind(id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE campaign_id=$1"
+        )))
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
         refuse(&pool, &f, &f.request).await;
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO {table} SELECT * FROM jsonb_populate_record(NULL::{table},$1)"

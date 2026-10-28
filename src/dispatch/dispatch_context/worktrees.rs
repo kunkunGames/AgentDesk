@@ -32,7 +32,9 @@ pub(crate) async fn resolve_card_worktree(
                 )
             })
             .await
-            .map_err(|error| anyhow::anyhow!("Worktree worker failed for card {card_id}: {error}"))?
+            .map_err(|error| {
+                anyhow::anyhow!("Worktree worker failed for card {card_id}: {error}")
+            })?
         }
     };
     Ok(worktree.map(|wt| (wt.path, wt.branch, wt.commit)))
@@ -63,7 +65,9 @@ pub(crate) async fn ensure_card_worktree(
     let ensured = match issue_number {
         Some(issue) => crate::services::git::ensure_worktree_for_issue_async(repo_dir, issue)
             .await
-            .map_err(|error| anyhow::anyhow!("Cannot create worktree for card {card_id}: {error}"))?,
+            .map_err(|error| {
+                anyhow::anyhow!("Cannot create worktree for card {card_id}: {error}")
+            })?,
         None => {
             let owned_card = card_id.to_owned();
             tokio::task::spawn_blocking(move || {
@@ -74,7 +78,9 @@ pub(crate) async fn ensure_card_worktree(
             })
             .await
             .map_err(|error| anyhow::anyhow!("Worktree worker failed for card {card_id}: {error}"))?
-            .map_err(|error| anyhow::anyhow!("Cannot create worktree for card {card_id}: {error}"))?
+            .map_err(|error| {
+                anyhow::anyhow!("Cannot create worktree for card {card_id}: {error}")
+            })?
         }
     };
     Ok(Some((

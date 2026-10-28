@@ -64,7 +64,10 @@ pub(super) async fn load(pool: &PgPool, card: &str) -> anyhow::Result<Option<Wor
     let query = format!(
         "SELECT k.verification_contract,k.verification_state,k.assigned_agent_id,k.repo_id,k.pipeline_stage_id,d.id AS dispatch_id,d.result {WORK_SCOPE} AND k.id=$1"
     );
-    let row = sqlx::query(sqlx::AssertSqlSafe(query)).bind(card).fetch_optional(pool).await?;
+    let row = sqlx::query(sqlx::AssertSqlSafe(query))
+        .bind(card)
+        .fetch_optional(pool)
+        .await?;
     row.map(|r| {
         Ok(Work {
             card: card.into(),

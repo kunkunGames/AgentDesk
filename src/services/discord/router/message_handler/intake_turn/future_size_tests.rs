@@ -40,9 +40,7 @@ fn intake_entry_futures_stay_within_worker_stack_budget() {
     let entry = handler_size(handle_text_message);
     let core = core_size(execute_intake_turn_core);
     let campaign = campaign_size(context::campaign_graph_prompt);
-    eprintln!(
-        "INTAKE_FUTURE_BYTES entry={entry} core={core} campaign={campaign}"
-    );
+    eprintln!("INTAKE_FUTURE_BYTES entry={entry} core={core} campaign={campaign}");
     assert!(entry <= 64 * 1024, "entry embeds {entry} bytes");
     assert!(core <= 64 * 1024, "worker core embeds {core} bytes");
     assert!(

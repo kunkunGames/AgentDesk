@@ -33,8 +33,7 @@ impl Lineage {
                 .iter()
                 .filter(|m| {
                     m.version <= 141
-                        || (m.version == 146
-                            && m.description == "campaign upstream convergence")
+                        || (m.version == 146 && m.description == "campaign upstream convergence")
                 })
                 .cloned()
                 .collect(),

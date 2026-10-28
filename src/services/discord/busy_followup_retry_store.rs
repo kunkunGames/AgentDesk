@@ -600,7 +600,8 @@ pub(in crate::services::discord) fn bind_legacy_draft_session(
         return Err("draft session must be non-empty".to_string());
     }
     let (root, _guard) = locked_root()?;
-    let Some(mut state) = refused(read_source_in_root(&root, provider, channel_id, input_id))? else {
+    let Some(mut state) = refused(read_source_in_root(&root, provider, channel_id, input_id))?
+    else {
         return Ok(false);
     };
     if !state.draft_hold {

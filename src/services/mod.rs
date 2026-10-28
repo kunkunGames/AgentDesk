@@ -24,9 +24,9 @@ pub mod codex_tui;
 pub mod cswap;
 pub mod discord;
 pub mod discord_config_audit;
+pub(crate) mod managed_checks;
 #[allow(dead_code)]
 pub(crate) mod tui_input;
-pub(crate) mod managed_checks;
 // #1693: `discord_delivery` moved to `dispatches::discord_delivery`. The
 // flat path is preserved as a re-export so existing import sites and
 // tests keep working without churn.

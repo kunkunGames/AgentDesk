@@ -41,10 +41,10 @@ pub(super) use output_paths::detect_live_tmux_output_path;
 use output_paths::recovery_output_path_with_tmux_fallback;
 #[path = "restore_inflight/diagnostics.rs"]
 mod diagnostics;
-#[path = "restore_inflight/replay_hold.rs"]
-mod replay_hold;
 #[path = "restore_inflight/replay_decision.rs"]
 mod replay_decision;
+#[path = "restore_inflight/replay_hold.rs"]
+mod replay_hold;
 use replay_decision::observe_restore_inflight_snapshot;
 
 pub(in crate::services::discord) async fn restore_inflight_turns(

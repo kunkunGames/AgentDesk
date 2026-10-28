@@ -14,8 +14,8 @@ use super::liveness_authority::{CaptureCoordinateObservation, CoordinateStatus};
 #[path = "probe_runtime.rs"]
 mod probe_runtime;
 mod relay_backlog;
-pub(super) use relay_backlog::RelayBacklogEvidence;
 pub(super) use probe_runtime::{HealthProbeRuntime, ProbeFault, ProbeOutcome};
+pub(super) use relay_backlog::RelayBacklogEvidence;
 
 pub(super) const WATCHER_STATE_DESYNC_STALE_MS: i64 = 30_000;
 

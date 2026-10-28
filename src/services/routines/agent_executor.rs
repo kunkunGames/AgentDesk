@@ -1,11 +1,11 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 
+#[cfg(test)]
+mod completion_pg_tests;
 mod execution;
 mod launch;
 mod owned_session;
-#[cfg(test)]
-mod completion_pg_tests;
 pub(crate) mod reliability;
 pub(crate) mod start_deferral;
 use reliability::{current_attempt_started_at, provider_error_from_completion};
