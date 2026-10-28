@@ -1029,7 +1029,12 @@ fn enrichment_from_evidence(
         capture_coordinate: capture,
         unread_bytes: Some(req.capture_end - req.frontier),
         relay_stale: true,
-        capture_lagged: super::super::eligible_capture_lagged(true, true, &evidence),
+        capture_lagged: super::super::eligible_capture_lagged(
+            true,
+            true,
+            &evidence,
+            req.capture_end != req.frontier,
+        ),
         relay_backlog: evidence,
         frontier_provenance: FrontierProvenance::observe(
             CoordFrontierObservation::PresentZero,

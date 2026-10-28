@@ -592,7 +592,7 @@ impl SessionEnrichment {
     }
 }
 
-fn eligible_capture_lagged(
+pub(super) fn eligible_capture_lagged(
     binding_matches: bool,
     inflight_present: bool,
     evidence: &RelayBacklogEvidence,
