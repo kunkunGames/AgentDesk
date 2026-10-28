@@ -250,7 +250,16 @@ fn process_stream_line_with_body_policy(
         }
         StreamMessage::Error { message, .. } => {
             state.stdout_error = Some((message.clone(), line.to_string()));
-            if msg_type == "result" {
+            let is_reconnect_error = json
+                .get("errors")
+                .and_then(Value::as_array)
+                .is_some_and(|arr| {
+                    arr.iter().any(|item| {
+                        item.as_str()
+                            .is_some_and(|s| s.starts_with("Reconnecting..."))
+                    })
+                });
+            if msg_type == "result" && !is_reconnect_error {
                 // A persistent wrapper remains alive after a terminal failure.
                 // Deliver it now; waiting for process death can synthesize a
                 // false success at idle or hold the routine until its timeout.

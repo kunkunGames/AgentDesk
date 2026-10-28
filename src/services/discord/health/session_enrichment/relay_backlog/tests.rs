@@ -1033,7 +1033,6 @@ fn enrichment_from_evidence(
             true,
             true,
             &evidence,
-            req.capture_end != req.frontier,
         ),
         relay_backlog: evidence,
         frontier_provenance: FrontierProvenance::observe(
